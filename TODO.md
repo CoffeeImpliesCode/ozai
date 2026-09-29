@@ -23,7 +23,7 @@ what "next" means.
 ## Waiting on a predecessor
 
 - **M8 — the QUIC substrate.** Decided, see
-  [`DECISIONS/0001-transport-substrate.md`](DECISIONS/0001-transport-substrate.md).
+  [`DECISIONS/0001-transport-substrate.md`](docs/DECISIONS/0001-transport-substrate.md).
   It sits behind M7, and M2–M7 do not wait on it. What genuinely cannot start is
   M9 and up: anything needing a live peer connection.
 

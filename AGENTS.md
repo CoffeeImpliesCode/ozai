@@ -89,8 +89,9 @@ review finding, not a documented limitation.
    dirty change? `jj commit -m "wip: ..."` (checkpoint) or a fresh change.
    Baseline tests must pass before the first edit — a red suite is provably
    yours.
-1. Read this file again + `README.md`, `SPEC.md`, `docs/PLAN.md`,
-   `docs/ARCHITECTURE.md`, `TODO.md`. Once per task.
+1. Read this file again + `README.md`, `TODO.md`, `docs/PLAN.md`,
+   `docs/ARCHITECTURE.md`, and the relevant record under `docs/DECISIONS/`.
+   Once per task.
 2. Bug fixes: **red-green** — failing test first, prove it fails, then fix.
 3. Features: agree test seams up front; vertical slices (test → impl →
    repeat), never horizontal dumps.
@@ -107,7 +108,7 @@ evidence in the same turn.** The house driver is `devenv shell -- gate`
 |---|------|----------|
 | 1 | Format | `zig fmt --check .` — zero diffs |
 | 2 | Build | `zig build -Doptimize=Debug` + `ReleaseSafe` — exit 0 |
-| 3 | Tests | `zig build test` Debug + ReleaseSafe — all green, zero leaks (`std.testing.allocator`) |
+| 3 | Tests | `zig build test` Debug + `ReleaseSafe` — all green, zero leaks (`std.testing.allocator`) |
 | 4 | Syntax | `zig ast-check` on every changed `.zig` |
 | 5 | Compile-all | `refAllDecls` test in each root — unused decls still type-check |
 | 6 | Lint | `zlint` — zero errors on changed files |
