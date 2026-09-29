@@ -14,15 +14,16 @@ demands. The plan front-loads that half and defers the half that needs QUIC.
 1. **QUIC is the risk, not the work.** iroh 1.3.0 runs `noq`/`noq-proto`/`noq-udp`
    — n0's own QUIC fork with multipath `PathId` and QNT
    (`draft-seemann-quic-nat-traversal-02`) grafted on. There is no QUIC in the Zig
-   0.16 standard library. Every milestone that needs a live connection is gated
-   on the decision in
-   [`DECISIONS/0001-transport-substrate.md`](DECISIONS/0001-transport-substrate.md).
+   0.16 standard library, and `std.crypto.tls` ships a client-only driver with no
+   server and no raw-key certificate support. M8 is now decided
+   ([`DECISIONS/0001`](DECISIONS/0001-transport-substrate.md)), so this is a known
+   cost with a recorded price rather than an open risk.
 2. **The TLS handshake is not a detail.** iroh's peer authentication *is* TLS 1.3
-   with raw Ed25519 public keys: the certificate is a DER `SubjectPublicKeyInfo`
-   wrapping the 32-byte node id, and verification reduces to a byte comparison
-   against the id you expected. A QUIC stack that cannot accept a raw key as its
-   certificate cannot be an iroh peer. This is the single hardest interop
-   requirement, and it is a requirement on the *chosen* QUIC, not on ozai's code.
+   with raw Ed25519 public keys: the certificate is a 44-byte DER
+   `SubjectPublicKeyInfo` wrapping the 32-byte node id, in both directions, and
+   verification reduces to a byte comparison against the id you expected. That is
+   a requirement on the *chosen* QUIC rather than on ozai's own code, and it is
+   what eliminated two of the three candidates outright.
 3. **`std.Io` is the only I/O vocabulary.** Zig 0.16 threads `io: std.Io` through
    every I/O-capable call. ozai never caches an `Io` in a struct, never reaches
    for a global, and never calls a syscall directly except through `Io` or
@@ -154,11 +155,26 @@ and paths silently alias.
 
 ### M8 — the QUIC substrate
 
-Gated on DECISIONS/0001. Whichever way it goes, the contract is fixed: a
-`feedPacket`-shaped seam that accepts a datagram from a transport multiplexer
-ozai owns and hands back an outgoing datagram, per connection, without the QUIC
-stack owning the socket. If the chosen stack cannot do that, it cannot be an
-iroh peer, and the decision is revisited rather than worked around.
+**Decided.** See
+[`DECISIONS/0001-transport-substrate.md`](DECISIONS/0001-transport-substrate.md):
+fork `endel/quic-zig`, strip its socket-owning layer, and patch its TLS to accept
+a raw Ed25519 SPKI as the certificate. The cost accepted with it is the loss of
+native multipath, mitigated by M7's synthetic-ULA map at the price of slower
+convergence.
+
+The contract for whatever sits here:
+
+- Sans-IO. A datagram in from a transport multiplexer ozai owns, a datagram out,
+  per connection. The QUIC layer never opens a socket, never links libc, and
+  never owns a clock.
+- Raw-SPKI Ed25519 peer authentication, both directions. A stack that insists on
+  parsing X.509 cannot be an iroh peer, and that is not something to work around.
+- A stable verifier identity across every client-config construction, or 0-RTT
+  stops working with no error to notice.
+
+Execution order: vendor the sans-IO core, **delete** the socket layer rather than
+leaving it unused (which also drops the forced `link_libc` and the `xev`
+dependency), then patch the two certificate paths, then expose it as a module.
 
 ### M9 — endpoint, router, connection
 

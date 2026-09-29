@@ -27,16 +27,14 @@ for the milestone order and the reasoning, and
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the module tree and the
 invariants a port must not break.
 
-There is deliberately no socket code yet. The transport substrate is the one
-decision in this project that cannot be reversed cheaply, and
+There is deliberately no socket code yet. The transport substrate was the one
+decision in this project that cannot be reversed cheaply, so it was made first
+and written down:
 [`docs/DECISIONS/0001-transport-substrate.md`](docs/DECISIONS/0001-transport-substrate.md)
-records what it was decided on and why.
+records what it was decided on, what it costs, and what would make it be
+revisited.
 
 ## Build
-
-The project is pinned to **Zig 0.16.0** through `.minimum_zig_version` in
-`build.zig.zon`. `zig` on this host is the anyzig shim, which reads that pin;
-there is no `zig` in `devenv.nix` on purpose.
 
 ```sh
 direnv allow          # once

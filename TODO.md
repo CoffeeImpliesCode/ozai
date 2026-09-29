@@ -20,11 +20,12 @@ what "next" means.
   lowercase-after-prefix base32 rule are the two things that will silently
   produce packets nobody accepts.
 
-## Blocked
+## Waiting on a predecessor
 
-- **M8 — the QUIC substrate.** Gated on
+- **M8 — the QUIC substrate.** Decided, see
   [`DECISIONS/0001-transport-substrate.md`](DECISIONS/0001-transport-substrate.md).
-  Milestones 2 through 7 are all pure over bytes and do not wait on it.
+  It sits behind M7, and M2–M7 do not wait on it. What genuinely cannot start is
+  M9 and up: anything needing a live peer connection.
 
 ## Standing constraints
 

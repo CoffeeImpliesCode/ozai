@@ -24,7 +24,7 @@ would break if it moved.
 │  ozai.relay           │  ozai.discovery                │
 │  client + server      │  pkarr, DNS TXT, publisher     │
 │  frame codec          │  resolver, merge               │
-├───────────────────────┴───────────────────────────────┤
+├───────────────────────────────────────────────────────┤
 │  ozai.net             net report, NAT classification,  │
 │                       portmapper, direct-address set  │
 ├───────────────────────────────────────────────────────┤
@@ -36,6 +36,11 @@ would break if it moved.
 The rule that makes the whole thing testable: **nothing below `ozai.base` may
 read a clock, read the environment, or take an allocator it was not handed.**
 Everything above it may, as long as `io: std.Io` is threaded rather than stored.
+
+The runtime is [`DECISIONS/0002`](DECISIONS/0002-async-substrate.md): zio, used
+at the transport and endpoint layers and invisible above them. A state machine
+that needs a runtime stood up in order to be tested has found a boundary in the
+wrong place.
 
 ## Module tree
 
