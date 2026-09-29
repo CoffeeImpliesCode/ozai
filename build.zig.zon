@@ -1,7 +1,7 @@
 .{
     .name = .ozai,
     .version = "0.0.0",
-    .fingerprint = 0x0, // placeholder; replaced by the compiler-suggested value
+    .fingerprint = 0x53ef56d532533043, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{

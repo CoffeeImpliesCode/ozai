@@ -1,0 +1,308 @@
+//! Node identity: the ed25519 key pair behind every ozai node address.
+//!
+//! `NodeId` is the public half and is the only identity ozai ever puts on the
+//! wire in the clear. `SecretKey` is the signing half. `Signature` is a
+//! detached ed25519 signature over bytes, with no algorithm negotiation.
+//!
+//! Divergence from iroh, on purpose: iroh calls the public half `PublicKey`
+//! with a type alias `EndpointId`. ozai has one name, `NodeId`, because the
+//! value is never used as a raw key in the API — every use is "address a node".
+
+const std = @import("std");
+const base32 = @import("base32.zig");
+
+pub const Ed25519 = std.crypto.sign.Ed25519;
+
+/// Errors from constructing a `NodeId` or a `SecretKey`.
+pub const KeyError = error{
+    /// The 32 bytes are not a canonical ed25519 point encoding.
+    NotOnCurve,
+    /// The seed derives the identity point and cannot sign.
+    DegenerateSeed,
+    /// The signature did not verify against this node id and message.
+    BadSignature,
+};
+
+/// A node's public identity: 32 bytes of canonical ed25519 point.
+///
+/// Ordering is lexicographic over the 32 bytes, not by curve order. Every
+/// sorted collection in ozai relies on it, so it is part of the type contract,
+/// not an implementation detail.
+pub const NodeId = struct {
+    key: Ed25519.PublicKey,
+
+    pub const byte_length = Ed25519.PublicKey.encoded_length;
+    pub const hex_length = byte_length * 2;
+    /// Both base32 forms are 52 characters for 32 bytes. A DNS label caps at
+    /// 63, which is why a node id is never written as hex on a wire that a DNS
+    /// label has to carry: hex would need 64 and would not fit.
+    pub const z32_length = base32.encodedLen(byte_length);
+    pub const dnssec_length = base32.encodedLen(byte_length);
+    /// Characters kept by `shortHex`.
+    pub const short_hex_length = 10;
+
+    /// Validate and wrap 32 bytes.
+    pub fn fromBytes(bytes: [byte_length]u8) KeyError!NodeId {
+        return .{ .key = Ed25519.PublicKey.fromBytes(bytes) catch return error.NotOnCurve };
+    }
+
+    pub fn toBytes(self: NodeId) [byte_length]u8 {
+        return self.key.toBytes();
+    }
+
+    /// Lowercase hex, the form used in config files, logs and CLI output.
+    pub fn toHex(self: NodeId) [hex_length]u8 {
+        return std.fmt.bytesToHex(&self.toBytes(), .lower);
+    }
+
+    pub fn parseHex(text: []const u8) KeyError!NodeId {
+        if (text.len != hex_length) return error.NotOnCurve;
+        var bytes: [byte_length]u8 = undefined;
+        _ = std.fmt.hexToBytes(&bytes, text) catch return error.NotOnCurve;
+        return fromBytes(bytes);
+    }
+
+    /// First `short_hex_length` hex characters, for human-facing lines where the
+    /// full id would drown the rest of the message.
+    pub fn shortHex(self: NodeId) [short_hex_length]u8 {
+        const full = self.toHex();
+        return full[0..short_hex_length].*;
+    }
+
+    /// z-base-32 form, the pkarr DNS label encoding.
+    pub fn toZ32(self: NodeId) [z32_length]u8 {
+        return base32.encode(base32.z32, byte_length, &self.toBytes());
+    }
+
+    pub fn parseZ32(text: []const u8) (KeyError || base32.DecodeError)!NodeId {
+        return fromBytes(try base32.decode(base32.z32, byte_length, text));
+    }
+
+    /// `{hex-extended-base32}.iroh.invalid`, the name ozai's TLS stack uses
+    /// *locally*.
+    ///
+    /// It is never sent as SNI. iroh stopped transmitting it in 1.0.3 because it
+    /// discloses the peer id; it survives only to select the expected peer and to
+    /// bucket the 0-RTT session cache. `.invalid` is reserved by RFC 2606 to
+    /// never resolve, so a stray resolver cannot turn it into a real lookup.
+    ///
+    /// This is the DNS alphabet, not z-base-32. Both are 52 characters, which is
+    /// why the mistake is easy to make and invisible until a handshake fails.
+    pub fn toLocalTlsName(self: NodeId) [dnssec_length + ".iroh.invalid".len]u8 {
+        var name: [dnssec_length + ".iroh.invalid".len]u8 = undefined;
+        @memcpy(name[0..dnssec_length], &base32.encode(
+            base32.dnssec,
+            byte_length,
+            &self.toBytes(),
+        ));
+        @memcpy(name[dnssec_length..], ".iroh.invalid");
+        return name;
+    }
+
+    pub fn parseLocalTlsName(text: []const u8) (KeyError || base32.DecodeError)!NodeId {
+        const suffix = ".iroh.invalid";
+        if (text.len != dnssec_length + suffix.len) return error.NotOnCurve;
+        if (!std.mem.eql(u8, text[dnssec_length..], suffix)) return error.NotOnCurve;
+        return fromBytes(try base32.decode(base32.dnssec, byte_length, text[0..dnssec_length]));
+    }
+
+    /// Lexicographic over bytes. Named so a reader does not have to check
+    /// whether this is the curve order.
+    pub fn order(self: NodeId, other: NodeId) std.math.Order {
+        return std.mem.order(u8, &self.toBytes(), &other.toBytes());
+    }
+
+    pub fn format(self: NodeId, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.writeAll(&self.toHex());
+    }
+};
+
+/// The signing half of a node identity.
+///
+/// `deinit` zeroes the key. There is no `clone`: copying a secret key is a
+/// decision the caller must make at the call site, with the copy visible.
+pub const SecretKey = struct {
+    key: Ed25519.SecretKey,
+
+    pub const byte_length = Ed25519.SecretKey.encoded_length;
+    /// The 32-byte half that is the actual entropy source.
+    pub const seed_length = Ed25519.KeyPair.seed_length;
+
+    pub fn generate(io: std.Io) SecretKey {
+        return .{ .key = Ed25519.KeyPair.generate(io).secret_key };
+    }
+
+    /// Derive a key deterministically. Used by tests and by anyone restoring a
+    /// key from a seed phrase; the seed must come from a real CSPRNG.
+    pub fn fromSeed(seed: [seed_length]u8) KeyError!SecretKey {
+        const pair = Ed25519.KeyPair.generateDeterministic(seed) catch
+            return error.DegenerateSeed;
+        return .{ .key = pair.secret_key };
+    }
+
+    pub fn nodeId(self: SecretKey) NodeId {
+        // A secret key built by `fromSeed` or `generate` always carries a key
+        // its own constructor accepted.
+        return .{ .key = Ed25519.PublicKey.fromBytes(self.key.publicKeyBytes()) catch unreachable };
+    }
+
+    pub fn sign(self: SecretKey, message: []const u8) Signature {
+        // `noise = null` is deterministic ed25519 (RFC 8032). A P2P node signs
+        // the same ticket twice on purpose: the bytes are public, and a
+        // deterministic signature makes the ticket itself a stable identifier.
+        const pair: Ed25519.KeyPair = .{
+            .public_key = self.nodeId().key,
+            .secret_key = self.key,
+        };
+        const signature = Ed25519.KeyPair.sign(pair, message, null) catch unreachable;
+        return .{ .bytes = signature.toBytes() };
+    }
+
+    pub fn toBytes(self: SecretKey) [byte_length]u8 {
+        return self.key.toBytes();
+    }
+
+    /// Zero the key material. Must be called; a `SecretKey` left in freed heap
+    /// is a `SecretKey` an attacker reads.
+    pub fn deinit(self: *SecretKey) void {
+        std.crypto.secureZero(u8, @volatileCast(std.mem.asBytes(self)));
+    }
+};
+
+/// A detached ed25519 signature.
+pub const Signature = struct {
+    bytes: [Ed25519.Signature.encoded_length]u8,
+
+    pub const byte_length = Ed25519.Signature.encoded_length;
+
+    pub fn fromBytes(bytes: [byte_length]u8) Signature {
+        return .{ .bytes = bytes };
+    }
+
+    pub fn toBytes(self: Signature) [byte_length]u8 {
+        return self.bytes;
+    }
+
+    /// `verify` (not `verifyStrict`): ozai re-derives the key from a `NodeId`
+    /// that was already canonicality-checked at construction, so the extra
+    /// small-order pass buys nothing and costs a decompression per verify.
+    /// Callers that must match iroh byte-for-byte over hostile input use
+    /// `verifyStrict`.
+    pub fn verify(self: Signature, message: []const u8, node_id: NodeId) KeyError!void {
+        const ed_signature = Ed25519.Signature.fromBytes(self.bytes);
+        ed_signature.verify(message, node_id.key) catch return error.BadSignature;
+    }
+
+    /// `verifyStrict` additionally rejects small-order and non-canonical keys,
+    /// which is what iroh's `verify_strict` does. It is the right check on any
+    /// key that arrived from the network rather than from `NodeId.fromBytes`.
+    pub fn verifyStrict(self: Signature, message: []const u8, node_id: NodeId) KeyError!void {
+        const ed_signature = Ed25519.Signature.fromBytes(self.bytes);
+        ed_signature.verifyStrict(message, node_id.key) catch return error.BadSignature;
+    }
+
+    pub fn format(self: Signature, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.writeAll(&std.fmt.bytesToHex(&self.bytes, .lower));
+    }
+};
+
+const t = std.testing;
+
+// The vector iroh publishes for an all-zero secret key, as the local TLS name.
+// If our seed derivation ever drifts from ed25519-as-RFC-8032, this is the
+// first thing that breaks.
+test "all-zero seed produces the iroh node id" {
+    var secret = try SecretKey.fromSeed([_]u8{0} ** SecretKey.seed_length);
+    defer secret.deinit();
+    const node_id = secret.nodeId();
+    try t.expectEqualStrings(
+        "7dl2ff6emqi2qol3l382krodedij45bn3nh479hqo14a32qpr8kg.iroh.invalid",
+        &node_id.toLocalTlsName(),
+    );
+    // The z-base-32 form is a different alphabet over the same bytes. The
+    // interop vector is the DNS-legal label above; this checks only that the
+    // two encodings describe one identity.
+    const via_z32 = try NodeId.parseZ32(&node_id.toZ32());
+    try t.expectEqual(node_id, via_z32);
+}
+
+test "local tls name round trips and rejects near misses" {
+    var secret = try SecretKey.fromSeed([_]u8{0} ** SecretKey.seed_length);
+    defer secret.deinit();
+    const node_id = secret.nodeId();
+    const name = node_id.toLocalTlsName();
+
+    try t.expectEqualStrings(
+        "7dl2ff6emqi2qol3l382krodedij45bn3nh479hqo14a32qpr8kg.iroh.invalid",
+        &name,
+    );
+    try t.expectEqual(node_id, try NodeId.parseLocalTlsName(&name));
+
+    // 'y' is past the end of the DNS alphabet, so the decoder names the fault
+    // instead of blaming the whole name.
+    var corrupt = name;
+    corrupt[0] = 'y';
+    try t.expectError(error.InvalidSymbol, NodeId.parseLocalTlsName(&corrupt));
+
+    // The right label under a different suffix is a different name, not a near
+    // miss on the label: the suffix is what makes the name local-only.
+    try t.expectError(error.NotOnCurve, NodeId.parseLocalTlsName(
+        "7dl2ff6emqi2qol3l382krodedij45bn3nh479hqo14a32qpr8kg.iroh.example",
+    ));
+}
+
+test "hex and z32 round trip, and both reject a bad encoding" {
+    const node_id = (try SecretKey.fromSeed([_]u8{7} ** SecretKey.seed_length)).nodeId();
+    try t.expectEqual(node_id, try NodeId.parseHex(&node_id.toHex()));
+    try t.expectEqual(node_id, try NodeId.parseZ32(&node_id.toZ32()));
+
+    try t.expectError(error.NotOnCurve, NodeId.parseHex("deadbeef"));
+    try t.expectError(error.InvalidLength, NodeId.parseZ32("y" ** 10));
+    // Uppercase z-base-32 is a different alphabet position, not a case variant.
+    try t.expectError(error.InvalidSymbol, NodeId.parseZ32("Y" ** NodeId.z32_length));
+}
+
+test "signatures verify only against the signing node and the signed bytes" {
+    const secret = try SecretKey.fromSeed([_]u8{9} ** SecretKey.seed_length);
+    const node_id = secret.nodeId();
+    const message = "ozai";
+
+    const signature = secret.sign(message);
+    try signature.verify(message, node_id);
+
+    try t.expectError(error.BadSignature, signature.verify("ozai!", node_id));
+    try t.expectError(
+        error.BadSignature,
+        signature.verify(message, (try SecretKey.fromSeed([_]u8{10} ** SecretKey.seed_length)).nodeId()),
+    );
+}
+
+test "signing is deterministic" {
+    const secret = try SecretKey.fromSeed([_]u8{3} ** SecretKey.seed_length);
+    try t.expectEqual(secret.sign("same").toBytes(), secret.sign("same").toBytes());
+}
+
+test "node id ordering is lexicographic over bytes" {
+    const low = try NodeId.fromBytes([_]u8{0x00} ** 32);
+    const high = try NodeId.fromBytes([_]u8{0x00} ** 31 ++ [_]u8{0x01});
+    try t.expectEqual(std.math.Order.lt, low.order(high));
+    try t.expectEqual(std.math.Order.eq, low.order(try NodeId.fromBytes([_]u8{0} ** 32)));
+}
+
+test "non-canonical point bytes are rejected" {
+    // y >= p has no curve point; the low 32 bytes of the field modulus plus a
+    // high bit is the canonical test std applies.
+    var bytes = [_]u8{0xff} ** 32;
+    bytes[31] = 0x7f;
+    bytes[0] = 0xed;
+    try t.expectError(error.NotOnCurve, NodeId.fromBytes(bytes));
+}
+
+test "secret key zeroes itself on deinit" {
+    var secret = try SecretKey.fromSeed([_]u8{5} ** SecretKey.seed_length);
+    const before = secret.toBytes();
+    try t.expect(std.mem.indexOfScalar(u8, &before, 5) != null);
+
+    secret.deinit();
+    try t.expect(std.mem.allEqual(u8, &secret.toBytes(), 0));
+}
