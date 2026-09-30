@@ -1,6 +1,6 @@
 { pkgs, lib, ... }:
 
-# ozai dev environment (house convention, cf. ~/projects/zig-agent-proto,
+# ozai dev environment (house convention, cf. ~/projects/zig-agent-protocols,
 # ~/projects/topology, ~/projects/wayland).
 #
 # `packages` deliberately carries no `zig`: on this host `zig` is the anyzig
