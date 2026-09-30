@@ -178,7 +178,33 @@ prevents, and each belongs in a test.
   as an argument. The map that reuses them is transport-layer state and lands
   with M7's transport seam. The `/l`, the global id, the subnets and the port
   are upstream's bytes and are pinned by golden vectors in `base/ula.zig`.
+- **A folded report names a global address, not the first one seen.**
+  Upstream's `global_v4` / `global_v6` store the first address a probe reported
+  and never replace it, so the published address is a function of the order the
+  probes happened to arrive in. ozai picks lowest latency, then freshest instant,
+  then lowest relay URL. The two can only differ when probes to several relays
+  disagree, and that is exactly the case where arrival order was deciding a
+  question of fact.
+- **The discovery ordering key writes a custom id big-endian.** Ordering is
+  timestamp, then the canonical encoding, and an ordering key has to sort in the
+  same order as the values it orders. `CustomAddr.writeBinary` is deliberately
+  little-endian for the wire, and little-endian integers do not sort that way
+  (1 before 256 does not survive a byte comparison). The two encodings are
+  therefore different on purpose, and a test pins that they agree on every
+  representable address.
 - **No `DiscoveryItem` enum.** Upstream replaced it with `Item` plus a
   `provenance` string; ozai keeps the stream, drops the stringly-typed tag in
-  favour of a typed provenance enum.
+  favour of a typed provenance enum. Upstream derives no ordering on `Item` and
+  nothing in its tree sorts one, so the total order the plan asks for is
+  entirely ozai's own construction.
 - **`NodeId` is one type, not two names.** See the table above.
+- **The relay frame header is a QUIC varint, and relay payloads are not
+  postcard.** The frame type is `noq_proto::VarInt`, and postcard appears in
+  exactly one place upstream — the `ServerDeniesAuth` reason. Segment sizes are
+  raw big-endian `u16`, restarting is two raw `u32`s, ping is eight raw bytes.
+  For types 0–13 the two varint encodings agree byte for byte, so this only
+  bites on decode, where a QUIC varint can spell a value a postcard reader would
+  take for something else entirely. A batch frame declaring a zero segment size
+  is rejected rather than accepted-and-normalised, so the
+  `segment_size ⇔ batch` rule is a property of the codec instead of a property
+  of a peer's cooperation.

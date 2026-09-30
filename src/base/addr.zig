@@ -351,7 +351,12 @@ pub const NodeAddr = struct {
         const at = std.sort.lowerBound(TransportAddr, self.addrs, addr, orderTransport);
         if (at < self.addrs.len and self.addrs[at].order(addr) == .eq) return null;
         const grown = try alloc.realloc(self.addrs, self.addrs.len + 1);
-        std.mem.copyForwards(TransportAddr, grown[at + 1 ..], grown[at..self.addrs.len]);
+        // `copyBackwards`, not `copyForwards`: the destination starts one
+        // element *after* the source, so each write lands on the element the
+        // next step still has to read. `copyForwards` is the forward loop
+        // (`lib/std/mem.zig`, `for (dest[0..source.len], source) |*d, s| d.* = s;`)
+        // and is only correct when the destination is at or before the source.
+        std.mem.copyBackwards(TransportAddr, grown[at + 1 ..], grown[at..self.addrs.len]);
         grown[at] = addr;
         return .{ .node_id = self.node_id, .addrs = grown };
     }

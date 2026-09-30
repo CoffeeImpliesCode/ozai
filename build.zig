@@ -105,6 +105,57 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);
 
+    // fuzzing
+    //
+    // Zig 0.16 exposes no build-script entry point for the fuzzer. The build
+    // runner reads `--fuzz[=N]` from its own command line, records which of the
+    // tests a run step owns called `std.testing.fuzz`, then rebuilds those run
+    // steps with `-ffuzz` and drives them. This step is what puts a run step on
+    // that path; the runner's flag is what bounds the run, and a bare
+    // `zig build fuzz` replays the seed corpus and stops, which is the form a
+    // commit gate can afford on every change.
+    //
+    // The artifact therefore carries no `fuzz = true` of its own: the rebuild
+    // adds `-ffuzz`, and a binary that already has it crashes when a fuzz test
+    // runs outside the fuzzer's own driver, which is exactly what a bare
+    // `zig build fuzz` is. The optimize mode is still pinned off Debug,
+    // because that rebuild is what meets the toolchain's fuzz error path: it
+    // hands `@errorReturnTrace()` to a `std.debug.writeStackTrace` wanting a
+    // different StackTrace, and only `-ffuzz` analyses it
+    // (ziglang/zig#36326). ReleaseSafe is the fastest mode that builds, and it
+    // keeps the safety checks a decoder bug trips.
+    //
+    // The artifact is also absent from the coverage list above, and that is
+    // where the two features collide: coverage turns `fuzz` on as its switch
+    // for LLVM counters, so a coverage build of this artifact would hand it
+    // `-ffuzz` outside the fuzzer's driver, which is the crash above. Separate
+    // artifacts are how that exclusion is expressed.
+    const fuzz_optimize: std.builtin.OptimizeMode =
+        if (optimize == .Debug) .ReleaseSafe else optimize;
+    // One pair per decoder: a target file and a corpus directory, and nothing
+    // else. Later milestones add a sibling of this pair, not a second harness.
+    const fuzz_targets = [_]struct { name: []const u8, file: []const u8 }{
+        .{ .name = "base32", .file = "test/base32_fuzz.zig" },
+        .{ .name = "range-spec", .file = "test/range_spec_fuzz.zig" },
+        .{ .name = "endpoint-ticket", .file = "test/endpoint_ticket_fuzz.zig" },
+        .{ .name = "blob-ticket", .file = "test/blob_ticket_fuzz.zig" },
+        .{ .name = "pkarr", .file = "test/pkarr_fuzz.zig" },
+        .{ .name = "relay-frame", .file = "test/relay_frame_fuzz.zig" },
+    };
+    const fuzz_step = b.step("fuzz", "Run the decoder fuzz targets, `--fuzz=N` to mutate");
+    for (fuzz_targets) |fuzz_target| {
+        const fuzz_mod = b.createModule(.{
+            .root_source_file = b.path(fuzz_target.file),
+            .target = target,
+            .optimize = fuzz_optimize,
+        });
+        fuzz_mod.addImport("ozai", lib_mod);
+        fuzz_step.dependOn(&b.addRunArtifact(b.addTest(.{
+            .name = b.fmt("ozai-fuzz-{s}", .{fuzz_target.name}),
+            .root_module = fuzz_mod,
+        })).step);
+    }
+
     // docs
 
     const install_docs = b.addInstallDirectory(.{

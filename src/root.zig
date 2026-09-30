@@ -14,6 +14,22 @@ pub const base32 = @import("base/base32.zig");
 pub const key = @import("base/key.zig");
 pub const addr = @import("base/addr.zig");
 pub const ula = @import("base/ula.zig");
+pub const postcard = @import("wire/postcard.zig");
+pub const net_report = @import("net/report.zig");
+
+pub const discovery_item = @import("discovery/item.zig");
+pub const discovery_resolve = @import("discovery/resolve.zig");
+pub const discovery_dns = @import("discovery/dns.zig");
+pub const pkarr = @import("discovery/pkarr.zig");
+
+pub const relay_frame = @import("relay/frame.zig");
+pub const relay_client = @import("relay/client.zig");
+pub const relay_server = @import("relay/server.zig");
+
+pub const range_spec = @import("blobs/range_spec.zig");
+
+pub const endpoint_ticket = @import("ticket/endpoint_ticket.zig");
+pub const blob_ticket = @import("ticket/blob_ticket.zig");
 
 pub const NodeId = key.NodeId;
 pub const SecretKey = key.SecretKey;
@@ -39,4 +55,16 @@ test {
     std.testing.refAllDecls(key);
     std.testing.refAllDecls(addr);
     std.testing.refAllDecls(ula);
+    std.testing.refAllDecls(net_report);
+    std.testing.refAllDecls(discovery_item);
+    std.testing.refAllDecls(discovery_resolve);
+    std.testing.refAllDecls(discovery_dns);
+    std.testing.refAllDecls(postcard);
+    std.testing.refAllDecls(pkarr);
+    std.testing.refAllDecls(relay_frame);
+    std.testing.refAllDecls(relay_client);
+    std.testing.refAllDecls(relay_server);
+    std.testing.refAllDecls(range_spec);
+    std.testing.refAllDecls(endpoint_ticket);
+    std.testing.refAllDecls(blob_ticket);
 }
