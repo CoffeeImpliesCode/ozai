@@ -29,6 +29,7 @@ pub const relay_server = @import("relay/server.zig");
 
 pub const addr_map = @import("transport/addr_map.zig");
 pub const transport_batch = @import("transport/batch.zig");
+pub const transport_quic_bridge = @import("transport/quic_bridge.zig");
 
 pub const router = @import("router/router.zig");
 
@@ -78,6 +79,7 @@ test {
     std.testing.refAllDecls(blobs_protocol);
     std.testing.refAllDecls(addr_map);
     std.testing.refAllDecls(transport_batch);
+    std.testing.refAllDecls(transport_quic_bridge);
     std.testing.refAllDecls(router);
     std.testing.refAllDecls(endpoint_ticket);
     std.testing.refAllDecls(blob_ticket);

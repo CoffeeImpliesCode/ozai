@@ -64,6 +64,16 @@ in
   # The house gate: fmt, build, test, ast-check, ziglint, zlint, zbc. The version
   # cross-check runs first because every later step is meaningless against a
   # toolchain the manifest does not describe.
+  #
+  # `vendor/quic` is excluded from every gate below, and that is a decision
+  # rather than an oversight. It is upstream code carrying its own formatting
+  # and its own idioms; reformatting it would bury the patch under thirty
+  # thousand lines of noise, and linting it with this project's rules would
+  # report findings nobody intends to fix. The patch ozai applies is a named
+  # list in `vendor/quic/VENDORED.md`, and that file is the reviewable
+  # artefact. The vendored tree is still compiled -- `zig build quic-test`
+  # builds it and runs its own tests -- so "not gated" never means "not
+  # proved to build".
   scripts.gate.exec = ''
     set -eu
     ${pinnedToolPath}
@@ -73,7 +83,7 @@ in
       echo "zig $version does not match .minimum_zig_version $pin" >&2
       exit 1
     }
-    zig-gate
+    GATE_EXCLUDE=vendor zig-gate
   '';
 
   # A second form for design work: the version cross-check plus coverage, no
@@ -87,7 +97,7 @@ in
       echo "zig $version does not match .minimum_zig_version $pin" >&2
       exit 1
     }
-    zig-gate --no-zbc --cov
+    GATE_EXCLUDE=vendor zig-gate --no-zbc --cov
   '';
 
   # See full reference at https://devenv.sh/reference/options/

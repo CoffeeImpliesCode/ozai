@@ -15,9 +15,11 @@ demands. The plan front-loads that half and defers the half that needs QUIC.
    — n0's own QUIC fork with multipath `PathId` and QNT
    (`draft-seemann-quic-nat-traversal-02`) grafted on. There is no QUIC in the Zig
    0.16 standard library, and `std.crypto.tls` ships a client-only driver with no
-   server and no raw-key certificate support. M8 is now decided
-   ([`DECISIONS/0001`](DECISIONS/0001-transport-substrate.md)), so this is a known
-   cost with a recorded price rather than an open risk.
+   server and no raw-key certificate support. M8 is built on a recorded
+   decision with a recorded price
+   ([`DECISIONS/0001`](DECISIONS/0001-transport-substrate.md)), so this is a
+   known cost rather than an open risk — with interop and 0-RTT named as still
+   open under M8.
 2. **The TLS handshake is not a detail.** iroh's peer authentication *is* TLS 1.3
    with raw Ed25519 public keys: the certificate is a 44-byte DER
    `SubjectPublicKeyInfo` wrapping the 32-byte node id, in both directions, and
@@ -184,68 +186,93 @@ Get the /l, the global id, or a subnet discriminator wrong and two paths to one
 peer land on one address with no error anywhere: the receiver has no way to tell
 them apart.
 
-### M8 — the QUIC substrate
+### M8 — the QUIC substrate ✅
 
-**Decided, and repriced 2026-09-30.** See
-[`DECISIONS/0001-transport-substrate.md`](DECISIONS/0001-transport-substrate.md):
-fork `endel/quic-zig`, delete its socket-owning layer, thread time and randomness
-through the core, and patch its TLS to accept a raw Ed25519 SPKI as the
-certificate. The substrate is unchanged; the price is roughly double what the
-first version of the record implied. The cost accepted with the decision is the
-loss of native multipath, mitigated by M7's synthetic-ULA map at the price of
+**Done 2026-09-30, with three items still open.** The decision and its price are
+in [`DECISIONS/0001`](DECISIONS/0001-transport-substrate.md); the
+[execution record](DECISIONS/0001-transport-substrate.md#execution-record-of-2026-09-30)
+says what was built, what it cost against what was predicted, and what was not
+finished.
+The substrate is quic-zig; the price came in at roughly double what the first
+version of the record implied. The cost accepted with the decision is the loss
+of native multipath, mitigated by M7's synthetic-ULA map at the price of
 slower convergence.
 
-Measured at `endel/quic-zig@14b9dc3e`, the sans-IO core is 32 files and 30,437
-lines, of which ozai needs `src/quic/*` and none of the 25,770 lines of `h3`,
-`webtransport`, `moq`, the separate TLS-over-TCP stack in `src/tls`, `http1` or
-`h0`. Three things the first version got wrong, and they set the order:
+**What is in the tree.** `vendor/quic/`, vendored from
+`endel/quic-zig@14b9dc3e5e8429d07e7ed18619c7b4f4baaa3719` — 33 `.zig` files and
+30,279 lines, against upstream's 74 files and 65,164. It is a module of its own
+at `build.zig:36-40` and its suite runs under `zig build quic-test`.
 
-- The socket owner is `src/event_loop.zig` (5,211 lines), not `ecn_socket.zig`
-  (584), and its constructors open and bind before returning. With `http1`,
-  `xev_backend.zig` and a rewritten `test_all.zig`, the deletion is 7 files and
-  7,194 lines.
-- **The core is not pure.** 60 hidden-input call sites — 34 clock, 26 CSPRNG —
-  across `connection.zig` and `tls13.zig`, plus a mutable `test_clock` global
-  that makes the library deterministic only under `zig build test`. That is the
-  largest single item in M8 and it is not optional: it collides with the
-  "no clock, no environment, no allocator it was not handed" rule at
-  [`ARCHITECTURE.md:37`](ARCHITECTURE.md) and with `AGENTS.md` §2.
-- The Ed25519 gap is **four** gated functions, not two, plus `TlsConfig` and
-  `ClientAuth`. And `TlsConfig.skip_cert_verify` must stay `true`: its `false`
-  branch *is* the X.509 chain validation this milestone exists to avoid. The
-  CertificateVerify check is split off the flag instead of the flag being set.
+The socket-owning layers were **never copied** — `event_loop.zig` (5,211 lines),
+`ecn_socket.zig` (584), `http1/socket.zig` (364), `http1/timers.zig` (194),
+`xev_backend.zig` (31) and `http1/e2e_test.zig` (759) — and neither did `h3`,
+`webtransport`, `h0`, `moq`, `http1` or the second TLS-over-TCP stack. That is
+why the module needs no `xev`, why `build.zig.zon`'s `.dependencies` is empty,
+and why the tree has never had a window in which it owned a socket. Deleted
+after vendoring, because something else stopped needing them: `qlog.zig` (411
+lines, it wanted a clock and an I/O sink), `tls/test_certs.zig` and
+`quic/ca_bundle.zig` (fixtures and trust anchor for a chain walk that is gone),
+`Connection.send` (it read the clock itself; `sendAt` already took the
+timestamp) and `sys.test_clock`, the mutable global that made the library
+deterministic only under `zig build test`. **`rsa.zig` stayed**: RSA is still a
+legal TLS 1.3 CertificateVerify signature scheme, which is a different thing
+from the certificate being an Ed25519 key.
 
-The contract for whatever sits here:
+**The order changed, and that is the point worth keeping.** The first version of
+this milestone had two steps and neither of them was the threading. The socket
+layer stopped being a step at all — it was never vendored — so what actually ran
+was two phases, threading first and the certificate patch second. Threading had
+to come first because a core that reads its own clock cannot be stepped at all,
+and because a simulated handshake is the only cheap way to drive certificate
+gates exhaustively rather than once. Leaving it out was the decision record's
+most expensive error, and it is why the record now carries it as its own phase
+instead of a line inside the certificate work.
 
-- Sans-IO. A datagram in from a transport multiplexer ozai owns, a datagram out,
-  per connection. The QUIC layer never opens a socket, never links libc, and
-  never owns a clock. Egress enters at `Connection.sendAt(out_buf, now)`, which
-  takes the timestamp; the `send(out_buf)` convenience wrapper does not.
-- Raw-SPKI Ed25519 peer authentication, both directions. A stack that insists on
-  parsing X.509 cannot be an iroh peer, and that is not something to work around.
-- A stable verifier identity across every client-config construction, or 0-RTT
-  stops working with no error to notice. This is about `session_ticket` and
-  `ticket_key`, and it is **not** discharged by `skip_cert_verify`.
-- No clock read and no global RNG anywhere in the core. 60 sites to thread, and
-  `test_clock` deleted rather than kept as a build-mode global.
+60 hidden-input call sites — 34 clock, 26 CSPRNG — became two parameters: `now:
+i64`, a monotonic instant the caller read, and `random: std.Random` **by
+value**, because a handshake holding a pointer could be driven twice from one
+generator. Both public entry points changed shape with them, to
+`recvDatagram(bytes, from, local, ecn_val, out_buf, now, random)` and
+`sendAt(out_buf, now, random)`. `src/sys.zig` went with them: split, emptied to
+the clock and entropy alone, then deleted, so the module has no file through
+which it could reach the operating system.
 
-Execution order, because each step makes the next one testable:
+The certificate work came out the other way from what was planned. It does not
+split the `skip_cert_verify` bit and leave the chain walk behind the flag; it
+**deletes the walk**. `certificateWellFormed`, `Certificate.parse`,
+`verifyHostName`, `verifyPeerChain`, `clientLeafUsageOk`, the extension parsers
+and `ChainError` are gone, and `skip_cert_verify`, `ca_bundle` and `keylog_file`
+went with them. A bare 44-byte DER `SubjectPublicKeyInfo` is the only accepted
+peer certificate, in both directions, compared byte for byte against
+`TlsConfig.expect_peer_node_id` or `ClientAuth.expect_node_id`. Both
+CertificateVerify checks are now unconditional, and an Ed25519 signature draws
+no nonce at all.
 
-1. Vendor the sans-IO core at the pinned commit SHA (no tags are published).
-2. **Delete** the socket layer rather than leaving it unused, which also drops
-   the forced `link_libc` and the `xev` dependency, split `src/sys.zig` rather
-   than dropping it, cut the module root, and rewrite `test_all.zig` in the same
-   commit — it is the test root and `zig build test` does not compile without it.
-3. **Thread time and randomness in**, replacing all 60 hidden-input reads with
-   an injected clock and byte source. Before the certificate work, not after:
-   this is what buys a virtual clock, and a virtual clock is what turns the
-   certificate gates from four hand-written cases into a sweep.
-4. Patch the four certificate functions, `TlsConfig` and `ClientAuth` for the
-   raw SPKI, splitting the `skip_cert_verify` bit so chain walking stays behind
-   the flag and CertificateVerify runs on a key lifted from the SPKI.
-5. Expose it as a module, consumed by `ozai.transport`, and re-run the interop
-   matrix at our own SHA — upstream's result is from a different commit, 10 of
-   88 cells red, one open against quiche.
+**Still open, and recorded as open rather than closed:**
+
+- **0-RTT.** `session_ticket` and `ticket_key` must be stable across every
+  client-config construction or resumption silently stops matching. The
+  certificate patch did not discharge it and M8 did not touch it.
+- **Interop, and with it requirement 3.** The matrix `DECISIONS/0001` leaned on
+  was upstream's, run at a different commit, and is not reproducible from this
+  repository — upstream's runner is a git submodule outside the published
+  package. M8 did not re-run it, so requirement 3 is re-established against
+  this fork or not at all.
+- **Nothing under `src/` imports `quic` yet.** The module is declared and
+  compiled at `build.zig:36-40`; `ozai.transport` does not consume it. M9 builds
+  on that seam.
+
+**One divergence to know before touching TLS.** `Tls13Handshake.step` takes
+`now_s`, and it is a second on the **caller's** clock, not the epoch. The
+connection hands it a monotonic instant. Nothing may compare it against an
+epoch-derived quantity: it is only ever differenced, and only inside one
+process. See the execution record.
+
+**Upstream does not compile on Zig 0.16.0.** Its `build.zig.zon` claims
+`minimum_zig_version = "0.16.0"` and its `src/sys.zig:513` passes `posix.errno`
+an `@bitCast`ed `isize` where a `c_int` is wanted. So the "drop the fork and
+consume the dependency directly" exit is not open today; the revisit triggers in
+`DECISIONS/0001` say so and say when it reopens.
 
 ### M9 — endpoint, router, connection
 

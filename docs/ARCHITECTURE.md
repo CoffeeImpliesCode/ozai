@@ -208,3 +208,21 @@ prevents, and each belongs in a test.
   is rejected rather than accepted-and-normalised, so the
   `segment_size ⇔ batch` rule is a property of the codec instead of a property
   of a peer's cooperation.
+- **The vendored core carries two paths; `ula` models three subnets.** The QUIC
+  substrate holds `paths: [2]NetworkPath` with one `active_path_idx` — an active
+  path and a candidate, which is RFC 9000 migration and nothing more, and is
+  upstream's own structure unchanged. The synthetic-ULA map offers a peer three
+  distinguishable subnets at once: any-path, one-per-relay, one-per-custom. A
+  connection handed all three is a connection the core reads as a migration, so
+  the map and the stack disagree about how many paths a peer has. This is the
+  cost `DECISIONS/0001` accepted when it took this substrate over one with
+  native multipath, now confirmed against the code rather than estimated. It
+  is a convergence cost and not a correctness one: the mapping still keeps the
+  paths from aliasing, and a peer that is given a second path before the first
+  is used loses the first.
+- **`TlsConfig` and `ClientAuth` carry different peer pins.** The client-side
+  field is `expect_peer_node_id`; the server-side one is `ClientAuth.expect_node_id`.
+  Upstream had `skip_cert_verify` and a `ca_bundle` on `TlsConfig` and treated
+  the two directions as the same decision. They are not — a client verifies who
+  it connected to, a server decides who to let in — and one field cannot carry
+  both without a comment explaining which is which at every use.

@@ -1,5 +1,15 @@
 const std = @import("std");
 
+/// The gate on what the vendored tree is allowed to reach for, held as a
+/// container-scope import rather than a root of its own for one reason:
+/// `@embedFile` may not leave the package root, and the package root is the
+/// directory of the root source file. The gate lives in `test/` and has to
+/// embed `vendor/quic/src/**`, so the module that runs it is rooted here, at the
+/// top of the tree, and reaches it through this import. Rooting the module at
+/// `test/vendored_invariants.zig` instead compiles to an error about an embed
+/// path, which says nothing about the invariant that was actually broken.
+const vendored_invariants = @import("test/vendored_invariants.zig");
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -19,6 +29,60 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_mod,
     });
     b.installArtifact(lib);
+
+    // The QUIC substrate, vendored from endel/quic-zig at the SHA recorded in
+    // vendor/quic/VENDORED.md. A separate module, not a folder under src/: it
+    // is third-party code carrying its own history, and the patch ozai applies
+    // to it is a short list in that file rather than a diff nobody can review.
+    // The socket-owning layers were never vendored, so nothing here opens a
+    // socket. The comment above used to claim that also meant no `link_libc`;
+    // it did not, because `sys.zig` read the clock through `std.c`. The clock
+    // is a parameter now and those functions are gone, so the claim holds —
+    // and if a future patch reintroduces a `std.c` call, the missing
+    // `link_libc` fails the build rather than quietly costing a dependency.
+    //
+    // The module is declared and then compiled, because a vendored tree that
+    // nothing references is a vendored tree nobody has proved still builds.
+    const quic_mod = b.addModule("quic", .{
+        .root_source_file = b.path("vendor/quic/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // Declared on the library so an importer of `ozai` can reach the transport
+    // stack as `ozai.quic` without this repository depending on it at build
+    // time. Zig modules are lazy, so naming it here costs nothing until
+    // something imports it.
+    lib_mod.addImport("quic", quic_mod);
+
+    // The test root is `test_all.zig`, not `lib.zig`. A root that only
+    // re-exports discovers zero tests and still exits 0, which is a green step
+    // proving nothing; `test_all.zig` names every file carrying test blocks so
+    // the vendored suite actually runs.
+    const quic_test_mod = b.createModule(.{
+        .root_source_file = b.path("vendor/quic/src/test_all.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_quic_tests = b.addRunArtifact(b.addTest(.{ .root_module = quic_test_mod }));
+    const quic_step = b.step("quic-test", "Run the vendored QUIC core's own tests");
+    quic_step.dependOn(&run_quic_tests.step);
+
+    // The gate reads the vendored tree as text and tokenizes it, so it needs
+    // nothing of the library and nothing of the vendored module: a tree under
+    // audit must not become a dependency of the audit.
+    const invariants_mod = b.createModule(.{
+        .root_source_file = b.path("build.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const invariants_tests = b.addTest(.{ .root_module = invariants_mod });
+    const run_invariants_tests = b.addRunArtifact(invariants_tests);
+
+    // `@embedFile` cannot glob, so the gate names every vendored file in a
+    // list. Comparing that list against the directory is the only way an
+    // addition can be noticed: a file the list omits is a file the gate never
+    // reads, and it would go on looking exactly like coverage.
+    checkVendoredFileList(b);
 
     // Examples are separate executables, never part of the library: an example
     // that only exists as a doc comment has never been run.
@@ -61,6 +125,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // The test root reaches `quic` through `src/root.zig`, and a fresh module
+    // does not inherit the imports of the module it was split from, so the
+    // import is repeated rather than reached through `lib_mod`.
+    lib_test_mod.addImport("quic", quic_mod);
     const lib_unit_tests = b.addTest(.{ .root_module = lib_test_mod });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
@@ -104,6 +172,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests and integration tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&run_invariants_tests.step);
 
     // fuzzing
     //
@@ -164,4 +233,93 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "docs",
     });
     b.step("docs", "Install docs into zig-out/docs").dependOn(&install_docs.step);
+}
+
+// Runs the gate's own tests. Reaching it from a root at the top of the tree is
+// the reason for the import at the top of this file; `_ = vendored_invariants`
+// is the same idiom `vendor/quic/src/test_all.zig` uses and for the same
+// reason. Under lazy analysis a test block in a file the compilation never
+// analyses is not a slow test, it is no test at all, and the run still exits 0.
+test {
+    _ = vendored_invariants;
+}
+
+/// Every `.zig` file under `vendor/quic/src`, relative to that root. Walked
+/// here and nowhere else: the gate runs on every `zig build test` and may not
+/// read the filesystem, because it audits a tree by embedding it.
+fn collectVendoredSources(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    dir: std.Io.Dir,
+    prefix: []const u8,
+    out: *std.ArrayList([]const u8),
+) !void {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .directory) {
+            var sub = try dir.openDir(io, entry.name, .{ .iterate = true });
+            defer sub.close(io);
+            try collectVendoredSources(io, gpa, sub, try std.fmt.allocPrint(gpa, "{s}{s}/", .{
+                prefix,
+                entry.name,
+            }), out);
+            continue;
+        }
+        if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, entry.name }));
+    }
+}
+
+/// Fails the configure when the gate's file list and the tree disagree, in
+/// either direction. `@embedFile` cannot glob, so that list is the gate's
+/// entire coverage: a file missing from it is a file nothing reads, and the
+/// gate would keep reporting full coverage while proving nothing about it.
+fn checkVendoredFileList(b: *std.Build) void {
+    const root = "vendor/quic/src";
+    const gpa = b.allocator;
+    const io = b.graph.io;
+
+    var found: std.ArrayList([]const u8) = .empty;
+    defer found.deinit(gpa);
+    var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| {
+        std.debug.panic("cannot read {s}: {s}", .{ root, @errorName(err) });
+    };
+    defer dir.close(io);
+    collectVendoredSources(io, gpa, dir, "", &found) catch |err| {
+        std.debug.panic("cannot walk {s}: {s}", .{ root, @errorName(err) });
+    };
+
+    for (found.items) |relative| {
+        const wanted = std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, relative }) catch @panic("oom");
+        const listed = for (vendored_invariants.vendored_files) |entry| {
+            if (std.mem.eql(u8, entry, wanted)) break true;
+        } else false;
+        if (!listed) {
+            std.debug.panic(
+                \\
+                \\{s}/{s} exists but is not in `vendored_files` in
+                \\test/vendored_invariants.zig, so the invariant gate never reads
+                \\it. That is the failure this check exists for: a file the gate
+                \\does not read is a file nothing is watching, and the gate still
+                \\reports full coverage of the tree.
+                \\
+                \\Add the path to `vendored_files`, in sorted order.
+            , .{ root, relative });
+        }
+    }
+    for (vendored_invariants.vendored_files) |entry| {
+        const relative = entry[root.len + 1 ..];
+        const present = for (found.items) |name| {
+            if (std.mem.eql(u8, name, relative)) break true;
+        } else false;
+        if (!present) {
+            std.debug.panic(
+                \\
+                \\`vendored_files` in test/vendored_invariants.zig lists {s},
+                \\which is not in {s}. Delete the entry — or restore the file.
+                \\Left alone, @embedFile fails on it with an error that names the
+                \\path and none of the reasoning above.
+            , .{ entry, root });
+        }
+    }
 }
