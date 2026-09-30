@@ -186,26 +186,66 @@ them apart.
 
 ### M8 — the QUIC substrate
 
-**Decided.** See
+**Decided, and repriced 2026-09-30.** See
 [`DECISIONS/0001-transport-substrate.md`](DECISIONS/0001-transport-substrate.md):
-fork `endel/quic-zig`, strip its socket-owning layer, and patch its TLS to accept
-a raw Ed25519 SPKI as the certificate. The cost accepted with it is the loss of
-native multipath, mitigated by M7's synthetic-ULA map at the price of slower
-convergence.
+fork `endel/quic-zig`, delete its socket-owning layer, thread time and randomness
+through the core, and patch its TLS to accept a raw Ed25519 SPKI as the
+certificate. The substrate is unchanged; the price is roughly double what the
+first version of the record implied. The cost accepted with the decision is the
+loss of native multipath, mitigated by M7's synthetic-ULA map at the price of
+slower convergence.
+
+Measured at `endel/quic-zig@14b9dc3e`, the sans-IO core is 32 files and 30,437
+lines, of which ozai needs `src/quic/*` and none of the 25,770 lines of `h3`,
+`webtransport`, `moq`, the separate TLS-over-TCP stack in `src/tls`, `http1` or
+`h0`. Three things the first version got wrong, and they set the order:
+
+- The socket owner is `src/event_loop.zig` (5,211 lines), not `ecn_socket.zig`
+  (584), and its constructors open and bind before returning. With `http1`,
+  `xev_backend.zig` and a rewritten `test_all.zig`, the deletion is 7 files and
+  7,194 lines.
+- **The core is not pure.** 60 hidden-input call sites — 34 clock, 26 CSPRNG —
+  across `connection.zig` and `tls13.zig`, plus a mutable `test_clock` global
+  that makes the library deterministic only under `zig build test`. That is the
+  largest single item in M8 and it is not optional: it collides with the
+  "no clock, no environment, no allocator it was not handed" rule at
+  [`ARCHITECTURE.md:37`](ARCHITECTURE.md) and with `AGENTS.md` §2.
+- The Ed25519 gap is **four** gated functions, not two, plus `TlsConfig` and
+  `ClientAuth`. And `TlsConfig.skip_cert_verify` must stay `true`: its `false`
+  branch *is* the X.509 chain validation this milestone exists to avoid. The
+  CertificateVerify check is split off the flag instead of the flag being set.
 
 The contract for whatever sits here:
 
 - Sans-IO. A datagram in from a transport multiplexer ozai owns, a datagram out,
   per connection. The QUIC layer never opens a socket, never links libc, and
-  never owns a clock.
+  never owns a clock. Egress enters at `Connection.sendAt(out_buf, now)`, which
+  takes the timestamp; the `send(out_buf)` convenience wrapper does not.
 - Raw-SPKI Ed25519 peer authentication, both directions. A stack that insists on
   parsing X.509 cannot be an iroh peer, and that is not something to work around.
 - A stable verifier identity across every client-config construction, or 0-RTT
-  stops working with no error to notice.
+  stops working with no error to notice. This is about `session_ticket` and
+  `ticket_key`, and it is **not** discharged by `skip_cert_verify`.
+- No clock read and no global RNG anywhere in the core. 60 sites to thread, and
+  `test_clock` deleted rather than kept as a build-mode global.
 
-Execution order: vendor the sans-IO core, **delete** the socket layer rather than
-leaving it unused (which also drops the forced `link_libc` and the `xev`
-dependency), then patch the two certificate paths, then expose it as a module.
+Execution order, because each step makes the next one testable:
+
+1. Vendor the sans-IO core at the pinned commit SHA (no tags are published).
+2. **Delete** the socket layer rather than leaving it unused, which also drops
+   the forced `link_libc` and the `xev` dependency, split `src/sys.zig` rather
+   than dropping it, cut the module root, and rewrite `test_all.zig` in the same
+   commit — it is the test root and `zig build test` does not compile without it.
+3. **Thread time and randomness in**, replacing all 60 hidden-input reads with
+   an injected clock and byte source. Before the certificate work, not after:
+   this is what buys a virtual clock, and a virtual clock is what turns the
+   certificate gates from four hand-written cases into a sweep.
+4. Patch the four certificate functions, `TlsConfig` and `ClientAuth` for the
+   raw SPKI, splitting the `skip_cert_verify` bit so chain walking stays behind
+   the flag and CertificateVerify runs on a key lifted from the SPKI.
+5. Expose it as a module, consumed by `ozai.transport`, and re-run the interop
+   matrix at our own SHA — upstream's result is from a different commit, 10 of
+   88 cells red, one open against quiche.
 
 ### M9 — endpoint, router, connection
 

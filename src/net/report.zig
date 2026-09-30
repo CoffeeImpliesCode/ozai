@@ -180,7 +180,12 @@ const RelayList = struct {
             }
         }
         if (self.len == max_relays) return false;
-        std.mem.copyForwards(
+        // `copyBackwards`, not `copyForwards`: the destination starts one entry
+        // *after* the source, so a forward loop reads back the entry it has
+        // already overwritten and drops the tail. `copyForwards` is the forward
+        // loop and is only correct when the destination is at or before the
+        // source.
+        std.mem.copyBackwards(
             RelayLatency,
             self.items[index + 1 .. self.len + 1],
             self.items[index..self.len],
@@ -911,6 +916,60 @@ test "a family holds as many relays as upstream probes" {
     try t.expect(latencies.update(try namedRelay(&scratch, 0), millis(5), .https));
     try t.expectEqual(millis(5), latencies.get(try namedRelay(&scratch, 0)).?);
     try t.expectEqual(@as(?Nanos, null), latencies.get(try namedRelay(&scratch, max_relays)));
+}
+
+test "an update in the middle of the order shifts the entries after it" {
+    const Want = struct { relay: RelayUrl, latency: Nanos };
+    const a = try RelayUrl.parse("https://a.example./");
+    const b = try RelayUrl.parse("https://b.example./");
+    const c = try RelayUrl.parse("https://c.example./");
+    const d = try RelayUrl.parse("https://d.example./");
+    var latencies: RelayLatencies = .{};
+
+    // Ascending with a hole at `b`, so `b` lands at index 1 and the entries
+    // behind it have somewhere to go. Appending shifts nothing, and updating a
+    // relay that is already in the list does not shift at all.
+    try t.expect(latencies.update(a, millis(10), .https));
+    try t.expect(latencies.update(c, millis(30), .https));
+    try t.expect(latencies.update(d, millis(40), .https));
+    try t.expectEqual(@as(usize, 3), latencies.https.len);
+
+    try t.expect(latencies.update(b, millis(20), .https));
+    try t.expectEqual(@as(usize, 4), latencies.https.len);
+
+    // Still ascending: `RelayList.get` gives up at the first entry that sorts
+    // high, so order is what makes a lookup mean anything.
+    const list = &latencies.https;
+    var index: usize = 1;
+    while (index < list.len) : (index += 1) {
+        const ordered = list.items[index - 1].relay.order(list.items[index].relay);
+        try t.expectEqual(std.math.Order.lt, ordered);
+    }
+
+    // Every relay recorded before the insert survived it. A shift that runs the
+    // wrong way overwrites the entry one place along and loses the last one, so
+    // this is where a lost entry shows up as a relay that was never measured.
+    try t.expectEqual(@as(?Nanos, millis(10)), list.get(a));
+    try t.expectEqual(@as(?Nanos, millis(20)), list.get(b));
+    try t.expectEqual(@as(?Nanos, millis(30)), list.get(c));
+    try t.expectEqual(@as(?Nanos, millis(40)), list.get(d));
+
+    // Three relays in, four out, and the fourth is the one that was just
+    // measured rather than a second copy of a neighbour.
+    const expected = [_]Want{
+        .{ .relay = a, .latency = millis(10) },
+        .{ .relay = b, .latency = millis(20) },
+        .{ .relay = c, .latency = millis(30) },
+        .{ .relay = d, .latency = millis(40) },
+    };
+    var iterator = latencies.iter();
+    for (expected) |want| {
+        const entry = iterator.next().?;
+        try t.expectEqual(Probe.https, entry.probe);
+        try t.expectEqual(std.math.Order.eq, entry.relay.order(want.relay));
+        try t.expectEqual(want.latency, entry.latency);
+    }
+    try t.expectEqual(@as(?RelayLatencies.Entry, null), iterator.next());
 }
 
 test "the public address is the one on the best observation" {

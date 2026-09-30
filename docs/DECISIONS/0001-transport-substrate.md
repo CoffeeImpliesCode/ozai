@@ -1,7 +1,21 @@
 # 0001 — Transport substrate
 
-- **Status**: accepted, recorded 2026-09-29. Execution happens at M8, not now.
+- **Status**: accepted, recorded 2026-09-29. **Corrected 2026-09-30** against a
+  measured read of the vendored tree; see
+  [Correction of 2026-09-30](#correction-of-2026-09-30). Execution happens at M8.
+- **The decision is unchanged.** What moved is the price. quic-zig is still the
+  substrate; the work to make it ozai's is 60 hidden-input call sites threaded
+  through plus a 7,194-line deletion plus four certificate functions, where the
+  first version billed "two functions and one flag". One instruction in that
+  first version was wrong in a way that would have failed at M8.
 - **Milestones 2–7 are unaffected.** Everything they build is pure over bytes.
+
+Every quic-zig claim below was read out of the tree at
+`endel/quic-zig@14b9dc3e5e8429d07e7ed18619c7b4f4baaa3719` (2026-09-28) and is cited
+by file and line. Line counts are `wc -l` on that tree, whose 74 `.zig` files
+under `src/` were fetched and byte-compared against the git tree sizes.
+Claims about the *rejected* candidates are marked where they were re-checked on
+2026-09-30 and carried over unverified where they were not.
 
 ## Context
 
@@ -23,47 +37,69 @@ Three requirements decide this, in order:
    wrapping the 32-byte node id, in both directions — the dialer presents one
    too. Verification reduces to a byte comparison against the id you expected.
    A stack that insists on parsing X.509 cannot be an iroh peer.
-3. **Proven interop.** Retry, resumption, 0-RTT, handshake and transfer, against
-   more than one independent implementation.
+3. **Demonstrated interop.** Retry, resumption, 0-RTT, handshake and transfer,
+   against more than one independent implementation. **Corrected**: quic-zig
+   passes the cases this record names, but not the whole matrix, and the matrix
+   does not pin to the commit we would vendor. See
+   [Interop](#interop-the-one-claim-that-got-worse).
 
 ## Options considered
 
 ### `endel/quic-zig` — Zig 0.16.0, MIT, v0.5.0
 
-- **Sans-IO**: `ConnectionManager.recvDatagram(bytes, from, local, ecn, out_buf) RecvAction`
-  is the ingress seam; `entry.conn.send(out_buf) -> usize` is egress, with the
-  caller performing the `sendto`. Requirement 1: **pass**.
-- **Ed25519**: `signCertificateVerify` already has an `.ed25519` branch signing
-  from the raw seed, and `verifyCertificateVerifySignature` already implements
-  `.ed25519`. The server sends the leaf verbatim and never parses it, so a bare
-  Ed25519 SPKI can be presented as the certificate. The gap is narrow and
-  named: `clientProcessCertificate` and `serverProcessClientCertificate` both
-  gate on X.509 parsing, and `TlsConfig.skip_cert_verify` defaults to `true`.
-  Requirement 2: **pass with a bounded patch** — two functions and one flag.
-- **Interop**: matrix dated 2026-09-18 against quic-go-interop and quiche-qns.
-  retry, resumption, zerortt, handshake, transfer, longrtt, blackhole and ipv6
-  pass in all four directions. Requirement 3: **pass**.
-- **Multipath**: not implemented. See the cost below.
-- **Licence**: MIT. **Version**: pins `minimum_zig_version = "0.16.0"`.
+**Size.** 74 `.zig` files, 65,164 lines under `src/`. The sans-IO core
+`src/quic/*` is 32 files and 30,437 lines, dominated by `connection.zig` (6,666),
+`tls13.zig` (4,866) and `stream.zig` (3,767). Everything above the core —
+`src/h3` (7,106), `src/webtransport` (3,886), `src/moq` (5,865), `src/tls` (4,887,
+a second TLS-over-TCP stack unrelated to QUIC), `src/http1` (3,818) and
+`src/h0` (208) — is 25,770 lines ozai has no use for.
 
-### `zigstack/zquic` — Zig 0.16.0, MIT, v1.7.86
+- **Sans-IO ingress: real.** `ConnectionManager.recvDatagram(bytes, from, local,
+  ecn_val: u2, out_buf) RecvAction` at
+  `src/quic/connection_manager.zig:548`. `RecvAction` (`:529`) has **four** arms,
+  not three: `processed` (`:531`), `send_response` (`:534`), `dropped` (`:536`),
+  `foreign` (`:540`, QUIC-LB steering to another server). The caller sends
+  `send_response` itself; `processed` hands back the `ConnEntry`. Requirement 1,
+  ingress half: **pass**.
+- **Egress: an error union, and it reads a clock.**
+  `pub fn send(self: *Connection, out_buf: []u8) !usize` at
+  `src/quic/connection.zig:3128` — not the bare `usize` first recorded — and it
+  delegates to `sendAt(out_buf, @intCast(sys.nanoTimestamp()))` at `:3129`, so
+  the convenience wrapper reads the monotonic clock itself. The seam is already
+  half built: `pub fn sendAt(self: *Connection, out_buf: []u8, now: i64) !usize`
+  at `:3134` takes the timestamp. Requirement 1, egress half: **pass, once the
+  caller uses `sendAt`.**
+- **Ed25519: present, and behind four gates plus a flag that must not be
+  flipped.** See [the raw-SPKI patch](#3-raw-spki-ed25519). Requirement 2:
+  **pass with a bounded but real patch** — four functions, `TlsConfig`, and
+  `ClientAuth`.
+- **Interop**: the one claim that got worse. See
+  [Interop](#interop-the-one-claim-that-got-worse).
+- **Multipath**: not implemented, by the maintainer's own statement in
+  `SPEC/STATUS.md` ("Multipath QUIC (draft-ietf-quic-multipath) — **Status: Not
+  implemented**"). Requirement is iroh's, not RFC 9000's. See the cost below.
+- **Licence**: MIT. **Version**: `build.zig.zon` pins
+  `.minimum_zig_version = "0.16.0"`, `.version = "0.5.0"`, and `.paths` of
+  `build.zig`, `build.zig.zon`, `src`. Sole dependency is `endel/libxev`,
+  pinned to tarball `9d7f95fc3ec34ce0a5903127a6c2f3237c1d52d3`.
 
-Rejected on two independent, disqualifying grounds:
+### `zigstack/zquic` — Zig 0.16.0, MIT
 
-- `Server.feedPacket` gives ingress, but egress is
-  `fn flushSendBatch(self) { self.send_batch.flush(self.sock); }` — every
-  outgoing datagram goes to the socket the server holds. No send callback, no
-  drain-outgoing API. Requirement 1: **fail**.
-- Its vendored TLS offers only ECDSA and RSA signature schemes. `PrivateKey` is
-  `union { rsa, ecdsa }` with no Ed25519 member. `processServerFlight` is
-  documented "Certificate is NOT verified — accepts any", and
-  `verifyClientCertificateVerifyMessage` handles ECDSA only. Requirement 2:
-  **fail**.
+Rejected on two independent grounds:
 
-Its own CI classifies retry, resumption and 0-RTT against quinn as
-`EXPECTED_UNSUPPORTED` rather than failing them, and its roadmap lists
-DPLPMTUD, the DATAGRAM extension and BBR as unimplemented. That is the
-maintainer's own assessment, and it is the right one to weigh.
+- **Ed25519: confirmed fail.** At `master` (`b33733d7286058857a70ecc1f8c87aa752957c72`)
+  `vendor/tls/src/PrivateKey.zig:13` declares
+  `key: union { rsa: rsa.KeyPair, ecdsa: [66]u8 }` with no Ed25519 member.
+  Requirement 2: **fail**.
+- **Egress: the first version of this record's evidence does not reproduce.**
+  It cited `fn flushSendBatch(self) { self.send_batch.flush(self.sock); }`.
+  `flushSendBatch` does not exist anywhere in the repository at that revision
+  (code search: 0 hits); `send_batch` appears once, in `src/cmd/client.zig:153`,
+  as a comment about client-side state. The *verdict* — no per-path egress seam,
+  no drain-outgoing API — is **not verified** and is carried over from the
+  2026-09-29 survey. Requirement 1: **fail (unverified this pass)**.
+
+One of two grounds is enough, and the confirmed one is the disqualifier.
 
 ### `c4milo/colibri` — 0.6.0, Apache-2.0, Zig 0.16.0
 
@@ -71,13 +107,16 @@ Architecturally the closest match to `AGENTS.md` §2 — sans-IO, owns no socket
 no allocator, no clock, octets in and events out, time passed in. Rejected
 because its TLS is a C11 dependency (`c4milo/chapulin`) and its own Limits
 section rules out 0-RTT, connection migration, HTTP datagrams, multipath and
-QUIC v2. One star, created 2026-09-16. **Re-check when it grows.**
+QUIC v2. Carried over from 2026-09-29 and **not re-read**. As of 2026-09-30 it
+is Apache-2.0 with one star and a push later that day. **Re-check when it grows.**
 
 ### `ericsssan/zquic` — MIT, sans-IO
 
 The best interop table of anything surveyed (22 tests against 11
 implementations) and it has Ed25519 and P-256 certificates. Rejected:
-`minimum_zig_version = "0.17.0-dev.657+2faf8debf"`. Unusable on 0.16.0.
+`build.zig.zon` at `main` (`2ccba649370f0a8f5458ce6e1e735e3b27fa83be`) pins
+`.minimum_zig_version = "0.17.0-dev.657+2faf8debf"`. Re-checked 2026-09-30, exact
+match. Unusable on 0.16.0.
 
 ### Bind `cloudflare/quiche` over C
 
@@ -90,36 +129,259 @@ caller-chosen source and destination.
 Cost: roughly one person-week to bind, plus a permanent C/FFI and a Rust
 toolchain on the build path. `ChainSafe/quiche-zig` exists and is not worth it —
 0 stars, one fork, treat it as scaffolding and write the extern block by hand.
+Carried over from 2026-09-29, **not re-verified**: note that this option escapes
+the threading work below entirely, because quiche is already sans-IO and takes
+time as a parameter.
 
 ## Decision
 
-**Fork `endel/quic-zig` into the project, strip the parts ozai must not have, and
-apply the raw-SPKI TLS patch.**
+**Fork `endel/quic-zig` into the project, strip the parts ozai must not have,
+thread time and randomness through the core, and apply the raw-SPKI TLS patch.**
 
-Concretely, at M8:
+Unchanged from 2026-09-29 except for the order, which now has to put the
+threading work first: the certificate patch cannot be tested on a core that
+reads a clock, and a simulated handshake is the only cheap way to drive it.
+The concrete plan is the next section. Pin by commit SHA — quic-zig publishes
+zero tags.
 
-1. Vendor the sans-IO core (`connection.zig`, `connection_manager.zig`,
-   `tls13.zig`, packet parsing) into `vendor/quic/`.
-2. **Delete** the socket-owning layer (`ecn_socket.zig` and its xev event-loop
-   wiring) rather than leaving it unused. That also removes the forced
-   `link_libc` and the `endel/libxev` dependency, both of which are
-   consequences of owning a socket — which ozai has decided not to let it own.
-3. Patch `clientProcessCertificate` and `serverProcessClientCertificate` to
-   accept a DER SPKI whose only member is the raw 32-byte Ed25519 key, and to
-   compare it against the expected node id rather than walking an X.509 chain.
-4. Set `skip_cert_verify = false` and keep the verifier and session-store
-   identities stable across every client-config construction, or 0-RTT silently
-   stops working.
-5. Expose it as a module: `b.addModule("quic", …)` consumed by
-   `ozai.transport`.
+## The plan, at measured size
 
-Pin by commit SHA. quic-zig publishes no tags.
+### 1. Delete the socket-owning layer
+
+`ecn_socket.zig` was named alone in the first version of this record. It is the
+smaller half. The socket owner is `src/event_loop.zig`, at **5,211 lines** —
+about nine times the 584 lines of `ecn_socket.zig` — and its
+`Server.init`/`Client.init` constructors open and bind sockets before returning:
+`src/event_loop.zig:856` calls `openUdpSocket(config, config.port)`, and `:892-894`
+create the `xev.Loop`, the `xev.File` watch on the socket fd, and the
+`xev.Timer`. A constructor with a side effect on the host network is exactly what
+ozai refuses to have behind it, so this is the file that has to go.
+
+| File | Lines | Why it goes |
+|---|---:|---|
+| `src/event_loop.zig` | 5,211 | the real socket owner; opens and binds in `init` |
+| `src/quic/ecn_socket.zig` | 584 | 5 × `sys.socket`, 4 × `sys.bind`, `sys.sleepNs` |
+| `src/http1/e2e_test.zig` | 759 | opens real TCP; binds ports 29440–29449 |
+| `src/http1/socket.zig` | 364 | TCP via `std.c.accept4` (`:338`) |
+| `src/http1/timers.zig` | 194 | bound to `xev.Timer` (`:43`, `:50`) via `xev_backend` (`:13`) |
+| `src/test_all.zig` | 51 | **rewrite, not delete** — see below |
+| `src/xev_backend.zig` | 31 | the `xev` re-export everything above reaches through |
+
+`src/test_all.zig` is the part that is easy to miss and breaks the build: it is
+the test root, and it imports three of the deleted files
+(`quic/ecn_socket.zig:23`, `http1/e2e_test.zig:34`, `event_loop.zig:50`).
+`zig build test` does not compile after the deletion until it is rewritten.
+Rewrite it in the same commit as the deletion, not after.
+
+`src/sys.zig` (864 lines) **splits rather than deletes.** The socket syscalls go
+— `socket` (`:113`), `close` (`:154`), `bind` (`:165`), `sendto` (`:192`),
+`recvfrom` (`:236`), `read` (`:267`), `write` (`:286`), `listen` (`:309`),
+`resolveHost` (`:336`), `accept` (`:386`), `getsockname` (`:411`) — along with
+the file and directory helpers (`File` `:584`, `openFileRead` `:693`,
+`createFile` `:718`, `makeDir` `:743`, `readFileAlloc` `:785`), which duplicate
+ozai's own IO. What stays is the small block the core actually needs and which
+step 2 then replaces: `realtimeSeconds` (`:459`), `nanoTimestamp` (`:484`),
+`randomInt` (`:499`), `randomBytes` (`:507`). `getenv` (`:532`) is an
+environment read with no caller in `src/` at all — delete it.
+
+The module root `src/lib.zig` (47 lines) re-exports the whole stack and must be
+cut in the same pass, or the core does not compile: `ecn_socket` (`:15`), `h3`
+(`:18`), `h0` (`:19`), `http1` (`:20`), `tls_server`/`tls_client` (`:21-22`),
+`webtransport` (`:24-26`), `event_loop` (`:28`), `moq` (`:29`).
+
+Deleting this layer also drops the forced `link_libc` and the `endel/libxev`
+dependency, both of which are consequences of owning a socket that ozai has
+decided the QUIC stack must not own.
+
+### 2. Thread time and randomness in
+
+**This is the largest single item in M8 and the first version of this record
+omitted it entirely.** The vendored core is not pure over `(state, input)`. It
+reads the clock and a global CSPRNG from inside the state machines, which
+collides directly with `AGENTS.md` §2 and with this project's own purity
+invariant. That makes it a design decision, not a chore.
+
+Measured across `src/quic/*.zig` library code — test blocks excluded,
+`ecn_socket.zig` excluded because step 1 deletes it — there are **60 call sites**
+that read hidden input:
+
+| File | Clock | CSPRNG | Total |
+|---|---:|---:|---:|
+| `src/quic/connection.zig` | 23 | 7 | 30 |
+| `src/quic/tls13.zig` | 7 | 11 | 18 |
+| `src/quic/connection_manager.zig` | 3 | 2 | 5 |
+| `src/quic/quic_lb.zig` | 0 | 2 | 2 |
+| `src/quic/ack_handler.zig` | 0 | 1 | 1 |
+| `src/quic/qlog.zig` | 1 | 0 | 1 |
+| `src/quic/rsa.zig` | 0 | 1 | 1 |
+| `src/quic/stateless_reset.zig` | 0 | 1 | 1 |
+| `src/quic/transport_params.zig` | 0 | 1 | 1 |
+| **Total** | **34** | **26** | **60** |
+
+`src/quic/packet.zig` is clean: its 14 `nanoTimestamp` occurrences are all
+inside test blocks.
+
+What each read is:
+
+- `sys.nanoTimestamp()` (`src/sys.zig:484`) — `CLOCK_MONOTONIC`, RTT, PTO, idle
+  timeout, keep-alive, path-challenge expiry, drain, closing backoff.
+- `sys.realtimeSeconds()` (`src/sys.zig:459`) — `CLOCK_REALTIME`, for
+  certificate validity and session-ticket creation time.
+- `sys.randomBytes()` (`src/sys.zig:507`) — a bare `getrandom`/`arc4random_buf`
+  syscall. Un-injectable by construction: there is no seed to pass in.
+- `sys.randomInt()` (`src/sys.zig:499`) — wraps `randomBytes`, at
+  `src/quic/ack_handler.zig` for the ACK-skip offset.
+
+The stack already knows this is a seam and works around it globally rather than
+by injection: `src/sys.zig:472` carries
+`pub var test_clock: if (builtin.is_test) ?i64 else void`, read back at `:485`
+by `nanoTimestamp` itself, so the library is deterministic only under
+`zig build test`. That is a mutable global switched by build mode — precisely
+what §2 forbids, and it is the proof that the seam was needed and not taken.
+
+`signCertificateVerify` makes it sharper. `src/quic/tls13.zig:3316` reads
+`sys.randomBytes(&noise)` **unconditionally**, before the scheme switch, and the
+Ed25519 arm at `:3324-3330` passes that noise to `kp.sign`. A deterministic
+Ed25519 signature needs no nonce at all, so that read is pure cost on the exact
+path ozai cares about.
+
+The destination is already in the standard library: `std.Io.Clock`
+(`lib/std/Io.zig:721`) is the settable/monotonic clock seam, and
+`Connection.sendAt` (`:3134`) already takes a `now: i64`. So the work is
+mechanical in shape — thread a clock and a byte source down through
+`ConnectionManager`, `Connection` and `Tls13Handshake`, and delete
+`test_clock` — but it is 60 sites across the two largest files in the tree, and
+every one of them sits on a path that has to keep its RFC behaviour.
+
+The measurable acceptance test, and the reason this has to come before the
+certificate patch: with a virtual clock the handshake runs in microseconds
+instead of seconds, so the four certificate gates in step 3 can be driven
+exhaustively instead of once.
+
+### 3. Raw-SPKI Ed25519
+
+**What upstream already does.** `signCertificateVerify`
+(`src/quic/tls13.zig:3309`) has an `.ed25519` arm at `:3324` signing from the
+raw 32-byte seed via `Ed25519.KeyPair.generateDeterministic` (`:3326`), and
+`PrivateKeyAlgorithm` (`:40`) has `.ed25519` at `:42` mapping to that scheme
+(`signatureSchemeFor`, `:51`/`:54`). `buildCertificate` (`:3260`, called at
+`:1964` and `:2352`) `memcpy`s `cert_chain_der` verbatim and never parses it, so
+**a bare Ed25519 SPKI can be presented as the certificate** — the first version
+of this record was right about that and it remains true.
+
+`verifyCertificateVerifySignature` (`:70`) also implements `.ed25519`, at `:92`.
+But its first statement is `if (pub_key_algo != .curveEd25519) return
+error.BadCertificateVerify;` (`:93`), and `pub_key_algo` is a
+`Certificate.AlgorithmCategory` produced by X.509 parsing — its only two
+assignments are `std.meta.activeTag(parsed.pub_key_algo)` at `:1818` and `:1840`.
+The Ed25519 arm is therefore unreachable for a raw SPKI unless the extraction is
+patched too. That is the first thing the first version of this record got wrong:
+the gap is not "two functions and one flag".
+
+**The four gates**, all in `src/quic/tls13.zig`:
+
+| # | Function | Line |
+|---|---|---:|
+| 1 | `clientProcessCertificate` | 1754 |
+| 2 | `clientProcessCertificateVerify` | 1875 |
+| 3 | `serverProcessClientCertificate` | 2462 |
+| 4 | `serverProcessClientCertificateVerify` | 2482 |
+
+What each one does, and why the raw SPKI stops there:
+
+- **`clientProcessCertificate` (`:1754`)** — `:1807-1828` lifts the leaf key only
+  when `cert_hashes` is set. Otherwise `:1829` runs the X.509 walk: parse, lift,
+  `verifyHostName`, issuer chain, CA bundle. A raw SPKI takes neither branch.
+- **`clientProcessCertificateVerify` (`:1875`)** — `:1880` runs the CV signature
+  check only when `leaf_pub_key_len > 0`, which only the two branches above ever
+  set. A raw SPKI leaves it at zero, so the signature is never checked.
+- **`serverProcessClientCertificate` (`:2462`)** — `:2473` calls
+  `verifyPeerChain` **unconditionally**. No flag guards this one, so a client
+  certificate has no raw-SPKI path at all today.
+- **`serverProcessClientCertificateVerify` (`:2482`)** — `:2497-2507` re-parses
+  `self.peer_cert` as X.509 and passes `std.meta.activeTag(leaf.pub_key_algo)`
+  into the same guard at `:93`.
+
+Plus two structural changes:
+
+- **`TlsConfig`** (`:1059`). `skip_cert_verify: bool = true` at `:1076`, with
+  the comment "Skip X.509 chain + CertificateVerify validation".
+- **`ClientAuth`** (`:331`). `ca_bundle: *const Certificate.Bundle` is a
+  non-optional, non-nullable trust anchor, and `serverProcessClientCertificate`
+  reaches for it with `self.client_auth.?` at `:2465`. A raw-SPKI peer identity
+  has no CA to chain to, so `ClientAuth` needs a pin field beside `ca_bundle`
+  rather than a bundle alone.
+
+`verifyPeerChain` (`:486`) takes `(chain, bundle: *const Certificate.Bundle,
+now_s: i64)` and walks issuers; it is the wrong shape for a byte comparison and
+is not reused.
+
+#### Do not set `skip_cert_verify = false`
+
+The first version of this record's step 4 said *"Set `skip_cert_verify = false`
+and keep the verifier and session-store identities stable …, or 0-RTT silently
+stops working."* That is wrong, and wrong in the one direction that cannot be
+undone cheaply: **the flag's `false` branch is the X.509 chain validation that
+must not run.** `:1829-1865` calls `certificateWellFormed`, `Certificate.parse`,
+`parsed.verifyHostName` (`:1845`), `prev.verify` (`:1852`) and `bundle.verify`
+(`:1860`) — hostname, issuer chain, CA bundle, and validity dates against
+`realtimeSeconds`. Setting it false is how you get a stack that insists on
+parsing X.509, which requirement 2 says cannot be an iroh peer at all.
+
+The flag also conflates two independent decisions. It is one bit standing for
+"walk a chain of trust" **and** "check the CertificateVerify signature". iroh
+needs the first **off** and the second **on**. Neither `true` nor `false` is
+that, which is why no value of the flag is the fix.
+
+**The right move is to split them, not to set the flag:**
+
+1. Leave `skip_cert_verify` at its default `true`, so `certificateWellFormed`,
+   `Certificate.parse`, the hostname check, the issuer walk and `bundle.verify`
+   never execute. The chain-validation code is then dead on this path and is
+   deleted rather than bypassed.
+2. In the `skip_cert_verify` branch of `clientProcessCertificate`, lift the
+   32-byte key out of the 44-byte DER SPKI by decoding its BIT STRING, compare
+   it byte-for-byte against the expected node id, and set `leaf_pub_key_len` and
+   `leaf_pub_key_algo` to `.curveEd25519` **by construction** rather than from
+   an X.509 parse. That last part is what makes `verifyCertificateVerifySignature`'s
+   existing `.ed25519` arm reachable, so `:93` needs no change.
+3. Change the guard at `:1880` from
+   `!self.config.skip_cert_verify and self.leaf_pub_key_len > 0` to
+   `self.leaf_pub_key_len > 0`, so the signature check runs on the lifted key
+   whether or not a chain was walked. This is the "split the bit" step: the
+   check becomes unconditional and the chain walk becomes the flag's only job.
+4. Mirror all of it on the server side: replace the unconditional
+   `verifyPeerChain` at `:2473` with the same byte comparison, and lift the key
+   from the 44-byte SPKI at `:2497` instead of re-parsing it as X.509. Extend
+   `ClientAuth` with the expected node id so the dialer presents and verifies a
+   peer identity, which is what makes this a *mutual* peer check.
+
+Upstream's own comment at `:1077-1082` states the same thing from the other
+side: a certificate pin "requires `skip_cert_verify = false`, or
+CertificateVerify never runs and the pin proves only that someone copied a
+public certificate." The flag is load-bearing for the pin precisely because it
+also gates the signature check — which is the coupling to remove.
+
+**The 0-RTT concern in that step was real but unrelated.** Verifier and
+session-store identity must be stable across every client-config construction or
+resumption silently stops matching, and the two knobs are `TlsConfig.session_ticket`
+(`:1085`) and `TlsConfig.ticket_key` (`:1086`). That is a separate requirement
+about resumption state, it is not discharged by the `skip_cert_verify` flag, and
+it is recorded here as its own item so it is not lost when the flag instruction
+is removed.
+
+`keyMatchesCertificate` (`src/quic/tls13.zig:3657`) also parses the certificate
+as X.509 and demands `parsed.pub_key_algo == .curveEd25519` at `:3669`. It has
+no caller outside its own tests at this revision, so it is deleted with the rest
+of the X.509 machinery rather than patched.
 
 ## What we give up, and what it costs
 
-**Native multipath.** quic-zig has `paths: [2]NetworkPath` with one active index
-and RFC 9000 migration; it does not implement `draft-ietf-quic-multipath`, and
-iroh wants up to 8 concurrent paths per connection.
+**Native multipath.** quic-zig has `paths: [2]NetworkPath`
+(`src/quic/connection.zig:608`) with a single `active_path_idx` (`:609`) and RFC
+9000 migration; it does not implement `draft-ietf-quic-multipath`, and iroh wants
+up to 8 concurrent paths per connection. The maintainer says so in
+`SPEC/STATUS.md` and does not list it as in progress.
 
 The mitigation is iroh's own, and it is the reason the design is survivable:
 the synthetic-ULA map presents relay and custom paths as RFC 4193 unique local
@@ -134,13 +396,79 @@ If that turns out not to be good enough, the follow-up is to extend quic-zig's
 path table rather than to reimplement QUIC. It is recorded here so the decision
 is revisited on evidence rather than on frustration.
 
-**Fork maintenance.** quic-zig is one small project with no tags. The fork has to
-be rebased when it moves, and the patch is ours to carry. That is a real cost
-and it is accepted: the alternative is a C dependency plus a Rust toolchain in
-the build, permanently.
+**Fork maintenance.** quic-zig is one small project with no tags, at 57 stars,
+last pushed 2026-09-29. The fork has to be rebased when it moves, and the patch
+is ours to carry. The patch is now larger than a fork of an untagged
+single-maintainer project usually is, which is the honest shape of this risk.
+Accepted: the alternative is a C dependency plus a Rust toolchain in the build,
+permanently.
 
-**No QUIC v2, no DPLPMTUD on the vendored path.** Neither is in `SPEC/STATUS.md`
-as done. Neither blocks an iroh peer.
+**No QUIC v2, no DPLPMTUD on the vendored path.** `SPEC/STATUS.md` marks QUIC v2
+(RFC 9369) ✅ Complete. DPLPMTUD is not claimed. Neither blocks an iroh peer.
+
+### The estimate, restated
+
+The first version of this record implied a patch of "two functions and one
+flag" against a core of 30,437 lines. Measured, M8 is three phases in this
+order:
+
+1. **Deletion** — 7 files, 7,194 lines out, plus a `src/sys.zig` split and a
+   `src/lib.zig` cut. Mechanical, but `test_all.zig` and the module root are
+   load-bearing for the build and must land in the same commit as the deletion.
+2. **Threading** — 60 hidden-input call sites across the two largest files,
+   plus deleting the `test_clock` global. The bulk of the work, and the part
+   that buys a virtual clock and therefore makes phase 3 testable.
+3. **Certificates** — four gated functions, `TlsConfig`, `ClientAuth`, and a
+   split of the `skip_cert_verify` bit.
+
+Phase 2 is not optional and not smaller than phase 3. A record that says
+"bounded patch" and then bills only the certificate work understates M8 by
+roughly half.
+
+### Interop: the one claim that got worse
+
+The matrix in `SPEC/interop-results.md` is dated 2026-09-18 and was run at
+quic-zig `4988228`, **not** at the `14b9dc3e` we would vendor. It uses
+`martenseemann/quic-go-interop:latest` and `cloudflare/quiche-qns:latest` through
+`interop/runner/matrix.sh`.
+
+The eight cases this record names — retry, resumption, zerortt, handshake,
+transfer, longrtt, blackhole, ipv6 — do pass in all four directions. But the
+matrix totals are not a pass, and the first version of this record called
+requirement 3 a flat pass:
+
+| Direction | Pass | Fail | Unsupported |
+|---|---:|---:|---:|
+| `quic-go<-quic-zig` | 19 | 0 | 3 |
+| `quic-zig<-quic-go` | 19 | **1** | 2 |
+| `quic-zig<-quiche` | 11 | **7** | 4 |
+| `quiche<-quic-zig` | 17 | **2** | 3 |
+
+Ten red cells, seven of them against a conforming peer implementation. Upstream's
+own write-up attributes most to the peer or the environment, and the
+attributions are specific and plausible — `amplificationlimit` fails because the
+runner waits for a Handshake-first datagram the quiche client never sends;
+`connectionmigration` and the rebind cases need client-side behaviour quic-go
+does not implement. Two are not let off that easily:
+
+- `multiplexing` against quiche is marked **open**: quiche's client completes
+  1986 of 1999 requests and times out, and fixing a real `MAX_STREAMS` bug did
+  not move the number.
+- `handshakeloss` and `handshakecorruption` against quiche are **slow, not
+  broken** — 50 sequential handshakes under 30 % loss complete at roughly 2.7 s
+  each, and quiche's client gives up. Still red, still our Initial/Handshake
+  retransmission being slower off the mark than a peer will wait.
+
+Two consequences for the record. The interop claim is **"passes the cases that
+matter for iroh; 10 of 88 cells red, 1 open"**, not "pass". And the evidence
+does not pin to the commit we vendor, so M8 must re-run the matrix at our own
+SHA before requirement 3 is discharged.
+
+Reproducing that matrix needs `interop/quic-interop-runner`, a git submodule
+declared in `.gitmodules` and outside `build.zig.zon`'s `.paths`. It does not
+block vendoring — it is simply not in the tarball. It does mean the interop
+matrix is reproducible only by initialising the submodule and running
+`interop/runner/matrix.sh` with Docker, `quic-network-simulator` and `tshark`.
 
 ## Revisit if
 
@@ -152,3 +480,71 @@ as done. Neither blocks an iroh peer.
 - `c4milo/colibri` ships a native TLS and closes the gaps in its Limits section.
 - The convergence cost above shows up in measurement, in which case the path
   table is extended before anything else is considered.
+- **Threading turns out to be worse than 60 sites.** If phase 2 grows past the
+  two largest files into a design change — a clock that has to be threaded
+  through the packet and frame layers, or a per-connection RNG the caller cannot
+  own — that is the point to price `quiche` again, because it is already
+  sans-IO with time as a parameter and the fallback's cost is a C boundary
+  rather than a rewrite of a 30,000-line core.
+- **`std.Io.Evented` absorbs what libxev was doing.** Zig 0.16 already ships it
+  at `lib/std/Io.zig:31` — `Uring` on Linux, `Kqueue` on the BSDs, `Dispatch` on
+  Apple, and `void` where fibers are unsupported. It is a stdlib event loop with
+  no dependency, which is the `libxev`/`link_libc` half of step 1 argued in
+  reach anyway. If a future 0.16.x makes it usable across ozai's targets, the
+  argument for forking a stack that needs its event loop cut out of it gets
+  weaker, and the fallback should be re-priced.
+- **`skip_cert_verify` proves to be a dead end, not a flag to set.** The analysis
+  in [step 3](#do-not-set-skip_cert_verify--false) is a prediction about how far
+  the flag can be bent. If the four gates plus `TlsConfig` plus `ClientAuth`
+  resist the split — if the chain walk turns out to be woven through the key
+  schedule rather than sitting in the four functions, or if `ClientAuth` cannot
+  carry a pin without becoming a second verifier — then this is a TLS rewrite
+  wearing a patch's clothing, and the patch estimate is void.
+
+## Correction of 2026-09-30
+
+A read-only survey of the pinned tree, followed by a line-by-line re-read of
+every file cited here, found the record's cost model wrong. The decision stands.
+The evidence is in [The plan, at measured size](#the-plan-at-measured-size); what
+moved is:
+
+1. **Ingress and egress.** Egress is `pub fn send(self: *Connection, out_buf:
+   []u8) !usize` at `src/quic/connection.zig:3128`, an error union rather than
+   the `usize` recorded, and it reads the clock itself at `:3129`. The
+   `sendAt(out_buf, now: i64)` seam at `:3134` already exists and is the real
+   entry point. `RecvAction` has four arms, not three.
+2. **Purity, absent from the record entirely.** 60 hidden-input call sites —
+   34 clock, 26 CSPRNG — and a mutable `test_clock` global at `src/sys.zig:472`.
+   The vendored core does the thing `AGENTS.md` §2 forbids, and phase 2 now
+   exists, is the largest item, and runs first.
+3. **Ed25519.** Four gated functions, not two: `clientProcessCertificate`
+   (`:1754`), `clientProcessCertificateVerify` (`:1875`),
+   `serverProcessClientCertificate` (`:2462`),
+   `serverProcessClientCertificateVerify` (`:2482`). Plus `TlsConfig` (`:1059`)
+   and `ClientAuth` (`:331`). And `verifyCertificateVerifySignature`'s `.ed25519`
+   arm is unreachable for a raw SPKI because its `:93` guard demands an
+   X.509-derived `pub_key_algo` that only `:1818` and `:1840` ever set.
+4. **The `skip_cert_verify = false` instruction is removed.** Its false branch
+   is the chain validation, hostname check and CA-bundle verification that
+   requirement 2 forbids. Replaced by a split of the bit: chain walking stays
+   behind the flag, the CertificateVerify check becomes unconditional on a key
+   lifted from the raw SPKI. The 0-RTT concern that shared the step is kept as
+   its own item against `session_ticket` and `ticket_key`.
+5. **The deletion set is much larger.** `src/event_loop.zig` (5,211 lines), not
+   `ecn_socket.zig` (584), is the socket owner, and it opens and binds inside
+   its constructors at `:856` and `:892-894`. With `http1/socket.zig`,
+   `http1/timers.zig`, `xev_backend.zig`, `http1/e2e_test.zig` and a rewritten
+   `test_all.zig`, the set is 7 files and 7,194 lines. `src/sys.zig` splits
+   rather than deletes, and the module root `src/lib.zig` has to be cut.
+6. **Requirement 3 is downgraded.** Ten of 88 interop cells are red, one
+   (`multiplexing` vs quiche) is open upstream, and the matrix was run at
+   `4988228` rather than the pinned commit.
+7. **Held.** MIT, `minimum_zig_version = "0.16.0"`, version `0.5.0`, zero tags
+   — so pinning by SHA is the only option. Sole dependency `endel/libxev`. The
+   interop-runner submodule is outside `.paths`, so it does not block vendoring
+   but does block reproducing the matrix. `signCertificateVerify`'s `.ed25519`
+   arm signs from the raw seed, and the server sends the leaf verbatim without
+   parsing it — that part of the first version was right.
+8. **One rejected-candidate claim could not be reproduced** and is marked
+   unverified: `flushSendBatch` does not exist in `zigstack/zquic` at
+   `master`. Its Ed25519 disqualifier was re-checked and is exact.

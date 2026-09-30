@@ -16,6 +16,7 @@ pub const addr = @import("base/addr.zig");
 pub const ula = @import("base/ula.zig");
 pub const postcard = @import("wire/postcard.zig");
 pub const net_report = @import("net/report.zig");
+pub const holepunch = @import("net/holepunch.zig");
 
 pub const discovery_item = @import("discovery/item.zig");
 pub const discovery_resolve = @import("discovery/resolve.zig");
@@ -26,10 +27,18 @@ pub const relay_frame = @import("relay/frame.zig");
 pub const relay_client = @import("relay/client.zig");
 pub const relay_server = @import("relay/server.zig");
 
-pub const range_spec = @import("blobs/range_spec.zig");
+pub const addr_map = @import("transport/addr_map.zig");
+pub const transport_batch = @import("transport/batch.zig");
 
+pub const router = @import("router/router.zig");
+
+pub const range_spec = @import("blobs/range_spec.zig");
+pub const blobs_protocol = @import("blobs/protocol.zig");
 pub const endpoint_ticket = @import("ticket/endpoint_ticket.zig");
 pub const blob_ticket = @import("ticket/blob_ticket.zig");
+
+pub const gossip_hyparview = @import("gossip/hyparview.zig");
+pub const gossip_plumtree = @import("gossip/plumtree.zig");
 
 pub const NodeId = key.NodeId;
 pub const SecretKey = key.SecretKey;
@@ -56,6 +65,7 @@ test {
     std.testing.refAllDecls(addr);
     std.testing.refAllDecls(ula);
     std.testing.refAllDecls(net_report);
+    std.testing.refAllDecls(holepunch);
     std.testing.refAllDecls(discovery_item);
     std.testing.refAllDecls(discovery_resolve);
     std.testing.refAllDecls(discovery_dns);
@@ -65,6 +75,12 @@ test {
     std.testing.refAllDecls(relay_client);
     std.testing.refAllDecls(relay_server);
     std.testing.refAllDecls(range_spec);
+    std.testing.refAllDecls(blobs_protocol);
+    std.testing.refAllDecls(addr_map);
+    std.testing.refAllDecls(transport_batch);
+    std.testing.refAllDecls(router);
     std.testing.refAllDecls(endpoint_ticket);
     std.testing.refAllDecls(blob_ticket);
+    std.testing.refAllDecls(gossip_hyparview);
+    std.testing.refAllDecls(gossip_plumtree);
 }

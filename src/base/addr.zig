@@ -545,3 +545,80 @@ test "node addr keeps its address list sorted and unique" {
         try t.expectEqual(std.math.Order.lt, addr.addrs[index - 1].order(addr.addrs[index]));
     }
 }
+
+/// Strictly increasing is sorted *and* unique in one pass, which is the whole
+/// invariant `insert` exists to maintain.
+fn expectSortedAndUnique(addrs: []const TransportAddr) !void {
+    var index: usize = 1;
+    while (index < addrs.len) : (index += 1) {
+        try t.expectEqual(std.math.Order.lt, addrs[index - 1].order(addrs[index]));
+    }
+}
+
+test "a mid-list insert keeps every address it shifted" {
+    // The relay sorts ahead of both sockets by variant order, so it lands at
+    // index 0 with two addresses behind it. Every other insert in this file
+    // appended, where the shift copies nothing and a copy in the wrong
+    // direction is indistinguishable from a copy in the right one.
+    const node_id = (try key.SecretKey.fromSeed([_]u8{1} ** key.SecretKey.seed_length)).nodeId();
+    const alloc = t.allocator;
+    const first: TransportAddr = .{
+        .ip = .{ .ip = IpAddress.parse("192.168.96.145").?, .port = 60165 },
+    };
+    const second: TransportAddr = .{
+        .ip = .{ .ip = IpAddress.parse("213.208.157.87").?, .port = 60165 },
+    };
+    const relay: TransportAddr = .{ .relay = try RelayUrl.parse("https://relay.example./") };
+
+    var addr: NodeAddr = .{
+        .node_id = node_id,
+        .addrs = try alloc.dupe(TransportAddr, &.{ first, second }),
+    };
+    defer addr.deinit(alloc);
+
+    addr = (try addr.insert(alloc, relay)).?;
+    try t.expectEqual(@as(usize, 3), addr.addrs.len);
+    try expectSortedAndUnique(addr.addrs);
+
+    // Copied forwards, the shift writes `first` over `second`: the length and
+    // the variant order both still look right, so the values themselves are
+    // the only thing that catches it.
+    try t.expectEqual(std.math.Order.eq, addr.addrs[0].order(relay));
+    try t.expectEqual(std.math.Order.eq, addr.addrs[1].order(first));
+    try t.expectEqual(std.math.Order.eq, addr.addrs[2].order(second));
+
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try addr.format(&writer);
+    const text = writer.buffered();
+    try t.expect(std.mem.indexOf(u8, text, "relay:https://relay.example./") != null);
+    try t.expect(std.mem.indexOf(u8, text, "ip:192.168.96.145:60165") != null);
+    try t.expect(std.mem.indexOf(u8, text, "ip:213.208.157.87:60165") != null);
+}
+
+test "a duplicate with addresses behind it is rejected and changes nothing" {
+    // `first` has `second` behind it, so the lower bound lands short of the
+    // end. A duplicate at the last index cannot tell a rejection that fires
+    // before the shift from one that fires because nothing had to move.
+    const node_id = (try key.SecretKey.fromSeed([_]u8{1} ** key.SecretKey.seed_length)).nodeId();
+    const alloc = t.allocator;
+    const first: TransportAddr = .{
+        .ip = .{ .ip = IpAddress.parse("192.168.96.145").?, .port = 60165 },
+    };
+    const second: TransportAddr = .{
+        .ip = .{ .ip = IpAddress.parse("213.208.157.87").?, .port = 60165 },
+    };
+    const relay: TransportAddr = .{ .relay = try RelayUrl.parse("https://relay.example./") };
+
+    const addr: NodeAddr = .{
+        .node_id = node_id,
+        .addrs = try alloc.dupe(TransportAddr, &.{ relay, first, second }),
+    };
+    defer addr.deinit(alloc);
+
+    try t.expectEqual(@as(?NodeAddr, null), try addr.insert(alloc, first));
+    try t.expectEqual(@as(usize, 3), addr.addrs.len);
+    try expectSortedAndUnique(addr.addrs);
+    try t.expectEqual(std.math.Order.eq, addr.addrs[1].order(first));
+    try t.expectEqual(std.math.Order.eq, addr.addrs[2].order(second));
+}
