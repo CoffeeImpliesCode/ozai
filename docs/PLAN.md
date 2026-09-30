@@ -69,7 +69,15 @@ dependency to adopt; it is a byte format to reproduce. In scope:
 - the postcard field order for every type listed in M3–M6
 - `RangeSpec` / `RangeSpecSeq` from iroh-blobs' `range_spec.rs`: alternating
   OFF/ON span widths, with an odd element count meaning open-ended ON
-- fuzzed at every decoder boundary, with round-trip properties as the oracle
+- fuzzed at every decoder boundary, with three properties as the oracle:
+  - round-trip: `encode(decode(encode(x))) == encode(x)`, so the pair is a
+    fixed point
+  - round-trip stability: decoding is order-independent. An encoder is
+    canonical, so decoding *any* accepted encoding and re-encoding it yields
+    the same bytes — two spellings of one value may not produce two tickets.
+  - rejection: arbitrary bytes never panic and never read out of bounds. They
+    either decode or land in a declared error; an undeclared one is a bug, not
+    a fuzz finding.
 
 ### M3 — tickets and discovery records
 
@@ -137,21 +145,44 @@ string is capped at 255 and `user-data=` costs 10.
 
 ### M7 — the transport seam
 
-`TransportAddr → SocketAddr` via iroh's synthetic-ULA map, which is the single
-most reusable idea in the upstream codebase:
+The synthetic-ULA map. A QUIC stack speaks IP and nothing else, so iroh dresses
+relay and custom paths up as RFC 4193 unique local addresses and remembers
+which key owns which address. One connection then carries a relay path and N
+direct paths with no change to the QUIC stack at all.
 
 ```
-fd15:070a:510b:0000::/64   a peer, any path      (subnet 0000)
-fd15:070a:510b:0001::/64   a peer via one relay (subnet 0001)
-fd15:070a:510b:0003::/64   a peer via a custom  (subnet 0003)
-port 12345 for all of them
+fd15:070a:510b:0000::/64   the peer, path not yet chosen  (subnet 0000)
+fd15:070a:510b:0001::/64   one (peer, relay) pair        (subnet 0001)
+fd15:070a:510b:0003::/64   one custom transport address  (subnet 0003)
+fd15:070a:510b:0000:ffff:ffff:ffff:ffff  the default fake address
+port 12345 on all of them
 ```
 
-A QUIC stack only speaks IP. Mapping relay and custom paths onto RFC 4193 unique
-local addresses lets one connection carry a relay path and N direct paths with
-no change to the QUIC stack at all. `From<SocketAddr>` must be a pure, total,
-deterministic function; get the prefix, global id, or subnet discriminator wrong
-and paths silently alias.
+Two halves, and the milestone is honest about which is done.
+
+**Done: the pure half, vector-pinned.** `src/base/ula.zig` builds the /64
+prefix, attaches the mapped port, carries the default fake address, and
+classifies an address that arrives off the wire — upstream's
+`From<SocketAddr> for MultipathMappedAddr`, which tries the endpoint-id subnet,
+then relay, then custom, and falls through to `Ip` for anything else,
+including all of IPv4. Every constant is a byte captured from
+`iroh/src/socket/mapped_addrs.rs` at iroh `1.3.0`, commit
+`187f59e80afdae6bd9866002b33d3365c00b06d8`, and the golden vectors sit next to
+them. A direct IP path is **not** mapped: it is already a socket address and
+upstream types it `MultipathMappedAddr::Ip`.
+
+**Still plan: the allocation.** Upstream fills the eight host bits from
+`rand::rng()` and memoises both directions in an `AddrMap` behind a `Mutex`. It
+is not a derivation from the node id and upstream makes no such claim; stability
+comes from the map. ozai injects the host bits instead — a deliberate
+divergence, recorded under "Divergences from upstream" in
+[`ARCHITECTURE.md`](ARCHITECTURE.md) — so that the map stays deterministic and
+the seam can be tested. The map itself is transport-layer state and arrives with
+the transport.
+
+Get the /l, the global id, or a subnet discriminator wrong and two paths to one
+peer land on one address with no error anywhere: the receiver has no way to tell
+them apart.
 
 ### M8 — the QUIC substrate
 

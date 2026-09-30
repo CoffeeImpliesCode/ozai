@@ -6,8 +6,11 @@ what "next" means.
 
 ## Done
 
-- **M1 — identity and addressing.** `src/base/`. 27 tests green in Debug and
+- **M1 — identity and addressing.** `src/base/`. 38 tests green in Debug and
   ReleaseSafe, pinned against iroh's published vectors.
+- **M7, pure half — the synthetic-ULA construction and its inverse.**
+  `src/base/ula.zig`, vector-pinned to iroh `1.3.0`. The allocation of an
+  address to a key, and the socket, are still plan.
 
 ## Next
 

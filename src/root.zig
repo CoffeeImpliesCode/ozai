@@ -5,13 +5,15 @@
 //!
 //! Scope, as of the first milestone: identity and addressing only. Everything
 //! that touches a socket is deliberately absent until the transport substrate
-//! is settled — see `docs/PLAN.md`.
+//! is settled — see `docs/PLAN.md`. `ula` maps a path onto the fake address a
+//! QUIC stack would take it on; that is a value, not a socket.
 
 const std = @import("std");
 
 pub const base32 = @import("base/base32.zig");
 pub const key = @import("base/key.zig");
 pub const addr = @import("base/addr.zig");
+pub const ula = @import("base/ula.zig");
 
 pub const NodeId = key.NodeId;
 pub const SecretKey = key.SecretKey;
@@ -25,6 +27,10 @@ pub const CustomAddr = addr.CustomAddr;
 pub const TransportAddr = addr.TransportAddr;
 pub const NodeAddr = addr.NodeAddr;
 
+/// The fake address a path is reached at, or the path's own address when it
+/// already has one. See `base/ula.zig` for what is and is not pure here.
+pub const syntheticSocketAddr = ula.syntheticSocketAddr;
+
 test {
     // Reference every declaration so an unused module still type-checks. Zig
     // 0.16 dropped `refAllDeclsRecursive`; the roots are named explicitly.
@@ -32,4 +38,5 @@ test {
     std.testing.refAllDecls(base32);
     std.testing.refAllDecls(key);
     std.testing.refAllDecls(addr);
+    std.testing.refAllDecls(ula);
 }

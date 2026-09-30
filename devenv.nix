@@ -26,6 +26,20 @@ let
   # symlink to the one shared toolchain store: build caches stay per-project,
   # downloaded toolchains stay shared.
   zigCache = "/tmp/zig-caches/ozai";
+
+  # `zig` and `zig-gate` live in the user's own bin directory, which a devenv
+  # shell's PATH does not carry — it is assembled from the nix store, so both
+  # gate scripts exited 127 at `zig version` before checking anything, and
+  # `enterShell` could not print the version it promises to print loudly.
+  #
+  # This is a shell fragment, not an `env` entry, for two reasons: `$PATH` has
+  # to be expanded by the shell that runs it (`${PATH}` in a Nix string is a Nix
+  # variable and does not exist), and an `env` PATH would be a literal nobody
+  # can predict. It is therefore prepended where it is needed — `enterShell`
+  # and the two gate scripts — and `devenv shell -- zig build` still has no
+  # `zig`; the build commands belong to a direnv shell, which keeps the PATH
+  # the user already had.
+  pinnedToolPath = ''export PATH="$HOME/.local/bin:$PATH"'';
 in
 {
   inherit packages;
@@ -40,6 +54,7 @@ in
   # https://devenv.sh/basics/
   enterShell = ''
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    ${pinnedToolPath}
     [ -e "$ZIG_GLOBAL_CACHE_DIR/p" ] || ln -s /tmp/zig-global-cache/p "$ZIG_GLOBAL_CACHE_DIR/p"
     echo "zig $(zig version 2>/dev/null || echo '<unresolved: check .minimum_zig_version>')"
   '';
@@ -51,6 +66,7 @@ in
   # toolchain the manifest does not describe.
   scripts.gate.exec = ''
     set -eu
+    ${pinnedToolPath}
     version="$(zig version)"
     pin="$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' build.zig.zon)"
     test "$version" = "$pin" || {
@@ -64,6 +80,7 @@ in
   # advisory tooling. Kept separate so a failing zbc advisory never blocks.
   scripts.gate-strict.exec = ''
     set -eu
+    ${pinnedToolPath}
     version="$(zig version)"
     pin="$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' build.zig.zon)"
     test "$version" = "$pin" || {

@@ -141,7 +141,10 @@ pub const RelayUrl = struct {
             .raw => |value| value,
             .percent_encoded => |value| value,
         };
-        if (host.len == 0 or host.len > max_host_length) return error.HostTooLong;
+        // Narrow to the field's `u8` once, here, so the bound is proved where
+        // the cast is; 253 fits a `u8`, so the cast alone admits 254 and 255.
+        const host_length: u8 = std.math.cast(u8, host.len) orelse return error.HostTooLong;
+        if (host_length == 0 or host_length > max_host_length) return error.HostTooLong;
 
         const port: u16 = uri.port orelse switch (scheme) {
             .http => default_http_port,
@@ -152,10 +155,10 @@ pub const RelayUrl = struct {
         var result: RelayUrl = .{
             .scheme = scheme,
             .host = undefined,
-            .host_length = @intCast(host.len),
+            .host_length = host_length,
             .port = port,
         };
-        @memcpy(result.host[0..host.len], host);
+        @memcpy(result.host[0..host_length], host);
         return result;
     }
 
@@ -214,11 +217,17 @@ pub const CustomAddrParseError = error{
 ///
 /// This is the extension seam: a new wire protocol registers an id here, and
 /// everything above it — node addresses, tickets, the router — is unchanged.
+///
+/// `data` borrows storage the caller owns. Both constructors below say so, and
+/// it is the borrow that matters: `NodeAddr.insert` copies a `TransportAddr`
+/// onto the heap, so a pointer to a frame that has already been popped keeps
+/// being read long after the frame is gone.
 pub const CustomAddr = struct {
     id: u64,
     data: []const u8,
 
     /// Binary form: little-endian u64 id, then raw data. Eight bytes minimum.
+    /// The result borrows `bytes`; keep them alive for as long as it is read.
     pub fn parseBinary(bytes: []const u8) CustomAddrParseError!CustomAddr {
         if (bytes.len < custom_id_length) return error.Malformed;
         if (bytes.len - custom_id_length > max_inline_length) return error.DataTooLong;
@@ -237,7 +246,17 @@ pub const CustomAddr = struct {
     /// Text form: `<hex id>_<hex data>`, split on the *first* underscore. The id
     /// is bare lowercase hex with no `0x` and no leading zeros, so `0_` is the
     /// canonical spelling of a custom address carrying no data.
-    pub fn parse(text: []const u8) CustomAddrParseError!CustomAddr {
+    ///
+    /// The bytes land in `storage` and the result borrows them, so the borrow's
+    /// lifetime is the caller's decision, for the reason `RelayUrl.hostSlice`
+    /// gives: a function that fills a local and returns a slice into it hands
+    /// back a pointer to a frame that is dead the moment it returns. Here that
+    /// pointer is read for as long as anything holds the address, and a
+    /// `NodeAddr` holds it on the heap. Keep `storage` alive that long.
+    pub fn parse(
+        text: []const u8,
+        storage: *[max_inline_length]u8,
+    ) CustomAddrParseError!CustomAddr {
         const separator = std.mem.indexOfScalar(u8, text, '_') orelse return error.Malformed;
         const id_text = text[0..separator];
         const data_text = text[separator + 1 ..];
@@ -248,9 +267,8 @@ pub const CustomAddr = struct {
         const data_length = data_text.len / 2;
         if (data_length > max_inline_length) return error.DataTooLong;
 
-        var data: [max_inline_length]u8 = undefined;
-        _ = std.fmt.hexToBytes(data[0..data_length], data_text) catch return error.Malformed;
-        return .{ .id = id, .data = data[0..data_length] };
+        _ = std.fmt.hexToBytes(storage[0..data_length], data_text) catch return error.Malformed;
+        return .{ .id = id, .data = storage[0..data_length] };
     }
 
     pub fn format(self: CustomAddr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -370,6 +388,16 @@ pub const NodeAddr = struct {
 
 const t = std.testing;
 
+/// Fill a frame big enough to cover whatever `parse` or `insert` unwound, so a
+/// slice into a dead frame reads back as poison instead of as the bytes it
+/// happened to leave behind. `never_inline` is load-bearing: an inlined helper
+/// would poison the caller's own live locals rather than the dead region.
+fn clobberStack() void {
+    var poison: [2048]u8 = undefined;
+    @memset(&poison, 0xcd);
+    std.mem.doNotOptimizeAway(&poison);
+}
+
 test "relay url parse fills in the default port and keeps a fully qualified host" {
     const url = try RelayUrl.parse("https://use1-1.relay.iroh.network./");
     try t.expectEqual(RelayUrl.Scheme.https, url.scheme);
@@ -425,16 +453,53 @@ test "custom address binary form is a little-endian id then raw data" {
 }
 
 test "custom address text form splits on the first underscore" {
-    const parsed = try CustomAddr.parse("2a_abab");
+    var storage: [max_inline_length]u8 = undefined;
+    const parsed = try CustomAddr.parse("2a_abab", &storage);
     try t.expectEqual(@as(u64, 0x2a), parsed.id);
     try t.expectEqualSlices(u8, &[_]u8{ 0xab, 0xab }, parsed.data);
 
-    const no_data = try CustomAddr.parse("0_");
+    const no_data = try CustomAddr.parse("0_", &storage);
     try t.expectEqual(@as(usize, 0), no_data.data.len);
 
-    try t.expectError(error.Malformed, CustomAddr.parse("2a"));
-    try t.expectError(error.IdOutOfRange, CustomAddr.parse("zz_ab"));
-    try t.expectError(error.OddDataLength, CustomAddr.parse("2a_abc"));
+    try t.expectError(error.Malformed, CustomAddr.parse("2a", &storage));
+    try t.expectError(error.IdOutOfRange, CustomAddr.parse("zz_ab", &storage));
+    try t.expectError(error.OddDataLength, CustomAddr.parse("2a_abc", &storage));
+}
+
+test "custom address text form outlives the frame it was parsed in" {
+    // `storage` is the caller's, and outlives the clobber below by
+    // construction. `parse` returning a slice into a frame of its own is the
+    // bug this pins: that frame dies before the next line runs.
+    var storage: [max_inline_length]u8 = undefined;
+    const parsed = try CustomAddr.parse("2a_abab", &storage);
+    @call(.never_inline, clobberStack, .{});
+
+    // Snapshot with no call in between: the assertion is a call, and its frame
+    // lands on the region this test exists to inspect, replacing the poison
+    // with unrelated garbage.
+    const seen = [_]u8{ parsed.data[0], parsed.data[1] };
+    try t.expectEqualSlices(u8, &[_]u8{ 0xab, 0xab }, &seen);
+    try t.expectEqual(@as(u64, 0x2a), parsed.id);
+}
+
+test "custom address outlives the copy into a node address" {
+    const node_id = (try key.SecretKey.fromSeed([_]u8{2} ** key.SecretKey.seed_length)).nodeId();
+    const alloc = t.allocator;
+    var storage: [max_inline_length]u8 = undefined;
+
+    var addr = try NodeAddr.withRelay(alloc, node_id, try RelayUrl.parse("https://z.example./"));
+    defer addr.deinit(alloc);
+
+    addr = (try addr.insert(alloc, .{ .custom = try CustomAddr.parse("2a_abab", &storage) })).?;
+    @call(.never_inline, clobberStack, .{});
+
+    // The heap slice now holds what `parse` handed back, so this is the same
+    // dangling read as above, one lifetime longer, read the same way.
+    const stored = addr.addrs[1].custom;
+    const seen = [_]u8{ stored.data[0], stored.data[1] };
+    try t.expectEqualSlices(u8, &[_]u8{ 0xab, 0xab }, &seen);
+    try t.expectEqual(@as(u64, 0x2a), stored.id);
+    try t.expectEqual(TransportAddr.custom, std.meta.activeTag(addr.addrs[1]));
 }
 
 test "transport address ordering is variant, then inner" {

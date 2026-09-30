@@ -52,7 +52,16 @@ pub fn build(b: *std.Build) void {
 
     // testing
 
-    const lib_unit_tests = b.addTest(.{ .root_module = lib_mod });
+    // The unit tests get a root module no other compilation imports: coverage
+    // hangs the runtime object off the root module, and a shared `lib_mod` would
+    // hand a second copy of it to every link that imports the library. The
+    // module is otherwise identical, so the unit-test compile is unchanged.
+    const lib_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const lib_unit_tests = b.addTest(.{ .root_module = lib_test_mod });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
     // Integration tests live outside `src/` and get their own module: Zig only
@@ -66,6 +75,31 @@ pub fn build(b: *std.Build) void {
     integration_mod.addImport("ozai", lib_mod);
     const integration_tests = b.addTest(.{ .root_module = integration_mod });
     const run_integration_tests = b.addRunArtifact(integration_tests);
+
+    // Coverage instrumentation is opt-in because it pins the LLVM backend,
+    // links the zig-cov runtime into the test binary, and makes that binary
+    // write a `.zcov` file on exit; none of that belongs in a plain build.
+    // `zig-cov test` turns it on by passing both options below. Both test
+    // artifacts are instrumented because they reach different code, and an
+    // uninstrumented one under-reports in silence rather than failing.
+    const coverage = b.option(bool, "coverage", "Instrument the test binaries") orelse false;
+    const coverage_rt = b.option([]const u8, "coverage-rt", "Path to zig-cov-rt.o");
+    if (coverage) {
+        const rt = coverage_rt orelse std.debug.panic(
+            "-Dcoverage=true also needs -Dcoverage-rt=<path to zig-cov-rt.o>. " ++
+                "Run coverage through `zig-cov test`, which passes both.",
+            .{},
+        );
+        for ([_]*std.Build.Step.Compile{ lib_unit_tests, integration_tests }) |artifact| {
+            // The self-hosted backends emit no counters, `fuzz` is the only
+            // switch that makes LLVM emit them, and the runtime flushes from a
+            // libc atexit handler, so all three settings are load-bearing.
+            artifact.use_llvm = true;
+            artifact.root_module.fuzz = true;
+            artifact.root_module.link_libc = true;
+            artifact.root_module.addObjectFile(.{ .cwd_relative = rt });
+        }
+    }
 
     const test_step = b.step("test", "Run unit tests and integration tests");
     test_step.dependOn(&run_lib_unit_tests.step);
