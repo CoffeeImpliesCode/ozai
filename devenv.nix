@@ -15,16 +15,23 @@ let
     git
     pkg-config
   ];
+
+  # Zig flocks every global-cache manifest. A build that dies holding one of
+  # its manifest locks wedges every later build that wants the same cache, so
+  # each project gets its own root under the node-local scratch disk.
+  #
+  # The anyzig shim resolves its toolchain through this same variable, at
+  # `<root>/p/<hash>`. A root without `p` makes the shim re-fetch the tarball
+  # from ziglang.org, fail extraction, and exit 1 in silence, so `p` is a
+  # symlink to the one shared toolchain store: build caches stay per-project,
+  # downloaded toolchains stay shared.
+  zigCache = "/tmp/zig-caches/ozai";
 in
 {
   inherit packages;
 
   env = {
-    # Zig flocks every global-cache manifest, so a build that dies holding one
-    # of those locks wedges every later build wanting the same global cache.
-    # A project-local global cache keeps this project independent of that; the
-    # cost is one extra compiler_rt build.
-    ZIG_GLOBAL_CACHE_DIR = ".zig-global-cache";
+    ZIG_GLOBAL_CACHE_DIR = zigCache;
 
     LD_LIBRARY_PATH = lib.makeLibraryPath packages;
     INCLUDE_DIRECTORIES = lib.makeIncludePath packages;
@@ -32,12 +39,14 @@ in
 
   # https://devenv.sh/basics/
   enterShell = ''
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    [ -e "$ZIG_GLOBAL_CACHE_DIR/p" ] || ln -s /tmp/zig-global-cache/p "$ZIG_GLOBAL_CACHE_DIR/p"
     echo "zig $(zig version 2>/dev/null || echo '<unresolved: check .minimum_zig_version>')"
   '';
 
   # https://devenv.sh/scripts/
   #
-  # The house gate: fmt, build, test, ast-check, zlint, zbc. The version
+  # The house gate: fmt, build, test, ast-check, ziglint, zlint, zbc. The version
   # cross-check runs first because every later step is meaningless against a
   # toolchain the manifest does not describe.
   scripts.gate.exec = ''
