@@ -17,6 +17,7 @@ pub const ula = @import("base/ula.zig");
 pub const postcard = @import("wire/postcard.zig");
 pub const net_report = @import("net/report.zig");
 pub const holepunch = @import("net/holepunch.zig");
+pub const net_probe = @import("net/probe.zig");
 
 pub const discovery_item = @import("discovery/item.zig");
 pub const discovery_resolve = @import("discovery/resolve.zig");
@@ -30,6 +31,8 @@ pub const relay_server = @import("relay/server.zig");
 pub const addr_map = @import("transport/addr_map.zig");
 pub const transport_batch = @import("transport/batch.zig");
 pub const transport_quic_bridge = @import("transport/quic_bridge.zig");
+pub const transport_socket = @import("transport/socket.zig");
+pub const transport_dial = @import("transport/dial.zig");
 
 pub const endpoint = @import("endpoint/endpoint.zig");
 pub const incoming_filter = @import("endpoint/incoming_filter.zig");
@@ -70,6 +73,7 @@ test {
     std.testing.refAllDecls(ula);
     std.testing.refAllDecls(net_report);
     std.testing.refAllDecls(holepunch);
+    std.testing.refAllDecls(net_probe);
     std.testing.refAllDecls(discovery_item);
     std.testing.refAllDecls(discovery_resolve);
     std.testing.refAllDecls(discovery_dns);
@@ -83,6 +87,8 @@ test {
     std.testing.refAllDecls(addr_map);
     std.testing.refAllDecls(transport_batch);
     std.testing.refAllDecls(transport_quic_bridge);
+    std.testing.refAllDecls(transport_socket);
+    std.testing.refAllDecls(transport_dial);
     std.testing.refAllDecls(endpoint);
     std.testing.refAllDecls(incoming_filter);
     std.testing.refAllDecls(router);

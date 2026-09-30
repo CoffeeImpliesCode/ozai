@@ -21,29 +21,58 @@ what "next" means.
   no global entropy, no libc. See
   [`DECISIONS/0001-transport-substrate.md`](DECISIONS/0001-transport-substrate.md)
   for the execution record and what it cost.
-- **M9 — dispatch half.** `src/router/router.zig`.
+- **M9 — dispatch, and the endpoint over it.** `src/router/router.zig`,
+  `src/endpoint/endpoint.zig`, `src/endpoint/incoming_filter.zig`. The filter
+  is a vtable. The accept loop is a function of `(state, event)` and takes no
+  `Io` at all: the two operations that need a runtime — spawning a task and
+  cancelling one — are named as `Action`s and performed by the caller with
+  the `Io` it already holds for the socket.
 - **M10 — the holepunch gate.** `src/net/holepunch.zig`.
 - **M11 — gossip and blobs.** `src/gossip/`, `src/blobs/protocol.zig`.
 
 ## Next
 
-- **M9, remaining half — the endpoint itself.** `src/endpoint/`: the accept
-  loop over a live connection, `IncomingFilter` in the run rather than in the
-  router, and graceful close. The router's dispatch table and the shutdown
-  ordering are done; what is left needs a connection that actually exists.
-- **Wire `ozai.transport` to the vendored core.** M8's last step is not
-  finished: the module is declared, compiled and tested, and
-  `src/transport/quic_bridge.zig` is the work in flight that makes something
-  under `src/` import it.
+The stack accepts a QUIC connection and cannot originate one, and nothing
+under `src/` owns a socket. Both halves are next, and neither is visible from
+the module list.
+
+- **A dial path.** There is none anywhere under `src/`. `quic_bridge.zig`
+  owns a `quic.ConnectionManager`, which only ever runs a server, so the
+  bridge is accept-side: `recv` (`:555`) takes a datagram the core did not
+  have and hands back an `Ingress`, and `Conn.drain` (`:279`) hands back
+  `batch.Send` values. Nothing originates a connection. The client half that
+  does exist is a test helper — `Client` (`quic_bridge.zig:854`) builds a
+  peer end with `quic.connection.connectInto` (`:888`) and is reachable only
+  from test blocks. Promoting it is the first act, and one field decides
+  whether it works: `TlsConfig.expect_peer_node_id` is client-only, so the
+  pin a dialler needs is not the pin an acceptor enforces
+  (`ClientAuth.expect_node_id`), and the translation has to set the right one
+  on each side rather than the one that looks like a pin.
+- **A socket.** `batch.zig` models what a socket is to be asked for —
+  `Capability`, `Send`, `Runs`, `Recv`, `Cmsg`, `Refused`, `Report` — and
+  stops before the `sendmsg` thin on purpose. Its module doc says "There is
+  no socket here", and `Capability`'s own doc says the probe "needs a
+  socket, so it is not here". So no one has asked the kernel what it can do:
+  every batch falls back a segment at a time, and no `EIO` or `EINVAL` ever
+  comes back to demote a `Capability`. What closes this is one file that
+  opens a UDP socket, answers the two probes into a `Capability`, applies
+  `socketOptions(family, coalesce)`, turns each run of a `Send` into one
+  `sendmsg` carrying the `Cmsg`s `cmsg` already built, and reports a refusal
+  as the `Refused` that `report` already turns into a `Report`.
 
 ## Open, and not yet closable here
 
 - **0-RTT.** `session_ticket` and `ticket_key` carry it and the certificate
   patch did not discharge it. `0001` records it as open.
 - **Interop.** The requirement that this stack talks to more than one
-  implementation is undischarged. Upstream's matrix cannot be reproduced from
-  this repository — its runner is a submodule outside the published package —
-  so it has to be re-established against this fork or not at all.
+  implementation is undischarged, and there are two independent blockers.
+  Upstream's matrix is not reproducible from this repository — its runner is
+  a submodule outside the published package — so it has to be
+  re-established against this fork. And it cannot be run on this node at
+  all: `docker` and `quic-network-simulator` are both absent (`podman`
+  too), while `tshark` is present. So the matrix needs a node that has the
+  toolchain, and until one does, nothing here has spoken to an
+  implementation that is not its own test suite.
 - **Willow and docs** stay out of scope, as the plan says.
 
 ## Standing constraints

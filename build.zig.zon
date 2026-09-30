@@ -10,5 +10,11 @@
         "src",
         "test",
         "examples",
+        // The QUIC substrate is a module of this package, so a fetched copy
+        // without it builds to a module-not-found rather than to a stack.
+        // `vendor/` also has to be a subdirectory rather than a file list:
+        // it is 33 files of pinned third-party code, and naming them here
+        // would make adding one an edit to this file.
+        "vendor",
     },
 }

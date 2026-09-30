@@ -129,6 +129,15 @@ pub fn build(b: *std.Build) void {
     // does not inherit the imports of the module it was split from, so the
     // import is repeated rather than reached through `lib_mod`.
     lib_test_mod.addImport("quic", quic_mod);
+    // `src/transport/socket.zig` reaches libc for `sendmsg`, `recvmsg` and the
+    // socket options. It is here, not on `lib_mod`, because Zig does not
+    // analyse a function body until something calls it: while nothing called
+    // the socket, no module needed libc and the whole syscall layer sat
+    // uncompiled. The first test that opens one is what makes this line
+    // necessary, and removing it turns that test into a link error rather than
+    // a silent hole. The vendored QUIC core must never need this — it opens no
+    // socket — and `test/vendored_invariants.zig` is what keeps that true.
+    lib_test_mod.link_libc = true;
     const lib_unit_tests = b.addTest(.{ .root_module = lib_test_mod });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
@@ -141,6 +150,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     integration_mod.addImport("ozai", lib_mod);
+    integration_mod.link_libc = true;
     const integration_tests = b.addTest(.{ .root_module = integration_mod });
     const run_integration_tests = b.addRunArtifact(integration_tests);
 

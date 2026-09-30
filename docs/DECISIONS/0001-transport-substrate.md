@@ -5,7 +5,8 @@
   [Correction of 2026-09-30](#correction-of-2026-09-30). **Executed at M8 on
   2026-09-30**; see
   [Execution record](#execution-record-of-2026-09-30), which names what is
-  still open.
+  still open. Item 3 of that list closed after M8; see
+  [Still open](#still-open-after-m8).
 - **The decision is unchanged.** What moved is the price, twice over.
   quic-zig is still the substrate; the work to make it ozai's is 60 hidden-input
   call sites threaded through, plus a 7,194-line layer that was never copied,
@@ -766,33 +767,158 @@ of those paths a way for `realtimeSeconds` to come back through.
 
 ### Still open after M8
 
+Items are kept after they close, each marked where it stands. Item 3 was
+closed after M8 and is marked below. Item 4 was added on 2026-09-30, when a
+measurement turned item 1 from "untidy" into a trap; item 1's reason was
+corrected in the same pass and its conclusion was not.
+
 **1. 0-RTT, and the verifier identity. Open.** `TlsConfig.session_ticket`
 (`tls13.zig:736`) and `TlsConfig.ticket_key` (`tls13.zig:737`) must be stable
 across every client-config construction, or resumption silently stops matching.
 The certificate patch did **not** discharge this and M8 did not touch it.
-*Closes when* one constructor owns both values and a test resumes against a
-server whose ticket key is held constant across two connections. Until then
-treat early data as unimplemented.
+*Closes when* one client-identity acquisition path exists that resumption does
+not skip, one constructor owns both ticket values, and a test resumes against a
+server whose ticket key is held constant across two connections and whose pin
+is enforced on the second. Until then treat early data as unimplemented.
 
-There is a tension here that keeps it open rather than merely untidy:
-`ClientAuth`'s doc at `tls13.zig:253-259` says session tickets are neither
-issued nor accepted while a client-auth policy is in force. In this tree a
-pinned client identity and resumption are mutually exclusive, and an iroh peer
-wants both.
+**Amended 2026-09-30: the reason this item gave was the wrong one.** It read
+`ClientAuth`'s doc at `tls13.zig:253-259` — "Session tickets are neither issued
+nor accepted while a policy is in force" — as why a pinned client identity and
+resumption are mutually exclusive here. That sentence points at the ticket
+format, and the ticket format is not the obstacle. A ticket carries no client
+identity today and carrying one is mechanical: the plaintext is `[64]u8`
+(`:2152`), laid out `psk(32) || creation_time(8) || alpn_len(1) || alpn`
+(`:2151`); the sealed form is the same plus a 16-byte tag (`:2164`); and
+`serverSendTicket` writes both at `:2152-2175`. Neither size is negotiated with
+anything. Do not read this item as a wire-format change.
+
+The block is structural: **TLS 1.3 has one client-identity acquisition path, and
+resumption skips it.** `serverProcessClientCertificate` (`:2066`) is the only
+place a server learns who the client is. It lifts the SPKI (`:2083`), compares
+`auth.expect_node_id` (`:2084-2086`), and is the only writer of `peer_cert`
+anywhere in the tree (`:2088`) and the only server-side writer of
+`peer_node_id` (`:2089` — the client writes the same field at `:1477`, for the
+server's certificate).
+Reaching it needs a CertificateRequest, and
+`serverBuildEncryptedExtensions` (`:1912`) decides whether to send one by
+testing `using_psk` (`:1934`) **before** it tests `client_auth` (`:1936`). A
+resumed connection therefore never triggers the CertificateRequest, never runs
+that function, and ends the handshake holding no client identity at all. In
+this tree a pinned client identity and resumption are mutually exclusive, and
+an iroh peer wants both.
+
+It is also not residue of the chain walk M8 deleted. `ClientAuth` (`:260`) is
+`expect_node_id` (`:264`) plus a two-valued `Mode` (`:267-272`), and the
+judgement is `liftEd25519Spki` (`:188`) over a fixed 44 bytes
+(`ed25519_spki_len`, `:144`). There is no X.509 in it and none on the path.
+The guard is live code over a live policy.
+
+Removing the guard is a trap rather than a chore, and item 4 is the
+measurement.
 
 **2. Interop, and therefore requirement 3. Open.** The matrix this record relied
 on was upstream's, run at `4988228` rather than the pinned commit, and it is
 **not reproducible from this repository**: upstream's runner is a git submodule
 outside `build.zig.zon`'s `.paths`. M8 did not re-run it. Requirement 3 is
 re-established against this fork or not at all.
-*Closes when* the matrix is run against this tree — initialise the submodule
-outside the package, run `interop/runner/matrix.sh` with Docker,
-`quic-network-simulator` and `tshark` — and the result is recorded against our
+
+There is a second blocker, independent of the first, and it is about the node
+rather than the package: **the matrix cannot be run here at all.** Of the
+three tools it needs, `tshark` is present and `docker` and
+`quic-network-simulator` are both absent. So this is not a case of a runner
+that could be wired up locally; it needs a machine that has the simulator's
+toolchain.
+*Closes when* the matrix is run against this tree **on a node that has
+Docker and `quic-network-simulator`** — initialise the submodule outside the
+package, run `interop/runner/matrix.sh`, and record the result against our
 SHA. Until then the honest statement is the one already in this record: ten of
 88 cells red upstream, one open, and ours unmeasured.
 
-**3. Nothing under `src/` imports `quic`. Open.** The module is declared and
-compiled at `build.zig:36-40`; `ozai.transport` reaches the transport
-multiplexer, not a connection. M8's last execution step claimed it and did not
-finish it, and M9 is what builds on it.
+**3. Nothing under `src/` imports `quic`. Closed 2026-09-30, after M8.**
+`src/transport/quic_bridge.zig` closed it: it imports `quic` (`:99`), owns a
+`ConnectionManager` (`:115`), and turns one datagram in (`recv`, `:555`) and
+one out (`Conn.drain`, `:279`) per call. The module was declared and compiled
+at `build.zig:36-40` long before, which is why this item was open at M8 and
+why declaring a module is not the same as reaching one. M8's last execution
+step claimed it and did not finish it; the bridge is the finishing, and it
+landed with M9 rather than in M8.
 
+The closure is of *reach*, not of the transport. What the bridge gives is the
+accept half: `ConnectionManager` only ever runs a server, so nothing under
+`src/` originates a connection, and `Client` — the client half at
+`quic_bridge.zig:854`, built on `connectInto` (`:888`) the way
+`vendor/quic/src/quic/lossy_link_test.zig` builds one — is reachable only
+from the file's own test blocks. There is still no socket: `batch.zig`
+models GSO, GRO and ECN as values and returns the values a socket would be
+asked for, without one. Those two gaps are what `TODO.md`'s *Next* now names,
+and they are invisible from a module list that otherwise looks connected.
+
+**4. Lifting item 1's guard turns a pinned server into one that authenticates
+nobody, and the repair that makes it not look broken is what does it. Open.**
+
+A measurement, not a proposal. Taken on a throwaway copy of
+`vendor/quic/src/quic/tls13.zig` on 2026-09-30, restored byte-exact afterwards,
+with both suites green after the restore (456 vendored tests, 399 project
+tests). Nothing in the tree was changed.
+
+**How it was measured.** Two guards of the same shape, `client_auth == null`,
+gate resumption: the accept guard at `:1795`, which is the only way into
+`tryProcessPsk`, and the issue guard at `:2057`, the only way a ticket is sent.
+The probe lifted them and drove the vendored loopback harness (`handshake`,
+`:3907`, which returns the server's view of the client certificate in
+`peer_cert_out` and pumps both ends through `driveLoopback`, `:3436`) across
+two connections: one full handshake to take a ticket, then a resumed one
+against a server whose `TlsConfig.client_auth` is
+`ClientAuth{ .expect_node_id = <32 bytes> }`. It reported `using_psk` and the
+state machine's state on both sides, and read `peerCertificate()` and
+`peerNodeId()` off the server after the resumed handshake. Neither the harness
+nor a pinned `ClientAuth` is new: `tls13.zig:3999` and its four siblings
+already drive exactly that shape.
+
+**What came back, first pass: a dead handshake, not a bypass.** With the guard
+lifted alone, `using_psk` is true, `serverBuildEncryptedExtensions` skips the
+CertificateRequest (`:1934`) — and `serverBuildFinished` (`:2003`) still routes
+on `client_auth` alone, at `:2027`, ignoring `using_psk`. The resumed server
+waits in `server_wait_client_certificate` for a Certificate the client is not
+going to send: `client_wait_certificate` jumps to `client_wait_finished` the
+moment `using_psk` is set (`:1179-1183`). The client's `finished` is then
+rejected as `error.UnexpectedMessage` at `:2068`. Loud, and fail-closed. Those
+two sites disagree about `using_psk`, and the disagreement is the only thing
+standing between the lift and a silent bypass.
+
+**Second pass: the bypass.** Making that routing PSK-aware is the natural
+reading of `:2027`, and it is what an author fixing the disagreement writes:
+
+    self.state = if (self.client_auth != null and !self.using_psk)
+        .server_wait_client_certificate
+    else
+        .server_wait_client_finished;
+
+**The result: the handshake completes.** `.connected` on both sides, no
+Certificate anywhere in it, and the server holding `peer_cert == null` and
+`peer_node_id == null` with `expect_node_id` set and never compared. A server
+that pinned a node id accepted a peer it never authenticated, and nothing on
+the wire or in either state said so. The pin is not weakened and the
+comparison is not wrong — it is on a path that did not run.
+
+**The same defect one layer up, in this repository.** The bridge reads the peer
+identity as `conn.entry.conn.peerCertificate().?` at
+`src/transport/quic_bridge.zig:1076` and `:1115`, and `Connection.peerCertificate`
+(`vendor/quic/src/quic/connection.zig:4021`) is optional because the TLS
+layer's is: it delegates to `Tls13Handshake.peerCertificate`
+(`tls13.zig:1234`), which is `peer_cert` outright, and `peer_cert` is null on
+exactly the connection this item is about. Both call sites are inside that
+file's test blocks, so the live accept half reaches no `peerCertificate`
+call at all today and nothing in `src/` is wrong yet. It is still the same
+trap one layer up: this is the idiom the project's own code already uses for
+*who is this peer*, and the bridge is built so that identity is the whole
+point of the connection — its module doc says the pin a server actually
+enforces is `ClientAuth.expect_node_id` (`:80-83`), and `buildTlsConfig`
+installs one (`:528`, `:537`). The first unwrap written on that path turns the
+upstream null into a panic here. Both shapes are bugs; which one arrives is
+the next reader's decision, not this record's to assume.
+
+*Closes when* item 1 closes: a resumed connection under a pinned `ClientAuth`
+either carries a verified client identity or fails the handshake, and a test
+in this tree says which. Until then, treat the two `client_auth == null`
+guards as load-bearing, and do not "fix" `:2027` before the guard above it.
