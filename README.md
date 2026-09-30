@@ -12,30 +12,37 @@ does not, ozai says so and diverges on the record.
 
 ## Status
 
-**Milestone 1 — identity and addressing. Complete.**
-
-Implemented, tested, and interoperable with iroh's own published vectors:
+**Milestones 1–11 are built.** Every wire format, state machine and pure half
+of the stack, plus the QUIC substrate itself. What is *not* here is a
+connection to a live peer: the endpoint drives an accept loop over the vendored
+core, and nothing yet runs two of them against each other over a real socket.
 
 | Module | What it is |
 |---|---|
-| `src/base/base32.zig` | The two base32 alphabets the wire formats need: z-base-32 (pkarr labels) and hex-extended base32 (the DNS/TLS label). |
-| `src/base/key.zig` | `NodeId`, `SecretKey`, `Signature`. Ed25519, deterministic signing, lexicographic ordering, hex / z32 / local-TLS-name encodings. |
-| `src/base/addr.zig` | `RelayUrl`, `IpAddress`, `SocketAddr`, `CustomAddr`, `TransportAddr`, `NodeAddr`. A sorted, duplicate-free address set, which is what makes a ticket a stable identifier. |
-| `src/base/ula.zig` | The synthetic-ULA map: the /64 prefix, the mapped port, and the classification of an address arriving off the wire. Pinned to upstream bytes; the allocation of an address to a key is not here. |
+| `src/base/` | `NodeId`, `SecretKey`, `Signature`, `RelayUrl`, `IpAddress`, `SocketAddr`, `CustomAddr`, `TransportAddr`, `NodeAddr`, and the two base32 alphabets. A sorted, duplicate-free address set, which is what makes a ticket a stable identifier. |
+| `src/wire/`, `src/blobs/` | The postcard codec, `RangeSpec`, and the blobs protocol. |
+| `src/ticket/`, `src/discovery/` | Both ticket kinds, the pkarr signed packet, the item model, and the resolvers. |
+| `src/relay/` | The relay frame codec and both relay state machines. |
+| `src/net/` | The net report fold, the NAT classifier, and the holepunch gate. |
+| `src/transport/` | The synthetic-ULA allocation, the GSO/GRO/ECN seam, and the bridge to the QUIC core. |
+| `src/router/`, `src/endpoint/` | ALPN dispatch, the accept loop, and the incoming filter. |
+| `src/gossip/` | HyParView, PlumTree, and a deterministic in-process simulator. |
+| `vendor/quic/` | The sans-IO QUIC core, 33 files, pinned by commit. No socket, no clock, no global entropy, no libc. |
 
-That last one is the pure half of M7, landed early because it is a value and
-touches no socket; the transport seam around it is still plan. Everything above
-that is plan, not code. Read [`docs/PLAN.md`](docs/PLAN.md)
-for the milestone order and the reasoning, and
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the module tree and the
-invariants a port must not break.
+Every wire format is pinned to bytes captured from the Rust implementation at a
+named commit. A claim with no captured bytes attached does not go in.
 
-There is deliberately no socket code yet. The transport substrate was the one
-decision in this project that cannot be reversed cheaply, so it was made first
-and written down:
+Read [`docs/PLAN.md`](docs/PLAN.md) for the milestone order and the reasoning,
+and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the module tree, the
+invariants a port must not break, and every point where ozai deliberately
+differs from upstream in one place.
+
+The transport substrate was the one decision in this project that could not be
+reversed cheaply, so it was made first and written down.
 [`docs/DECISIONS/0001-transport-substrate.md`](docs/DECISIONS/0001-transport-substrate.md)
-records what it was decided on, what it costs, and what would make it be
-revisited.
+records what it was decided on, what it actually cost, and what would make it be
+revisited. `vendor/quic/VENDORED.md` records what was taken from it, what was
+left behind, and every patch ozai applies.
 
 ## Build
 

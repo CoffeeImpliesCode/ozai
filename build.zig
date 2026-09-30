@@ -210,6 +210,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "blob-ticket", .file = "test/blob_ticket_fuzz.zig" },
         .{ .name = "pkarr", .file = "test/pkarr_fuzz.zig" },
         .{ .name = "relay-frame", .file = "test/relay_frame_fuzz.zig" },
+        .{ .name = "postcard", .file = "test/postcard_fuzz.zig" },
     };
     const fuzz_step = b.step("fuzz", "Run the decoder fuzz targets, `--fuzz=N` to mutate");
     for (fuzz_targets) |fuzz_target| {
