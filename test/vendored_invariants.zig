@@ -31,7 +31,7 @@
 //!
 //! That line is drawn by what a function mentions, and it is drawn in one
 //! direction. An imprecision there can cost a complaint about a test helper,
-//+//! which a reader dismisses, or it can cost a library PRNG nobody reports,
+//! which a reader dismisses, or it can cost a library PRNG nobody reports,
 //! which nothing catches. Which of the two it is turns on whether a brace has
 //! been mistaken for a function body, so the pass that draws the line has to
 //! know which `fn` keywords are declarations at all — see `Scanner.classify`.
@@ -249,40 +249,40 @@ const Rule = struct {
     breaks: []const u8,
 };
 
-const rule_socket = Rule{
+const rule_socket: Rule = .{
     .name = "a socket syscall",
     .breaks = "a stack that owns a descriptor cannot be handed a datagram by " ++
         "the transport multiplexer, so the endpoint stops being drivable in " ++
         "process. DECISIONS/0001 dropped the socket-owning layers for this.",
 };
 
-const rule_libc_call = Rule{
+const rule_libc_call: Rule = .{
     .name = "a libc call",
     .breaks = "the vendored module declares no `link_libc`, so a std.c call " ++
         "that reaches an unlinked symbol fails the build for whoever is left " ++
         "reading the error, with nothing pointing at this file.",
 };
 
-const rule_extern = Rule{
+const rule_extern: Rule = .{
     .name = "a hand-declared libc symbol",
     .breaks = "`extern \"c\"` is how a libc dependency comes back without the " ++
         "build script noticing, and nothing in this tree needs one.",
 };
 
-const rule_link_libc = Rule{
+const rule_link_libc: Rule = .{
     .name = "`link_libc`",
     .breaks = "the vendored module deliberately does not link libc; setting " ++
         "it here would make every consumer pay for a dependency that " ++
         "DECISIONS/0001 removed.",
 };
 
-const rule_cimport = Rule{
+const rule_cimport: Rule = .{
     .name = "`@cImport`",
     .breaks = "a C header is a dependency this tree does not vendor and the " ++
         "build does not resolve, so it breaks on every machine but this one.",
 };
 
-const rule_clock = Rule{
+const rule_clock: Rule = .{
     .name = "a clock read",
     .breaks = "the real clock is hidden input. A test cannot put a " ++
         "connection at a chosen time, so loss recovery and idle timeouts can " ++
@@ -290,47 +290,47 @@ const rule_clock = Rule{
         "`ozai.base`, and the vendored core is below it.",
 };
 
-const rule_entropy = Rule{
+const rule_entropy: Rule = .{
     .name = "entropy from the kernel",
     .breaks = "a draw no test can predict: the same run twice is not the same " ++
         "run, so a failure found once cannot be reproduced and a proof that " ++
         "held once does not hold.",
 };
 
-const rule_env = Rule{
+const rule_env: Rule = .{
     .name = "the environment",
     .breaks = "a value that changes with the machine makes the result depend " ++
         "on where it ran, and a state machine has no way to be handed one.",
 };
 
-const rule_fs = Rule{
+const rule_fs: Rule = .{
     .name = "a file",
     .breaks = "the core is fed bytes by its caller. Reading a file makes the " ++
         "behaviour under test depend on that file's contents, and a file read " ++
         "is a blocking syscall inside a state machine.",
 };
 
-const rule_process = Rule{
+const rule_process: Rule = .{
     .name = "a process",
     .breaks = "spawning or querying a process puts the machine outside the " ++
         "state machine, where no assertion can reach it.",
 };
 
-const rule_global_rng = Rule{
+const rule_global_rng: Rule = .{
     .name = "a mutable global PRNG",
     .breaks = "every caller shares one generator, so the bytes one call draws " ++
         "change what the next call draws. Entropy belongs in a parameter, and " ++
         "the generator it came from belongs to the caller.",
 };
 
-const rule_library_rng = Rule{
+const rule_library_rng: Rule = .{
     .name = "a PRNG in library code",
     .breaks = "a state machine that draws its own randomness cannot be " ++
         "replayed or asserted on. In test code a seeded `TestRandom` is the " ++
         "sanctioned idiom; in library code the caller hands the entropy in.",
 };
 
-const rule_seam_import = Rule{
+const rule_seam_import: Rule = .{
     .name = "an import of the deleted seam",
     .breaks = "`sys.zig` held the sockets, the clock and the process CSPRNG " ++
         "behind one import, and DECISIONS/0001 step 2 deleted it once its last " ++
@@ -338,7 +338,7 @@ const rule_seam_import = Rule{
         "and points at whoever expected it back.",
 };
 
-const rule_unwired_tests = Rule{
+const rule_unwired_tests: Rule = .{
     .name = "test blocks that nothing runs",
     .breaks = "Zig analyses a test block only if the compilation reaches it, " ++
         "so a file the test root does not name has no tests at all, and a " ++
@@ -436,8 +436,8 @@ const Scanner = struct {
         for (self.tokens.items, 0..) |tok, i| {
             if (tok.tag == .keyword_fn) {
                 want_fn_body = true;
-                if (self.tagAfter(i) == .identifier) {
-                    try self.local_fns.append(alloc, self.textAfter(i).?);
+                if (self.fnNameAfter(i)) |name| {
+                    try self.local_fns.append(alloc, name);
                 }
             }
             switch (tok.tag) {
@@ -525,9 +525,28 @@ const Scanner = struct {
         return self.src[ahead.loc.start..ahead.loc.end];
     }
 
+    /// The name a `fn` keyword declares, or null when it declares none: a
+    /// function *type* — in a field, a parameter or a type alias — carries no
+    /// name, and the brace that follows one belongs to whatever encloses it.
+    ///
+    /// `tagAfter` and `textAfter` in one read, so the shape of the token and
+    /// the payload a caller unwraps cannot come apart at the call site.
+    fn fnNameAfter(self: *const Scanner, i: usize) ?[]const u8 {
+        if (self.tagAfter(i) != .identifier) return null;
+        return self.textAfter(i);
+    }
+
     fn textAt(self: *const Scanner, i: usize, back: usize) ?[]const u8 {
         const ahead = self.token(i -| back) orelse return null;
         return self.src[ahead.loc.start..ahead.loc.end];
+    }
+
+    /// The text of the token `back` places before `i`, or null unless that
+    /// token is a string literal. A caller that wants the literal's bytes has
+    /// to know it is one first, and this is where the two are one question.
+    fn stringAt(self: *const Scanner, i: usize, back: usize) ?[]const u8 {
+        if (self.tagAt(i, back) != .string_literal) return null;
+        return self.textAt(i, back);
     }
 
     /// True when the token `back` places before `i` is the identifier `name`.
@@ -608,7 +627,7 @@ const Scanner = struct {
     /// The offending line, for the reader who has to go look at it.
     fn sourceLine(self: *const Scanner, loc: std.zig.Token.Loc) []const u8 {
         const head = self.src[0..loc.start];
-        const from = if (std.mem.lastIndexOfScalar(u8, head, '\n')) |at| at + 1 else 0;
+        const from = if (std.mem.findScalarLast(u8, head, '\n')) |at| at + 1 else 0;
         const to = std.mem.indexOfScalarPos(u8, self.src, loc.end, '\n') orelse self.src.len;
         return std.mem.trim(u8, self.src[from..to], " \t\r");
     }
@@ -711,13 +730,11 @@ const Scanner = struct {
 
             // --- the deleted seam, whichever way it is reached. -----------
             if (self.tagAt(i, 0) == .builtin and std.mem.eql(u8, text, "@import")) {
-                if (self.tagAt(i, 1) == .l_paren and self.tagAt(i, 2) == .string_literal) {
-                    const quoted = self.textAt(i, 2).?;
-                    if (quoted.len > 2) {
-                        const inner = quoted[1 .. quoted.len - 1];
-                        if (std.mem.endsWith(u8, inner, deleted_seam)) {
-                            self.hit(rule_seam_import, token_line, tok.loc);
-                        }
+                const quoted = self.stringAt(i, 2) orelse "";
+                if (self.tagAt(i, 1) == .l_paren and quoted.len > 2) {
+                    const inner = quoted[1 .. quoted.len - 1];
+                    if (std.mem.endsWith(u8, inner, deleted_seam)) {
+                        self.hit(rule_seam_import, token_line, tok.loc);
                     }
                 }
             }
@@ -726,8 +743,7 @@ const Scanner = struct {
             // --- this tree must not contradict the build script. ----------
             if (self.stdChain(i, "c")) self.hit(rule_libc_call, token_line, tok.loc);
             if (tok.tag == .keyword_extern and
-                self.tagAt(i, 1) == .string_literal and
-                std.mem.eql(u8, self.textAt(i, 1).?, "\"c\"") and
+                std.mem.eql(u8, self.stringAt(i, 1) orelse "", "\"c\"") and
                 self.tagAt(i, 2) == .keyword_fn)
             {
                 self.hit(rule_extern, token_line, tok.loc);
@@ -993,7 +1009,7 @@ test "a function body that reaches the testing namespace is scaffolding" {
 test "a list with no pair in it is in order" {
     // `unsortedAt` walks from one, so these two are the arms where the walk
     // never runs and `index - 1` would have nothing in front of it.
-    const empty = [_][]const u8{};
+    const empty: [0][]const u8 = .{};
     const one = [_][]const u8{"only.zig"};
     try t.expect(unsortedAt(&empty) == null);
     try t.expect(unsortedAt(&one) == null);
@@ -1006,14 +1022,14 @@ test "the sortedness check names the pair that is out of order" {
     // Out of order in the middle, not at an end: a check that only compared
     // the first entry against the rest would pass this list.
     const unsorted = [_][]const u8{ "a.zig", "c.zig", "b.zig" };
-    const pair = unsortedAt(&unsorted).?;
+    const pair = unsortedAt(&unsorted) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(usize, 1), pair.before);
     try t.expectEqual(@as(usize, 2), pair.after);
 
     // A repeated entry is the same defect from the other side: that file is
     // checked twice while the one it displaced is checked never.
     const repeated = [_][]const u8{ "a.zig", "b.zig", "b.zig" };
-    const dup = unsortedAt(&repeated).?;
+    const dup = unsortedAt(&repeated) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(usize, 1), dup.before);
     try t.expectEqual(@as(usize, 2), dup.after);
 }

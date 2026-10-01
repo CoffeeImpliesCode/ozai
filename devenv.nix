@@ -61,19 +61,30 @@ in
 
   # https://devenv.sh/scripts/
   #
-  # The house gate: fmt, build, test, ast-check, ziglint, zlint, zbc. The version
-  # cross-check runs first because every later step is meaningless against a
-  # toolchain the manifest does not describe.
+  # The house gate: `zig-gate`'s sections in order — fmt, build, test,
+  # ast-check, ziglint, zlint, zbc, zwanzig, cross-test. The version cross-check
+  # above runs first because every later step is meaningless against a
+  # toolchain the manifest does not describe. `zbc` is the only advisory
+  # section here (`ZBC_STRICT=1` makes it binding) and `cross-test` is the only
+  # one that leaves this host, so this gate is as slow as its slowest section.
   #
-  # `vendor/quic` is excluded from every gate below, and that is a decision
-  # rather than an oversight. It is upstream code carrying its own formatting
-  # and its own idioms; reformatting it would bury the patch under thirty
-  # thousand lines of noise, and linting it with this project's rules would
-  # report findings nobody intends to fix. The patch ozai applies is a named
-  # list in `vendor/quic/VENDORED.md`, and that file is the reviewable
-  # artefact. The vendored tree is still compiled -- `zig build quic-test`
-  # builds it and runs its own tests -- so "not gated" never means "not
-  # proved to build".
+  # `GATE_EXCLUDE` is the driver's named mechanism for what is not this
+  # project's source, and it overrides the built-in default rather than adding
+  # to it, so the default's patterns have to be written out here too.
+  #
+  # `^[.]/vendor/` covers `vendor/quic`, and excluding it is a decision rather
+  # than an oversight. It is upstream code carrying its own formatting and its
+  # own idioms; reformatting it would bury the patch under thirty thousand
+  # lines of noise, and linting it with this project's rules would report
+  # findings nobody intends to fix. The patch ozai applies is a named list in
+  # `vendor/quic/VENDORED.md`, and that file is the reviewable artefact. The
+  # vendored tree is still compiled -- `zig build quic-test` builds it and runs
+  # its own tests -- so "not gated" never means "not proved to build".
+  #
+  # The four cache/output roots are the rest of what is not source. A lint
+  # section reads whatever the file list hands it, and a build leaves
+  # `.zig-cache/` and `zig-out/` in the tree; reporting build output as a
+  # defect is a measurement of build state, not of this repository.
   scripts.gate.exec = ''
     set -eu
     ${pinnedToolPath}
@@ -83,11 +94,15 @@ in
       echo "zig $version does not match .minimum_zig_version $pin" >&2
       exit 1
     }
-    GATE_EXCLUDE=vendor zig-gate
+    GATE_EXCLUDE='^[.]/vendor/ /[.]zig-cache/ /zig-out/ /zig-cache/ /zig-global-cache/' zig-gate
   '';
 
-  # A second form for design work: the version cross-check plus coverage, no
-  # advisory tooling. Kept separate so a failing zbc advisory never blocks.
+  # The same gate with two changes, and only two. `--no-zbc` drops section 7
+  # and nothing else — fmt, build, test, ast-check, ziglint, zlint, zwanzig
+  # and cross-test all still run — and `--cov` adds the coverage section on
+  # top, advisory until `ZIG_COV_FAIL_UNDER` is set. It is kept separate so a
+  # failing zbc advisory never blocks a design pass, and it is not a cheaper
+  # gate: only the zbc section is gone.
   scripts.gate-strict.exec = ''
     set -eu
     ${pinnedToolPath}
@@ -97,7 +112,8 @@ in
       echo "zig $version does not match .minimum_zig_version $pin" >&2
       exit 1
     }
-    GATE_EXCLUDE=vendor zig-gate --no-zbc --cov
+    GATE_EXCLUDE='^[.]/vendor/ /[.]zig-cache/ /zig-out/ /zig-cache/ /zig-global-cache/' \
+      zig-gate --no-zbc --cov
   '';
 
   # See full reference at https://devenv.sh/reference/options/

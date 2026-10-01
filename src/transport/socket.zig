@@ -26,7 +26,7 @@
 //! # Where `io` is, and where it is not
 //!
 //! `DECISIONS/0002`: "`rt.io()` is never stored. It is a parameter to the
-//! functions that need it." So `Socket` holds a descriptor and no `Io`, and
+//! functions that need it." So `Socket` holds descriptors and no `Io`, and
 //! every operation that can be cancelled takes one. What the runtime is asked
 //! for is cancellation and nothing else — `Io.Threaded.checkCancel` is an
 //! atomic load — because a descriptor this module opened is a descriptor no
@@ -34,6 +34,26 @@
 //! holds for `Threaded`. The wait before a receive is a `poll` on the
 //! descriptor for the same reason, and a task cancelled inside the `recvmsg`
 //! is not seen until that call returns.
+//!
+//! # The second descriptor, and the wait it ends
+//!
+//! `Socket` owns two of them: the socket, and an `eventfd` that exists to be
+//! woken. It is the first thing besides the socket this struct holds, and it
+//! is here because a `poll` is asleep in the kernel — there is nowhere to
+//! consult a flag from, so a wait that has to be *ended* rather than run to
+//! the end of its slice needs a descriptor to become readable. An `eventfd`
+//! rather than a self-pipe: one descriptor instead of two, a counter instead
+//! of a byte buffer, and `EFD_SEMAPHORE` makes a read take one wake off the
+//! counter rather than all of them.
+//!
+//! What a wake means belongs to `Socket.stop`, and its two halves are in
+//! different places on purpose. `stop` raises the wake with one store and one
+//! `write`; `discovery/lookup_live.zig` uses it when a lookup is cancelled.
+//! The waiter owns queue cleanup, because the cancellation callback may run
+//! while the socket is being polled. A send spends any remaining wake before
+//! making the socket usable again.
+//! The CLI's signal handler only calls `Stop.request`: it does not raise
+//! this wake, so a node notices its stop at the next poll timeout.
 //!
 //! # Linux, and only Linux
 //!
@@ -46,12 +66,12 @@
 //!
 //! # `link_libc`, and what does not cover this file
 //!
-//! `socket`, `bind`, `getsockname`, `setsockopt`, `sendmsg`, `recvmsg` and
-//! `close` are libc's here, so an artifact that calls any of them needs
-//! `linkLibC()`. Nothing above them is: the layout work is arithmetic on
-//! bytes, which is why every test here reaches libc's code without leaving a
-//! syscall behind. The one that names `setsockopt` proves a refusal, and the
-//! refusal comes before the call.
+//! `socket`, `bind`, `getsockname`, `setsockopt`, `sendmsg`, `recvmsg`,
+//! `eventfd`, `read`, `write` and `close` are libc's here, so an artifact that
+//! calls any of them needs `linkLibC()`. Nothing above them is: the layout
+//! work is arithmetic on bytes, which is why every test here reaches libc's
+//! code without leaving a syscall behind. The one that names `setsockopt`
+//! proves a refusal, and the refusal comes before the call.
 //!
 //! The other half of that was a gate that did not exist. Zig analyses a
 //! function body when it is called, not when it is referenced, so
@@ -90,14 +110,71 @@ const endian = builtin.cpu.arch.endian();
 /// becoming a hang.
 pub const max_syscall_attempts = 4;
 
+/// The `eventfd` flags, which the 0.16 std tree does not spell and
+/// `<sys/eventfd.h>` does. `semaphore` is the load-bearing one: a read takes
+/// one unit off the counter rather than all of it, so a wake nobody was
+/// waiting for cannot leave the next wait spinning on a count that never
+/// reaches zero. The other two are the two every descriptor this file opens
+/// carries.
+const wake_flags = struct {
+    const semaphore: c_uint = 1;
+    const nonblock: c_uint = 0o4000;
+    const cloexec: c_uint = 0o2000000;
+};
+
+/// The counter an `eventfd` counts in, which the kernel fixes at eight bytes
+/// and both `read` and `write` want all of. It is a value rather than a count
+/// of anything in this file, which is the whole of what a wake carries.
+const wake_width = @sizeOf(u64);
+
+/// How many datagrams a stop takes off the queue before it stops taking.
+///
+/// A bound and not a budget. RFC 1035 §7.2 has one query in flight per lookup,
+/// so a queue deeper than this is a peer filling it faster than a waiter can
+/// empty it, and the next thing to hang would be the resolve that gave up.
+pub const max_discarded = 64;
+
+/// How many wake units one cleanup takes off the counter before it says the
+/// counter is not spending.
+///
+/// A bound and not a budget, and the same fact `max_discarded` is about with
+/// the other half of a stop: one unit is one `stop`, and a stop belongs to a
+/// caller with a wait in progress, so a counter this deep is cancellation
+/// being raised faster than a send can spend it. Reaching it is a refusal and
+/// not a partial spend, because a unit left standing ends the next wait
+/// exactly the way a real stop would and nothing else would take it off.
+pub const max_wakes_spent = 64;
+
+// 80 display columns; the rule counts UTF-8 bytes, three per box character.
+// ziglint-ignore: Z024
 // ────────────────────────────────────────────────────── control-message layout
 
-/// `CMSG_ALIGN`: a length rounded up to the alignment of a control-message
-/// header. The 0.16 std tree carries no `CMSG_*` macro — a search for
-/// `CMSG_LEN` across `lib/std` finds nothing — so the three arithmetic facts
-/// are here once and every message below is written and read through them.
+/// The boundary a control message is padded to, and the one number in this
+/// file that decides where a message ends and the next one begins.
+///
+/// It is `sizeof(size_t)` and not the alignment of a `cmsghdr`, and on musl
+/// those are two different numbers: `CMSG_ALIGN` in musl's `sys/socket.h`
+/// and in the kernel's `include/linux/socket.h` both round a length up to a
+/// word, while glibc declares `cmsg_len` a `size_t`, so its struct is
+/// eight-byte aligned and the two agree there. musl aims at POSIX and
+/// declares the same field a `socklen_t` with four bytes of padding above it,
+/// which makes its struct four-byte aligned and sixteen bytes wide while
+/// `CMSG_ALIGN` still rounds to eight — `std/c.zig` says as much over
+/// `posix_cmsghdr`.
+///
+/// Rounding by the struct instead is not cosmetic. The buffer below is ten
+/// bytes short of the two messages a coalesced read carries, and the kernel
+/// answers a control buffer it cannot fill with `MSG_CTRUNC`; a send's second
+/// message lands four bytes before the offset the kernel's own `CMSG_NXTHDR`
+/// walks to, so what it reads there is padding rather than a header.
+const cmsg_boundary: usize = @sizeOf(usize);
+
+/// `CMSG_ALIGN`: a length rounded up to that boundary. The 0.16 std tree
+/// carries no `CMSG_*` macro — a search for `CMSG_LEN` across `lib/std`
+/// finds nothing — so the three arithmetic facts are here once and every
+/// message below is written and read through them.
 pub fn cmsgAlign(length: usize) usize {
-    return std.mem.alignForward(usize, length, @alignOf(c.cmsghdr));
+    return std.mem.alignForward(usize, length, cmsg_boundary);
 }
 
 /// `CMSG_LEN`: the aligned header plus the value, and nothing else. The
@@ -120,16 +197,28 @@ pub fn cmsgSpace(width: usize) usize {
 /// arrives a byte wide and a `u16` still occupies a whole padded message.
 pub const control_size: usize = cmsgSpace(batch.tos_width) + cmsgSpace(@sizeOf(u16));
 
+/// The width `msg_controllen` is spelled in: POSIX says `socklen_t` and musl
+/// says POSIX, while glibc follows the kernel and spells it a `size_t`.
+const ControlExtent = @FieldType(c.msghdr_const, "controllen");
+
+comptime {
+    // The bound every narrowing of a control length is taken against. No
+    // buffer this file hands to a syscall is longer than `control_size` —
+    // `writeCmsg` cannot return more of a `ControlBuffer` than it holds —
+    // so this is what proves `sendmsg`'s own narrowing cannot lose a bit.
+    std.debug.assert(control_size <= std.math.maxInt(ControlExtent));
+}
+
 /// The bytes a `sendmsg` writes its control messages into, and the bytes a
 /// `recvmsg` reads them back out of.
 ///
 /// One traffic-class message and one `UDP_GRO` message is every message a
 /// socket asked for: `IP_PKTINFO` and `SO_TIMESTAMP` are not set, so the
 /// kernel has no other reason to send one. The struct carries its own
-/// alignment, because the kernel reads these headers at the alignment a
-/// `cmsghdr` has and a bare `[]u8` does not promise it.
+/// alignment, because the kernel writes these headers at `cmsg_boundary` and
+/// a bare `[]u8` does not promise it.
 pub const ControlBuffer = extern struct {
-    bytes: [control_size]u8 align(@alignOf(c.cmsghdr)),
+    bytes: [control_size]u8 align(cmsg_boundary),
 };
 
 /// Why a set of control messages would not fit.
@@ -138,10 +227,11 @@ pub const ControlError = error{
     /// stops halfway is a different message, not a shorter one: the kernel
     /// reads `cmsg_len` bytes whatever the buffer holds.
     BufferTooSmall,
-    /// A header field the ABI's own type cannot hold: a length past what
-    /// `socklen_t` spells, or a level or an option past what an `int`
-    /// spells. The truncated field would be a header pointing at bytes that
-    /// are not there, so it is refused instead of written.
+    /// A field the ABI's own type cannot hold: a header's length past what
+    /// `socklen_t` spells, a level or an option past what an `int` spells, or
+    /// a control buffer longer than `msg_controllen` can say. The truncated
+    /// field would be a header pointing at bytes that are not there, so it is
+    /// refused instead of written.
     FieldTooWide,
 };
 
@@ -202,7 +292,7 @@ pub fn readCmsg(blob: []const u8) CmsgRead {
             read.truncated = rest.len != 0;
             break;
         }
-        const length: usize = getHeader(rest, "len");
+        const length: usize = getLength(rest);
         if (length < @sizeOf(c.cmsghdr) or length > rest.len) {
             read.truncated = true;
             break;
@@ -226,22 +316,33 @@ const Header = struct {
 // a `socklen_t` work without a second spelling of any of this.
 
 fn putHeader(at: []u8, header: Header) ControlError!void {
-    // Three narrowings, none of them proved anywhere above: a `cmsghdr`
-    // spells its length in `socklen_t` and its level and type in an `int`,
-    // and a bare `@intCast` panics in Debug on the value that does not fit
-    // rather than writing a defined one. Each is narrowed here, where the
-    // bound is, and a header the ABI cannot spell is refused rather than
-    // written with a field that describes something else.
-    const len_type = @FieldType(c.cmsghdr, "len");
-    const length = std.math.cast(len_type, header.length) orelse return error.FieldTooWide;
+    // Three narrowings, none of them proved anywhere above: the C header
+    // spells `cmsg_len` a `socklen_t` under musl and a `size_t` under glibc,
+    // spells its level and type an `int`, and a bare `@intCast` panics in
+    // Debug on a value that does not fit rather than writing a defined one.
+    // Each is narrowed here, where the bound is, and a header the ABI cannot
+    // spell is refused rather than written with a field that describes
+    // something else.
+    const ControlLength = @FieldType(c.cmsghdr, "len");
+    const length = std.math.cast(ControlLength, header.length) orelse return error.FieldTooWide;
     const level = std.math.cast(c_int, header.level) orelse return error.FieldTooWide;
     const kind = std.math.cast(c_int, header.kind) orelse return error.FieldTooWide;
+    // The word that goes out is the kernel's and not the C struct's. `struct
+    // cmsghdr` in `include/linux/socket.h` spells `cmsg_len` a
+    // `__kernel_size_t` at offset zero of a sixteen-byte header, and
+    // `__sys_sendmsg` copies that whole word out of this buffer before
+    // `sock_cmsg_send` and `udp_cmsg_send` read it back and check it against
+    // `CMSG_OK` and `CMSG_LEN(sizeof(u16))`. musl's own header spells the
+    // same field a `socklen_t` and puts four bytes of padding around it —
+    // above the field on a little-endian host, below it on a big-endian one —
+    // inside that same word. So the word is zeroed and the field written into
+    // the middle of it: writing the field alone would hand the kernel a
+    // length with whatever the stack held inside it, and whether a send is
+    // refused at all would come to depend on that.
     const len_at = @offsetOf(c.cmsghdr, "len");
-    switch (@sizeOf(len_type)) {
-        4 => std.mem.writeInt(u32, at[len_at..][0..4], length, endian),
-        8 => std.mem.writeInt(usize, at[len_at..][0..8], length, endian),
-        else => @compileError("a cmsghdr length field is four or eight bytes"),
-    }
+    const control_width = @sizeOf(ControlLength);
+    @memset(at[0..@sizeOf(usize)], 0);
+    std.mem.writeInt(ControlLength, at[len_at..][0..control_width], length, endian);
     const word = @sizeOf(c_int);
     const level_at = @offsetOf(c.cmsghdr, "level");
     const kind_at = @offsetOf(c.cmsghdr, "type");
@@ -249,13 +350,23 @@ fn putHeader(at: []u8, header: Header) ControlError!void {
     std.mem.writeInt(c_int, at[kind_at..][0..word], kind, endian);
 }
 
-fn getHeader(at: []const u8, comptime field: []const u8) u32 {
+/// The length a header reports, read in the width the kernel wrote it.
+///
+/// One word at offset zero of the header, which is where the kernel's own
+/// `__kernel_size_t` is and which therefore holds musl's `socklen_t` and its
+/// padding together. The C struct's field offset would be the same number on
+/// a little-endian host and would read into the level that follows the length
+/// on a big-endian one, so it is the word and not the field that is read.
+fn getLength(at: []const u8) usize {
+    return std.mem.readInt(usize, at[0..@sizeOf(usize)], endian);
+}
+
+/// The level or the option a header names, which are an `int` on every ABI
+/// here — `getLength` is the one field that is not the same width twice.
+fn getHeader(comptime field: []const u8, at: []const u8) u32 {
     const offset = @offsetOf(c.cmsghdr, field);
-    return switch (@sizeOf(@FieldType(c.cmsghdr, field))) {
-        4 => std.mem.readInt(u32, at[offset..][0..4], endian),
-        8 => @as(u32, @truncate(std.mem.readInt(u64, at[offset..][0..8], endian))),
-        else => @compileError("a cmsghdr field is four or eight bytes"),
-    };
+    const word = @sizeOf(c_int);
+    return @bitCast(std.mem.readInt(c_int, at[offset..][0..word], endian));
 }
 
 fn putValue(at: []u8, value: batch.Value) void {
@@ -273,8 +384,8 @@ fn putValue(at: []u8, value: batch.Value) void {
 
 fn takeValue(header: []const u8, value_at: usize, length: usize, read: *CmsgRead) void {
     const value = header[value_at..length];
-    const level = getHeader(header, "level");
-    const kind = getHeader(header, "type");
+    const level = getHeader("level", header);
+    const kind = getHeader("type", header);
     if (level == names.udp_level and kind == names.gro) {
         // `UDP_GRO` carries a `u16`, which is what `CMSG_LEN` was computed
         // from on the way in; a wider value is a different message.
@@ -313,6 +424,8 @@ fn trafficClass(value: []const u8) ?batch.Ecn {
     return batch.Recv.ecnFromBits(@truncate(@as(u32, @bitCast(raw))));
 }
 
+// 79 display columns; the rule counts UTF-8 bytes, three per box character.
+// ziglint-ignore: Z024
 // ───────────────────────────────────────────────────────────── address layout
 
 /// Write `address` into `out` in the kernel's own layout and say how many
@@ -372,6 +485,8 @@ pub fn readSockaddr(raw: *const c.sockaddr.storage) ?base_addr.SocketAddr {
     };
 }
 
+// 79 display columns; the rule counts UTF-8 bytes, three per box character.
+// ziglint-ignore: Z024
 // ───────────────────────────────────────────────────────────────── error sets
 
 /// Why a `setsockopt` was refused. `Unsupported` is the whole of a capability
@@ -467,7 +582,11 @@ pub const SendError = batch.Error || ControlError || error{
     /// answer, so this is the kernel disagreeing about where the datagram
     /// ends, and the caller has to know that it did.
     PartialDatagram,
-    /// `EINTR` on every attempt in the budget.
+    /// A bound on this call ran out: `EINTR` on every attempt the send had, or
+    /// a stop whose queue or wake counter a send could not empty within
+    /// `max_discarded` and `max_wakes_spent`. Nothing went out, and a stop this
+    /// send did not deal with leaves the socket stopped, so asking again is
+    /// what drains the rest and makes progress.
     Interrupted,
     /// Anything else.
     Unexpected,
@@ -502,6 +621,8 @@ pub const ReceiveError = error{
     Unexpected,
 };
 
+// 80 display columns; the rule counts UTF-8 bytes, three per box character.
+// ziglint-ignore: Z024
 // ────────────────────────────────────────────────────────────────────── socket
 
 /// What to set on a socket before the bind.
@@ -538,11 +659,21 @@ pub const Received = struct {
 ///
 /// No `Io` is stored, for the reason `DECISIONS/0002` gives. No buffer is
 /// either: the receive buffer and the control buffer are the caller's, which
-/// is what lets a stack pool them and what lets a test hand over a stack array.
+/// is what lets a stack pool them and what lets a test hand over a stack
+/// array. Two descriptors and one flag, and every one of the three is about
+/// being stopped rather than about carrying a datagram; see `stop`.
 pub const Socket = struct {
     /// The descriptor. `O_NONBLOCK` from the moment it exists, which is what
     /// makes `EAGAIN` a fact a caller can act on instead of a stall.
     handle: c.fd_t,
+    /// The descriptor a stop writes to, in the same `poll` set as `handle`
+    /// and the only thing that can end a wait before its timeout. The first
+    /// descriptor this struct owns that is not the socket.
+    wake: c.fd_t,
+    /// Set by `stop` and cleared by the next send, which drains on its way
+    /// past. Between the two, nothing arriving on this descriptor is an
+    /// answer to anything.
+    stopped: std.atomic.Value(bool),
     /// Which control message carries the codepoint here.
     family: batch.Family,
     /// What the socket answered when it was asked, and the only field that
@@ -577,25 +708,55 @@ pub const Socket = struct {
             };
         }
         const caps = try probe(handle, family);
+        // After the probe: a socket refused on its own options never reached
+        // the point of having a wait to wake.
+        const wake = try createWake();
+        errdefer _ = c.close(wake);
         var name: c.sockaddr.storage = undefined;
         const length = writeSockaddr(address, &name);
         try bindSocket(handle, &name, length);
         return .{
             .handle = handle,
+            .wake = wake,
+            .stopped = .init(false),
             .family = family,
             .caps = caps,
             .address = try boundAddress(handle),
         };
     }
 
-    /// Close the descriptor. Nothing is buffered on this side: a send that
+    /// Close both descriptors. Nothing is buffered on this side: a send that
     /// returned has left the socket, and a read that returned has been taken.
     pub fn close(self: *Socket) void {
+        _ = c.close(self.wake);
         _ = c.close(self.handle);
     }
 
+    /// Name this socket stopped: end the wait in flight, and leave the queue
+    /// as though nothing had ever been asked of it.
+    ///
+    /// A socket outlives whatever stopped it — it is the caller's, and the
+    /// next request on this descriptor is the whole reason it is not closed —
+    /// so this is not a latch. It is a message: a wait in flight ends at once,
+    /// the queue is emptied, and nothing that arrives is wanted until a
+    /// datagram goes out. That last part is what leaves the socket usable,
+    /// because nothing queued before the next send can be an answer to it, and
+    /// it is deliberately not a `shutdown` — which would answer that next
+    /// request with a descriptor no read will ever work on again.
+    ///
+    /// Everything this body does is something a signal handler may do: one
+    /// store and one `write`, both on POSIX's list of calls such a handler is
+    /// allowed to make. The queue is emptied by the wait this wakes and by the
+    /// next send, because `recvmsg` is not on that list.
+    pub fn stop(self: *Socket) void {
+        self.stopped.store(true, .release);
+        var one: u64 = 1;
+        _ = c.write(self.wake, std.mem.asBytes(&one), wake_width);
+    }
+
     // A method's receiver is its first parameter, so `io` comes second on
-    // the three operations that need the runtime.
+    // every operation that needs the runtime — which is all of them except
+    // `stop`, and that is the one a signal handler may call.
     // `docs/DECISIONS/0002-async-substrate.md` wants the runtime threaded
     // rather than stored and does not say which position it takes, and every
     // other method on every other type in this project puts its receiver
@@ -616,6 +777,28 @@ pub const Socket = struct {
         payload: batch.Send,
     ) SendError!batch.Report {
         try io.checkCancel();
+        // A stop means nothing arriving on this descriptor is wanted, so
+        // whatever is queued goes with it rather than being left for whoever
+        // reads next. This is the one place a stopped socket becomes a socket
+        // again, and the only place the wake is spent: a counter left standing
+        // would wake every wait that followed, for a stop already dealt with.
+        if (self.stopped.load(.acquire)) {
+            // Cleared only once the queue is empty, in that order: a drain a
+            // cancellation cut short leaves the socket stopped rather than
+            // clean with a straggler still in it, and the next send drains
+            // again. Two sends racing here is harmless — one of them finds
+            // nothing to take.
+            try self.discard(io);
+            self.stopped.store(false, .release);
+            // The flag goes before the counter so a stop raised between the two
+            // is not spent by this drain and still leaves the socket stopped,
+            // and it goes back if the counter could not be spent: a socket that
+            // says it is running with a unit still standing on it ends the next
+            // wait the way a real stop would, and nothing else would take that
+            // unit off.
+            errdefer self.stopped.store(true, .release);
+            try self.clearWake();
+        }
         var refused = try self.sendBatch(io, dest, payload);
         if (refused == .segmentation) {
             // Found by sending, not by asking, and permanent: noq lowers the
@@ -717,14 +900,23 @@ pub const Socket = struct {
         control: []const u8,
     ) SendError!Outcome {
         var vectors = [_]c.iovec_const{.{ .base = bytes.ptr, .len = bytes.len }};
-        const control_ptr: ?*const anyopaque = if (control.len == 0) null else control.ptr;
+        // The length narrowed where the bound is, rather than by a bare
+        // `@intCast` that traps in Debug on a value which does not fit: under
+        // musl `msg_controllen` is a `socklen_t` and a slice length is a
+        // `usize`. It cannot fail, because `writeCmsg` hands back no more of a
+        // `ControlBuffer` than it holds and `control_size` is proved against
+        // this very field at comptime — but the proof is that assertion, and
+        // this is the cast that reads it.
+        const control_length = std.math.cast(ControlExtent, control.len) orelse
+            return error.FieldTooWide;
+        const control_ptr: ?*const anyopaque = if (control_length == 0) null else control.ptr;
         var header: c.msghdr_const = .{
             .name = @as(?*const c.sockaddr, @ptrCast(name)),
             .namelen = name_length,
             .iov = vectors[0..].ptr,
             .iovlen = vectors.len,
             .control = control_ptr,
-            .controllen = control.len,
+            .controllen = control_length,
             .flags = 0,
         };
         var attempt: usize = 0;
@@ -758,29 +950,142 @@ pub const Socket = struct {
         return error.Interrupted;
     }
 
-    /// Wait for the descriptor to be readable.
+    /// Wait for the descriptor to be readable, or for a stop to end the wait.
     ///
     /// A `poll` on the descriptor and not an `Io` operation: this module
     /// opened the socket with `std.c.socket`, so no backend has ever been told
     /// the descriptor exists and only `Io.Threaded` would cope with being
     /// handed one. `posix.poll` already retries a signal, and zero ready is
     /// the timeout rather than an error.
+    ///
+    /// The set has two entries, and that is the whole of how a stop reaches a
+    /// wait already in progress: the wake is a descriptor like any other, and
+    /// `poll` returns for it exactly as it returns for a datagram. A flag
+    /// consulted around the call would be consulted only once the call was
+    /// over, which is the failure the wake descriptor exists to remove.
     fn awaitReadable(
         self: *const Socket,
         io: std.Io,
         timeout_ms: ?i32,
     ) ReceiveError!void {
         try io.checkCancel();
-        var descriptors = [_]posix.pollfd{.{
-            .fd = self.handle,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
+        var descriptors = [_]posix.pollfd{
+            .{
+                .fd = self.handle,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            },
+            .{
+                .fd = self.wake,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            },
+        };
         _ = posix.poll(&descriptors, timeout_ms orelse -1) catch |err| switch (err) {
             error.NetworkDown => return error.NetworkDown,
             error.SystemResources => return error.ResourcesExhausted,
             error.Unexpected => return error.Unexpected,
         };
+        // A stop, and not a datagram, and it outranks a datagram the socket
+        // may have found in the same pass: the queue is drained, so the bytes
+        // this socket is holding are wanted by nobody, and the wait is over
+        // rather than starting a read nobody is left to want the answer of.
+        if (descriptors[1].revents != 0) {
+            // A stop is what ended this wait however the drain made of the
+            // queue, and a drain that could not empty it is not a different
+            // answer. Nothing here clears the flag or spends the counter, so
+            // the socket stays stopped and the next send drains again — and a
+            // cancellation reported as anything but `Canceled` is a refusal
+            // the caller above this one is not waiting for.
+            self.discard(io) catch return error.Canceled;
+            return error.Canceled;
+        }
+    }
+
+    /// Take everything queued on the descriptor and throw it away.
+    ///
+    /// One byte of buffer, because a datagram leaves the queue whatever the
+    /// buffer holds and this is the one read whose bytes nobody asked for. The
+    /// wake counter is left alone: a stop stands until the next send, and a
+    /// counter emptied here would let the wait after this one block on a
+    /// socket that is still stopped.
+    ///
+    /// A queue deeper than `max_discarded` is refused rather than emptied as
+    /// far as it goes, and the caller keeps the socket stopped when it is: the
+    /// next send drains again, which is the difference between a straggler it
+    /// can see and one the next query would have read as its own answer.
+    fn discard(
+        self: *const Socket,
+        io: std.Io,
+    ) error{ Canceled, Interrupted, Unexpected }!void {
+        var sink: [1]u8 = undefined;
+        var vectors = [_]c.iovec{.{ .base = &sink, .len = sink.len }};
+        var header: c.msghdr = .{
+            .name = null,
+            .namelen = 0,
+            .iov = vectors[0..].ptr,
+            .iovlen = vectors.len,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+        var dropped: usize = 0;
+        var signals: usize = 0;
+        // Two bounds, because a signal is not a fact about the queue: charging
+        // one to the other either bounds nothing at all or spends datagrams to
+        // pay for a storm. Out of the loop by either is the same refusal, and
+        // neither is a claim that the queue is empty.
+        while (dropped < max_discarded and signals < max_syscall_attempts) {
+            try io.checkCancel();
+            const rc = c.recvmsg(self.handle, &header, linux.MSG.DONTWAIT);
+            switch (c.errno(rc)) {
+                // One datagram off the queue, and the loop above is what bounds
+                // how many: every one of them is wanted by nobody, so the depth
+                // of the queue is the only thing that decides. A read that
+                // returned after this one would leave the rest of the queue
+                // standing for the next query to read as its answer.
+                .SUCCESS => dropped += 1,
+                .AGAIN => return,
+                .INTR => signals += 1,
+                // A failed read does not prove the queue is empty.
+                else => return error.Unexpected,
+            }
+        }
+        return error.Interrupted;
+    }
+
+    /// Spend the wake counter, which the send that ends a stop does along with
+    /// the queue.
+    ///
+    /// A wake is a message to a wait and not a latch, so it is spent here and
+    /// nowhere else. Left standing, it would wake every wait that followed it
+    /// for a stop that has already been dealt with. `EFD_SEMAPHORE` gives a
+    /// read one unit rather than the whole count, so spending the counter is
+    /// one read per unit and a counter deeper than `max_wakes_spent` is
+    /// refused rather than half spent — a unit left on it ends the next wait
+    /// exactly the way a real stop would, and nothing else takes it off.
+    fn clearWake(self: *const Socket) error{Interrupted}!void {
+        var count: u64 = 0;
+        var spent: usize = 0;
+        var signals: usize = 0;
+        // Bounded on the units and on the signals, as `discard` is: a counter
+        // that keeps rising under cancellation raised faster than a send can
+        // spend it is not a queue to empty, and the refusal leaves the socket
+        // stopped for the next send rather than spent half way.
+        while (spent < max_wakes_spent and signals < max_syscall_attempts) {
+            const rc = c.read(self.wake, std.mem.asBytes(&count), wake_width);
+            switch (c.errno(rc)) {
+                .SUCCESS => spent += 1,
+                // Nothing standing, which is the whole of what spending the
+                // counter means.
+                .AGAIN => return,
+                .INTR => signals += 1,
+                // A counter that cannot be read is a counter that cannot be
+                // claimed empty.
+                else => return error.Interrupted,
+            }
+        }
+        return error.Interrupted;
     }
 
     fn recvmsg(
@@ -846,6 +1151,9 @@ fn strongest(current: batch.Refused, next: batch.Refused) batch.Refused {
 }
 
 fn createSocket(family: batch.Family) OpenError!c.fd_t {
+    // A value, not a type alias: `c_uint` is what the switch below evaluates
+    // to, and `domain` is the address family this descriptor is opened for.
+    // zwanzig-disable-next-line: identifier-style
     const domain: c_uint = switch (family) {
         .v4 => linux.AF.INET,
         .v6 => linux.AF.INET6,
@@ -860,6 +1168,25 @@ fn createSocket(family: batch.Family) OpenError!c.fd_t {
         .AFNOSUPPORT => error.AddressFamilyUnsupported,
         .PROTONOSUPPORT => error.ProtocolUnsupported,
         .SOCKTNOSUPPORT => error.SocketModeUnsupported,
+        .INVAL => error.InvalidArgument,
+        .MFILE, .NFILE => error.DescriptorQuotaExceeded,
+        .NOMEM, .NOBUFS => error.ResourcesExhausted,
+        else => error.Unexpected,
+    };
+}
+
+/// The descriptor a stop wakes a wait on, or a refusal to have one.
+///
+/// A refusal refuses the socket. A socket whose wait cannot be ended is the
+/// failure this descriptor exists to prevent, and a caller that opened one
+/// anyway would be handed a cancellation that arrives a slice late with nothing
+/// to say that it had.
+fn createWake() OpenError!c.fd_t {
+    const flags = wake_flags.semaphore | wake_flags.nonblock | wake_flags.cloexec;
+    const handle = c.eventfd(0, flags);
+    if (handle >= 0) return handle;
+    return switch (c.errno(handle)) {
+        .ACCES, .PERM => error.PermissionDenied,
         .INVAL => error.InvalidArgument,
         .MFILE, .NFILE => error.DescriptorQuotaExceeded,
         .NOMEM, .NOBUFS => error.ResourcesExhausted,
@@ -1001,23 +1328,11 @@ fn setOption(handle: c.fd_t, level: u32, name: u32, value: []const u8) OptionErr
     }
 }
 
+// 78 display columns; the rule counts UTF-8 bytes, three per box character.
+// ziglint-ignore: Z024
 // ───────────────────────────────────────────────────────────────────── tests
 
 const t = std.testing;
-
-test "a control message is a header and an aligned value" {
-    // `CMSG_LEN` is what a message says about itself and `CMSG_SPACE` is what
-    // a buffer must hold for the next one to follow it, and the two differ
-    // whenever the value does not fill the header's padding.
-    try t.expectEqual(@sizeOf(c.cmsghdr), cmsgLen(0));
-    try t.expectEqual(@sizeOf(c.cmsghdr), cmsgSpace(0));
-    const word: usize = @sizeOf(c_int);
-    try t.expectEqual(@sizeOf(c.cmsghdr) + word, cmsgLen(word));
-    try t.expectEqual(cmsgAlign(@sizeOf(c.cmsghdr) + word), cmsgSpace(word));
-    // A `u16` segment size falls short of the header's alignment, so its space
-    // is the padded length and not the length itself.
-    try t.expect(cmsgSpace(@sizeOf(u16)) > cmsgLen(@sizeOf(u16)));
-}
 
 test "a single datagram writes one control message" {
     const payload = [_]u8{0xaa} ** 64;
@@ -1056,13 +1371,39 @@ test "a header field the ABI cannot spell is refused, not a trap" {
         .kind = std.math.maxInt(u32),
     }));
 
-    // A length past what `cmsg_len` spells is the third narrowing and the
-    // only arm this test cannot reach: the field is a `socklen_t`, `std.c`
-    // spells it from the kernel's own headers, and it is the width of a
-    // `usize` on every platform this file supports. The check below says so
-    // out loud instead of leaving the gap for another platform to find; the
-    // same narrowing out of a real buffer is refused in the option test.
-    try t.expectEqual(@sizeOf(usize), @sizeOf(@FieldType(c.cmsghdr, "len")));
+    // A length past what `cmsg_len` spells is the third narrowing, and no
+    // caller reaches it: `writeCmsg` builds its lengths from `cmsgLen` over a
+    // buffer of `control_size`, a fixed number well inside what any
+    // `socklen_t` holds. What that bound cannot say is the width — musl
+    // declares the field a `socklen_t` where the kernel reads a `size_t` — and
+    // that is the next test.
+}
+
+test "a header spells its length in the width the kernel reads" {
+    // The kernel copies one whole word out of this buffer for every send it
+    // validates a message from, and musl's own `cmsghdr` puts a `socklen_t`
+    // and four bytes of padding inside that same word. A header written
+    // through the C struct's declared field alone would leave four bytes of an
+    // undefined buffer in the middle of the length the kernel reads, and a
+    // send refused or not would come to depend on what the stack held. The
+    // buffer is poisoned first, so this fails the same way every time instead
+    // of passing on a stack that happened to be zeros.
+    var messages: [batch.max_cmsg]batch.Cmsg = undefined;
+    var control: ControlBuffer = undefined;
+    @memset(&control.bytes, 0xaa);
+    const written = try writeCmsg(
+        batch.cmsg(batch.Send.single(&.{}, .ect1), .v4, &messages),
+        &control,
+    );
+
+    const word = std.mem.readInt(usize, control.bytes[0..@sizeOf(usize)], endian);
+    try t.expectEqual(cmsgLen(batch.tos_width), word);
+
+    // And the message is still the one that was written: the word is the
+    // header's own length and not one field too wide into the level.
+    const read = readCmsg(written);
+    try t.expect(!read.truncated);
+    try t.expectEqual(@as(?batch.Ecn, .ect1), read.ecn);
 }
 
 test "a codepoint comes back one byte wide, not at the send width" {
@@ -1392,4 +1733,205 @@ test "a coalesced read of one datagram is the uncoalesced read" {
     try t.expectError(error.StrideExceedsBuffer, batch.Recv.init(&one, 17, null));
     try t.expectError(error.ZeroSegmentSize, batch.Recv.init(&one, 0, null));
     try t.expectError(error.ZeroSegmentSize, batch.Recv.init(&.{}, null, null));
+}
+
+// 79 display columns; the rule counts UTF-8 bytes, three per box character.
+// ziglint-ignore: Z024
+// ──────────────────────────────────────────────────────── a stop, on a socket
+//
+// The wake descriptor is a claim about two descriptors and a `poll` set, and a
+// claim about descriptors is worth only what the kernel says about them. Every
+// other test in this file stays above the syscall on purpose; this one does
+// not, because there is nothing above the syscall to ask.
+
+/// Loopback on an ephemeral port, so the kernel picks and two tests at once
+/// cannot collide. The spelling `test/loopback_test.zig` uses.
+const loopback: base_addr.SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0 };
+
+test "a stop ends its wait, and the next query out takes the queue with it" {
+    var server = try Socket.create(loopback, .{});
+    defer server.close();
+    var client = try Socket.create(loopback, .{});
+    defer client.close();
+    var untouched = try Socket.create(loopback, .{});
+    defer untouched.close();
+    var buffer: [64]u8 = undefined;
+    var control: ControlBuffer = undefined;
+    const straggler = "the answer to a query nobody is waiting for";
+    const query = "the next query";
+
+    // What a stop has to deal with, shown first where nothing has stopped
+    // anything: on loopback the kernel has the datagram queued by the time
+    // `sendmsg` answers, and a read finds it. Without this the `WouldBlock` at
+    // the end of the test would be satisfied just as well by nothing having
+    // been queued in the first place.
+    _ = try server.send(t.io, untouched.address, batch.Send.single(straggler, null));
+    const found = try untouched.tryReceive(t.io, &buffer, &control);
+    try t.expectEqualStrings(straggler, found.bytes);
+
+    // The wait the stop is aimed at. Five seconds, and it ends long before
+    // that: nothing was sent to this socket and nothing can be, so the only
+    // thing that can end the wait is the descriptor `stop` wrote to. Leave it
+    // out of the `poll` set and this is a wait that runs out and answers
+    // `WouldBlock` — a deadline reported for a cancellation that had already
+    // been asked for.
+    client.stop();
+    try t.expectError(error.Canceled, client.receive(t.io, &buffer, &control, 5000));
+
+    // The answer, arriving after the stop. It is the send below that takes it,
+    // not the wait above, because nothing was waiting when it landed: a
+    // datagram queued before the next query went out cannot be that query's
+    // answer, whichever of the two arrived first.
+    _ = try server.send(t.io, client.address, batch.Send.single(straggler, null));
+    _ = try client.send(t.io, server.address, batch.Send.single(query, null));
+    try t.expectError(error.WouldBlock, client.tryReceive(t.io, &buffer, &control));
+
+    // And the socket is the caller's again. The wake was spent with the stop,
+    // so this wait waits instead of being ended by one already dealt with, and
+    // fifty milliseconds is long enough for a datagram sent first to be there.
+    _ = try server.send(t.io, client.address, batch.Send.single(query, null));
+    const read = try client.receive(t.io, &buffer, &control, 50);
+    try t.expectEqualStrings(query, read.bytes);
+    try t.expectEqual(server.address, read.from);
+}
+
+test "a stop drains every queued datagram, and the next answer is not a leftover" {
+    var server = try Socket.create(loopback, .{});
+    defer server.close();
+    var client = try Socket.create(loopback, .{});
+    defer client.close();
+    var buffer: [64]u8 = undefined;
+    var control: ControlBuffer = undefined;
+    const first = "the answer to a query nobody is waiting for";
+    const second = "and the answer to the query after it";
+    const query = "the next query";
+    const answer = "this query's own answer";
+
+    // Both stragglers are real datagrams, shown first where nothing has
+    // stopped anything, so the `WouldBlock` below can only be the queue
+    // having been drained rather than never having been filled.
+    var untouched = try Socket.create(loopback, .{});
+    defer untouched.close();
+    _ = try server.send(t.io, untouched.address, batch.Send.single(first, null));
+    _ = try server.send(t.io, untouched.address, batch.Send.single(second, null));
+    try t.expectEqualStrings(first, (try untouched.tryReceive(t.io, &buffer, &control)).bytes);
+    try t.expectEqualStrings(second, (try untouched.tryReceive(t.io, &buffer, &control)).bytes);
+
+    // The same two queued on the socket that is about to be stopped. A stop
+    // empties the queue, and two datagrams is the smallest case that can
+    // tell emptying it from emptying only the first datagram it read: a
+    // drain that stops after one leaves the second, and that second is
+    // exactly what the receive at the end would report as the answer.
+    _ = try server.send(t.io, client.address, batch.Send.single(first, null));
+    _ = try server.send(t.io, client.address, batch.Send.single(second, null));
+    client.stop();
+
+    // The send is the drain: this is where a stopped socket becomes usable
+    // again, and everything the stop found queued goes with it. `WouldBlock`
+    // is the only answer that says the queue is empty rather than that a
+    // leftover duplicate is waiting in it.
+    _ = try client.send(t.io, server.address, batch.Send.single(query, null));
+    try t.expectError(error.WouldBlock, client.tryReceive(t.io, &buffer, &control));
+
+    // And the answer to the query that just went out is the next thing read,
+    // from the peer that was asked. Fifty milliseconds bounds the wait; the
+    // datagram is already queued by the time `sendmsg` above returned, so the
+    // criterion is the bytes and not the clock.
+    _ = try server.send(t.io, client.address, batch.Send.single(answer, null));
+    const read = try client.receive(t.io, &buffer, &control, 50);
+    try t.expectEqualStrings(answer, read.bytes);
+    try t.expectEqual(server.address, read.from);
+}
+
+test "two stops leave no wake standing for the receive that follows the send" {
+    var server = try Socket.create(loopback, .{});
+    defer server.close();
+    var client = try Socket.create(loopback, .{});
+    defer client.close();
+    var buffer: [64]u8 = undefined;
+    var control: ControlBuffer = undefined;
+    const query = "the query the send carries";
+    const answer = "this query's own answer";
+
+    // The wake descriptor is an `eventfd` in semaphore mode: each `stop` adds
+    // one unit to the counter and each read takes one off. Two stops leave two
+    // units standing, and the send that resets the stop has to spend both. A
+    // unit left behind is a wake nobody asked for, and it ends the next wait
+    // exactly the way a real stop would.
+    client.stop();
+    client.stop();
+
+    // The send resets the stop, spending the counter as it goes, and carries
+    // the query whatever the two stops were about.
+    _ = try client.send(t.io, server.address, batch.Send.single(query, null));
+
+    // The answer to the query that just went out. With the counter empty the
+    // wait ends on the datagram and reads it; with a unit still standing the
+    // wait ends on the wake instead and reports `Canceled` for a stop the send
+    // has already dealt with — and takes the answer with it.
+    _ = try server.send(t.io, client.address, batch.Send.single(answer, null));
+    const read = try client.receive(t.io, &buffer, &control, 50);
+    try t.expectEqualStrings(answer, read.bytes);
+    try t.expectEqual(server.address, read.from);
+}
+
+test "a queue or a counter past its bound is refused, and the next send takes it" {
+    var server = try Socket.create(loopback, .{});
+    defer server.close();
+    var client = try Socket.create(loopback, .{});
+    defer client.close();
+    var buffer: [64]u8 = undefined;
+    var control: ControlBuffer = undefined;
+    const query = "the query the send carries";
+    const answer = "this query's own answer";
+    // One byte, so the whole queue this fills costs the kernel a fraction of
+    // the receive buffer it opens with: the datagrams have to be *queued*,
+    // and a queue the kernel dropped some of would make the bounds below
+    // unreachable rather than wrong.
+    const filler = [_]u8{0x5a};
+
+    // One datagram past `max_discarded`, which is the depth at which a drain
+    // can no longer promise the queue is empty. The bound is on the datagrams
+    // and not on the syscalls, so the read that finds the queue still deep is
+    // the one that has to refuse.
+    for (0..max_discarded + 1) |_| {
+        _ = try server.send(t.io, client.address, batch.Send.single(&filler, null));
+    }
+    client.stop();
+
+    // Nothing goes out on a refused cleanup, and the socket stays stopped
+    // rather than clean with a straggler in it: that straggler was queued
+    // before this query went out, so reading it as the answer is the fault
+    // the bound exists to prevent.
+    try t.expectError(
+        error.Interrupted,
+        client.send(t.io, server.address, batch.Send.single(query, null)),
+    );
+
+    // The next send drains the rest and carries the query, and `WouldBlock`
+    // after it says the queue really is empty — not merely emptied as far as
+    // one call's bound goes.
+    _ = try client.send(t.io, server.address, batch.Send.single(query, null));
+    try t.expectError(error.WouldBlock, client.tryReceive(t.io, &buffer, &control));
+
+    // The same bound on the counter, one `stop` past `max_wakes_spent`. A unit
+    // left standing is a wake nobody asked for, and it ends the next wait the
+    // way a real stop would, so a counter this deep is refused for the same
+    // reason and dealt with by the same retry. Nothing is queued here, which
+    // is what makes this the counter's bound and not the queue's.
+    for (0..max_wakes_spent + 1) |_| client.stop();
+    try t.expectError(
+        error.Interrupted,
+        client.send(t.io, server.address, batch.Send.single(query, null)),
+    );
+
+    // And the answer is what the wait after that reads, which is the whole of
+    // what spending the counter is for: with a unit still on it the wait would
+    // end on the wake and answer `Canceled` for a stop the send has dealt
+    // with, taking the answer with it.
+    _ = try client.send(t.io, server.address, batch.Send.single(query, null));
+    _ = try server.send(t.io, client.address, batch.Send.single(answer, null));
+    const read = try client.receive(t.io, &buffer, &control, 50);
+    try t.expectEqualStrings(answer, read.bytes);
+    try t.expectEqual(server.address, read.from);
 }

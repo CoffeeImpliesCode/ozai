@@ -266,7 +266,7 @@ const Wire = struct {
         errdefer self.socket.close();
         // Both transport keys are supplied rather than drawn from `t.io`: a
         // test whose Retry key differs on every run has failures that move.
-        self.bridge = try Bridge.create(t.io, t.allocator, .{
+        self.bridge = try Bridge.create(t.allocator, t.io, .{
             .secret = secret,
             .expect_peer = expect_peer,
             .alpn = alpn,
@@ -278,7 +278,7 @@ const Wire = struct {
             .secret = secret,
             .alpn = alpn,
         });
-        errdefer self.dialer.destroy() catch unreachable;
+        errdefer self.dialer.destroy() catch @panic("new dialer has no live connections");
         // A bridge created a moment ago has no entry for `destroy` to refuse,
         // so this fires only on an allocation that followed it.
         self.egress = try t.allocator.alloc(Egress, max_egress);
@@ -304,10 +304,9 @@ const Wire = struct {
             if (!entry.conn.is_server) self.bridge.manager.removeConnection(entry);
         }
         self.bridge.sweep();
-        // `catch unreachable`, and this is the why rather than a teardown with
-        // nowhere to put an error: the loop above is the thing `destroy`
-        // refuses, and the loop has already run.
-        self.dialer.destroy() catch unreachable;
+        // Only server entries can survive: the bridge never dials, and no code
+        // between the removal walk and destroy can add another connection.
+        self.dialer.destroy() catch @panic("dialer retained a connection after removal");
         self.bridge.destroy();
         t.allocator.free(self.egress);
         t.allocator.free(self.out);
@@ -316,6 +315,7 @@ const Wire = struct {
         self.map.deinit(t.allocator);
         self.socket.close();
         self.secret.deinit();
+        self.* = undefined;
     }
 
     fn random(self: *Wire) std.Random {
@@ -342,6 +342,9 @@ const Wire = struct {
             var position: usize = 0;
             while (position < recv.datagramCount()) : (position += 1) {
                 const ingress = try self.bridge.recv(&self.map, .{
+                    // The loop's bound is `recv.datagramCount()`, and
+                    // `Recv.datagram` answers null only past that count.
+                    // zwanzig-disable-next-line: optional-unwrap
                     .bytes = recv.datagram(position).?,
                     .from = got.from,
                     .local = self.socket.address,
@@ -578,8 +581,8 @@ fn specOf(request: blobs.GetRequest) range_spec.RangeSpec {
 /// The spec a decoded request carries for the store's one blob, whatever
 /// framing it arrived in. A `push` is a newtype over a `GetRequest`, so its
 /// body is the same shape and its first pair is the same pair.
-fn requestSpec(job: *const Job) error{GetManyUnsupported}!range_spec.RangeSpec {
-    return switch (job.seen.?) {
+fn requestSpec(job: *const Job) error{ GetManyUnsupported, NoRequestSeen }!range_spec.RangeSpec {
+    return switch (job.seen orelse return error.NoRequestSeen) {
         .to_eof => |request| switch (request) {
             .get => |value| specOf(value),
             .observe => |value| value.ranges,
@@ -709,6 +712,7 @@ const StreamBytes = struct {
 
     fn deinit(self: *StreamBytes) void {
         self.queued.deinit(t.allocator);
+        self.* = undefined;
     }
 
     fn push(self: *StreamBytes, chunk: []const u8) !void {
@@ -869,6 +873,7 @@ const Link = struct {
         link.store.deinit(t.allocator);
         link.provider.deinit();
         link.getter.deinit();
+        link.* = undefined;
     }
 
     /// One round: the clock moves, both sides take and flush, both sides drain
@@ -904,7 +909,7 @@ const Link = struct {
             const id = entry.key_ptr.*;
             const stream = entry.value_ptr.*;
             const gop = try bytes.getOrPut(id);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            if (!gop.found_existing) gop.value_ptr.* = StreamBytes.empty;
             while (stream.recv.read()) |chunk| {
                 // The same handover `Wire.take` uses: the append is what
                 // copies, and the chunk is the caller's from the `try` on.
@@ -990,12 +995,13 @@ const Link = struct {
             // The request as it came off the socket, decoded by the one reader
             // `Request.read` dispatches to.
             var reader = postcard.Reader.init(received(&link.provider_bytes, job.stream));
-            job.seen = try blobs.Request.read(&reader, &job.storage.inner);
+            const seen = try blobs.Request.read(&reader, &job.storage.inner);
+            job.seen = seen;
             const stream = conn.entry.conn.streams.getStream(job.stream) orelse
                 return error.NoStream;
             job.served = true;
             moved = true;
-            switch (job.seen.?) {
+            switch (seen) {
                 .to_eof => |request| {
                     // The `to_eof` rule, and it applies to that arm alone: the
                     // request is the whole stream, so a byte after it is a
@@ -1226,8 +1232,9 @@ test "a whole blob crosses a real socket, and the send seam segments it" {
     try drive(&link, "the whole blob never finished arriving", allComplete);
 
     // ── the request survived the socket ──
-    try t.expectEqual(blobs.RequestType.get, job.seen.?.discriminant());
-    const get = switch (job.seen.?) {
+    const seen = job.seen orelse return error.NoRequestSeen;
+    try t.expectEqual(blobs.RequestType.get, seen.discriminant());
+    const get = switch (seen) {
         .to_eof => |request| switch (request) {
             .get => |value| value,
             else => return error.NotAGet,
@@ -1253,7 +1260,8 @@ test "a whole blob crosses a real socket, and the send seam segments it" {
     try t.expectEqualSlices(u8, link.store.bytes, answer.bytes);
     // And the stream ended, with no reset behind it: `protocol.zig` has no
     // error frame, and a reset is what one would have cost this layer.
-    const stream = link.dialled.entry.conn.streams.getStream(job.stream).?;
+    const stream = link.dialled.entry.conn.streams.getStream(job.stream) orelse
+        return error.NoStream;
     try t.expect(stream.recv.allReceived());
     try t.expectEqual(@as(?u64, null), stream.recv.reset_err);
 
@@ -1296,7 +1304,7 @@ test "disjoint ranges and a whole blob return exactly the bytes asked for" {
     // is inside chunk 4 and 20000 is inside chunk 19, so the outward rounding
     // asks for chunks 4 through 20 and the answer is bytes 4096 through 20480
     // — which is what the assertions below say, and not 5000.
-    const unaligned = blobs.ByteRange{ .start = 5000, .end = 20000 };
+    const unaligned: blobs.ByteRange = .{ .start = 5000, .end = 20000 };
     try t.expectEqual(blobs.ChunkRange{ .start = 4, .end = 20 }, blobs.bytesToChunks(unaligned));
     const unaligned_widths = [_]u64{ 4, 16 };
 
@@ -1334,10 +1342,11 @@ test "disjoint ranges and a whole blob return exactly the bytes asked for" {
     // went out and the frame that came back, not one buffer against itself.
     for (0..jobs) |index| {
         const job = &link.jobs[index];
-        try t.expectEqual(job.kind.discriminant(), job.seen.?.discriminant());
+        const seen = job.seen orelse return error.NoRequestSeen;
+        try t.expectEqual(job.kind.discriminant(), seen.discriminant());
         var check: [request_room]u8 = undefined;
         var writer = postcard.Writer.init(&check);
-        try job.seen.?.write(&writer, &link.body);
+        try seen.write(&writer, &link.body);
         try t.expectEqualSlices(u8, job.frame[0..job.frame_len], writer.finish());
         // The request's own ranges, read back out of the storage it was decoded
         // into. And that the decoded sequence borrows that storage, which is a
@@ -1345,7 +1354,7 @@ test "disjoint ranges and a whole blob return exactly the bytes asked for" {
         // `Storage` that was copied out of its own struct reads whatever is in
         // a dead frame now, and a debug build is the only reason that can look
         // like it worked.
-        const get: ?blobs.GetRequest = switch (job.seen.?) {
+        const get: ?blobs.GetRequest = switch (seen) {
             .to_eof => |request| switch (request) {
                 .get => |value| value,
                 .observe, .get_many => null,
@@ -1403,7 +1412,8 @@ test "disjoint ranges and a whole blob return exactly the bytes asked for" {
             try t.expectEqualSlices(u8, want, answer.bytes[at .. at + want.len]);
             at += want.len;
         }
-        const stream = link.dialled.entry.conn.streams.getStream(job.stream).?;
+        const stream = link.dialled.entry.conn.streams.getStream(job.stream) orelse
+            return error.NoStream;
         try t.expect(stream.recv.allReceived());
         try t.expectEqual(@as(?u64, null), stream.recv.reset_err);
     }
@@ -1473,8 +1483,9 @@ test "a push body cannot be read as a get body, on the wire" {
     const get = &link.jobs[1];
 
     // ── the push arrived as a `push`, and its payload is behind it ──
-    try t.expectEqual(blobs.RequestType.push, push.seen.?.discriminant());
-    const framed = switch (push.seen.?) {
+    const push_seen = push.seen orelse return error.NoRequestSeen;
+    try t.expectEqual(blobs.RequestType.push, push_seen.discriminant());
+    const framed = switch (push_seen) {
         .length_prefixed => |value| value,
         .to_eof => return error.PushReadAsEof,
     };
@@ -1505,8 +1516,9 @@ test "a push body cannot be read as a get body, on the wire" {
     // A `to_eof` request has no payload at all, which the type says rather than
     // leaving the caller to know which framing it was handed.
     {
+        const get_seen = get.seen orelse return error.NoRequestSeen;
         var reader = postcard.Reader.init(received(&link.provider_bytes, get.stream));
-        try t.expectEqualSlices(u8, "", get.seen.?.payload(&reader));
+        try t.expectEqualSlices(u8, "", get_seen.payload(&reader));
     }
     // The `get` on the same ranges got the bytes, which says the push did not
     // eat the connection and the framing is per stream.
@@ -1666,7 +1678,8 @@ test "a truncated answer is not a complete transfer, and no answer is EOF" {
     try t.expect(!answer.isEof());
     // The stream ended anyway, and ended cleanly: a FIN and no reset, which is
     // the whole of the evidence the getter has.
-    const stream = link.dialled.entry.conn.streams.getStream(cut.stream).?;
+    const stream = link.dialled.entry.conn.streams.getStream(cut.stream) orelse
+        return error.NoStream;
     try t.expect(stream.recv.allReceived());
     try t.expectEqual(@as(?u64, null), stream.recv.reset_err);
     // The bytes that did arrive are the right ones — the transfer is not
@@ -1690,7 +1703,8 @@ test "a truncated answer is not a complete transfer, and no answer is EOF" {
     // answers are the same bytes, and the caller has to know which it asked
     // for.
     try t.expect(!covers(link.store, empty.expected, nothing));
-    const empty_stream = link.dialled.entry.conn.streams.getStream(empty.stream).?;
+    const empty_stream = link.dialled.entry.conn.streams.getStream(empty.stream) orelse
+        return error.NoStream;
     try t.expect(empty_stream.recv.allReceived());
     try t.expectEqual(@as(?u64, null), empty_stream.recv.reset_err);
     // The provider still planned the ranges it was asked for before it found it
@@ -1713,7 +1727,7 @@ test "a stream's received count is the count written, below and above its room" 
     }
 
     const gop = try bytes.getOrPut(1);
-    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    if (!gop.found_existing) gop.value_ptr.* = StreamBytes.empty;
     const short = [_]u8{ 1, 2, 3 };
     try gop.value_ptr.push(&short);
 

@@ -431,13 +431,13 @@ const Harness = struct {
         errdefer self.map.deinit(t.allocator);
         // The server pins the client, so a handshake this run opens is
         // verified against a peer that exists rather than against nothing.
-        self.client = try quic_bridge.Bridge.create(t.io, t.allocator, .{
+        self.client = try quic_bridge.Bridge.create(t.allocator, t.io, .{
             .secret = self.client_secret,
             .expect_peer = null,
             .alpn = alpn,
         }, engine.random());
         errdefer self.client.destroy();
-        self.server = try quic_bridge.Bridge.create(t.io, t.allocator, .{
+        self.server = try quic_bridge.Bridge.create(t.allocator, t.io, .{
             .secret = self.server_secret,
             .expect_peer = self.client_secret.nodeId(),
             .alpn = alpn,
@@ -451,6 +451,15 @@ const Harness = struct {
 
     /// Take every dialled connection out of the table and free it, then the
     /// dialer, then the bridges.
+    ///
+    /// `Dialer.destroy` refuses while a connection it opened is still in the
+    /// table. The walk below takes every client entry out of it first, so a
+    /// refusal is not a path this expects — but that is a claim about a live
+    /// table rather than about a constant, and a table that disagreed would
+    /// leave the dialer's seed, chain and ALPN freed under a connection still
+    /// reading them. `defer` has nowhere to send an error and `deinit` has no
+    /// caller that could act, so the refusal is named here: a teardown that
+    /// carried on would report success over a dialer freed too early.
     fn deinit(self: *Harness) void {
         // Backwards: `removeConnection` swap-removes from the list being
         // walked, so a forward walk skips an entry and leaves a freed one in
@@ -462,14 +471,23 @@ const Harness = struct {
             if (!entry.conn.is_server) self.client.manager.removeConnection(entry);
         }
         self.client.sweep();
-        // Every client entry was taken out and swept above, so there is
-        // nothing left for `destroy` to refuse.
-        self.dialer.destroy() catch unreachable;
+        self.dialer.destroy() catch |err| switch (err) {
+            error.DialedConnectionsLive => std.debug.panic(
+                "a dialled connection outlived the dialer that opened it",
+                .{},
+            ),
+        };
         self.client.destroy();
         self.server.destroy();
         self.map.deinit(t.allocator);
         self.client_secret.deinit();
         self.server_secret.deinit();
+        // Invalid rather than merely freed. The harness is a test's whole
+        // world, and a second teardown over bridges that are already gone
+        // would be a use-after-free reported as a mystery rather than as the
+        // mistake it is. `secureZero` above has already run, so this erases
+        // nothing it was there to erase.
+        self.* = undefined;
     }
 };
 
@@ -550,7 +568,7 @@ const Counter = struct {
 const Counted = struct {
     inner: resolve.AddressLookup,
     asked: u32 = 0,
-    vtable: resolve.AddressLookup.VTable = countedVTable,
+    vtable: resolve.AddressLookup.VTable = counted_vtable,
 
     fn init(inner: resolve.AddressLookup) Counted {
         return .{ .inner = inner };
@@ -561,13 +579,17 @@ const Counted = struct {
     }
 };
 
-const countedVTable: resolve.AddressLookup.VTable = .{
+const counted_vtable: resolve.AddressLookup.VTable = .{
     .publish = resolve.AddressLookup.ignore_publish,
     .resolve = countedResolve,
 };
 
 fn countedResolve(
     ctx: *anyopaque,
+    // The order is `AddressLookup.VTable.resolve`'s own, and a vtable entry's
+    // signature is the interface's to fix: moving the allocator first would
+    // change the type every service in the tree implements.
+    // ziglint-ignore: Z023
     alloc: std.mem.Allocator,
     node_id: addr.NodeId,
 ) resolve.ResolveError!?resolve.Stream {
@@ -599,6 +621,9 @@ const Unstartable = struct {
 
 fn refuseStart(
     ctx: *anyopaque,
+    // `AddressLookup.VTable.resolve`'s parameter order, for the reason
+    // `countedResolve` above gives. Only the answer is this file's.
+    // ziglint-ignore: Z023
     _: std.mem.Allocator,
     _: addr.NodeId,
 ) resolve.ResolveError!?resolve.Stream {
@@ -656,8 +681,8 @@ test "the merge chooses the address and the dial opens on it" {
     // prefix that would decide it first. A run that took the first usable
     // address instead of the merge would dial `one.example.` and the key
     // assertion below would fail on its first line.
-    var stops = Counter{};
-    var relay = FakeRelay{
+    var stops: Counter = .{};
+    var relay: FakeRelay = .{
         .answers = "signed\x00",
         .packets = &.{.{ .node_id = peer, .txt = .init("relay=https://two.example./\x00") }},
     };
@@ -713,7 +738,8 @@ test "the merge chooses the address and the dial opens on it" {
     // accepts it: the whole distance from "cannot be found" to "a connection
     // exists", with no socket open and no clock read.
     try t.expectEqual(@as(usize, 1), harness.client.manager.entries.items.len);
-    const client = harness.client.connectionAt(0).?;
+    const client = harness.client.connectionAt(0) orelse
+        return error.TestUnexpectedResult;
     try t.expect(try forward(client, harness.server, &harness.map, &engine));
     const accepted = harness.server.connectionAt(0) orelse return error.NoAcceptedConnection;
     try t.expectEqual(quic.connection.State.handshake, accepted.entry.conn.state);
@@ -735,8 +761,8 @@ test "a service that will not resolve stops the walk where it made its claim" {
 
     // A relay that would have answered with an address, so the refusal is
     // shown to cost an answer rather than to describe a node nobody has.
-    var first_stops = Counter{};
-    var first_relay = FakeRelay{
+    var first_stops: Counter = .{};
+    var first_relay: FakeRelay = .{
         .answers = "signed\x00",
         .packets = &.{.{ .node_id = peer, .txt = .init("addr=192.0.2.9:9999\x00") }},
     };
@@ -795,8 +821,8 @@ test "an answer with nothing in it does not stop the walk" {
     var service = dns.DnsAddressLookup.init(dns.prod_origin, .init(""), null);
     var published_nothing = Counted.init(service.lookup());
 
-    var stops = Counter{};
-    var relay = FakeRelay{
+    var stops: Counter = .{};
+    var relay: FakeRelay = .{
         .answers = "signed\x00",
         .packets = &.{.{ .node_id = peer, .txt = .init("relay=https://relay.example./\x00") }},
     };
@@ -834,7 +860,7 @@ test "an empty result, an empty address list and a refused path are told apart" 
     // A relay that answered with no packets. It was asked, it ran, and the
     // world had nothing in it: no items at all, which is
     // `item.Resolution.isEmptyResult` and not the absence of a service.
-    var quiet = FakeRelay{ .answers = "", .packets = &.{} };
+    var quiet: FakeRelay = .{ .answers = "", .packets = &.{} };
     var quiet_resolver = resolve.PkarrResolver.init(quiet.source(null));
     var silent = Counted.init(quiet_resolver.lookup());
     const only_quiet = [_]resolve.AddressLookup{silent.lookup()};
@@ -864,8 +890,8 @@ test "an empty result, an empty address list and a refused path are told apart" 
     // again: the network named a path and the caller declined it. The run
     // reports it beside the two above rather than as one of them, and no
     // connection is opened.
-    var stops = Counter{};
-    var relay = FakeRelay{
+    var stops: Counter = .{};
+    var relay: FakeRelay = .{
         .answers = "signed\x00",
         .packets = &.{.{ .node_id = peer, .txt = .init("relay=https://relay.example./\x00") }},
     };
@@ -901,8 +927,8 @@ test "a run that gives up mid-walk still stops every retrieval it started" {
     // services before it open, and the error escapes; a run that returned
     // before closing them would have cancelled nothing, and the resolve behind
     // a stream nobody holds any more would keep running.
-    var stops = Counter{};
-    var relay = FakeRelay{
+    var stops: Counter = .{};
+    var relay: FakeRelay = .{
         .answers = "signed\x00",
         .packets = &.{.{ .node_id = peer, .txt = .init("addr=192.0.2.9:9999\x00") }},
     };
@@ -930,8 +956,8 @@ test "a run that gives up mid-walk still stops every retrieval it started" {
     // resolve. All three are closed, and the two that produced nothing had a
     // retrieval cancelled as well, because a finished resolve has nothing
     // left to cancel and says so rather than skipping the call.
-    var quiet_stops = Counter{};
-    var quiet = FakeRelay{ .answers = "", .packets = &.{} };
+    var quiet_stops: Counter = .{};
+    var quiet: FakeRelay = .{ .answers = "", .packets = &.{} };
     var quiet_resolver = resolve.PkarrResolver.init(quiet.source(quiet_stops.cancellation()));
     var silent = Counted.init(quiet_resolver.lookup());
     var publisher = resolve.PkarrPublisher.init(t.allocator);

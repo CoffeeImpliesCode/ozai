@@ -149,8 +149,7 @@ fn checkVerify(bytes: []const u8, packet: pkarr.Packet) !void {
 /// A check's outcome as a value, so two checks can be compared rather than
 /// each run and thrown away.
 fn verdict(result: anyerror!void) ?anyerror {
-    result catch |err| return err;
-    return null;
+    if (result) |_| return null else |err| return err;
 }
 
 /// Why `bytes` is not a packet, or null when it is one.

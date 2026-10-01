@@ -507,14 +507,15 @@ const t = std.testing;
 
 /// A key from a fixed seed, so every signature below is reproducible.
 ///
-/// The only failure `fromSeed` has is a degenerate seed, and finding one
-/// takes a specific byte pattern rather than any uniform fill.
-fn testSecret(seed: u8) SecretKey {
-    return SecretKey.fromSeed([_]u8{seed} ** SecretKey.seed_length) catch unreachable;
+/// `fromSeed` fails only on a degenerate seed, which a uniform fill is not.
+/// The error is propagated rather than asserted away anyway: a seed that was
+/// somehow not accepted fails the test that named it, not the whole run.
+fn testSecret(seed: u8) !SecretKey {
+    return SecretKey.fromSeed([_]u8{seed} ** SecretKey.seed_length);
 }
 
 test "the message signed for a challenge is derived, not the challenge" {
-    const challenge = frame.ServerChallenge{ .challenge = @splat(0x11) };
+    const challenge: frame.ServerChallenge = .{ .challenge = @splat(0x11) };
     const message = messageToSign(challenge);
 
     // The point of deriving: a relay that picks the challenge must not be
@@ -541,7 +542,7 @@ test "the message signed for a challenge is derived, not the challenge" {
 }
 
 test "a client that offered key material is admitted without another frame" {
-    const secret = testSecret(1);
+    const secret = try testSecret(1);
     const stepped = step(
         start(.key_material),
         .{ .frame = .server_confirms_auth },
@@ -552,7 +553,7 @@ test "a client that offered key material is admitted without another frame" {
 }
 
 test "a challenge after key material is normal operation, not a failure" {
-    const secret = testSecret(2);
+    const secret = try testSecret(2);
 
     // This is the whole load-bearing detail: the relay could not verify the
     // export, and the client signs the challenge instead. Upstream's own test
@@ -577,7 +578,7 @@ test "a challenge after key material is normal operation, not a failure" {
 }
 
 test "the key material credential is a signature over half the export" {
-    const secret = testSecret(3);
+    const secret = try testSecret(3);
     // Two distinguishable halves: a uniform export would let a signature
     // over the first half verify against the second one as well.
     var material: KeyMaterial = @splat(0x33);
@@ -605,7 +606,7 @@ test "the key material credential is a signature over half the export" {
 }
 
 test "a failed key material verify names which half disagreed" {
-    const secret = testSecret(4);
+    const secret = try testSecret(4);
     const material: KeyMaterial = @splat(0x44);
     const auth = KeyMaterialAuth.create(&secret, material) orelse
         return error.TestUnexpectedResult;
@@ -616,8 +617,8 @@ test "a failed key material verify names which half disagreed" {
 
     // The same export with the signature of a different key is a client
     // fault, and it is reported as such rather than as a proxy problem.
-    const other = testSecret(5);
-    const tampered = KeyMaterialAuth{
+    const other = try testSecret(5);
+    const tampered: KeyMaterialAuth = .{
         .node_id = auth.node_id,
         .signature = other.sign(material[0..16]),
         .key_material_suffix = auth.key_material_suffix,
@@ -626,8 +627,8 @@ test "a failed key material verify names which half disagreed" {
 }
 
 test "a client with no credential still signs the challenge" {
-    const secret = testSecret(6);
-    const challenge = frame.ServerChallenge{ .challenge = @splat(0x66) };
+    const secret = try testSecret(6);
+    const challenge: frame.ServerChallenge = .{ .challenge = @splat(0x66) };
     const answered = step(
         start(.signed_challenge),
         .{ .frame = .{ .server_challenge = challenge } },
@@ -643,7 +644,7 @@ test "a client with no credential still signs the challenge" {
 }
 
 test "a relay that confirms a client with no credential admits nobody" {
-    const secret = testSecret(7);
+    const secret = try testSecret(7);
     // Upstream accepts this, so the machine names it rather than refusing
     // it: the outcome is real, and a log line that cannot tell it from an
     // authenticated admission is a log line that cannot be trusted.
@@ -657,8 +658,8 @@ test "a relay that confirms a client with no credential admits nobody" {
 }
 
 test "a denial is an outcome, and the connection goes with it" {
-    const secret = testSecret(8);
-    const denial = frame.ServerDeniesAuth{ .reason = "signature invalid" };
+    const secret = try testSecret(8);
+    const denial: frame.ServerDeniesAuth = .{ .reason = "signature invalid" };
 
     // Refused on the first read, which is what a relay that could not verify
     // the export and had already given up on this client looks like.
@@ -688,7 +689,7 @@ test "a denial is an outcome, and the connection goes with it" {
 }
 
 test "the first read names three frames and the rest are out of order" {
-    const secret = testSecret(9);
+    const secret = try testSecret(9);
     // The whole send/recv protocol, plus a second challenge, is what a
     // handshake that did not ask for it can be sent. Upstream accepts the
     // same three and rejects the rest with `UnexpectedFrameType`
@@ -710,7 +711,7 @@ test "the first read names three frames and the rest are out of order" {
 }
 
 test "a second challenge is out of order where a first one was not" {
-    const secret = testSecret(10);
+    const secret = try testSecret(10);
     const answered = step(
         start(.key_material),
         .{ .frame = .{ .server_challenge = .{ .challenge = @splat(0x01) } } },
@@ -732,7 +733,7 @@ test "a second challenge is out of order where a first one was not" {
 }
 
 test "a stream that ends mid-handshake fails, wherever it ends" {
-    const secret = testSecret(11);
+    const secret = try testSecret(11);
     const opened = step(start(.key_material), .stream_ended, &secret);
     try t.expectEqual(Action.close, opened.action.?);
     try t.expectEqual(Failure.stream_ended, opened.state.failed);
@@ -747,7 +748,7 @@ test "a stream that ends mid-handshake fails, wherever it ends" {
 }
 
 test "a finished handshake ignores whatever arrives next" {
-    const secret = testSecret(12);
+    const secret = try testSecret(12);
     const finished = [_]State{
         .{ .established = .key_material },
         .{ .denied = .{ .reason = "not authorized" } },

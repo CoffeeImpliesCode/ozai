@@ -477,6 +477,9 @@ pub const GetRequest = struct {
     /// `ChunkRangesSeq::from_ranges([all])`, which is one selected spec at the
     /// blob and an empty spec one blob on to end the run; the wire form is in
     /// the golden vectors below.
+    // `Hash` is a private alias of the public builtin `[32]u8]`, so a caller
+    // passes those 32 bytes and names no private type.
+    // ziglint-ignore: Z012
     pub fn blob(hash: Hash) GetRequest {
         return .{ .hash = hash, .ranges = .{ .items = &blob_ranges } };
     }
@@ -485,6 +488,9 @@ pub const GetRequest = struct {
     /// it. Upstream's `ChunkRangesSeq::all()`, which is one selected spec and
     /// nothing after it, so the walk repeats it forever — the way a request
     /// asks for a hash sequence whose length neither side knows.
+    // `Hash` is a private alias of the public builtin `[32]u8]`, so a caller
+    // passes those 32 bytes and names no private type.
+    // ziglint-ignore: Z012
     pub fn all(hash: Hash) GetRequest {
         return .{ .hash = hash, .ranges = .{ .items = &all_ranges } };
     }
@@ -630,6 +636,9 @@ pub const ObserveRequest = struct {
 pub const PushRequest = struct {
     get: GetRequest,
 
+    // `Hash` is a private alias of the public builtin `[32]u8]`, so a caller
+    // passes those 32 bytes and names no private type.
+    // ziglint-ignore: Z012
     pub fn new(hash: Hash, ranges: range_spec.RangeSpecSeq) PushRequest {
         return .{ .get = .{ .hash = hash, .ranges = ranges } };
     }

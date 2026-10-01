@@ -373,19 +373,19 @@ fn writeTransportAddr(writer: *postcard.Writer, one: TransportAddr) postcard.Err
 }
 
 fn readTransportAddr(
-    reader: *postcard.Reader,
     alloc: Allocator,
+    reader: *postcard.Reader,
 ) (postcard.Error || BodyError || Allocator.Error)!TransportAddr {
     return switch (try reader.readVariant(TransportTag)) {
         .relay => .{ .relay = try readRelayUrl(reader) },
         .ip => .{ .ip = try readSocketAddr(reader) },
-        .custom => try readCustomAddr(reader, alloc),
+        .custom => try readCustomAddr(alloc, reader),
     };
 }
 
 fn readCustomAddr(
-    reader: *postcard.Reader,
     alloc: Allocator,
+    reader: *postcard.Reader,
 ) (postcard.Error || BodyError || Allocator.Error)!TransportAddr {
     const id = try reader.readU64();
     const data = try reader.readBytes();
@@ -491,7 +491,7 @@ pub const EndpointTicket = struct {
     /// `alloc` takes the address list and every custom transport payload in
     /// it, and the result says so, so that the two cannot be confused with a
     /// ticket the caller built and therefore owns differently.
-    pub fn decodeBytes(bytes: []const u8, alloc: Allocator) DecodeError!Decoded {
+    pub fn decodeBytes(alloc: Allocator, bytes: []const u8) DecodeError!Decoded {
         var reader = postcard.Reader.init(bytes);
         // The ticket discriminant is read as a number rather than through
         // `readVariant`, because a wrong one is not an unknown enum arm: it is
@@ -510,8 +510,8 @@ pub const EndpointTicket = struct {
 
         var addrs: std.ArrayList(TransportAddr) = .empty;
         errdefer addrs.deinit(alloc);
-        errdefer freeCustomPayloads(addrs.items, alloc);
-        for (0..count) |_| try addrs.append(alloc, try readTransportAddr(&reader, alloc));
+        errdefer freeCustomPayloads(alloc, addrs.items);
+        for (0..count) |_| try addrs.append(alloc, try readTransportAddr(alloc, &reader));
         try reader.finish();
         // The wire order is upstream's `BTreeSet` order, which a peer is free
         // to ignore, and the set collapses a repeated address on the way in.
@@ -525,12 +525,12 @@ pub const EndpointTicket = struct {
 
     /// A ticket's text form to a ticket. The base32 body is decoded through a
     /// fresh allocation, because its length is whatever the text said it was.
-    pub fn decodeString(text: []const u8, alloc: Allocator) DecodeError!Decoded {
+    pub fn decodeString(alloc: Allocator, text: []const u8) DecodeError!Decoded {
         const symbols = try splitBody(kind, text);
         const raw = try alloc.alloc(u8, byteLength(symbols.len));
         defer alloc.free(raw);
         try decodeBase32(symbols, raw);
-        return decodeBytes(raw, alloc);
+        return decodeBytes(alloc, raw);
     }
 };
 
@@ -554,12 +554,12 @@ pub const Decoded = struct {
     /// of any other kind is fine: the payloads already in the list are the
     /// same ones either way.
     pub fn deinit(self: Decoded, alloc: Allocator) void {
-        freeCustomPayloads(self.ticket.addr.addrs, alloc);
+        freeCustomPayloads(alloc, self.ticket.addr.addrs);
         self.ticket.addr.deinit(alloc);
     }
 };
 
-fn freeCustomPayloads(addrs: []const TransportAddr, alloc: Allocator) void {
+fn freeCustomPayloads(alloc: Allocator, addrs: []const TransportAddr) void {
     for (addrs) |one| {
         if (one == .custom) alloc.free(one.custom.data);
     }
@@ -574,6 +574,9 @@ const t = std.testing;
 // published ticket: `tmc/go-iroh` `endpointticket/example_test.go` at commit
 // a22a7c30ef8d5892ba144e2f72461edb3c541bdb hands that exact string to its
 // decoder and asserts it names the id and two addresses.
+
+// Half-length buffers rule out NoSpaceLeft. Invalid captured hex therefore
+// fails the test that requested it, rather than terminating the whole runner.
 
 const golden_hex =
     "00" ++
@@ -601,7 +604,7 @@ fn expectHexEqual(expected_hex: []const u8, got: []const u8) !void {
     var index: usize = 0;
     while (index < got.len) : (index += 1) {
         var nibbles: [1]u8 = undefined;
-        _ = std.fmt.hexToBytes(&nibbles, expected_hex[2 * index ..][0..2]) catch unreachable;
+        _ = try std.fmt.hexToBytes(&nibbles, expected_hex[2 * index ..][0..2]);
         try t.expectEqual(nibbles[0], got[index]);
     }
 }
@@ -610,18 +613,18 @@ fn expectHexEqual(expected_hex: []const u8, got: []const u8) !void {
 fn goldenAddr(alloc: Allocator) !NodeAddr {
     const id = try NodeId.parseHex(golden_id_hex);
     var address = try NodeAddr.withRelay(alloc, id, try RelayUrl.parse("http://derp.me./"));
-    address = (try address.insert(alloc, .{
-        .ip = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1024 },
-    })).?;
+    const socket: SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1024 };
+    address = (try address.insert(alloc, .{ .ip = socket })) orelse
+        return error.TestUnexpectedResult;
     return address;
 }
 
 test "golden: the endpoint ticket bytes, iroh-tickets src/endpoint.rs" {
-    var bytes: [64]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, golden_hex) catch unreachable;
+    var bytes: [golden_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, golden_hex);
 
     const alloc = t.allocator;
-    const decoded = try EndpointTicket.decodeBytes(bytes[0..60], alloc);
+    const decoded = try EndpointTicket.decodeBytes(alloc, bytes[0..60]);
     defer decoded.deinit(alloc);
 
     try t.expectEqualStrings(golden_id_hex, decoded.ticket.addr.node_id.toHex()[0..]);
@@ -640,7 +643,7 @@ test "golden: the endpoint ticket bytes, iroh-tickets src/endpoint.rs" {
 
 test "golden: the endpoint ticket text form, tmc/go-iroh endpointticket" {
     const alloc = t.allocator;
-    const decoded = try EndpointTicket.decodeString(golden_ticket, alloc);
+    const decoded = try EndpointTicket.decodeString(alloc, golden_ticket);
     defer decoded.deinit(alloc);
 
     try t.expectEqualStrings(golden_id_hex, decoded.ticket.addr.node_id.toHex()[0..]);
@@ -664,7 +667,7 @@ test "the text form is a fixed point" {
     var first: [128]u8 = undefined;
     var second: [128]u8 = undefined;
     const once = try ticket.encodeString(bytes, &first);
-    const twice = try EndpointTicket.decodeString(once, alloc);
+    const twice = try EndpointTicket.decodeString(alloc, once);
     defer twice.deinit(alloc);
     const again = try twice.ticket.encodeString(try twice.ticket.encode(&body), &second);
 
@@ -705,7 +708,7 @@ test "the lower casing happens after the prefix, not before it" {
     @memcpy(shouted_text, written);
     const shouted_body = shouted_text[EndpointTicket.kind.len..];
     _ = std.ascii.upperString(shouted_body, written[EndpointTicket.kind.len..]);
-    const shouted = try EndpointTicket.decodeString(shouted_text, alloc);
+    const shouted = try EndpointTicket.decodeString(alloc, shouted_text);
     defer shouted.deinit(alloc);
     try t.expect(std.ascii.eqlIgnoreCase(written, shouted_text));
     try t.expectEqualStrings(golden_id_hex, shouted.ticket.addr.node_id.toHex()[0..]);
@@ -713,18 +716,18 @@ test "the lower casing happens after the prefix, not before it" {
 
 test "a foreign kind prefix is not a ticket" {
     const alloc = t.allocator;
-    try t.expectError(error.UnknownKind, EndpointTicket.decodeString("", alloc));
-    try t.expectError(error.UnknownKind, EndpointTicket.decodeString("blob", alloc));
+    try t.expectError(error.UnknownKind, EndpointTicket.decodeString(alloc, ""));
+    try t.expectError(error.UnknownKind, EndpointTicket.decodeString(alloc, "blob"));
     // The prefix is matched exactly and is lower case. A ticket shouted in
     // its prefix is a different string, which is upstream's rule too: it
     // strips `Self::KIND` and does not fold case.
     try t.expectError(
         error.UnknownKind,
-        EndpointTicket.decodeString("Endpoint" ++ golden_ticket["endpoint".len..], alloc),
+        EndpointTicket.decodeString(alloc, "Endpoint" ++ golden_ticket["endpoint".len..]),
     );
     // A prefix that is a prefix of the kind is a kind of nothing.
-    try t.expectError(error.UnknownKind, EndpointTicket.decodeString("endpoin", alloc));
-    try t.expectError(error.UnknownKind, EndpointTicket.decodeString(" endpoint", alloc));
+    try t.expectError(error.UnknownKind, EndpointTicket.decodeString(alloc, "endpoin"));
+    try t.expectError(error.UnknownKind, EndpointTicket.decodeString(alloc, " endpoint"));
 }
 
 test "a body that is not whole bytes is refused" {
@@ -733,10 +736,10 @@ test "a body that is not whole bytes is refused" {
     // and six is between the five a three-byte body produces and the seven a
     // four-byte body does. The text is complete in both cases, which is why
     // this is its own error and not `UnexpectedEnd`.
-    try t.expectError(error.BadBase32Length, EndpointTicket.decodeString("endpointa", t.allocator));
+    try t.expectError(error.BadBase32Length, EndpointTicket.decodeString(t.allocator, "endpointa"));
     try t.expectError(
         error.BadBase32Length,
-        EndpointTicket.decodeString("endpointaaaaaa", t.allocator),
+        EndpointTicket.decodeString(t.allocator, "endpointaaaaaa"),
     );
 }
 
@@ -749,7 +752,7 @@ test "a character outside the alphabet is refused" {
         @memcpy(text[0..EndpointTicket.kind.len], EndpointTicket.kind);
         text[EndpointTicket.kind.len] = 'a';
         text[EndpointTicket.kind.len + 1] = c;
-        try t.expectError(error.BadBase32Symbol, EndpointTicket.decodeString(&text, t.allocator));
+        try t.expectError(error.BadBase32Symbol, EndpointTicket.decodeString(t.allocator, &text));
     }
 }
 
@@ -760,8 +763,8 @@ test "bytes below the boundary are refused" {
     // drops a byte rather than tampering with the ticket: `data-encoding`
     // checks trailing bits, and an encoder that emitted value in them would
     // be giving one ticket two spellings.
-    var bytes: [64]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, golden_hex) catch unreachable;
+    var bytes: [golden_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, golden_hex);
 
     var buffer: [128]u8 = undefined;
     const body = bytes[0..59];
@@ -776,34 +779,36 @@ test "bytes below the boundary are refused" {
     // here is 'A' and all five of its bits are pad.
     try t.expectEqual(@as(u8, 'A'), symbols[symbols.len - 1]);
     symbols[symbols.len - 1] = 'B';
-    try t.expectError(error.NonZeroBase32Padding, EndpointTicket.decodeString(text, t.allocator));
+    try t.expectError(error.NonZeroBase32Padding, EndpointTicket.decodeString(t.allocator, text));
 }
 
 test "trailing bytes after the body are refused" {
     const alloc = t.allocator;
-    var body: [65]u8 = undefined;
-    _ = std.fmt.hexToBytes(body[0..60], golden_hex) catch unreachable;
+    // One byte past the vector, so the byte this test adds past the body has
+    // somewhere to land.
+    var body: [golden_hex.len / 2 + 1]u8 = undefined;
+    _ = try std.fmt.hexToBytes(body[0 .. golden_hex.len / 2], golden_hex);
     body[60] = 0x00;
 
-    const decoded = EndpointTicket.decodeBytes(body[0..61], alloc);
+    const decoded = EndpointTicket.decodeBytes(alloc, body[0..61]);
     try t.expectError(error.TrailingBytes, decoded);
 
     // The same through the text form: two more symbols are one more zero
     // byte, so the length stays legal and the failure is the one under test.
     var text: [128]u8 = undefined;
-    _ = std.mem.copyForwards(u8, &text, golden_ticket);
+    @memcpy(text[0..golden_ticket.len], golden_ticket);
     text[golden_ticket.len] = 'a';
     text[golden_ticket.len + 1] = 'a';
     try t.expectError(
         error.TrailingBytes,
-        EndpointTicket.decodeString(text[0 .. golden_ticket.len + 2], alloc),
+        EndpointTicket.decodeString(alloc, text[0 .. golden_ticket.len + 2]),
     );
 }
 
 test "a truncated body is refused" {
     const alloc = t.allocator;
-    var bytes: [64]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, golden_hex) catch unreachable;
+    var bytes: [golden_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, golden_hex);
 
     // Cut inside a fixed-width field, or at the very end of the frame, and it
     // simply stops: `UnexpectedEnd`. Cut just after the address count and the
@@ -811,38 +816,32 @@ test "a truncated body is refused" {
     // which is `BadLength`, and is why the two are separate members of
     // `postcard.Error`.
     for ([_]usize{ 0, 1, 8, 20, 32, 33, 59 }) |length| {
-        try t.expectError(
-            error.UnexpectedEnd,
-            EndpointTicket.decodeBytes(bytes[0..length], alloc),
-        );
+        try t.expectError(error.UnexpectedEnd, EndpointTicket.decodeBytes(alloc, bytes[0..length]));
     }
     for ([_]usize{ 34, 35, 40, 50 }) |length| {
-        try t.expectError(error.BadLength, EndpointTicket.decodeBytes(bytes[0..length], alloc));
+        try t.expectError(error.BadLength, EndpointTicket.decodeBytes(alloc, bytes[0..length]));
     }
 }
 
 test "a wire variant this build has no arm for is refused" {
     const alloc = t.allocator;
-    var body: [64]u8 = undefined;
-    _ = std.fmt.hexToBytes(&body, golden_hex) catch unreachable;
+    var body: [golden_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&body, golden_hex);
     body[0] = 0x01;
-    try t.expectError(
-        error.UnknownTicketVariant,
-        EndpointTicket.decodeBytes(&body, alloc),
-    );
+    try t.expectError(error.UnknownTicketVariant, EndpointTicket.decodeBytes(alloc, &body));
 }
 
 test "an address list longer than the body is refused" {
     const alloc = t.allocator;
-    var body: [64]u8 = undefined;
-    _ = std.fmt.hexToBytes(&body, golden_hex) catch unreachable;
+    var body: [golden_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&body, golden_hex);
     // The count is at offset 33. A peer may name any `u64` it likes and the
     // bytes behind it do not have to exist.
     body[33] = 0xff;
     body[34] = 0xff;
     body[35] = 0xff;
     body[36] = 0x7f;
-    try t.expectError(error.BadLength, EndpointTicket.decodeBytes(&body, alloc));
+    try t.expectError(error.BadLength, EndpointTicket.decodeBytes(alloc, &body));
 }
 
 test "a custom transport survives an endpoint ticket" {
@@ -851,13 +850,12 @@ test "a custom transport survives an endpoint ticket" {
 
     const id = try NodeId.parseHex(golden_id_hex);
     var address = try NodeAddr.withRelay(alloc, id, try RelayUrl.parse("https://a.example./"));
-    address = (try address.insert(alloc, .{ .ip = .{
-        .ip = .{ .v4 = .{ 192, 0, 2, 7 } },
-        .port = 41641,
-    } })).?;
-    address = (try address.insert(alloc, .{
-        .custom = try CustomAddr.parse("2a_abab", &storage),
-    })).?;
+    const socket: SocketAddr = .{ .ip = .{ .v4 = .{ 192, 0, 2, 7 } }, .port = 41641 };
+    address = (try address.insert(alloc, .{ .ip = socket })) orelse
+        return error.TestUnexpectedResult;
+    const transport = try CustomAddr.parse("2a_abab", &storage);
+    address = (try address.insert(alloc, .{ .custom = transport })) orelse
+        return error.TestUnexpectedResult;
     defer address.deinit(alloc);
     const ticket = EndpointTicket.new(address);
 
@@ -866,7 +864,7 @@ test "a custom transport survives an endpoint ticket" {
     var text: [256]u8 = undefined;
     const written = try ticket.encodeString(bytes, &text);
 
-    const decoded = try EndpointTicket.decodeString(written, alloc);
+    const decoded = try EndpointTicket.decodeString(alloc, written);
     defer decoded.deinit(alloc);
 
     try t.expectEqual(@as(usize, 3), decoded.ticket.addr.addrs.len);
@@ -892,10 +890,7 @@ test "a custom payload longer than a CustomAddr holds is refused" {
     try writer.writeU64(1);
     try writer.writeBytes(&[_]u8{0xaa} ** (addr.max_inline_length + 1));
 
-    try t.expectError(
-        error.CustomAddrTooLong,
-        EndpointTicket.decodeBytes(writer.finish(), alloc),
-    );
+    try t.expectError(error.CustomAddrTooLong, EndpointTicket.decodeBytes(alloc, writer.finish()));
 }
 
 test "a relay url the address layer will not take is refused" {
@@ -908,15 +903,15 @@ test "a relay url the address layer will not take is refused" {
     try writer.writeVariant(TransportTag.relay);
     try writer.writeStr("not a url");
 
-    try t.expectError(error.BadRelayUrl, EndpointTicket.decodeBytes(writer.finish(), alloc));
+    try t.expectError(error.BadRelayUrl, EndpointTicket.decodeBytes(alloc, writer.finish()));
 }
 
 test "an endpoint id that is not a point is refused" {
     const alloc = t.allocator;
     var body: [128]u8 = undefined;
-    _ = std.fmt.hexToBytes(&body, golden_hex) catch unreachable;
+    _ = try std.fmt.hexToBytes(body[0 .. golden_hex.len / 2], golden_hex);
     @memset(body[1..33], 0xff);
-    try t.expectError(error.NotANodeId, EndpointTicket.decodeBytes(&body, alloc));
+    try t.expectError(error.NotANodeId, EndpointTicket.decodeBytes(alloc, &body));
 }
 
 test "maxEncodedLength bounds every encoding this module writes" {
@@ -925,15 +920,15 @@ test "maxEncodedLength bounds every encoding this module writes" {
     const id = try NodeId.parseHex(golden_id_hex);
 
     var address = try NodeAddr.withRelay(alloc, id, try RelayUrl.parse("https://a.example./"));
-    address = (try address.insert(alloc, .{ .ip = .{
-        .ip = .{ .v6 = [_]u8{ 0x20, 0x01 } ** 8 },
-        .port = 65535,
-    } })).?;
+    const socket: SocketAddr = .{ .ip = .{ .v6 = [_]u8{ 0x20, 0x01 } ** 8 }, .port = 65535 };
+    address = (try address.insert(alloc, .{ .ip = socket })) orelse
+        return error.TestUnexpectedResult;
     const custom = try CustomAddr.parse(
         "ffffffffffffffff_00112233445566778899aabbccddeeff",
         &storage,
     );
-    address = (try address.insert(alloc, .{ .custom = custom })).?;
+    address = (try address.insert(alloc, .{ .custom = custom })) orelse
+        return error.TestUnexpectedResult;
     defer address.deinit(alloc);
 
     const ticket = EndpointTicket.new(address);
@@ -976,7 +971,7 @@ test "a decoded address list is sorted and duplicate-free whatever order it arri
     try writeTransportAddr(&writer, .{ .relay = relay });
     try writeTransportAddr(&writer, .{ .ip = ip });
 
-    const decoded = try EndpointTicket.decodeBytes(writer.finish(), alloc);
+    const decoded = try EndpointTicket.decodeBytes(alloc, writer.finish());
     defer decoded.deinit(alloc);
     try t.expectEqual(@as(usize, 2), decoded.ticket.addr.addrs.len);
     try t.expectEqual(TransportAddr.relay, std.meta.activeTag(decoded.ticket.addr.addrs[0]));

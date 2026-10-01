@@ -213,9 +213,9 @@ pub const Writer = struct {
         try self.writeVarint(u32, discriminant);
     }
 
-    /// A fixed-size byte array, inline: `N` bytes and no length prefix, so
-    /// `readArray` knows how many to take from `N` alone.
-    pub fn writeArray(self: *Writer, comptime N: usize, bytes: *const [N]u8) Error!void {
+    /// A fixed-size byte array, inline: `n` bytes and no length prefix, so
+    /// `readArray` knows how many to take from `n` alone.
+    pub fn writeArray(self: *Writer, comptime n: usize, bytes: *const [n]u8) Error!void {
         try self.append(bytes);
     }
 
@@ -375,10 +375,10 @@ pub const Reader = struct {
         return std.enums.fromInt(Variant, discriminant) orelse error.UnknownVariant;
     }
 
-    /// A fixed-size byte array, inline: `N` bytes with no length prefix.
-    pub fn readArray(self: *Reader, comptime N: usize) Error![N]u8 {
-        var out: [N]u8 = undefined;
-        @memcpy(&out, try self.take(N));
+    /// A fixed-size byte array, inline: `n` bytes with no length prefix.
+    pub fn readArray(self: *Reader, comptime n: usize) Error![n]u8 {
+        var out: [n]u8 = undefined;
+        @memcpy(&out, try self.take(n));
         return out;
     }
 
@@ -426,6 +426,9 @@ fn zigZag(value: anytype) @Int(.unsigned, @bitSizeOf(@TypeOf(value))) {
     const Signed = @TypeOf(value);
     comptime std.debug.assert(@typeInfo(Signed) == .int);
     comptime std.debug.assert(@typeInfo(Signed).int.signedness == .signed);
+    // A type, not a value: `@Int` builds one, which is why it is spelled in
+    // PascalCase here and next to the `@TypeOf` bindings above and below.
+    // zwanzig-disable-next-line: identifier-style
     const Unsigned = @Int(.unsigned, @bitSizeOf(Signed));
     const raw: Unsigned = @bitCast(value);
     const sign: Unsigned = 0 -% (raw >> @intCast(@bitSizeOf(Signed) - 1));

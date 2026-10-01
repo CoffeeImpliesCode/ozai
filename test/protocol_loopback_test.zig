@@ -443,7 +443,8 @@ fn encodeData(w: *postcard.Writer, data: ?[]const u8) WireError!void {
 
 fn decodeData(r: *postcard.Reader) WireError!?[]const u8 {
     if (!try r.readOption()) return null;
-    return try r.readBytes();
+    const bytes = try r.readBytes();
+    return bytes;
 }
 
 fn encodeInfo(w: *postcard.Writer, info: gossip.PeerInfo) WireError!void {
@@ -555,7 +556,7 @@ const Wire = struct {
         errdefer self.socket.close();
         // Both transport keys are supplied rather than drawn from `t.io`: a
         // test whose Retry key differs on every run has failures that move.
-        self.bridge = try Bridge.create(t.io, t.allocator, .{
+        self.bridge = try Bridge.create(t.allocator, t.io, .{
             .secret = secret,
             .expect_peer = expect_peer,
             .alpn = alpn,
@@ -567,7 +568,7 @@ const Wire = struct {
             .secret = secret,
             .alpn = alpn,
         });
-        errdefer self.dialer.destroy() catch unreachable;
+        errdefer self.dialer.destroy() catch @panic("new dialer has no live connections");
         // A bridge that was created a moment ago has no entry for `destroy` to
         // refuse, so this fires only on an allocation that followed it.
         self.egress = try t.allocator.alloc(Egress, max_egress);
@@ -593,17 +594,9 @@ const Wire = struct {
             if (!entry.conn.is_server) self.bridge.manager.removeConnection(entry);
         }
         self.bridge.sweep();
-        // `catch unreachable`, and this is the why rather than a teardown with
-        // nowhere to put an error: the loop above is the thing `destroy` refuses,
-        // and the loop has already run. A bridge only ever *accepts* server
-        // connections, so every non-server entry was one this dialer opened;
-        // `removeConnection` is total and swap-removes, which is why the walk
-        // is backwards; and nothing between that walk and this line reads a
-        // socket or adds an entry, so no peer can put one back. A peer does
-        // decide how many entries are in the table by the time teardown starts,
-        // which is exactly why the loop above — and not this assertion — is
-        // where that has to be right.
-        self.dialer.destroy() catch unreachable;
+        // Only server entries can survive: the bridge never dials, and no code
+        // between the removal walk and destroy can add another connection.
+        self.dialer.destroy() catch @panic("dialer retained a connection after removal");
         self.bridge.destroy();
         t.allocator.free(self.egress);
         t.allocator.free(self.out);
@@ -612,6 +605,7 @@ const Wire = struct {
         self.map.deinit(t.allocator);
         self.socket.close();
         self.secret.deinit();
+        self.* = undefined;
     }
 
     fn random(self: *Wire) std.Random {
@@ -638,6 +632,9 @@ const Wire = struct {
             var position: usize = 0;
             while (position < recv.datagramCount()) : (position += 1) {
                 const ingress = try self.bridge.recv(&self.map, .{
+                    // The loop's bound is `recv.datagramCount()`, and
+                    // `Recv.datagram` answers null only past that count.
+                    // zwanzig-disable-next-line: optional-unwrap
                     .bytes = recv.datagram(position).?,
                     .from = got.from,
                     .local = self.socket.address,
@@ -774,9 +771,9 @@ const Node = struct {
 
         // A `u16` port is at most five digits and `port_buf` is six, so the only
         // way `bufPrint` refuses here is a format this file owns.
-        self.advert = std.fmt.bufPrint(&self.port_buf, "{d}", .{
+        self.advert = try std.fmt.bufPrint(&self.port_buf, "{d}", .{
             self.wire.socket.address.port,
-        }) catch unreachable;
+        });
         const data = try gossip.PeerData.fromBytes(self.advert);
         self.topic = try gossip.TopicState.init(self.wire.id, data, config, rng);
     }
@@ -790,6 +787,7 @@ const Node = struct {
     fn deinit(self: *Node) void {
         self.deinitBuffers();
         self.wire.deinit();
+        self.* = undefined;
     }
 
     /// This node is the client on every link to a higher index, which is what
@@ -941,6 +939,7 @@ const Mesh = struct {
         t.allocator.free(mesh.codec);
         t.allocator.free(mesh.frame);
         t.allocator.free(mesh.wire_out);
+        mesh.* = undefined;
     }
 
     /// Dial every peer with a higher index, each with its own pin.
@@ -1123,11 +1122,7 @@ const Mesh = struct {
             // Re-read the slice: `feed` may have reallocated another link's
             // queue, and this one only ever shrinks here.
             const rest = node.inbound[peer].items.len - consumed;
-            std.mem.copyForwards(
-                u8,
-                node.inbound[peer].items[0..rest],
-                node.inbound[peer].items[consumed..],
-            );
+            @memmove(node.inbound[peer].items[0..rest], node.inbound[peer].items[consumed..]);
             node.inbound[peer].items.len = rest;
         }
     }
@@ -1448,9 +1443,9 @@ test "a swarm of ozai endpoints converges on one membership over real sockets" {
     // `peerNodeId` is where the pin a dial carried comes back out.
     for (0..max_nodes) |index| {
         for (index + 1..max_nodes) |peer| {
-            const dialed = mesh.nodes[index].dialled[peer].?;
+            const dialed = mesh.nodes[index].dialled[peer] orelse return error.NoConnection;
             try t.expect(dialed.established());
-            const carried = dialed.entry.conn.tls13_hs.?;
+            const carried = dialed.entry.conn.tls13_hs orelse return error.NoHandshakeState;
             try t.expectEqual(
                 mesh.nodes[peer].wire.id.toBytes(),
                 carried.peerNodeId().?,
@@ -1462,8 +1457,8 @@ test "a swarm of ozai endpoints converges on one membership over real sockets" {
             // The accept side read the dialler's certificate off the wire and
             // compared it against an SPKI built here from the DER encoding,
             // rather than against the configuration that produced it.
-            const accepted = mesh.nodes[peer]
-                .connTo(index, mesh.ports).?;
+            const accepted = mesh.nodes[peer].connTo(index, mesh.ports) orelse
+                return error.NoConnection;
             try t.expectEqualSlices(
                 u8,
                 &spkiOf(mesh.nodes[index].wire.id),
@@ -1752,6 +1747,7 @@ const BlobLink = struct {
         link.alloc.free(link.scratch);
         link.provider.deinit();
         link.getter.deinit();
+        link.* = undefined;
     }
 
     fn round(link: *BlobLink) !bool {
@@ -1976,7 +1972,9 @@ test "a blob the provider does not have is EOF on the wire, not an error frame" 
         while (position < requests.len) : (position += 1) {
             if (answered[position]) continue;
             if (!link.finished(&link.provider_fin, requests[position])) continue;
-            var reader = postcard.Reader.init(link.provider_bytes.get(requests[position]).?.items);
+            const queued = link.provider_bytes.get(requests[position]) orelse
+                return error.NoStream;
+            var reader = postcard.Reader.init(queued.items);
             decoded[position] = try blobs.Request.read(&reader, &storages[position].inner);
             // The reader has to end at the end of it: a byte after a `get` is a
             // stream that carried something else, and `finish` is what makes
@@ -1984,8 +1982,8 @@ test "a blob the provider does not have is EOF on the wire, not an error frame" 
             try reader.finish();
             answered[position] = true;
 
-            const stream = provider_conn.entry.conn
-                .streams.getStream(requests[position]).?;
+            const stream = provider_conn.entry.conn.streams.getStream(requests[position]) orelse
+                return error.NoStream;
             // The first request is answered with bytes, the second has no
             // answer at all. `Closed.request_received` is upstream's own reason
             // for stopping: one request per stream.
@@ -2047,10 +2045,11 @@ test "a blob the provider does not have is EOF on the wire, not an error frame" 
     // FIN set and no reset — and a reset is what an error would have cost this
     // layer, because `protocol.zig` has no error frame and says so in its own
     // doc: a provider that does not have the data stops writing.
-    const missing_stream = getter_conn.entry.conn.streams.getStream(requests[1]).?;
-    var missing_reader = postcard.Reader.init(
-        link.getter_bytes.get(requests[1]).?.items,
-    );
+    const missing_stream = getter_conn.entry.conn.streams.getStream(requests[1]) orelse
+        return error.NoStream;
+    const missing_bytes = link.getter_bytes.get(requests[1]) orelse
+        return error.NoStream;
+    var missing_reader = postcard.Reader.init(missing_bytes.items);
     const missing = blobs.BaoResponse.read(&missing_reader);
     try t.expect(missing.isEof());
     try t.expectEqual(@as(usize, 0), missing.bytes.len);
@@ -2059,9 +2058,9 @@ test "a blob the provider does not have is EOF on the wire, not an error frame" 
 
     // And the getter's read path is not vacuously empty: the stream that was
     // answered carried bytes, and they are the ones the provider wrote.
-    var present_reader = postcard.Reader.init(
-        link.getter_bytes.get(requests[0]).?.items,
-    );
+    const present_bytes = link.getter_bytes.get(requests[0]) orelse
+        return error.NoStream;
+    var present_reader = postcard.Reader.init(present_bytes.items);
     const present = blobs.BaoResponse.read(&present_reader);
     try t.expect(!present.isEof());
     try t.expectEqualSlices(u8, answer_bytes, present.bytes);

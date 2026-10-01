@@ -180,16 +180,12 @@ const RelayList = struct {
             }
         }
         if (self.len == max_relays) return false;
-        // `copyBackwards`, not `copyForwards`: the destination starts one entry
-        // *after* the source, so a forward loop reads back the entry it has
-        // already overwritten and drops the tail. `copyForwards` is the forward
-        // loop and is only correct when the destination is at or before the
-        // source.
-        std.mem.copyBackwards(
-            RelayLatency,
-            self.items[index + 1 .. self.len + 1],
-            self.items[index..self.len],
-        );
+        // `@memmove`, not `@memcpy`: the destination starts one entry *after*
+        // the source, so the ranges overlap and a forward copy reads back the
+        // entry it has already overwritten, dropping the tail. `@memmove`
+        // picks the direction from the pointers, which is what `copyBackwards`
+        // spelled by hand and is now deprecated.
+        @memmove(self.items[index + 1 .. self.len + 1], self.items[index..self.len]);
         self.items[index] = .{ .relay = relay, .latency = latency };
         self.len += 1;
         return true;
@@ -242,6 +238,9 @@ pub const RelayLatencies = struct {
         family: usize = 0,
         index: usize = 0,
 
+        // `Entry` is declared `pub` in this same container, so a caller
+        // reaches it as `RelayLatencies.Entry` and nothing private is exposed.
+        // ziglint-ignore: Z012
         pub fn next(self: *Iter) ?Entry {
             while (self.family < RelayLatencies.family_order.len) {
                 const probe = RelayLatencies.family_order[self.family];
@@ -864,15 +863,15 @@ test "a relay keeps the fastest latency ever measured to it" {
     try t.expectEqual(millis(30), latencies.get(b).?);
 
     var iterator = latencies.iter();
-    const first = iterator.next().?;
+    const first = iterator.next() orelse return error.TestUnexpectedResult;
     try t.expectEqual(Probe.https, first.probe);
     try t.expectEqual(std.math.Order.eq, first.relay.order(a));
     try t.expectEqual(millis(8), first.latency);
-    const second = iterator.next().?;
+    const second = iterator.next() orelse return error.TestUnexpectedResult;
     try t.expectEqual(Probe.qad_ipv4, second.probe);
     try t.expectEqual(std.math.Order.eq, second.relay.order(a));
     try t.expectEqual(millis(20), second.latency);
-    const third = iterator.next().?;
+    const third = iterator.next() orelse return error.TestUnexpectedResult;
     try t.expectEqual(Probe.qad_ipv4, third.probe);
     try t.expectEqual(std.math.Order.eq, third.relay.order(b));
     try t.expectEqual(millis(30), third.latency);
@@ -964,7 +963,7 @@ test "an update in the middle of the order shifts the entries after it" {
     };
     var iterator = latencies.iter();
     for (expected) |want| {
-        const entry = iterator.next().?;
+        const entry = iterator.next() orelse return error.TestUnexpectedResult;
         try t.expectEqual(Probe.https, entry.probe);
         try t.expectEqual(std.math.Order.eq, entry.relay.order(want.relay));
         try t.expectEqual(want.latency, entry.latency);

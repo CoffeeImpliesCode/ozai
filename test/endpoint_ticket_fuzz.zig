@@ -88,7 +88,7 @@ fn testOne(_: Context, smith: *t.Smith) anyerror!void {
 
 fn check(text: []const u8) !void {
     const alloc = t.allocator;
-    const decoded = EndpointTicket.decodeString(text, alloc) catch |err| {
+    const decoded = EndpointTicket.decodeString(alloc, text) catch |err| {
         // Oracle: the error set is closed, and every member of it names a rule
         // the text broke. The one that says nothing about the input is
         // `OutOfMemory`, so a decode that failed for any other reason is a
@@ -134,7 +134,7 @@ fn check(text: []const u8) !void {
     // back and writing it again is the same string. This is what makes a ticket
     // an identifier rather than a fresh value on every send, and a second
     // spelling of one ticket is what breaks it.
-    const second = try EndpointTicket.decodeString(again, alloc);
+    const second = try EndpointTicket.decodeString(alloc, again);
     defer second.deinit(alloc);
 
     var second_body: [reencode_len]u8 = undefined;

@@ -202,8 +202,7 @@ const CidKey = quic.connection_manager.CidKey;
 const Connection = quic.connection.Connection;
 const ConnectionConfig = quic.connection.ConnectionConfig;
 const State = quic.connection.State;
-const Tls13 = quic.tls13;
-const TlsConfig = Tls13.TlsConfig;
+const tls13 = quic.tls13;
 
 /// The instant the core is driven at. Re-exported so a caller threading a dial
 /// names one module for its identity and its clock.
@@ -330,8 +329,8 @@ pub const Route = struct {
 /// for a direct path, and why the answer to a null id on the others is
 /// `error.NoPeerId` rather than an address nobody could resolve back to a peer.
 pub fn resolveRoute(
-    map: *addr_map.MappedAddrs,
     gpa: std.mem.Allocator,
+    map: *addr_map.MappedAddrs,
     transport: TransportAddr,
     peer: ?NodeId,
     random: std.Random,
@@ -339,15 +338,15 @@ pub fn resolveRoute(
     switch (transport) {
         .ip => |socket| return .{ .socket = socket, .key = null, .subnet = null },
         .relay => |url| return routeThrough(
-            map,
             gpa,
+            map,
             .{ .relay = .{ .relay = url, .node = peer orelse return error.NoPeerId } },
             .relay,
             random,
         ),
         .custom => |custom| return routeThrough(
-            map,
             gpa,
+            map,
             // `from` copies the data into the key. An entry outlives the frame
             // that produced the address, so a key pointing into it would be
             // read back over bytes already reused.
@@ -360,8 +359,8 @@ pub fn resolveRoute(
 
 /// The address a synthetic key is reached at, on the subnet its arm names.
 fn routeThrough(
-    map: *addr_map.MappedAddrs,
     gpa: std.mem.Allocator,
+    map: *addr_map.MappedAddrs,
     key: addr_map.Key,
     subnet: base_ula.Path,
     random: std.Random,
@@ -446,7 +445,7 @@ pub const Dialer = struct {
             .cert_chain = undefined,
             .alpn_list = undefined,
         };
-        self.spki = Tls13.ed25519Spki(&self.node_id.toBytes());
+        self.spki = tls13.ed25519Spki(&self.node_id.toBytes());
         self.cert_chain = .{self.spki[0..]};
         self.alpn_list = .{config.alpn};
         return self;
@@ -481,7 +480,10 @@ pub const Dialer = struct {
     /// rather than a value because `connectInto` copies it into the handshake
     /// and the handshake keeps that copy: one value per dialer could not say
     /// what a given dial used.
-    pub fn tlsConfigFor(self: *const Dialer, expect_peer: ?NodeId) TlsConfig {
+    ///
+    /// The type is the core's own and is spelled in full: an alias for it here
+    /// would be private, and a public signature may not name a private type.
+    pub fn tlsConfigFor(self: *const Dialer, expect_peer: ?NodeId) quic.tls13.TlsConfig {
         return .{
             // Two required fields the core's struct has no default for, and
             // both server-only. A client presents nothing here; the identity it
@@ -538,7 +540,7 @@ pub const Dialer = struct {
         // Before the map is touched, so a refused dial leaves no trace: no
         // host bits drawn, no entry allocated, nothing in the manager.
         if (expect_peer == null and self.config.require_peer_pin) return error.NoPeerPin;
-        const route = try resolveRoute(map, self.gpa, transport, expect_peer, random);
+        const route = try resolveRoute(self.gpa, map, transport, expect_peer, random);
         const conn = try self.open(route.socket, local, self.tlsConfigFor(expect_peer), at, random);
         return .{ .conn = conn, .route = route };
     }
@@ -552,7 +554,7 @@ pub const Dialer = struct {
         self: *Dialer,
         peer_addr: SocketAddr,
         local: SocketAddr,
-        tls: TlsConfig,
+        tls: quic.tls13.TlsConfig,
         at: Instant,
         random: std.Random,
     ) Error!Conn {
@@ -904,13 +906,13 @@ const Pair = struct {
         errdefer self.dialer_secret.deinit();
         errdefer self.server_secret.deinit();
         errdefer self.map.deinit(t.allocator);
-        self.dialer_bridge = try Bridge.create(t.io, t.allocator, .{
+        self.dialer_bridge = try Bridge.create(t.allocator, t.io, .{
             .secret = self.dialer_secret,
             .expect_peer = expect_peer,
             .alpn = alpn,
         }, self.engine.random());
         errdefer self.dialer_bridge.destroy();
-        self.server_bridge = try Bridge.create(t.io, t.allocator, .{
+        self.server_bridge = try Bridge.create(t.allocator, t.io, .{
             .secret = self.server_secret,
             .expect_peer = self.dialer_secret.nodeId(),
             .alpn = alpn,
@@ -941,15 +943,26 @@ const Pair = struct {
         }
         self.dialer_bridge.sweep();
         // Every client entry was taken out and swept above, so there is
-        // nothing left for `destroy` to refuse. A test that gets here with one
-        // still in the table has a bug in the loop above, and a panic names
-        // the line that made it.
-        self.dialer.destroy() catch unreachable;
+        // nothing left for `destroy` to refuse. What it refuses on is an
+        // entry it opened, and the walk above swap-removes every one it
+        // finds, backwards, so an entry it moves down is never one it has
+        // already passed. A client entry here means the walk is wrong, which
+        // is a bug to name rather than a state to unwind.
+        self.dialer.destroy() catch @panic(
+            "a client connection outlived the walk in Pair.deinit",
+        );
         self.dialer_bridge.destroy();
         self.server_bridge.destroy();
         self.map.deinit(t.allocator);
         self.dialer_secret.deinit();
         self.server_secret.deinit();
+
+        // Nothing here is live: the dialer and both bridges are freed and both
+        // seeds are zeroed, so every field left standing is a dangling pointer
+        // or a key that is no longer this node's. Left as it was, a second
+        // `deinit` or any read after the `defer` would be reading freed memory
+        // and would still look like a value.
+        self.* = undefined;
     }
 };
 
@@ -961,8 +974,8 @@ test "a relay target becomes one address the core is told, and the map says whos
 
     var route_engine = Prng.init(2);
     const route = try resolveRoute(
-        &pair.map,
         t.allocator,
+        &pair.map,
         try relayTarget(),
         peer,
         route_engine.random(),
@@ -994,8 +1007,8 @@ test "a relay target becomes one address the core is told, and the map says whos
     // cannot change the answer.
     var again_engine = Prng.init(999);
     const again = try resolveRoute(
-        &pair.map,
         t.allocator,
+        &pair.map,
         try relayTarget(),
         peer,
         again_engine.random(),
@@ -1013,8 +1026,8 @@ test "a custom target is its own subnet, and the key owns the bytes" {
     const custom: CustomAddr = .{ .id = 7, .data = payload[0..] };
     var route_engine = Prng.init(4);
     const route = try resolveRoute(
-        &pair.map,
         t.allocator,
+        &pair.map,
         .{ .custom = custom },
         pair.server_secret.nodeId(),
         route_engine.random(),
@@ -1044,8 +1057,8 @@ test "a direct target keeps its own address and never enters the map" {
 
     var route_engine = Prng.init(6);
     const route = try resolveRoute(
-        &pair.map,
         t.allocator,
+        &pair.map,
         .{ .ip = direct_addr },
         null,
         route_engine.random(),
@@ -1074,8 +1087,8 @@ test "a custom address too long for a key is refused, not truncated" {
     try t.expectError(
         error.DataTooLong,
         resolveRoute(
-            &pair.map,
             t.allocator,
+            &pair.map,
             .{ .custom = .{ .id = 1, .data = oversize[0..] } },
             pair.server_secret.nodeId(),
             route_engine.random(),
@@ -1099,7 +1112,7 @@ test "the configuration the core is handed is this node's SPKI and the peer's pi
     // No `certs`, so no server ever calls `selectCertificateFor` and no SNI
     // selects anything on this stack. See the module doc on `server_name`.
     try t.expectEqual(@as(usize, 0), tls.certs.len);
-    try t.expectEqual(@as(?*const Tls13.ClientAuth, null), tls.client_auth);
+    try t.expectEqual(@as(?*const tls13.ClientAuth, null), tls.client_auth);
     try t.expectEqualStrings(default_server_name, tls.server_name.?);
     try t.expectEqual(@as(usize, 1), tls.alpn.len);
     try t.expectEqualStrings(alpn, tls.alpn[0]);
@@ -1111,11 +1124,11 @@ test "the configuration the core is handed is this node's SPKI and the peer's pi
     try t.expectEqual(spki_length, tls.client_certificate.?.cert_chain_der[0].len);
     try t.expectEqualSlices(
         u8,
-        &Tls13.ed25519Spki(&pair.dialer_secret.nodeId().toBytes()),
+        &tls13.ed25519Spki(&pair.dialer_secret.nodeId().toBytes()),
         tls.client_certificate.?.cert_chain_der[0],
     );
     try t.expectEqual(
-        Tls13.PrivateKeyAlgorithm.ed25519,
+        tls13.PrivateKeyAlgorithm.ed25519,
         tls.client_certificate.?.private_key_algorithm,
     );
     const seed = pair.dialer_secret.toBytes();
@@ -1148,7 +1161,8 @@ test "the SNI the core was actually given is the caller's name, not the config's
     // from its own argument, so the value inside the handshake is the one the
     // caller passed positionally. The field in `tlsConfigFor` is a readable
     // mirror of it and nothing more, and this is the test that says so.
-    const given = dial.conn.entry.conn.tls13_hs.?.config;
+    const handshake = dial.conn.entry.conn.tls13_hs orelse return error.TestUnexpectedResult;
+    const given = handshake.config;
     try t.expectEqualStrings(default_server_name, given.server_name.?);
     try t.expectEqual(
         pair.server_secret.nodeId().toBytes(),
@@ -1278,7 +1292,7 @@ test "a dial runs initiated to connected as a function of datagrams and nothing 
     // connection is found by the bridge's own index walk — there is no second
     // table for it to be in.
     try t.expectEqual(@as(usize, 1), pair.dialer_bridge.manager.connectionCount());
-    const found = pair.dialer_bridge.connectionAt(0).?;
+    const found = pair.dialer_bridge.connectionAt(0) orelse return error.TestUnexpectedResult;
     try t.expectEqual(dial.conn.id(), found.id());
 
     // What the core was told, and what it learned. The synthetic address
@@ -1312,11 +1326,11 @@ test "a dial runs initiated to connected as a function of datagrams and nothing 
     // And the server saw the same SPKI we presented, as the mirror image of
     // the pin it enforces: two bridges, one handshake, no second loop. A
     // server does keep the copy, so the whole 44 bytes are readable here.
-    const accepted = pair.server_bridge.connectionAt(0).?;
+    const accepted = pair.server_bridge.connectionAt(0) orelse return error.TestUnexpectedResult;
     try t.expect(accepted.established());
     try t.expectEqualSlices(
         u8,
-        &Tls13.ed25519Spki(&pair.dialer_secret.nodeId().toBytes()),
+        &tls13.ed25519Spki(&pair.dialer_secret.nodeId().toBytes()),
         accepted.entry.conn.peerCertificate().?,
     );
     try t.expectEqual(

@@ -344,10 +344,10 @@ test "two paths to one peer never alias" {
     peer = (try peer.insert(t.allocator, .{ .ip = .{
         .ip = .{ .v4 = .{ 192, 0, 2, 7 } },
         .port = 7842,
-    } })).?;
+    } })) orelse return error.TestUnexpectedResult;
     peer = (try peer.insert(t.allocator, .{
         .custom = .{ .id = 0x2a, .data = &.{} },
-    })).?;
+    })) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(usize, 3), peer.addrs.len);
 
     var sockets: [3]SocketAddr = undefined;

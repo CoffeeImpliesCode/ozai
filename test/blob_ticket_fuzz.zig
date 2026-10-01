@@ -83,7 +83,7 @@ fn testOne(_: Context, smith: *t.Smith) anyerror!void {
 
 fn check(text: []const u8) !void {
     const alloc = t.allocator;
-    const decoded = BlobTicket.decodeString(text, alloc) catch |err| {
+    const decoded = BlobTicket.decodeString(alloc, text) catch |err| {
         // Oracle: the error set is closed, and every member of it names a rule
         // the text broke. The one that says nothing about the input is
         // `OutOfMemory`, so a decode that failed for any other reason is a
@@ -138,7 +138,7 @@ fn check(text: []const u8) !void {
     // holds for a ticket that had a custom transport, because the projection
     // is idempotent once it has happened; the first decode is where the loss
     // would show, and the oracle above is what catches that.
-    const second = try BlobTicket.decodeString(again, alloc);
+    const second = try BlobTicket.decodeString(alloc, again);
     defer second.deinit(alloc);
 
     var second_body: [reencode_len]u8 = undefined;

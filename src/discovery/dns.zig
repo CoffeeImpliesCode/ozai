@@ -130,7 +130,7 @@ pub const DnsAddressLookup = struct {
     /// cached answer has nothing to cancel, and saying so is different from
     /// having a cancellation that nobody fired.
     cancellation: ?resolve.Cancellation,
-    vtable: resolve.AddressLookup.VTable = dnsVTable,
+    vtable: resolve.AddressLookup.VTable = dns_vtable,
 
     pub fn init(
         origin: []const u8,
@@ -149,7 +149,7 @@ pub const DnsAddressLookup = struct {
     }
 };
 
-const dnsVTable: resolve.AddressLookup.VTable = .{
+const dns_vtable: resolve.AddressLookup.VTable = .{
     .publish = resolve.AddressLookup.ignore_publish,
     .resolve = dnsResolve,
 };
@@ -191,6 +191,10 @@ const DnsState = struct {
 
 fn dnsResolve(
     ctx: *anyopaque,
+    // `resolve.AddressLookup.VTable.resolve`'s parameter order: a vtable entry
+    // takes its context first and the allocator second, and the type every
+    // service in the tree implements is fixed there rather than here.
+    // ziglint-ignore: Z023
     alloc: std.mem.Allocator,
     node_id: addr.NodeId,
 ) resolve.ResolveError!?resolve.Stream {
@@ -215,13 +219,13 @@ fn dnsResolve(
     // means "cannot resolve at all" belongs to the publisher.
     return .{
         .state = @ptrCast(@alignCast(state)),
-        .vtable = &dnsStreamVTable,
+        .vtable = &dns_stream_vtable,
         .alloc = alloc,
         .status = .live,
     };
 }
 
-const dnsStreamVTable: resolve.Stream.VTable = .{
+const dns_stream_vtable: resolve.Stream.VTable = .{
     .next = dnsNext,
     .finish = dnsFinish,
     .cancel = dnsCancel,
@@ -251,6 +255,11 @@ fn dnsCancel(state: *anyopaque) void {
     if (self.parent.cancellation) |cancellation| cancellation.fire();
 }
 
+// `resolve.Stream.VTable.destroy`'s parameter order, for the reason
+// `dnsResolve` above gives: the state it is releasing, then the allocator the
+// stream was started with. A vtable entry is handed its arguments in the
+// order its type declares.
+// ziglint-ignore: Z023
 fn dnsDestroy(state: *anyopaque, alloc: std.mem.Allocator) void {
     const self: *DnsState = @ptrCast(@alignCast(state));
     // The arena owns the item, its address list and the bytes behind any custom
@@ -338,12 +347,14 @@ test "a TXT lookup yields one item, tagged as the dns service" {
         "relay=https://euw1-1.relay.iroh.network./\x00";
     var service = DnsAddressLookup.init(prod_origin, .init(records), null);
 
-    var stream = (try service.lookup().resolve(t.allocator, id)).?;
+    var stream = (try service.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
     defer stream.deinit();
 
     // Upstream's resolve is one `once_future`, so the stream has exactly one
     // pull that produces something and one that ends it.
-    const first = stream.next().?;
+    const first = stream.next() orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(item.Provenance.dns, first.item.provenance);
     try t.expectEqual(id, first.item.endpoint.node_id);
     try t.expectEqual(@as(usize, 3), first.item.endpoint.addrs.len);
@@ -358,10 +369,12 @@ test "a TXT answer that is not records fails the lookup, not the stream" {
         .init("relay=https://relay.example./\x00hostname=x\x00"),
         null,
     );
-    var stream = (try service.lookup().resolve(t.allocator, id)).?;
+    var stream = (try service.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
     defer stream.deinit();
 
-    const first = stream.next().?;
+    const first = stream.next() orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(error.MalformedRecord, first.failed.reason);
     try t.expectEqual(item.Provenance.dns, first.failed.provenance);
     try t.expect(stream.next() == null);
@@ -388,7 +401,8 @@ test "dropping a DNS stream stops the query behind it" {
     // Never pulled. The item was sitting there ready to be read and the caller
     // walked away, which is the case a stream that only cancels on `next` would
     // get wrong.
-    var stream = (try service.lookup().resolve(t.allocator, id)).?;
+    var stream = (try service.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(@as(u32, 0), cancels);
     stream.deinit();
     try t.expectEqual(@as(u32, 1), cancels);
@@ -402,10 +416,12 @@ test "an empty answer is a node that published nothing" {
     // `EndpointInfo::from_txt_lookup` over an empty `lookup`.
     const id = try key.NodeId.parseHex(upstream_id);
     var service = DnsAddressLookup.init(prod_origin, .init(""), null);
-    var stream = (try service.lookup().resolve(t.allocator, id)).?;
+    var stream = (try service.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
     defer stream.deinit();
 
-    const first = stream.next().?;
+    const first = stream.next() orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(@as(usize, 0), first.item.endpoint.addrs.len);
     try t.expectEqual(id, first.item.endpoint.node_id);
     try t.expect(stream.next() == null);

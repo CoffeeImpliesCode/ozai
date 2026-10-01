@@ -239,7 +239,7 @@ const Side = struct {
         errdefer self.socket.close();
         // Both transport keys are supplied rather than drawn from `t.io`: a
         // test whose Retry key differs on every run has failures that move.
-        self.bridge = try Bridge.create(t.io, t.allocator, .{
+        self.bridge = try Bridge.create(t.allocator, t.io, .{
             .secret = secret,
             .expect_peer = expect,
             .alpn = alpn,
@@ -268,6 +268,7 @@ const Side = struct {
         t.allocator.free(self.buf);
         self.map.deinit(t.allocator);
         self.socket.close();
+        self.* = undefined;
     }
 
     /// A generator over this side's own engine, good until the next call.
@@ -386,6 +387,7 @@ const Link = struct {
         self.closeDialed();
         self.client.deinit();
         self.server.deinit();
+        self.* = undefined;
     }
 
     /// Take the dialled connections out of the client's bridge, then free the
@@ -497,6 +499,9 @@ const Link = struct {
             var position: usize = 0;
             while (position < recv.datagramCount()) : (position += 1) {
                 const ingress = try side.bridge.recv(&side.map, .{
+                    // The loop's bound is `recv.datagramCount()`, and
+                    // `Recv.datagram` answers null only past that count.
+                    // zwanzig-disable-next-line: optional-unwrap
                     .bytes = recv.datagram(position).?,
                     .from = got.from,
                     .local = side.socket.address,
@@ -643,10 +648,10 @@ test "two endpoints meet on a loopback socket, and the dialled peer is the one t
     // connection the dialer was handed. `Dialer.dial` returns a `Conn` and
     // nothing else; if the bridge could not find the same connection by
     // walking its own table, the dial path would be a second one.
-    const dialled = link.client.bridge.connectionAt(0).?;
+    const dialled = link.client.bridge.connectionAt(0) orelse return error.NoConnection;
     try t.expectEqual(link.dialled.id(), dialled.id());
     try t.expect(dialled.established());
-    const accepted = link.server.bridge.connectionAt(0).?;
+    const accepted = link.server.bridge.connectionAt(0) orelse return error.NoConnection;
     try t.expect(accepted.established());
 
     // The addresses on both ends are the loopback ones the sockets came back
@@ -715,7 +720,8 @@ test "two endpoints meet on a loopback socket, and the dialled peer is the one t
     // And back the other way, on the same stream: a handshake that completes
     // and then goes silent is a handshake that works and a stack that does
     // not.
-    const server_stream = accepted.entry.conn.streams.getStream(stream.stream_id).?;
+    const server_stream = accepted.entry.conn.streams.getStream(stream.stream_id) orelse
+        return error.NoStream;
     try server_stream.send.writeData(answer);
     server_stream.send.close();
 
@@ -822,7 +828,10 @@ test "a dial that names a peer nobody is fails, and it fails at the certificate"
     // because it never accepted the certificate the id would have come out
     // of. A peer that was accepted and then found wanting would leave the id
     // behind instead.
-    const carried = dialled.entry.conn.tls13_hs.?;
+    const carried = dialled.entry.conn.tls13_hs orelse {
+        link.report("pin check", "the refused handshake kept no state to read the pin off");
+        return error.PinFailureNotInspectable;
+    };
     try t.expectEqual(@as(?[32]u8, null), carried.peerNodeId());
     try t.expectEqual(stranger.nodeId().toBytes(), carried.config.expect_peer_node_id.?);
 

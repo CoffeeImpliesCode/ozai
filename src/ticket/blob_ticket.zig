@@ -256,7 +256,7 @@ pub const BlobTicket = struct {
 
     /// postcard bytes to a ticket. The address list comes from `alloc`; see
     /// `deinit`.
-    pub fn decodeBytes(bytes: []const u8, alloc: Allocator) DecodeError!BlobTicket {
+    pub fn decodeBytes(alloc: Allocator, bytes: []const u8) DecodeError!BlobTicket {
         var reader = postcard.Reader.init(bytes);
         if (try reader.readU32() != @intFromEnum(WireVariant.variant0)) {
             return error.UnknownTicketVariant;
@@ -291,12 +291,12 @@ pub const BlobTicket = struct {
 
     /// A ticket's text form to a ticket. The base32 body is decoded through a
     /// fresh allocation, because its length is whatever the text said it was.
-    pub fn decodeString(text: []const u8, alloc: Allocator) DecodeError!BlobTicket {
+    pub fn decodeString(alloc: Allocator, text: []const u8) DecodeError!BlobTicket {
         const symbols = try shared.splitBody(kind, text);
         const raw = try alloc.alloc(u8, shared.byteLength(symbols.len));
         defer alloc.free(raw);
         try shared.decodeBase32(symbols, raw);
-        return decodeBytes(raw, alloc);
+        return decodeBytes(alloc, raw);
     }
 };
 
@@ -327,6 +327,9 @@ const t = std.testing;
 // — no iroh implementation publishes a blob ticket in text form — and is
 // pinned here so the derivation cannot drift.
 
+// Half-length buffers rule out NoSpaceLeft. Invalid captured hex therefore
+// fails the test that requested it, rather than terminating the whole runner.
+
 const golden_hex =
     "00" ++
     // endpoint id, 32 bytes
@@ -353,7 +356,7 @@ fn expectHexEqual(expected_hex: []const u8, got: []const u8) !void {
     var index: usize = 0;
     while (index < got.len) : (index += 1) {
         var nibble: [1]u8 = undefined;
-        _ = std.fmt.hexToBytes(&nibble, expected_hex[2 * index ..][0..2]) catch unreachable;
+        _ = try std.fmt.hexToBytes(&nibble, expected_hex[2 * index ..][0..2]);
         try t.expectEqual(nibble[0], got[index]);
     }
 }
@@ -363,17 +366,17 @@ fn expectHexEqual(expected_hex: []const u8, got: []const u8) !void {
 fn providerAddr(alloc: Allocator) !NodeAddr {
     const id = try NodeId.parseHex(golden_id_hex);
     var address = NodeAddr.init(id);
-    return (try address.insert(alloc, .{
-        .ip = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1234 },
-    })).?;
+    const socket: SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1234 };
+    return (try address.insert(alloc, .{ .ip = socket })) orelse
+        return error.TestUnexpectedResult;
 }
 
 test "golden: the blob ticket bytes, iroh-blobs src/ticket.rs" {
-    var bytes: [72]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, golden_hex) catch unreachable;
+    var bytes: [golden_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, golden_hex);
 
     const alloc = t.allocator;
-    const decoded = try BlobTicket.decodeBytes(bytes[0..68], alloc);
+    const decoded = try BlobTicket.decodeBytes(alloc, bytes[0..68]);
     defer decoded.deinit(alloc);
 
     try t.expectEqualStrings(golden_id_hex, decoded.addr.node_id.toHex()[0..]);
@@ -389,7 +392,7 @@ test "golden: the blob ticket bytes, iroh-blobs src/ticket.rs" {
 
 test "golden: the blob ticket text form" {
     const alloc = t.allocator;
-    const decoded = try BlobTicket.decodeString(golden_ticket, alloc);
+    const decoded = try BlobTicket.decodeString(alloc, golden_ticket);
     defer decoded.deinit(alloc);
 
     try t.expectEqualStrings(golden_id_hex, decoded.addr.node_id.toHex()[0..]);
@@ -416,7 +419,7 @@ test "the text form is a fixed point" {
     var first: [512]u8 = undefined;
     var second: [512]u8 = undefined;
     const once = try ticket.encodeString(encoded, &first);
-    const twice = try BlobTicket.decodeString(once, alloc);
+    const twice = try BlobTicket.decodeString(alloc, once);
     defer twice.deinit(alloc);
     const again = try twice.encodeString(try twice.encode(&body), &second);
 
@@ -431,14 +434,12 @@ test "a ticket with no custom transport round trips through variant 0 unchanged"
         try NodeId.parseHex(golden_id_hex),
         try RelayUrl.parse("https://relay.example/"),
     );
-    address = (try address.insert(alloc, .{ .ip = .{
-        .ip = .{ .v4 = .{ 192, 0, 2, 7 } },
-        .port = 41641,
-    } })).?;
-    address = (try address.insert(alloc, .{ .ip = .{
-        .ip = .{ .v6 = [_]u8{ 0x20, 0x01 } ** 8 },
-        .port = 443,
-    } })).?;
+    const v4: SocketAddr = .{ .ip = .{ .v4 = .{ 192, 0, 2, 7 } }, .port = 41641 };
+    const v6: SocketAddr = .{ .ip = .{ .v6 = [_]u8{ 0x20, 0x01 } ** 8 }, .port = 443 };
+    address = (try address.insert(alloc, .{ .ip = v4 })) orelse
+        return error.TestUnexpectedResult;
+    address = (try address.insert(alloc, .{ .ip = v6 })) orelse
+        return error.TestUnexpectedResult;
     defer address.deinit(alloc);
 
     const hash = try parseHashHex(golden_hash_hex);
@@ -455,7 +456,7 @@ test "a ticket with no custom transport round trips through variant 0 unchanged"
     var text: [512]u8 = undefined;
     const written = try ticket.encodeString(encoded, &text);
 
-    const decoded = try BlobTicket.decodeString(written, alloc);
+    const decoded = try BlobTicket.decodeString(alloc, written);
     defer decoded.deinit(alloc);
 
     try t.expectEqualStrings(golden_id_hex, decoded.addr.node_id.toHex()[0..]);
@@ -490,9 +491,9 @@ test "variant 0 drops a custom transport, and the ticket says so" {
         try NodeId.parseHex(golden_id_hex),
         try RelayUrl.parse("https://relay.example/"),
     );
-    address = (try address.insert(alloc, .{
-        .custom = try addr.CustomAddr.parse("2a_abab", &storage),
-    })).?;
+    const custom = try addr.CustomAddr.parse("2a_abab", &storage);
+    address = (try address.insert(alloc, .{ .custom = custom })) orelse
+        return error.TestUnexpectedResult;
     defer address.deinit(alloc);
 
     const hash = try parseHashHex(golden_hash_hex);
@@ -513,7 +514,7 @@ test "variant 0 drops a custom transport, and the ticket says so" {
     var text: [512]u8 = undefined;
     const written = try ticket.encodeString(encoded, &text);
 
-    const decoded = try BlobTicket.decodeString(written, alloc);
+    const decoded = try BlobTicket.decodeString(alloc, written);
     defer decoded.deinit(alloc);
 
     // The loss is real, not a report of one: the custom transport is simply
@@ -532,8 +533,10 @@ test "variant 0 keeps one relay out of several, and the ticket says which" {
     var address = try NodeAddr.withRelay(alloc, id, try RelayUrl.parse("https://a.example./"));
     const second: TransportAddr = .{ .relay = try RelayUrl.parse("https://b.example./") };
     const third: TransportAddr = .{ .relay = try RelayUrl.parse("https://c.example./") };
-    address = (try address.insert(alloc, second)).?;
-    address = (try address.insert(alloc, third)).?;
+    address = (try address.insert(alloc, second)) orelse
+        return error.TestUnexpectedResult;
+    address = (try address.insert(alloc, third)) orelse
+        return error.TestUnexpectedResult;
     defer address.deinit(alloc);
 
     const ticket = BlobTicket.new(address, try parseHashHex(golden_hash_hex), .raw);
@@ -544,7 +547,7 @@ test "variant 0 keeps one relay out of several, and the ticket says which" {
     const encoded = try ticket.encode(&body);
     try t.expectEqual(@as(usize, 2), encoded.loss.relays);
 
-    const decoded = try BlobTicket.decodeBytes(encoded.bytes, alloc);
+    const decoded = try BlobTicket.decodeBytes(alloc, encoded.bytes);
     defer decoded.deinit(alloc);
     try t.expectEqual(@as(usize, 1), decoded.addr.addrs.len);
     // `relay_urls().next()` is the first in `TransportAddr.order`, which is
@@ -554,32 +557,34 @@ test "variant 0 keeps one relay out of several, and the ticket says which" {
 
 test "a foreign kind prefix is not a blob ticket" {
     const alloc = t.allocator;
-    try t.expectError(error.UnknownKind, BlobTicket.decodeString("", alloc));
-    try t.expectError(error.UnknownKind, BlobTicket.decodeString("endpoint", alloc));
+    try t.expectError(error.UnknownKind, BlobTicket.decodeString(alloc, ""));
+    try t.expectError(error.UnknownKind, BlobTicket.decodeString(alloc, "endpoint"));
     try t.expectError(
         error.UnknownKind,
-        BlobTicket.decodeString("Blob" ++ golden_ticket["blob".len..], alloc),
+        BlobTicket.decodeString(alloc, "Blob" ++ golden_ticket["blob".len..]),
     );
-    try t.expectError(error.UnknownKind, BlobTicket.decodeString(" blob", alloc));
-    try t.expectError(error.UnknownKind, BlobTicket.decodeString("bl", alloc));
+    try t.expectError(error.UnknownKind, BlobTicket.decodeString(alloc, " blob"));
+    try t.expectError(error.UnknownKind, BlobTicket.decodeString(alloc, "bl"));
 }
 
 test "a body that is not whole bytes is refused" {
-    try t.expectError(error.BadBase32Length, BlobTicket.decodeString("bloba", t.allocator));
-    try t.expectError(error.BadBase32Length, BlobTicket.decodeString("blobaaaaaa", t.allocator));
+    try t.expectError(error.BadBase32Length, BlobTicket.decodeString(t.allocator, "bloba"));
+    try t.expectError(error.BadBase32Length, BlobTicket.decodeString(t.allocator, "blobaaaaaa"));
 }
 
 test "a character outside the alphabet is refused" {
-    try t.expectError(error.BadBase32Symbol, BlobTicket.decodeString("bloba0", t.allocator));
-    try t.expectError(error.BadBase32Symbol, BlobTicket.decodeString("bloba!", t.allocator));
+    try t.expectError(error.BadBase32Symbol, BlobTicket.decodeString(t.allocator, "bloba0"));
+    try t.expectError(error.BadBase32Symbol, BlobTicket.decodeString(t.allocator, "bloba!"));
 }
 
 test "trailing bytes after the body are refused" {
     const alloc = t.allocator;
-    var bytes: [72]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, golden_hex) catch unreachable;
+    // One byte past the vector, so the byte this test adds past the body has
+    // somewhere to land.
+    var bytes: [golden_hex.len / 2 + 1]u8 = undefined;
+    _ = try std.fmt.hexToBytes(bytes[0 .. golden_hex.len / 2], golden_hex);
     bytes[68] = 0x00;
-    try t.expectError(error.TrailingBytes, BlobTicket.decodeBytes(bytes[0..69], alloc));
+    try t.expectError(error.TrailingBytes, BlobTicket.decodeBytes(alloc, bytes[0..69]));
 
     var text: [128]u8 = undefined;
     @memcpy(text[0..golden_ticket.len], golden_ticket);
@@ -587,48 +592,48 @@ test "trailing bytes after the body are refused" {
     text[golden_ticket.len + 1] = 'a';
     try t.expectError(
         error.TrailingBytes,
-        BlobTicket.decodeString(text[0 .. golden_ticket.len + 2], alloc),
+        BlobTicket.decodeString(alloc, text[0 .. golden_ticket.len + 2]),
     );
 }
 
 test "a truncated body is refused" {
     const alloc = t.allocator;
-    var bytes: [72]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, golden_hex) catch unreachable;
+    var bytes: [golden_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, golden_hex);
     // Every cut of this vector is `UnexpectedEnd` and none of them is
     // `BadLength`, which is a fact about the vector and not a rule: its only
     // length prefix is a zero direct-address count, so no cut can leave a
     // prefix claiming more than the bytes behind it. The case where it does
     // is a test of its own below.
     for ([_]usize{ 0, 1, 8, 32, 33, 34, 35, 36, 40, 67 }) |length| {
-        try t.expectError(error.UnexpectedEnd, BlobTicket.decodeBytes(bytes[0..length], alloc));
+        try t.expectError(error.UnexpectedEnd, BlobTicket.decodeBytes(alloc, bytes[0..length]));
     }
 }
 
 test "a format this build has no arm for is refused" {
     const alloc = t.allocator;
-    var bytes: [72]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, golden_hex) catch unreachable;
+    var bytes: [golden_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, golden_hex);
     // 68 bytes, laid out: variant 0, the id at 1..33, the relay option at 33,
     // the direct count at 34, the format at 35, and the hash at 36..68.
     bytes[35] = 0x07;
-    try t.expectError(error.UnknownVariant, BlobTicket.decodeBytes(bytes[0..68], alloc));
+    try t.expectError(error.UnknownVariant, BlobTicket.decodeBytes(alloc, bytes[0..68]));
 }
 
 test "a wire variant this build has no arm for is refused" {
     const alloc = t.allocator;
-    var bytes: [72]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, golden_hex) catch unreachable;
+    var bytes: [golden_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, golden_hex);
     bytes[0] = 0x01;
-    try t.expectError(error.UnknownTicketVariant, BlobTicket.decodeBytes(bytes[0..68], alloc));
+    try t.expectError(error.UnknownTicketVariant, BlobTicket.decodeBytes(alloc, bytes[0..68]));
 }
 
 test "an endpoint id that is not a point is refused" {
     const alloc = t.allocator;
-    var bytes: [72]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, golden_hex) catch unreachable;
+    var bytes: [golden_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, golden_hex);
     @memset(bytes[1..33], 0xff);
-    try t.expectError(error.NotANodeId, BlobTicket.decodeBytes(bytes[0..68], alloc));
+    try t.expectError(error.NotANodeId, BlobTicket.decodeBytes(alloc, bytes[0..68]));
 }
 
 test "a relay url the address layer will not take is refused" {
@@ -643,19 +648,19 @@ test "a relay url the address layer will not take is refused" {
     try writer.writeVariant(BlobFormat.raw);
     try writer.writeArray(hash_length, &try parseHashHex(golden_hash_hex));
 
-    try t.expectError(error.BadRelayUrl, BlobTicket.decodeBytes(writer.finish(), alloc));
+    try t.expectError(error.BadRelayUrl, BlobTicket.decodeBytes(alloc, writer.finish()));
 }
 
 test "a direct address list longer than the body is refused" {
     const alloc = t.allocator;
-    var bytes: [72]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, golden_hex) catch unreachable;
+    var bytes: [golden_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, golden_hex);
     // A peer may name any `u64` and the bytes behind it do not have to exist.
     bytes[34] = 0xff;
     bytes[35] = 0xff;
     bytes[36] = 0xff;
     bytes[37] = 0x7f;
-    try t.expectError(error.BadLength, BlobTicket.decodeBytes(bytes[0..68], alloc));
+    try t.expectError(error.BadLength, BlobTicket.decodeBytes(alloc, bytes[0..68]));
 }
 
 test "a direct address sent twice is one address" {
@@ -674,7 +679,7 @@ test "a direct address sent twice is one address" {
 
     // postcard reads a `BTreeSet` by inserting, so upstream collapses this
     // too, and the re-encode is the shorter spelling.
-    const decoded = try BlobTicket.decodeBytes(writer.finish(), alloc);
+    const decoded = try BlobTicket.decodeBytes(alloc, writer.finish());
     defer decoded.deinit(alloc);
     try t.expectEqual(@as(usize, 1), decoded.addr.addrs.len);
 

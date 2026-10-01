@@ -279,25 +279,50 @@ pub fn build(b: *std.Build) void {
     });
     two_process_mod.addImport("ozai", lib_mod);
     two_process_mod.link_libc = true;
+    // An install path can name a stale native or uninstrumented child when a
+    // test build uses another prefix, target, or coverage mode. The emitted
+    // path and its options dependency select and build that exact child.
+    const node_test_options = b.addOptions();
+    node_test_options.addOptionPath("node_executable", node_exe.getEmittedBin());
+    two_process_mod.addOptions("node_test_options", node_test_options);
     const two_process_tests = b.addTest(.{
         .root_module = two_process_mod,
         .test_runner = .{ .path = b.path("test/expected_log_runner.zig"), .mode = .server },
     });
     const run_two_process_tests = b.addRunArtifact(two_process_tests);
-    // The binary it runs is the one `zig build` installs, so installing it is a
-    // dependency of the run step rather than something the test builds a second
-    // copy of.
-    run_two_process_tests.step.dependOn(b.getInstallStep());
+
+    // The relay reached the way a peer reaches one: by a relay URL, over a
+    // real socket, against a relay that did not place it. Wired like the four
+    // artifacts above and for the same reason — it opens sockets, so it needs
+    // `link_libc` — and it runs under the same custom runner with no
+    // `--expect-log`, because nothing in it provokes an error-level log on
+    // purpose and an error log here is a finding about the relay rather than
+    // an expectation.
+    const relay_wire_mod = b.createModule(.{
+        .root_source_file = b.path("test/relay_wire_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    relay_wire_mod.addImport("ozai", lib_mod);
+    relay_wire_mod.link_libc = true;
+    const relay_wire_tests = b.addTest(.{
+        .root_module = relay_wire_mod,
+        .test_runner = .{ .path = b.path("test/expected_log_runner.zig"), .mode = .server },
+    });
+    const run_relay_wire_tests = b.addRunArtifact(relay_wire_tests);
 
     // Coverage instrumentation is opt-in because it pins the LLVM backend,
-    // links the zig-cov runtime into the test binary, and makes that binary
-    // write a `.zcov` file on exit; none of that belongs in a plain build.
-    // `zig-cov test` turns it on by passing both options below. Every test
-    // artifact is instrumented, the loopback one included: it reaches code
-    // nothing else reaches — the socket, and both halves of the stack around
-    // it — and an uninstrumented one under-reports in silence rather than
-    // failing.
-    const coverage = b.option(bool, "coverage", "Instrument the test binaries") orelse false;
+    // links the zig-cov runtime into the artifacts, and makes them write a
+    // `.zcov` file on exit; none of that belongs in a plain build.
+    // Process tests drive the node child. Instrument that same compile too —
+    // it is the artifact the options module above hands them, not a second
+    // copy of it — or those tests leave the CLI, signal readiness, and live
+    // snapshots unmeasured.
+    const coverage = b.option(
+        bool,
+        "coverage",
+        "Instrument tests and their node child",
+    ) orelse false;
     const coverage_rt = b.option([]const u8, "coverage-rt", "Path to zig-cov-rt.o");
     if (coverage) {
         const rt = coverage_rt orelse std.debug.panic(
@@ -305,6 +330,17 @@ pub fn build(b: *std.Build) void {
                 "Run coverage through `zig-cov test`, which passes both.",
             .{},
         );
+
+        // The fuzz runtime's `runner_*` callbacks, which every artifact below
+        // links once `fuzz` is on and none of them can ever be reached: the
+        // test runners among them refuse the start message that is the only
+        // way into `fuzzer_main`, and the node is not a test and has no runner
+        // to ask. One module owns all seven so the answer is written once.
+        const coverage_abi_mod = b.createModule(.{
+            .root_source_file = b.path("test/coverage_abi.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
         for ([_]*std.Build.Step.Compile{
             lib_unit_tests,
             integration_tests,
@@ -312,6 +348,8 @@ pub fn build(b: *std.Build) void {
             protocol_tests,
             transfer_tests,
             two_process_tests,
+            relay_wire_tests,
+            node_exe,
         }) |artifact| {
             // The self-hosted backends emit no counters, `fuzz` is the only
             // switch that makes LLVM emit them, and the runtime flushes from a
@@ -320,6 +358,11 @@ pub fn build(b: *std.Build) void {
             artifact.root_module.fuzz = true;
             artifact.root_module.link_libc = true;
             artifact.root_module.addObjectFile(.{ .cwd_relative = rt });
+            // Attached to the root of each of them, so `test/coverage_abi.zig`
+            // resolves from the node's own `main` as well as from a runner
+            // compiled into a test artifact. A root that does not reach it
+            // keeps no import to name and is unaffected outside coverage.
+            artifact.root_module.addImport("coverage_abi", coverage_abi_mod);
         }
     }
 
@@ -330,6 +373,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_protocol_tests.step);
     test_step.dependOn(&run_transfer_tests.step);
     test_step.dependOn(&run_two_process_tests.step);
+    test_step.dependOn(&run_relay_wire_tests.step);
     test_step.dependOn(&run_invariants_tests.step);
 
     // fuzzing
@@ -407,8 +451,8 @@ test {
 /// here and nowhere else: the gate runs on every `zig build test` and may not
 /// read the filesystem, because it audits a tree by embedding it.
 fn collectVendoredSources(
-    io: std.Io,
     gpa: std.mem.Allocator,
+    io: std.Io,
     dir: std.Io.Dir,
     prefix: []const u8,
     out: *std.ArrayList([]const u8),
@@ -418,7 +462,7 @@ fn collectVendoredSources(
         if (entry.kind == .directory) {
             var sub = try dir.openDir(io, entry.name, .{ .iterate = true });
             defer sub.close(io);
-            try collectVendoredSources(io, gpa, sub, try std.fmt.allocPrint(gpa, "{s}{s}/", .{
+            try collectVendoredSources(gpa, io, sub, try std.fmt.allocPrint(gpa, "{s}{s}/", .{
                 prefix,
                 entry.name,
             }), out);
@@ -444,7 +488,7 @@ fn checkVendoredFileList(b: *std.Build) void {
         std.debug.panic("cannot read {s}: {s}", .{ root, @errorName(err) });
     };
     defer dir.close(io);
-    collectVendoredSources(io, gpa, dir, "", &found) catch |err| {
+    collectVendoredSources(gpa, io, dir, "", &found) catch |err| {
         std.debug.panic("cannot walk {s}: {s}", .{ root, @errorName(err) });
     };
 

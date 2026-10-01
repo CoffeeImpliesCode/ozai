@@ -132,6 +132,10 @@ fn ignorePublish(_: *anyopaque, _: Published) void {}
 
 fn refuseResolve(
     _: *anyopaque,
+    // `AddressLookup.refuse_resolve`'s parameter order: the vtable entry takes
+    // its context first and the allocator second, and the type is declared on
+    // the public `AddressLookup` rather than here.
+    // ziglint-ignore: Z023
     _: std.mem.Allocator,
     _: addr.NodeId,
 ) ResolveError!?Stream {
@@ -306,6 +310,13 @@ pub const Stream = struct {
         return self.vtable.finish(self.state);
     }
 
+    // `.closed` is this stream's terminal state, and it is what `next` reads to
+    // answer as finished after a close; the guard that skips an already-closed
+    // stream is what makes a second `deinit` a no-op rather than a second
+    // cancel of a retrieval that is already gone. Z030 recognises a fixed list
+    // of terminal field names and `status` is not on it, so the write it cannot
+    // see is here to be read.
+    // ziglint-ignore: Z030
     /// Stop the work and release the state. Idempotent.
     ///
     /// The producer is told to stop exactly once, on every path, and a stream
@@ -634,7 +645,7 @@ pub const PkarrPublisher = struct {
     /// take-ownership swap, into the same one slot, read by a background task
     /// that republishes on a timer.
     stored: ?item.Item,
-    vtable: AddressLookup.VTable = publisherVTable,
+    vtable: AddressLookup.VTable = publisher_vtable,
 
     /// The allocator is taken here and held rather than taken per call, because
     /// the one slot has to be given back on the next `publish` and on `deinit`
@@ -643,6 +654,12 @@ pub const PkarrPublisher = struct {
         return .{ .alloc = alloc, .stored = null };
     }
 
+    // The slot is given back and then nulled, and null is the terminal state:
+    // `published` answers null, a second `deinit` frees nothing, and the next
+    // `publish` starts a fresh slot. Z030 recognises a fixed list of terminal
+    // field names and `stored` is not on it, so the `= null` it cannot see is
+    // here to be read.
+    // ziglint-ignore: Z030
     /// The one slot has to be given back. Not a vtable entry, because the
     /// vtable is a borrowed view: see `AddressLookup`.
     pub fn deinit(self: *PkarrPublisher) void {
@@ -718,7 +735,7 @@ pub const PkarrPublisher = struct {
     }
 };
 
-const publisherVTable: AddressLookup.VTable = .{
+const publisher_vtable: AddressLookup.VTable = .{
     .publish = publisherPublish,
     .resolve = AddressLookup.refuse_resolve,
 };
@@ -742,7 +759,7 @@ fn publisherPublish(ctx: *anyopaque, data: Published) void {
 /// "what the network says about that node" the same value.
 pub const PkarrResolver = struct {
     source: PacketSource,
-    vtable: AddressLookup.VTable = resolverVTable,
+    vtable: AddressLookup.VTable = resolver_vtable,
 
     pub fn init(source: PacketSource) PkarrResolver {
         return .{ .source = source };
@@ -753,7 +770,7 @@ pub const PkarrResolver = struct {
     }
 };
 
-const resolverVTable: AddressLookup.VTable = .{
+const resolver_vtable: AddressLookup.VTable = .{
     .publish = AddressLookup.ignore_publish,
     .resolve = resolverResolve,
 };
@@ -789,6 +806,10 @@ const PkarrState = struct {
 
 fn resolverResolve(
     ctx: *anyopaque,
+    // `AddressLookup.VTable.resolve`'s parameter order: a vtable entry takes
+    // its context first and the allocator second, and the type every service
+    // in the tree implements is fixed on `AddressLookup`.
+    // ziglint-ignore: Z023
     alloc: std.mem.Allocator,
     node_id: addr.NodeId,
 ) ResolveError!?Stream {
@@ -807,13 +828,13 @@ fn resolverResolve(
     state.alloc = state.arena.allocator();
     return .{
         .state = @ptrCast(@alignCast(state)),
-        .vtable = &pkarrStreamVTable,
+        .vtable = &pkarr_stream_vtable,
         .alloc = alloc,
         .status = .live,
     };
 }
 
-const pkarrStreamVTable: Stream.VTable = .{
+const pkarr_stream_vtable: Stream.VTable = .{
     .next = pkarrNext,
     .finish = pkarrFinish,
     .cancel = pkarrCancel,
@@ -866,6 +887,10 @@ fn pkarrCancel(state: *anyopaque) void {
     if (self.parent.source.cancellation) |cancellation| cancellation.fire();
 }
 
+// `Stream.VTable.destroy`'s parameter order, for the reason `resolverResolve`
+// above gives: the state being released, then the allocator the stream was
+// started with.
+// ziglint-ignore: Z023
 fn pkarrDestroy(state: *anyopaque, alloc: std.mem.Allocator) void {
     const self: *PkarrState = @ptrCast(@alignCast(state));
     // The arena owns every item, their address lists and the bytes behind any
@@ -979,12 +1004,13 @@ test "cannot resolve and resolved to nothing are different answers" {
     // A service that was asked, ran, and had nothing to say. The answer set is
     // empty because the relay answered with no packets, which is a real state of
     // the world: a node that has published nothing.
-    var relay = FakeRelay{
+    var relay: FakeRelay = .{
         .answers = "",
         .packets = &.{},
     };
     var resolver = PkarrResolver.init(relay.source());
-    var stream = (try resolver.lookup().resolve(t.allocator, id)).?;
+    var stream = (try resolver.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
     defer stream.deinit();
     try t.expect(stream.next() == null);
 
@@ -1000,7 +1026,7 @@ test "cannot resolve and resolved to nothing are different answers" {
 
 test "dropping a stream stops the work behind it" {
     const id = try corpusId(3);
-    var relay = FakeRelay{
+    var relay: FakeRelay = .{
         .answers = "signed\x00signed\x00",
         .packets = &.{
             .{ .node_id = id, .txt = .init("relay=https://relay.example./\x00") },
@@ -1012,7 +1038,8 @@ test "dropping a stream stops the work behind it" {
     // Abandoned part-drained, with a second answer still waiting: the case a
     // future-driven stream gets wrong, because nothing in the caller's control
     // has to happen for the work behind it to keep going.
-    var stream = (try resolver.lookup().resolve(t.allocator, id)).?;
+    var stream = (try resolver.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
     try t.expect(stream.next() != null);
     // Nothing has been told to stop yet, and saying so is the half of the
     // assertion that makes the other half mean anything.
@@ -1023,12 +1050,13 @@ test "dropping a stream stops the work behind it" {
 
 test "a drained stream is cancelled exactly once too" {
     const id = try corpusId(3);
-    var relay = FakeRelay{
+    var relay: FakeRelay = .{
         .answers = "signed\x00",
         .packets = &.{.{ .node_id = id, .txt = .init("relay=https://relay.example./\x00") }},
     };
     var resolver = PkarrResolver.init(relay.source());
-    var stream = (try resolver.lookup().resolve(t.allocator, id)).?;
+    var stream = (try resolver.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
     try t.expect(stream.next() != null);
     try t.expect(stream.next() == null);
     try t.expectEqual(@as(?usize, 1), stream.finish().itemCount());
@@ -1048,7 +1076,7 @@ test "a resolver with no retrieval in flight still runs and still frees" {
     // stored-answer-set shape rather than the production one, and it has to
     // work because that is how a cache is read back.
     const id = try corpusId(4);
-    var relay = FakeRelay{
+    var relay: FakeRelay = .{
         .answers = "signed\x00",
         .packets = &.{.{ .node_id = id, .txt = .init("addr=127.0.0.1:1234\x00") }},
     };
@@ -1058,7 +1086,8 @@ test "a resolver with no retrieval in flight still runs and still frees" {
         .answers = .init("signed\x00"),
         .cancellation = null,
     });
-    var stream = (try resolver.lookup().resolve(t.allocator, id)).?;
+    var stream = (try resolver.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
     try t.expect(stream.next() != null);
     try t.expect(stream.next() == null);
     try t.expectEqual(@as(?usize, 1), stream.finish().itemCount());
@@ -1185,7 +1214,7 @@ test "a packet signed for another node is reported, not returned" {
     // with another's record is obeyed. ozai reports it instead.
     const id = try corpusId(7);
     const other = try corpusId(8);
-    var relay = FakeRelay{
+    var relay: FakeRelay = .{
         .answers = "signed\x00signed\x00",
         .packets = &.{
             .{ .node_id = other, .txt = .init("relay=https://elsewhere.example./\x00") },
@@ -1193,15 +1222,18 @@ test "a packet signed for another node is reported, not returned" {
         },
     };
     var resolver = PkarrResolver.init(relay.source());
-    var stream = (try resolver.lookup().resolve(t.allocator, id)).?;
+    var stream = (try resolver.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
     defer stream.deinit();
 
-    const first = stream.next().?;
+    const first = stream.next() orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(error.UnexpectedSigner, first.failed.reason);
     try t.expectEqual(item.Provenance.pkarr, first.failed.provenance);
     // The failure did not end the stream, so the packet that *was* signed for
     // this node still arrives behind it.
-    const second = stream.next().?;
+    const second = stream.next() orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(id, second.item.endpoint.node_id);
     try t.expect(stream.next() == null);
     try t.expectEqual(@as(?usize, 1), stream.finish().itemCount());
@@ -1209,17 +1241,20 @@ test "a packet signed for another node is reported, not returned" {
 
 test "a packet that will not decode fails one answer and not the stream" {
     const id = try corpusId(7);
-    var relay = FakeRelay{
+    var relay: FakeRelay = .{
         .answers = "garbage\x00signed\x00",
         .packets = &.{.{ .node_id = id, .txt = .init("relay=https://relay.example./\x00") }},
     };
     var resolver = PkarrResolver.init(relay.source());
-    var stream = (try resolver.lookup().resolve(t.allocator, id)).?;
+    var stream = (try resolver.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
     defer stream.deinit();
 
-    const first = stream.next().?;
+    const first = stream.next() orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(error.MalformedPacket, first.failed.reason);
-    const second = stream.next().?;
+    const second = stream.next() orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(id, second.item.endpoint.node_id);
     try t.expect(stream.next() == null);
 }
@@ -1264,7 +1299,8 @@ test "published records read back as the address that was published" {
     defer arena.deinit();
     const read = try parseTxt(arena.allocator(), id, .init(records), .pkarr);
     defer read.endpoint.deinit(arena.allocator());
-    const stored = publisher.published().?;
+    const stored = publisher.published() orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(stored.endpoint.node_id, read.endpoint.node_id);
     try t.expectEqual(stored.endpoint.addrs.len, read.endpoint.addrs.len);
     for (stored.endpoint.addrs, read.endpoint.addrs) |left, right| {
@@ -1287,7 +1323,7 @@ test "resolver output is what merge and order are for" {
     const dns_id = try key.NodeId.parseHex(upstream_id);
     const pkarr_id = try corpusId(9);
     const records = "relay=https://use1-1.relay.iroh.network./\x00addr=192.0.2.9:9999\x00";
-    var relay = FakeRelay{
+    var relay: FakeRelay = .{
         .answers = "signed\x00",
         .packets = &.{.{ .node_id = pkarr_id, .txt = .init(records) }},
     };
@@ -1295,7 +1331,8 @@ test "resolver output is what merge and order are for" {
 
     var pulled: [1]item.Item = undefined;
     {
-        var stream = (try resolver.lookup().resolve(t.allocator, pkarr_id)).?;
+        var stream = (try resolver.lookup().resolve(t.allocator, pkarr_id)) orelse
+            return error.TestUnexpectedResult;
         defer stream.deinit();
         var count: usize = 0;
         var failed_count: usize = 0;

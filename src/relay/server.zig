@@ -529,29 +529,33 @@ pub fn Registry(comptime inactive_depth: usize) type {
             /// Connections this node id opened that a later one displaced,
             /// newest last. Upstream `inactive: Vec<Client>`.
             inactive: struct {
+                // Registry already defines Self; that alias is ambiguous here.
+                // ziglint-ignore: Z022
+                const Inactive = @This();
+
                 ids: [inactive_depth]ConnectionId,
                 len: usize,
 
-                fn pop(self: *@This()) ?ConnectionId {
+                fn pop(self: *Inactive) ?ConnectionId {
                     if (self.len == 0) return null;
                     self.len -= 1;
                     return self.ids[self.len];
                 }
 
-                fn push(self: *@This(), id: ConnectionId) error{TooManyDuplicateConnections}!void {
+                fn push(self: *Inactive, id: ConnectionId) error{TooManyDuplicateConnections}!void {
                     if (self.len == self.ids.len) return error.TooManyDuplicateConnections;
                     self.ids[self.len] = id;
                     self.len += 1;
                 }
 
-                fn holds(self: @This(), id: ConnectionId) bool {
+                fn holds(self: Inactive, id: ConnectionId) bool {
                     for (self.ids[0..self.len]) |candidate| {
                         if (candidate == id) return true;
                     }
                     return false;
                 }
 
-                fn forget(self: *@This(), id: ConnectionId) void {
+                fn forget(self: *Inactive, id: ConnectionId) void {
                     for (self.ids[0..self.len], 0..) |*candidate, offset| {
                         if (candidate.* != id) continue;
                         // Newest last, and the order is what decides which
@@ -716,7 +720,7 @@ pub fn Registry(comptime inactive_depth: usize) type {
         ) Unregister {
             const index = self.find(node_id) orelse return .already_gone;
             const entry = self.entryAt(index);
-            const ended = Disconnection{ .node_id = node_id, .connection_id = connection_id };
+            const ended: Disconnection = .{ .node_id = node_id, .connection_id = connection_id };
 
             // The connection id is what tells the three cases apart, and it is
             // why upstream passes one (`server/clients.rs:110-121`).
@@ -830,21 +834,22 @@ const t = std.testing;
 /// A key from a fixed seed, so the node ids below name the same nodes on
 /// every run.
 ///
-/// The only failure `fromSeed` has is a degenerate seed, and finding one
-/// takes a specific byte pattern rather than any uniform fill.
-fn testSecret(seed: u8) key.SecretKey {
-    return key.SecretKey.fromSeed([_]u8{seed} ** key.SecretKey.seed_length) catch unreachable;
+/// `fromSeed` fails only on a degenerate seed, which a uniform fill is not.
+/// The error is propagated rather than asserted away anyway: a seed that was
+/// somehow not accepted fails the test that named it, not the whole run.
+fn testSecret(seed: u8) !key.SecretKey {
+    return key.SecretKey.fromSeed([_]u8{seed} ** key.SecretKey.seed_length);
 }
 
 /// The node id that key claims.
-fn testNodeId(seed: u8) NodeId {
-    return testSecret(seed).nodeId();
+fn testNodeId(seed: u8) !NodeId {
+    return (try testSecret(seed)).nodeId();
 }
 
 /// A challenge from a fixed pattern. Upstream draws these from a CSPRNG; the
 /// machine is handed one instead, which is the same reason the relay is
 /// handed the key material it will export.
-const test_challenge = frame.ServerChallenge{ .challenge = @splat(0x5a) };
+const test_challenge: frame.ServerChallenge = .{ .challenge = @splat(0x5a) };
 
 /// A stand-in for a TLS exporter, of the shape upstream's own test uses
 /// (`handshake.rs:640-657`): two ends handed the same number derive the same
@@ -856,7 +861,7 @@ fn exported(shared: u64) client.KeyMaterial {
 }
 
 test "key material carries the handshake without a frame in between" {
-    const secret = testSecret(1);
+    const secret = try testSecret(1);
     const material = exported(42);
     const credential = client.KeyMaterialAuth.create(&secret, material) orelse
         return error.TestUnexpectedResult;
@@ -880,7 +885,7 @@ test "key material carries the handshake without a frame in between" {
 }
 
 test "a key material verify that fails falls back instead of failing" {
-    const secret = testSecret(2);
+    const secret = try testSecret(2);
     const credential = client.KeyMaterialAuth.create(&secret, exported(10)) orelse
         return error.TestUnexpectedResult;
 
@@ -916,7 +921,7 @@ test "a key material verify that fails falls back instead of failing" {
 }
 
 test "every failed key material verify falls back, and says which it was" {
-    const secret = testSecret(3);
+    const secret = try testSecret(3);
     const material = exported(7);
     const credential = client.KeyMaterialAuth.create(&secret, material) orelse
         return error.TestUnexpectedResult;
@@ -934,8 +939,8 @@ test "every failed key material verify falls back, and says which it was" {
 
     // A well-formed credential whose signature does not verify: a client
     // with a broken key, not a broken proxy.
-    const wrong = testSecret(4);
-    const forged = client.KeyMaterialAuth{
+    const wrong = try testSecret(4);
+    const forged: client.KeyMaterialAuth = .{
         .node_id = credential.node_id,
         .signature = wrong.sign(material[0..16]),
         .key_material_suffix = credential.key_material_suffix,
@@ -984,7 +989,7 @@ test "no credential is a challenge, and is not a failure" {
 }
 
 test "a challenge answered with a bad signature is denied, not retried" {
-    const wrong = testSecret(5);
+    const wrong = try testSecret(5);
     const offered = step(.opened, .{ .offered = .{
         .credential = .none,
         .material = null,
@@ -993,8 +998,8 @@ test "a challenge answered with a bad signature is denied, not retried" {
     // Claiming one node id and signing with another: the relay verifies the
     // signature under the claimed id, so this is the only shape of a bad
     // answer, and it is the one upstream's `ClientAuth::verify` rejects.
-    const forged = frame.ClientAuth{
-        .node_id = testNodeId(20),
+    const forged: frame.ClientAuth = .{
+        .node_id = try testNodeId(20),
         .signature = wrong.sign(&client.messageToSign(test_challenge)),
     };
     const refused = step(offered.state, .{ .frame = .{ .client_auth = forged } });
@@ -1006,8 +1011,8 @@ test "a challenge answered with a bad signature is denied, not retried" {
 }
 
 test "access control decides, and a bare denial carries the default reason" {
-    const secret = testSecret(6);
-    const proof = Proof{ .node_id = secret.nodeId(), .mechanism = .signed_challenge };
+    const secret = try testSecret(6);
+    const proof: Proof = .{ .node_id = secret.nodeId(), .mechanism = .signed_challenge };
     const with_reason = step(.{ .authenticated = proof }, .{ .access = .{ .deny = "no" } });
     try t.expectEqualStrings("no", with_reason.state.denied.reason);
     try t.expectEqualStrings("no", with_reason.action.?.write.server_denies_auth.reason);
@@ -1031,7 +1036,7 @@ test "a relay reads nothing before the credential, and asks nobody before a proo
     try t.expectEqual(Action.close, early_access.action.?);
     try t.expectEqual(Failure.out_of_order, early_access.state.failed);
 
-    const challenged = State{ .challenged = .{
+    const challenged: State = .{ .challenged = .{
         .challenge = test_challenge,
         .key_material_failure = null,
     } };
@@ -1055,8 +1060,8 @@ test "a relay reads nothing before the credential, and asks nobody before a proo
     // decision upstream is holding a `SuccessfulAuthentication` and reading
     // nothing, so a frame or a second upgrade request arriving here is out
     // of order for the same reason it is one step earlier.
-    const proof = Proof{ .node_id = testNodeId(21), .mechanism = .signed_challenge };
-    const proved = State{ .authenticated = proof };
+    const proof: Proof = .{ .node_id = try testNodeId(21), .mechanism = .signed_challenge };
+    const proved: State = .{ .authenticated = proof };
     try t.expectEqual(
         Failure{ .unexpected_frame = .pong },
         step(proved, .{ .frame = .{ .pong = @splat(1) } }).state.failed,
@@ -1072,11 +1077,11 @@ test "a relay reads nothing before the credential, and asks nobody before a proo
 }
 
 test "a stream that ends at any unfinished point fails" {
-    const challenged = State{ .challenged = .{
+    const challenged: State = .{ .challenged = .{
         .challenge = test_challenge,
         .key_material_failure = null,
     } };
-    const proof = Proof{ .node_id = testNodeId(21), .mechanism = .signed_key_material };
+    const proof: Proof = .{ .node_id = try testNodeId(21), .mechanism = .signed_key_material };
     for ([_]State{ .opened, challenged, .{ .authenticated = proof } }) |state| {
         const stepped = step(state, .stream_ended);
         try t.expectEqual(Action.close, stepped.action.?);
@@ -1085,8 +1090,8 @@ test "a stream that ends at any unfinished point fails" {
 }
 
 test "a finished relay handshake ignores whatever arrives next" {
-    const secret = testSecret(7);
-    const proof = Proof{ .node_id = secret.nodeId(), .mechanism = .signed_key_material };
+    const secret = try testSecret(7);
+    const proof: Proof = .{ .node_id = secret.nodeId(), .mechanism = .signed_key_material };
     const finished = [_]State{
         .{ .admitted = proof },
         .{ .denied = .{ .reason = default_denial } },
@@ -1207,7 +1212,7 @@ fn loopback(
 }
 
 test "the two halves of the handshake agree, in every key material case" {
-    const secret = testSecret(8);
+    const secret = try testSecret(8);
     const matching = exported(42);
 
     // Upstream's four scenarios (`handshake.rs:747-800`). The one that
@@ -1268,10 +1273,13 @@ test "the two halves of the handshake agree, in every key material case" {
 }
 
 test "a second connection takes the node id and does not make a second entry" {
+    // `Registry` is a generic factory: the binding holds the struct type it
+    // returns, and a type binding is PascalCase rather than a value.
+    // zwanzig-disable-next-line: identifier-style
     const Reg = Registry(4);
     var slots: [4]Reg.Slot = undefined;
     var registry = Reg.init(&slots);
-    const node_id = testNodeId(1);
+    const node_id = try testNodeId(1);
 
     const first = try registry.admit(node_id, 1);
     try t.expectEqual(Reg.Admit.fresh, first.admit);
@@ -1287,19 +1295,22 @@ test "a second connection takes the node id and does not make a second entry" {
     try t.expectEqual(@as(?ConnectionId, 2), registry.activeConnectionId(node_id));
 
     // A different node id is a different entry, and the table holds both.
-    const other = try registry.admit(testNodeId(2), 3);
+    const other = try registry.admit(try testNodeId(2), 3);
     try t.expectEqual(Reg.Admit.fresh, other.admit);
     try t.expectEqual(@as(usize, 2), registry.nodeCount());
     try t.expectEqual(@as(?ConnectionId, 2), registry.activeConnectionId(node_id));
-    try t.expectEqual(@as(?ConnectionId, 3), registry.activeConnectionId(testNodeId(2)));
-    try t.expectEqual(@as(?ConnectionId, null), registry.activeConnectionId(testNodeId(3)));
+    try t.expectEqual(@as(?ConnectionId, 3), registry.activeConnectionId(try testNodeId(2)));
+    try t.expectEqual(@as(?ConnectionId, null), registry.activeConnectionId(try testNodeId(3)));
 }
 
 test "a departing connection hands its node id to the newest one it displaced" {
+    // `Registry` is a generic factory: the binding holds the struct type it
+    // returns, and a type binding is PascalCase rather than a value.
+    // zwanzig-disable-next-line: identifier-style
     const Reg = Registry(4);
     var slots: [4]Reg.Slot = undefined;
     var registry = Reg.init(&slots);
-    const node_id = testNodeId(4);
+    const node_id = try testNodeId(4);
 
     var first = (try registry.admit(node_id, 1)).guard;
     var second = (try registry.admit(node_id, 2)).guard;
@@ -1332,10 +1343,13 @@ test "a departing connection hands its node id to the newest one it displaced" {
 }
 
 test "a displaced connection's own departure leaves the active one alone" {
+    // `Registry` is a generic factory: the binding holds the struct type it
+    // returns, and a type binding is PascalCase rather than a value.
+    // zwanzig-disable-next-line: identifier-style
     const Reg = Registry(4);
     var slots: [4]Reg.Slot = undefined;
     var registry = Reg.init(&slots);
-    const node_id = testNodeId(5);
+    const node_id = try testNodeId(5);
 
     // The second connection takes the node id, so the first is the displaced
     // one and the second is the one that owns it.
@@ -1360,10 +1374,13 @@ test "a displaced connection's own departure leaves the active one alone" {
 }
 
 test "a disconnect is reported once, whichever way the connection ends" {
+    // `Registry` is a generic factory: the binding holds the struct type it
+    // returns, and a type binding is PascalCase rather than a value.
+    // zwanzig-disable-next-line: identifier-style
     const Reg = Registry(4);
     var slots: [4]Reg.Slot = undefined;
     var registry = Reg.init(&slots);
-    const node_id = testNodeId(6);
+    const node_id = try testNodeId(6);
 
     var admitted = try registry.admit(node_id, 1);
 
@@ -1383,7 +1400,7 @@ test "a disconnect is reported once, whichever way the connection ends" {
     try t.expectEqual(Unregister.already_gone, guard.deinit());
 
     // And a handle for a connection that was never admitted.
-    var stranger = Reg.OnDisconnectGuard{
+    var stranger: Reg.OnDisconnectGuard = .{
         .registry = &registry,
         .node_id = node_id,
         .connection_id = 99,
@@ -1394,34 +1411,40 @@ test "a disconnect is reported once, whichever way the connection ends" {
 
 test "a registry refuses what the caller sized it for" {
     // One slot and one displaced connection: neither is generous.
+    // `Registry` is a generic factory: the binding holds the struct type it
+    // returns, and a type binding is PascalCase rather than a value.
+    // zwanzig-disable-next-line: identifier-style
     const Reg = Registry(1);
     var slots: [1]Reg.Slot = undefined;
     var registry = Reg.init(&slots);
-    var first = try registry.admit(testNodeId(7), 1);
-    try t.expectError(error.NoFreeSlot, registry.admit(testNodeId(8), 2));
+    var first = try registry.admit(try testNodeId(7), 1);
+    try t.expectError(error.NoFreeSlot, registry.admit(try testNodeId(8), 2));
     // One displaced connection fits; the second does not.
     try t.expectEqual(
         Reg.Admit{ .replaced = 1 },
-        (try registry.admit(testNodeId(7), 3)).admit,
+        (try registry.admit(try testNodeId(7), 3)).admit,
     );
     try t.expectError(
         error.TooManyDuplicateConnections,
-        registry.admit(testNodeId(7), 4),
+        registry.admit(try testNodeId(7), 4),
     );
     // The two refusals changed nothing, which is the other half of a refusal
     // being safe. Connection 3 is the one that did get in.
     try t.expectEqual(@as(usize, 1), registry.nodeCount());
-    try t.expectEqual(@as(?ConnectionId, 3), registry.activeConnectionId(testNodeId(7)));
+    try t.expectEqual(@as(?ConnectionId, 3), registry.activeConnectionId(try testNodeId(7)));
     try t.expect(first.guard.deinit() == .duplicate);
 }
 
 test "an empty registry holds nothing and refuses everything" {
     // Zero slots is degenerate rather than broken: every admission is refused
     // and every lookup is empty, with no indexing anywhere.
+    // `Registry` is a generic factory: the binding holds the struct type it
+    // returns, and a type binding is PascalCase rather than a value.
+    // zwanzig-disable-next-line: identifier-style
     const Reg = Registry(1);
     var registry = Reg.init(&.{});
-    try t.expectError(error.NoFreeSlot, registry.admit(testNodeId(9), 1));
-    try t.expectEqual(@as(?ConnectionId, null), registry.activeConnectionId(testNodeId(9)));
+    try t.expectError(error.NoFreeSlot, registry.admit(try testNodeId(9), 1));
+    try t.expectEqual(@as(?ConnectionId, null), registry.activeConnectionId(try testNodeId(9)));
     try t.expectEqual(@as(usize, 0), registry.nodeCount());
 }
 
@@ -1429,11 +1452,14 @@ test "a removed entry does not hide the one behind it" {
     // A table with room for two, and two node ids in it. Whether their
     // probes collide is up to the hash; what must hold either way is that a
     // removal leaves the other findable, which is what a tombstone is for.
+    // `Registry` is a generic factory: the binding holds the struct type it
+    // returns, and a type binding is PascalCase rather than a value.
+    // zwanzig-disable-next-line: identifier-style
     const Reg = Registry(2);
     var slots: [2]Reg.Slot = undefined;
     var registry = Reg.init(&slots);
-    const first_node = testNodeId(10);
-    const second_node = testNodeId(11);
+    const first_node = try testNodeId(10);
+    const second_node = try testNodeId(11);
 
     var first = try registry.admit(first_node, 1);
     var second = try registry.admit(second_node, 2);
@@ -1456,8 +1482,8 @@ test "a status is not refused by a full datagram backlog" {
     var data_storage: [2]Packet = undefined;
     var control_storage: [2]Control = undefined;
     var connection = Connection.init(&data_storage, &control_storage);
-    const node_id = testNodeId(12);
-    const datagram = Packet{ .src = node_id, .data = "ozai" };
+    const node_id = try testNodeId(12);
+    const datagram: Packet = .{ .src = node_id, .data = "ozai" };
 
     // Fill the datagram queue, which is what a client that has stopped
     // reading looks like from here.
@@ -1501,7 +1527,7 @@ test "merging the two queues loses the status, which is the point of them" {
     // superseded is a client that never hears it.
     var merged_storage: [2]Packet = undefined;
     var merged = Queue(Packet).init(&merged_storage);
-    const datagram = Packet{ .src = testNodeId(13), .data = "ozai" };
+    const datagram: Packet = .{ .src = try testNodeId(13), .data = "ozai" };
     try merged.push(datagram);
     try merged.push(datagram);
     try t.expectError(error.QueueFull, merged.push(datagram));
@@ -1512,10 +1538,13 @@ test "a registry action lands on a saturated connection's control queue" {
     // The two halves together, which is the shape invariant 9 is really
     // about: a second connection arrives for a node id whose first connection
     // has a full datagram backlog.
+    // `Registry` is a generic factory: the binding holds the struct type it
+    // returns, and a type binding is PascalCase rather than a value.
+    // zwanzig-disable-next-line: identifier-style
     const Reg = Registry(2);
     var slots: [2]Reg.Slot = undefined;
     var registry = Reg.init(&slots);
-    const node_id = testNodeId(14);
+    const node_id = try testNodeId(14);
 
     var data_storage: [1]Packet = undefined;
     var control_storage: [1]Control = undefined;

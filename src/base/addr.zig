@@ -56,6 +56,18 @@ pub const SocketAddr = struct {
     ip: IpAddress,
     port: u16,
 
+    /// The longest text `format` can produce, which is what a caller holding a
+    /// buffer of its own sizes it by.
+    ///
+    /// Two brackets, sixteen address bytes as two hex digits each, the colon
+    /// before the port and five port digits: `format` elides no zeros and
+    /// writes no zone, so nothing longer can come out of it. A v4 address is
+    /// nineteen shorter — fifteen characters of dotted quad against thirty-four
+    /// of bracketed hex — so it is not the one that overruns. The bound is the
+    /// derivation rather than a round number because a buffer sized to a round
+    /// number is a buffer nobody has checked.
+    pub const max_text_length: usize = 2 + 2 * 16 + 1 + 5;
+
     pub fn format(self: SocketAddr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.ip) {
             .v4 => |address| try writer.print("{d}.{d}.{d}.{d}", .{
@@ -94,6 +106,21 @@ pub const RelayUrlParseError = error{
     HostTooLong,
     /// Port 0 is never a relay.
     InvalidPort,
+};
+
+/// Why a relay URL could not be turned into something a dial can use.
+pub const RelayUrlResolveError = error{
+    /// The host is a name and not an IP literal.
+    ///
+    /// **Not `Malformed`, and it must not grow into it.** The URL is a
+    /// perfectly good relay address; what is missing is a name lookup, and
+    /// name lookup belongs to `src/discovery/`, which owns the endpoint
+    /// lookups and a `net/probe.zig` that decides which relays to ask — and
+    /// not a host resolver, for the reason `socketAddr` gives. `base` has no
+    /// `Io`, no allocator and no clock, so it cannot do one and would be
+    /// wrong to pretend otherwise. "This is a name" and "this is not an
+    /// address" are different facts and they stay different facts.
+    NotAnIpLiteral,
 };
 
 /// The address of a relay server.
@@ -196,6 +223,46 @@ pub const RelayUrl = struct {
         }
         if (self.port != other.port) return std.math.order(self.port, other.port);
         return std.mem.order(u8, self.hostSlice(), other.hostSlice());
+    }
+
+    /// The socket a dial reaches this relay on, when the host is an IP
+    /// literal.
+    ///
+    /// Upstream does the same thing with the same refusal: `derp` opens its
+    /// QUIC connection to `url.host` and parses it as a `SocketAddr`
+    /// outright, so a derp URL whose host is a name is not usable by the
+    /// client at all. A `RelayUrl` names a relay's *address*, and a dial
+    /// needs a `SocketAddr`; this is the whole of the step between them.
+    ///
+    /// **A name is refused rather than resolved.** `src/discovery/` owns the
+    /// endpoint lookups and nothing in `src/` turns a host into an address:
+    /// `dns.zig` builds the `_iroh.<z32>.<origin>` TXT query and there is no
+    /// A/AAAA path. Its socket seam is real — `discovery/lookup_live.zig`
+    /// runs a query on `transport/socket.zig` — and it carries those questions
+    /// rather than host lookups, so the half that needs a host resolver stays
+    /// open instead of being papered over with a system resolver this module
+    /// must not have.
+    ///
+    /// The port is the URL's, which `parse` has already defaulted from the
+    /// scheme, and the scheme itself is not consulted: a relay is reached at
+    /// its port either way, and `https`'s default is a port and not a
+    /// transport decision this value can make.
+    ///
+    /// **An IPv6 host keeps its brackets here and they come off now.** RFC
+    /// 3986 writes an IP literal as `[addr]` and `std.Uri` hands `parse` the
+    /// host with both brackets still on it. They are URL syntax and not part
+    /// of the address, so `[::1]` is the literal `::1` and not a name;
+    /// calling it a name would drop an address the dial already holds.
+    /// `hostSlice` keeps the brackets because a relay URL printed without them
+    /// would not be the URL it was parsed from.
+    pub fn socketAddr(self: *const RelayUrl) RelayUrlResolveError!SocketAddr {
+        const host = self.hostSlice();
+        const address = if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']')
+            host[1 .. host.len - 1]
+        else
+            host;
+        const ip = IpAddress.parse(address) orelse return error.NotAnIpLiteral;
+        return .{ .ip = ip, .port = self.port };
     }
 };
 
@@ -351,12 +418,13 @@ pub const NodeAddr = struct {
         const at = std.sort.lowerBound(TransportAddr, self.addrs, addr, orderTransport);
         if (at < self.addrs.len and self.addrs[at].order(addr) == .eq) return null;
         const grown = try alloc.realloc(self.addrs, self.addrs.len + 1);
-        // `copyBackwards`, not `copyForwards`: the destination starts one
-        // element *after* the source, so each write lands on the element the
-        // next step still has to read. `copyForwards` is the forward loop
-        // (`lib/std/mem.zig`, `for (dest[0..source.len], source) |*d, s| d.* = s;`)
-        // and is only correct when the destination is at or before the source.
-        std.mem.copyBackwards(TransportAddr, grown[at + 1 ..], grown[at..self.addrs.len]);
+        // `@memmove`, not `@memcpy`: the destination starts one element
+        // *after* the source, so the two ranges overlap and a forward copy
+        // would write each element over the one the next step still has to
+        // read. `@memmove` is the only one of the two that is defined for
+        // overlap, so the direction is its problem to get right and not the
+        // caller's to reason about.
+        @memmove(grown[at + 1 ..], grown[at..self.addrs.len]);
         grown[at] = addr;
         return .{ .node_id = self.node_id, .addrs = grown };
     }
@@ -413,6 +481,59 @@ test "relay url parse fills in the default port and keeps a fully qualified host
     try t.expectEqual(@as(u16, 7842), local.port);
 }
 
+test "a relay url becomes a socket when its host is a literal, and is refused when it is not" {
+    const local = try RelayUrl.parse("http://127.0.0.1:7842/");
+    try t.expectEqual(
+        SocketAddr{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 7842 },
+        try local.socketAddr(),
+    );
+
+    // The scheme's default port survives: the port is the URL's either way.
+    const named_port = try RelayUrl.parse("http://192.0.2.7/");
+    try t.expectEqual(
+        SocketAddr{ .ip = .{ .v4 = .{ 192, 0, 2, 7 } }, .port = RelayUrl.default_http_port },
+        try named_port.socketAddr(),
+    );
+
+    // A name is discovery's problem, and saying so is the whole answer. It is
+    // not `Malformed`: the URL parsed, and what it will not give up is a host.
+    try t.expectError(
+        error.NotAnIpLiteral,
+        (try RelayUrl.parse("https://use1-1.relay.iroh.network./")).socketAddr(),
+    );
+    try t.expectError(
+        error.NotAnIpLiteral,
+        (try RelayUrl.parse("http://7842/")).socketAddr(),
+    );
+}
+
+test "a bracketed ipv6 relay host is an address, not a name" {
+    // Brackets are URL syntax, not part of the address, and `std.Uri` hands
+    // `parse` the host with both of them still on it. A literal behind them is
+    // as good a relay host as any other, so calling it a name drops an address
+    // the dial already has.
+    const loopback = try RelayUrl.parse("http://[::1]:7842/");
+    try t.expectEqual(
+        SocketAddr{
+            .ip = .{ .v6 = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } },
+            .port = 7842,
+        },
+        try loopback.socketAddr(),
+    );
+
+    // The port is the URL's either way and is defaulted from the scheme, with
+    // the brackets or without, so the second case pins an address that is not
+    // a run of zeros against the https default at once.
+    const documented = try RelayUrl.parse("https://[2001:db8::1]/");
+    try t.expectEqual(
+        SocketAddr{
+            .ip = .{ .v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } },
+            .port = RelayUrl.default_https_port,
+        },
+        try documented.socketAddr(),
+    );
+}
+
 test "relay url rejects what is not a relay" {
     try t.expectError(error.Malformed, RelayUrl.parse("not a url"));
     try t.expectError(error.UnsupportedScheme, RelayUrl.parse("ftp://example.com./"));
@@ -435,10 +556,37 @@ test "relay url ordering is scheme, then port, then host" {
 }
 
 test "ip address parsing accepts both families and rejects rubbish" {
-    try t.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, &(IpAddress.parse("127.0.0.1").?.v4));
+    const loopback = IpAddress.parse("127.0.0.1") orelse return error.TestUnexpectedResult;
+    try t.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, &loopback.v4);
     try t.expect(IpAddress.parse("::1") != null);
     try t.expectEqual(@as(?IpAddress, null), IpAddress.parse("127.0.0.256"));
     try t.expectEqual(@as(?IpAddress, null), IpAddress.parse("example.com"));
+}
+
+test "the longest text a socket address prints is exactly max_text_length" {
+    // Every field at its widest: sixteen v6 bytes that each print as two hex
+    // digits, and a port of five digits. That is the whole of
+    // `max_text_length` and nothing else can reach it.
+    const longest: SocketAddr = .{
+        .ip = .{ .v6 = @splat(0xff) },
+        .port = std.math.maxInt(u16),
+    };
+    var text: [SocketAddr.max_text_length]u8 = undefined;
+    // Into a buffer of exactly the bound: one with room to spare would pass
+    // whether or not the bound is right.
+    const printed = try std.fmt.bufPrint(&text, "{f}", .{longest});
+    try t.expectEqual(SocketAddr.max_text_length, printed.len);
+
+    // And the narrow family, nineteen shorter: the arithmetic in the constant's
+    // doc comment stated as a check rather than left as a claim.
+    const narrow: SocketAddr = .{
+        .ip = .{ .v4 = .{ 255, 255, 255, 255 } },
+        .port = std.math.maxInt(u16),
+    };
+    try t.expectEqual(
+        SocketAddr.max_text_length - 19,
+        (try std.fmt.bufPrint(&text, "{f}", .{narrow})).len,
+    );
 }
 
 test "custom address binary form is a little-endian id then raw data" {
@@ -495,7 +643,9 @@ test "custom address outlives the copy into a node address" {
     var addr = try NodeAddr.withRelay(alloc, node_id, try RelayUrl.parse("https://z.example./"));
     defer addr.deinit(alloc);
 
-    addr = (try addr.insert(alloc, .{ .custom = try CustomAddr.parse("2a_abab", &storage) })).?;
+    const custom = try CustomAddr.parse("2a_abab", &storage);
+    addr = (try addr.insert(alloc, .{ .custom = custom })) orelse
+        return error.TestUnexpectedResult;
     @call(.never_inline, clobberStack, .{});
 
     // The heap slice now holds what `parse` handed back, so this is the same
@@ -509,7 +659,8 @@ test "custom address outlives the copy into a node address" {
 
 test "transport address ordering is variant, then inner" {
     const relay: TransportAddr = .{ .relay = try RelayUrl.parse("https://r.example./") };
-    const ip: TransportAddr = .{ .ip = .{ .ip = IpAddress.parse("0.0.0.0").?, .port = 1 } };
+    const unspecified = IpAddress.parse("0.0.0.0") orelse return error.TestUnexpectedResult;
+    const ip: TransportAddr = .{ .ip = .{ .ip = unspecified, .port = 1 } };
     const custom: TransportAddr = .{ .custom = .{ .id = 0, .data = &.{} } };
 
     try t.expectEqual(std.math.Order.lt, relay.order(ip));
@@ -525,15 +676,14 @@ test "node addr keeps its address list sorted and unique" {
     defer addr.deinit(alloc);
     try t.expectEqual(@as(usize, 1), addr.addrs.len);
 
-    addr = (try addr.insert(alloc, .{
-        .ip = .{ .ip = IpAddress.parse("10.0.0.1").?, .port = 9 },
-    })).?;
+    const host = IpAddress.parse("10.0.0.1") orelse return error.TestUnexpectedResult;
+    const direct: TransportAddr = .{ .ip = .{ .ip = host, .port = 9 } };
+    addr = (try addr.insert(alloc, direct)) orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(@as(usize, 2), addr.addrs.len);
 
     // The duplicate must be rejected, and must not have grown the slice.
-    try t.expectEqual(@as(?NodeAddr, null), try addr.insert(alloc, .{
-        .ip = .{ .ip = IpAddress.parse("10.0.0.1").?, .port = 9 },
-    }));
+    try t.expectEqual(@as(?NodeAddr, null), try addr.insert(alloc, direct));
     try t.expectEqual(@as(usize, 2), addr.addrs.len);
 
     // Relay sorts before ip by variant, so it stays at index 0.
@@ -562,12 +712,10 @@ test "a mid-list insert keeps every address it shifted" {
     // direction is indistinguishable from a copy in the right one.
     const node_id = (try key.SecretKey.fromSeed([_]u8{1} ** key.SecretKey.seed_length)).nodeId();
     const alloc = t.allocator;
-    const first: TransportAddr = .{
-        .ip = .{ .ip = IpAddress.parse("192.168.96.145").?, .port = 60165 },
-    };
-    const second: TransportAddr = .{
-        .ip = .{ .ip = IpAddress.parse("213.208.157.87").?, .port = 60165 },
-    };
+    const first_host = IpAddress.parse("192.168.96.145") orelse return error.TestUnexpectedResult;
+    const first: TransportAddr = .{ .ip = .{ .ip = first_host, .port = 60165 } };
+    const second_host = IpAddress.parse("213.208.157.87") orelse return error.TestUnexpectedResult;
+    const second: TransportAddr = .{ .ip = .{ .ip = second_host, .port = 60165 } };
     const relay: TransportAddr = .{ .relay = try RelayUrl.parse("https://relay.example./") };
 
     var addr: NodeAddr = .{
@@ -576,7 +724,8 @@ test "a mid-list insert keeps every address it shifted" {
     };
     defer addr.deinit(alloc);
 
-    addr = (try addr.insert(alloc, relay)).?;
+    addr = (try addr.insert(alloc, relay)) orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(@as(usize, 3), addr.addrs.len);
     try expectSortedAndUnique(addr.addrs);
 
@@ -602,12 +751,10 @@ test "a duplicate with addresses behind it is rejected and changes nothing" {
     // before the shift from one that fires because nothing had to move.
     const node_id = (try key.SecretKey.fromSeed([_]u8{1} ** key.SecretKey.seed_length)).nodeId();
     const alloc = t.allocator;
-    const first: TransportAddr = .{
-        .ip = .{ .ip = IpAddress.parse("192.168.96.145").?, .port = 60165 },
-    };
-    const second: TransportAddr = .{
-        .ip = .{ .ip = IpAddress.parse("213.208.157.87").?, .port = 60165 },
-    };
+    const first_host = IpAddress.parse("192.168.96.145") orelse return error.TestUnexpectedResult;
+    const first: TransportAddr = .{ .ip = .{ .ip = first_host, .port = 60165 } };
+    const second_host = IpAddress.parse("213.208.157.87") orelse return error.TestUnexpectedResult;
+    const second: TransportAddr = .{ .ip = .{ .ip = second_host, .port = 60165 } };
     const relay: TransportAddr = .{ .relay = try RelayUrl.parse("https://relay.example./") };
 
     const addr: NodeAddr = .{

@@ -38,13 +38,18 @@
 //!
 //! One divergence from upstream is load-bearing and belongs in the
 //! `docs/ARCHITECTURE.md` list. Upstream's `Incoming::retry()`
-//! (`connection.rs:183-189`) is a per-attempt call into the QUIC core; the
-//! vendored core has no such hook, and answers a Retry from a manager-wide
-//! `require_retry` or `retry_threshold` before any application code runs
-//! (`vendor/quic/src/quic/connection_manager.zig:606-645`). So the verdict here
-//! is a decision the endpoint records and the filter reads, and the substrate
-//! realises the wire half through that flag. Closing the gap is a change in
-//! `vendor/quic/`, which this milestone does not own.
+//! (`connection.rs:183-189`) is a per-attempt call into the QUIC core. The
+//! vendored core has no such call: it decides Retry from two manager-wide
+//! fields, `require_retry` and `retry_threshold`, inside the same call that
+//! accepts the connection and hands it the ClientHello
+//! (`vendor/quic/src/quic/connection_manager.zig:606-647`, `:662`), so a
+//! decision made by application code arrives after the point at which RFC 9000
+//! §17.2.5 permits a Retry at all. A retry verdict is therefore **refused**
+//! here, which is what upstream does when `incoming.retry()` fails: `if let
+//! Err(err) = incoming.retry() { err.into_incoming().refuse() }`
+//! (`protocol.rs:583-586`). Closing the gap is a change in `vendor/quic/` — the
+//! core has to grow a hook that runs before `acceptConnection` — so the token
+//! is not a thing this endpoint names.
 
 const std = @import("std");
 const router = @import("../router/router.zig");
@@ -55,7 +60,6 @@ const filter = @import("incoming_filter.zig");
 const Incoming = filter.Incoming;
 const IncomingFilter = filter.IncomingFilter;
 const Validation = filter.Validation;
-const Verdict = router.Verdict;
 
 /// One long-lived `accept`, held as a value.
 ///
@@ -136,9 +140,6 @@ pub const Action = union(enum) {
     /// Take this accept task and drive it to the end. Upstream
     /// `join_set.spawn` (`:601-603`).
     spawn: Task,
-    /// Answer the datagram with a retry token worth this much on this path.
-    /// Upstream `incoming.retry()` (`:583`).
-    send_token: router.Retry,
     /// Refuse: the peer is told at once, and this is the only way anything here
     /// can tell a peer anything. Upstream `incoming.refuse()` (`:588`).
     refuse,
@@ -155,15 +156,16 @@ pub const Action = union(enum) {
     /// What the peer learns from this action.
     ///
     /// The loop owes a peer two things and no more, and they are the router's
-    /// two: a refusal, and nothing else. A retry token is not an ending — the
-    /// peer comes back with it — and every local ending leaves the peer with
-    /// nothing to time out on, which is invariant 19 and upstream's
-    /// `warn!`-and-drop. Exhaustive, so an action added later has to decide
-    /// this rather than inherit it.
+    /// two: a refusal, and nothing else. Every local ending leaves the peer
+    /// with nothing to time out on, which is invariant 19 and upstream's
+    /// `warn!`-and-drop — a retry verdict among them, which is refused here
+    /// because the token it asks for cannot be sent; see the module doc.
+    /// Exhaustive, so an action added later has to decide this rather than
+    /// inherit it.
     pub fn peerOutcome(action: Action) router.PeerOutcome {
         return switch (action) {
             .refuse => .refused,
-            .offer, .spawn, .send_token, .ignore, .shutdown, .none => .nothing,
+            .offer, .spawn, .ignore, .shutdown, .none => .nothing,
         };
     }
 };
@@ -328,7 +330,11 @@ pub const Loop = struct {
         );
         return switch (routed.action) {
             .negotiate_alpn => spawn(next, pending.id),
-            .send_retry => |retry| .{ .loop = next, .action = .{ .send_token = retry } },
+            // A retry the endpoint cannot answer with a token is upstream's
+            // `Err` arm: `incoming.retry()` did not happen, so the attempt is
+            // refused (`protocol.rs:583-586`). The payload the router carried
+            // is dropped here because nothing this loop can do reads it back.
+            .send_retry => .{ .loop = next, .action = .refuse },
             .refuse => .{ .loop = next, .action = .refuse },
             .ignore => .{ .loop = next, .action = .ignore },
             // A verdict cannot produce anything else: in the `incoming` state
@@ -659,7 +665,7 @@ fn offer(loop: *Loop, incoming: Incoming) !Step {
 fn owed(action: Action) ?router.Shutdown.Action {
     return switch (action) {
         .shutdown => |shutdown| shutdown.action,
-        .offer, .spawn, .send_token, .refuse, .ignore, .none => null,
+        .offer, .spawn, .refuse, .ignore, .none => null,
     };
 }
 
@@ -706,30 +712,34 @@ test "a connection is offered to the filter and then dispatched" {
     try t.expectEqual(router.PeerOutcome.nothing, Action.peerOutcome(step.action));
     try t.expectEqual(@as(usize, 0), handler.accept_calls);
     loop = step.loop;
-    try t.expectEqual(Task{ .id = 1, .state = .negotiating }, loop.task(1).?.*);
+    // One lookup names the task for the rest of the walk: `Loop` is copied by
+    // value, but the table it points at is the caller's own array and is not
+    // moved, so the pointer stays the pointer the loop would hand back.
+    const held = loop.task(1) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(Task{ .id = 1, .state = .negotiating }, held.*);
 
     // The handshake produces the ALPN the peer negotiated, which is what finds
     // the handler, and the handler takes the connection over.
-    var routed = router.dispatchStep(&table, loop.task(1).?.state, .{
+    var routed = router.dispatchStep(&table, held.state, .{
         .outcome = .{ .alpn = "/echo" },
     });
-    loop.task(1).?.state = routed.state;
-    try t.expectEqual(router.ConnState{ .accepting = handler.handler() }, loop.task(1).?.state);
+    held.state = routed.state;
+    try t.expectEqual(router.ConnState{ .accepting = handler.handler() }, held.state);
     try t.expectEqual(router.DispatchAction{ .on_accepting = handler.handler() }, routed.action);
 
     // `on_accepting` is the handler's early take-over, and the caller runs it,
     // because the loop names the call the way the router does. Its answer is
     // the connection the next step is owed.
     const handler_table = routed.action.on_accepting;
-    const takeover = handler_table.on_accepting.?;
+    const takeover = handler_table.on_accepting orelse return error.TestUnexpectedResult;
     const connection = try takeover(handler_table.ptr, .{ .ptr = &entries });
     try t.expectEqual(@as(usize, 1), handler.on_accepting_calls);
     try t.expectEqual(@as(usize, 0), handler.accept_calls);
 
-    routed = router.dispatchStep(&table, loop.task(1).?.state, .{
+    routed = router.dispatchStep(&table, held.state, .{
         .outcome = .{ .connection = connection },
     });
-    loop.task(1).?.state = routed.state;
+    held.state = routed.state;
     try t.expectEqual(router.DispatchAction{ .accept = handler.handler() }, routed.action);
 
     // The handler runs it. Upstream runs it on a task and it may be long-lived;
@@ -739,7 +749,7 @@ test "a connection is offered to the filter and then dispatched" {
 
     // It returns, the connection goes back to the endpoint, and the task comes
     // back to the loop.
-    const finished = router.dispatchStep(&table, loop.task(1).?.state, .{
+    const finished = router.dispatchStep(&table, held.state, .{
         .outcome = .finished,
     });
     try t.expectEqual(router.DispatchAction.release, finished.action);
@@ -761,8 +771,12 @@ test "the filter's four answers, and what each one does to the loop" {
             .action = .{ .spawn = .{ .id = 1, .state = .negotiating } },
             .peer = .nothing,
         },
-        // A token, worth source validation on a direct path.
-        .{ .answer = .retry, .action = .{ .send_token = .source_validation }, .peer = .nothing },
+        // A retry is a refusal, and that is the surprise worth a row of its
+        // own: the token cannot be sent, so the peer is told the connection is
+        // refused rather than left to time out. It reads the same as the
+        // reject below because it does the same thing, not because the two
+        // answers are one.
+        .{ .answer = .retry, .action = .refuse, .peer = .refused },
         // The one verdict a peer is told about.
         .{ .answer = .reject, .action = .refuse, .peer = .refused },
         // Silence.
@@ -781,13 +795,13 @@ test "the filter's four answers, and what each one does to the loop" {
         try t.expectEqual(want.peer, Action.peerOutcome(step.action));
         // Only an accepted attempt is a connection: the other three leave no
         // task behind, and the slot is free for the next one.
-        const held = @as(usize, if (want.answer == .accept) 1 else 0);
+        const held: usize = if (want.answer == .accept) 1 else 0;
         try t.expectEqual(held, step.loop.live);
         try t.expectEqual(@as(?Incoming, null), step.loop.pending);
     }
 }
 
-test "a retry on a direct path and on a relay are different decisions" {
+test "a retry cannot be sent, so it ends in a refusal on either path" {
     var handler: Handler = .{};
     var entries: [2]router.Entry = undefined;
     var builder = router.Builder.init(&entries);
@@ -796,43 +810,46 @@ test "a retry on a direct path and on a relay are different decisions" {
     const table = builder.build();
 
     // The direct path, and a filter that wants the address proved first. The
-    // first attempt proves nothing, so the filter asks for a token, and the
-    // token is worth what a direct path's retry is worth.
+    // first attempt proves nothing, so the filter asks for a token — and the
+    // core has no hook to send one with, so the attempt is refused and the peer
+    // is told.
     var proving: Proving = .{};
     var tasks: [1]Task = undefined;
     var loop = Loop.init(&table, proving.filterer(), &tasks);
     var step = try offer(&loop, direct(1));
-    try t.expectEqual(Action{ .send_token = .source_validation }, step.action);
-    try t.expectEqual(router.PeerOutcome.nothing, Action.peerOutcome(step.action));
+    try t.expectEqual(Action.refuse, step.action);
+    try t.expectEqual(router.PeerOutcome.refused, Action.peerOutcome(step.action));
     try t.expectEqual(@as(usize, 0), step.loop.live);
 
-    // The second attempt carries the token, and what the core proved on a direct
-    // path is an address: this filter is satisfied and the connection is in.
+    // The second attempt on that flow carries the token the first one was sent.
+    // What the core proved on a direct path is an address: this filter is
+    // satisfied and the connection is in.
     const proved_direct = withToken(direct(1));
     try t.expectEqual(Validation{ .validated = direct(1).remote }, proved_direct.validation);
     step = try offer(&loop, proved_direct);
     try t.expectEqual(Task{ .id = 1, .state = .negotiating }, step.action.spawn);
     try t.expectEqual(@as(usize, 1), step.loop.live);
-    // Two attempts, one of them retried, and the filter has been asked twice.
+    // Two attempts, and the filter has been asked twice.
     try t.expectEqual(@as(usize, 2), proving.calls);
     loop = step.loop;
 
-    // The relay path, and the same filter. The first attempt is answered with a
-    // token too, and it is worth something else: a round trip and nothing more.
+    // The relay path, and the same filter, is refused exactly as the direct one
+    // was: what the endpoint cannot do is the same on both, so it cannot tell a
+    // peer two different things about it.
     var relayed_proving: Proving = .{};
     var relay_tasks: [1]Task = undefined;
     var relay_loop = Loop.init(&table, relayed_proving.filterer(), &relay_tasks);
     step = try offer(&relay_loop, relayed(1));
-    try t.expectEqual(Action{ .send_token = .cost_imposition }, step.action);
+    try t.expectEqual(Action.refuse, step.action);
+    try t.expectEqual(router.PeerOutcome.refused, Action.peerOutcome(step.action));
     try t.expectEqual(@as(usize, 0), step.loop.live);
 
-    // The second attempt carries the token, and what the core proved on a relay
-    // path is not an address: the relay vouched for the origin before the
-    // endpoint saw the datagram, so the flow has proved only that the client
-    // cooperated. The same filter is therefore asked again — and QUIC allows one
-    // Retry per flow, so the endpoint refuses, which is upstream's
-    // `err.into_incoming().refuse()` (`protocol.rs:583-586`). This time the peer
-    // is told, and it is told the connection is refused.
+    // The second attempt on a relay path carries the token the first one was
+    // sent, and what the core proved there is not an address: the relay vouched
+    // for the origin before the endpoint saw the datagram, so the flow has
+    // proved only that the client cooperated. The same filter is therefore
+    // asked again, and QUIC allows one Retry per flow, so the endpoint refuses
+    // — which is what it now does with every retry.
     const proved_relay = withToken(relayed(1));
     try t.expectEqual(Validation.cooperated, proved_relay.validation);
     step = try offer(&relay_loop, proved_relay);
@@ -841,11 +858,12 @@ test "a retry on a direct path and on a relay are different decisions" {
     try t.expectEqual(@as(usize, 0), step.loop.live);
     try t.expectEqual(@as(usize, 2), relayed_proving.calls);
 
-    // So the same verb, the same filter and the same core bit, and three
-    // observable differences: the token that goes out, the state the filter
-    // reads next, and what the peer learns. A filter that collapsed the two
-    // meanings would let a relayed peer in on the strength of a token that
-    // proved nothing.
+    // So the same verb, the same filter and the same core bit, and the one
+    // difference the two meanings still make is the state the filter reads next:
+    // the direct path reaches the state its filter wants and the relay path
+    // cannot, whatever the endpoint does with the verdict. A filter that
+    // collapsed the two would let a relayed peer in on the strength of a token
+    // that proved nothing.
     try t.expect(proving.asks(proved_direct) == .accept);
     try t.expect(relayed_proving.asks(proved_relay) == .retry);
 }

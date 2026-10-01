@@ -855,9 +855,13 @@ pub const Lease = struct {
     /// The single exit. `.closed` is the one good answer, and the only way to
     /// reach it is to have driven the shutdown to `closed` — which is the only
     /// way the endpoint is closed.
+    // `reported` is the readable report-once tombstone; Z030 only recognizes
+    // its fixed vocabulary of lifecycle field names, not this marker.
+    // ziglint-ignore: Z030
     pub fn deinit(self: *Lease) Release {
-        if (self.reported) return .already_gone;
+        const already = self.reported;
         self.reported = true;
+        if (already) return .already_gone;
         if (self.shutdown.phase == .closed) return .closed;
         return .{ .abandoned = self.shutdown.phase };
     }
@@ -975,10 +979,12 @@ test "every callback gets the handler's own context back" {
     var recorder: Recorder = .{};
     const handler = recorder.handler();
 
-    const connection = try handler.on_accepting.?(handler.ptr, .{ .ptr = &recorder });
+    const on_accepting = handler.on_accepting orelse return error.TestUnexpectedResult;
+    const shutdown = handler.shutdown orelse return error.TestUnexpectedResult;
+    const connection = try on_accepting(handler.ptr, .{ .ptr = &recorder });
     try t.expectEqual(handler.ptr, connection.ptr);
     try handler.accept(handler.ptr, connection);
-    handler.shutdown.?(handler.ptr);
+    shutdown(handler.ptr);
 
     // The context is not copied or replaced, and each entry is called once.
     try t.expectEqual(@as(usize, 1), recorder.on_accepting_calls);

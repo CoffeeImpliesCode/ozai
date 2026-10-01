@@ -485,15 +485,15 @@ fn referenceOption(bytes: []const u8) ?Error {
 }
 
 fn referenceU16(bytes: []const u8) ?Error {
-    return referenceVarint(bytes, u16);
+    return referenceVarint(u16, bytes);
 }
 
 fn referenceU32(bytes: []const u8) ?Error {
-    return referenceVarint(bytes, u32);
+    return referenceVarint(u32, bytes);
 }
 
 fn referenceU64(bytes: []const u8) ?Error {
-    return referenceVarint(bytes, u64);
+    return referenceVarint(u64, bytes);
 }
 
 /// The two varint rules, which are different rules.
@@ -508,7 +508,7 @@ fn referenceU64(bytes: []const u8) ?Error {
 /// Computed as a scan bounded by the width, where `readVarint` counts to the
 /// width and reads as it goes: the same rule, two computations, so a decoder
 /// that miscounts its groups disagrees here instead of agreeing with itself.
-fn referenceVarint(bytes: []const u8, comptime Unsigned: type) ?Error {
+fn referenceVarint(comptime Unsigned: type, bytes: []const u8) ?Error {
     const width = postcard.varintMax(Unsigned);
     var index: usize = 0;
     while (index < width and index < bytes.len) : (index += 1) {
@@ -532,7 +532,7 @@ fn referenceVarint(bytes: []const u8, comptime Unsigned: type) ?Error {
 /// frame that cannot be the frame it claims to be. Both are `BadLength` rather
 /// than `UnexpectedEnd`, because the buffer is not short.
 fn referenceLen(bytes: []const u8) ?Error {
-    if (referenceVarint(bytes, u64)) |reason| return reason;
+    if (referenceVarint(u64, bytes)) |reason| return reason;
     const scanned = scanVarint(bytes);
     const length = std.math.cast(usize, scanned.value) orelse return error.BadLength;
     if (length > bytes.len - scanned.len) return error.BadLength;
@@ -568,7 +568,7 @@ fn referenceArray(bytes: []const u8) ?Error {
 /// number this build has no arm for is `UnknownVariant` rather than a value
 /// invented for it.
 fn referenceVariant(bytes: []const u8) ?Error {
-    if (referenceVarint(bytes, u32)) |reason| return reason;
+    if (referenceVarint(u32, bytes)) |reason| return reason;
     const scanned = scanVarint(bytes);
     const discriminant = std.math.cast(u32, scanned.value) orelse return error.ValueOutOfRange;
     if (std.enums.fromInt(Probe, discriminant) == null) return error.UnknownVariant;

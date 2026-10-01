@@ -481,11 +481,11 @@ pub const Rng = struct {
 /// neighbours in a different insertion order sends the same bytes in a
 /// different order. It is kept because it is upstream's, and the sets here are
 /// small enough that the difference is a copy rather than a tree.
-pub fn IndexSet(comptime N: usize) type {
+pub fn IndexSet(comptime capacity: usize) type {
     return struct {
         const Self = @This();
 
-        items: [N]NodeId = undefined,
+        items: [capacity]NodeId = undefined,
         len: usize = 0,
 
         pub fn count(self: *const Self) usize {
@@ -512,7 +512,7 @@ pub fn IndexSet(comptime N: usize) type {
         /// to send exactly one `Neighbor` per request.
         pub fn insert(self: *Self, peer: NodeId) Error!bool {
             if (self.contains(peer)) return false;
-            if (self.len == N) return error.ActiveViewFull;
+            if (self.len == capacity) return error.ActiveViewFull;
             self.items[self.len] = peer;
             self.len += 1;
             return true;
@@ -533,9 +533,8 @@ pub fn IndexSet(comptime N: usize) type {
 
         pub fn removeAt(self: *Self, index: usize) NodeId {
             const removed = self.items[index];
-            std.mem.copyForwards(
-                NodeId,
-                self.items[index..self.len],
+            @memmove(
+                self.items[index .. self.len - 1],
                 self.items[index + 1 .. self.len],
             );
             self.len -= 1;
@@ -557,7 +556,7 @@ pub fn IndexSet(comptime N: usize) type {
         /// Upstream `pick_random_without`: uniform over the members that are
         /// not in `without`.
         pub fn pickRandomWithout(self: *const Self, without: []const NodeId, rng: *Rng) ?NodeId {
-            var candidates: [N]NodeId = undefined;
+            var candidates: [capacity]NodeId = undefined;
             var found: usize = 0;
             for (self.slice()) |item| {
                 if (containsNode(without, item)) continue;
@@ -577,7 +576,7 @@ pub fn IndexSet(comptime N: usize) type {
             rng: *Rng,
             out: []NodeId,
         ) usize {
-            var scratch: [N]NodeId = undefined;
+            var scratch: [capacity]NodeId = undefined;
             var found: usize = 0;
             for (self.slice()) |item| {
                 if (containsNode(without, item)) continue;
@@ -1621,24 +1620,27 @@ pub const sim = struct {
         TooManyDisconnects,
     };
 
-    /// Every way this harness can fail, over both layers.
-    pub const HarnessError = Error || plumtree.Error || SimError || Allocator.Error;
+    /// Every way this harness can fail, over both layers. `key.KeyError` is
+    /// here because `nodeIdFor` mints a real key from a seed, and a seed that
+    /// derives the identity point is a harness input like any other.
+    pub const HarnessError = Error || plumtree.Error || SimError ||
+        key.KeyError || Allocator.Error;
 
     /// A node's identity, from a fixed seed. A `NodeId` cannot be made from
     /// arbitrary bytes — `NodeId.fromBytes` rejects anything that is not a
     /// point on the curve — so a simulator of `u64` peer ids has to mint real
     /// keys, deterministically.
     ///
-    /// The `unreachable` is a claim about a constant, not about a condition:
-    /// the seed is `0x5c…` with one byte changed, and none of the
-    /// `max_peers` of those is a degenerate one. The test
-    /// "every simulated node has its own identity" walks the whole range and
-    /// would panic rather than pass if that ever stopped being true.
-    pub fn nodeIdFor(index: u8) NodeId {
+    /// Fallible because `SecretKey.fromSeed` refuses a seed that derives the
+    /// identity point, and a `0x5c` fill says nothing about the twelve
+    /// indices a swarm holds. A harness caller reports it, a test fails on
+    /// it, and both name the seed; `unreachable` could do neither and would
+    /// have taken the process down instead.
+    pub fn nodeIdFor(index: u8) key.KeyError!NodeId {
         var seed: [key.SecretKey.seed_length]u8 = undefined;
         @memset(&seed, 0x5c);
         seed[0] = index;
-        return (key.SecretKey.fromSeed(seed) catch unreachable).nodeId();
+        return (try key.SecretKey.fromSeed(seed)).nodeId();
     }
 
     /// How long a message takes to cross a link. Upstream `LatencyConfig`.
@@ -1673,6 +1675,8 @@ pub const sim = struct {
         membership: Config = .{},
         broadcast: plumtree.Config = .{},
 
+        // `pub` under `pub const sim`; ziglint's visibility map is top-level decls.
+        // ziglint-ignore: Z012
         pub fn topicConfig(self: NetworkConfig) TopicConfig {
             return .{ .membership = self.membership, .broadcast = self.broadcast };
         }
@@ -1759,6 +1763,8 @@ pub const sim = struct {
         latencies: [max_conns]Latency,
         latency_count: usize,
 
+        // `pub` under `pub const sim`; ziglint's visibility map is top-level decls.
+        // ziglint-ignore: Z012 Z015
         pub fn init(
             gpa: Allocator,
             config: NetworkConfig,
@@ -1787,8 +1793,14 @@ pub const sim = struct {
             self.queue.deinit(self.gpa);
             self.events.deinit(self.gpa);
             self.arena.deinit();
+            // Everything above is freed, so the struct is poisoned rather than
+            // half-reset: a field that still looked like a network would read
+            // as a plausible run instead of as the use-after-free that it is.
+            self.* = undefined;
         }
 
+        // `pub` under `pub const sim`; ziglint's visibility map is top-level decls.
+        // ziglint-ignore: Z015
         /// Add a node. Upstream `Network::insert_with_config`.
         pub fn insert(self: *Network, index: u8) HarnessError!void {
             if (index >= max_peers) return error.PeerIndexOutOfRange;
@@ -1796,11 +1808,16 @@ pub const sim = struct {
             // Upstream draws each node's generator from the network's, so two
             // nodes in one simulation do not walk in lockstep.
             const rng = self.rng.child();
+            // Minted before the slot is written and used twice: a `NodeId` is
+            // a key derivation, not a lookup, and a slot written from one
+            // `id` and another `state.id` would be a swarm that disagrees
+            // with itself about who it is.
+            const id = try nodeIdFor(index);
             self.peers[index] = .{
-                .id = nodeIdFor(index),
+                .id = id,
                 .joined = true,
                 .state = try TopicState.init(
-                    nodeIdFor(index),
+                    id,
                     null,
                     self.config.topicConfig(),
                     rng,
@@ -1812,6 +1829,8 @@ pub const sim = struct {
             if (index + 1 > self.peer_count) self.peer_count = index + 1;
         }
 
+        // `pub` under `pub const sim`; ziglint's visibility map is top-level decls.
+        // ziglint-ignore: Z015
         /// Add a node and send it a join command. Upstream
         /// `Network::insert_and_join`.
         pub fn insertAndJoin(
@@ -1821,7 +1840,7 @@ pub const sim = struct {
         ) HarnessError!void {
             try self.insert(index);
             var peers: [max_bootstrap]NodeId = undefined;
-            for (bootstrap, 0..) |peer, position| peers[position] = nodeIdFor(peer);
+            for (bootstrap, 0..) |peer, position| peers[position] = try nodeIdFor(peer);
             try self.command(index, .{ .join = try Peers.init(peers[0..bootstrap.len]) });
         }
 
@@ -1895,6 +1914,8 @@ pub const sim = struct {
             return self.neighbors(index).len;
         }
 
+        // `pub` under `pub const sim`; ziglint's visibility map is top-level decls.
+        // ziglint-ignore: Z015
         /// Hand a command to a node, then run whatever the current instant
         /// has queued. Upstream `Network::command`.
         pub fn command(self: *Network, index: u8, request: Command) HarnessError!void {
@@ -1906,10 +1927,14 @@ pub const sim = struct {
             if (self.peerSlot(index)) |peer| peer.joined = false;
         }
 
+        // `pub` under `pub const sim`; ziglint's visibility map is top-level decls.
+        // ziglint-ignore: Z015
         pub fn runTrips(self: *Network, count: u64) HarnessError!void {
             try self.runDuration(self.config.latency.maxLatency() * count);
         }
 
+        // `pub` under `pub const sim`; ziglint's visibility map is top-level decls.
+        // ziglint-ignore: Z015
         pub fn runDuration(self: *Network, duration: Nanos) HarnessError!void {
             const end = self.time + duration;
             while (self.queue.items.len > 0 and self.queue.items[0].time <= end) {
@@ -2009,7 +2034,9 @@ pub const sim = struct {
         fn killConnection(self: *Network, a: u8, b: u8) HarnessError!void {
             if (!self.removeConn(a, b)) return;
             const latency = self.latencyBetween(a, b) + disconnect_grace;
-            try self.enqueue(self.time + latency, b, .{ .peer_disconnected = nodeIdFor(a) });
+            try self.enqueue(self.time + latency, b, .{
+                .peer_disconnected = try nodeIdFor(a),
+            });
         }
 
         fn addConn(self: *Network, a: u8, b: u8) void {
@@ -2023,8 +2050,7 @@ pub const sim = struct {
         fn removeConn(self: *Network, a: u8, b: u8) bool {
             for (self.links[0..self.conn_count], 0..) |conn, index| {
                 if (conn.a != @min(a, b) or conn.b != @max(a, b)) continue;
-                std.mem.copyForwards(
-                    Conn,
+                @memmove(
                     self.links[index .. self.conn_count - 1],
                     self.links[index + 1 .. self.conn_count],
                 );
@@ -2268,7 +2294,8 @@ pub const sim = struct {
 
     fn parkData(a: Allocator, data: ?[]const u8) HarnessError!?[]const u8 {
         const held = data orelse return null;
-        return try a.dupe(u8, held);
+        const parked = try a.dupe(u8, held);
+        return parked;
     }
 
     fn parkInfo(a: Allocator, info: PeerInfo) HarnessError!PeerInfo {
@@ -2305,6 +2332,8 @@ pub const sim = struct {
         network: Network,
         config: SimulatorConfig,
 
+        // `pub` under `pub const sim`; ziglint's visibility map is top-level decls.
+        // ziglint-ignore: Z012 Z015
         pub fn init(
             gpa: Allocator,
             config: SimulatorConfig,
@@ -2318,8 +2347,11 @@ pub const sim = struct {
 
         pub fn deinit(self: *Simulator) void {
             self.network.deinit();
+            self.* = undefined;
         }
 
+        // `pub` under `pub const sim`; ziglint's visibility map is top-level decls.
+        // ziglint-ignore: Z012 Z015
         /// Bring the swarm up. Upstream `Simulator::bootstrap`.
         pub fn bootstrap(self: *Simulator, mode: BootstrapMode) HarnessError!void {
             const count = self.config.peers;
@@ -2351,6 +2383,8 @@ pub const sim = struct {
             }
         }
 
+        // `pub` under `pub const sim`; ziglint's visibility map is top-level decls.
+        // ziglint-ignore: Z012 Z015
         /// Broadcast from one node and count who got it. Upstream
         /// `Simulator::gossip_round`, reduced to a single sender: the
         /// multiple-sender case differs only in how many messages are in
@@ -2418,8 +2452,8 @@ fn prime(state: *State, out: *Actions(SwarmOutEvent)) !void {
     out.clear();
 }
 
-fn newMembership(index: u8, config: Config, seed: u64) Error!State {
-    return State.init(sim.nodeIdFor(index), null, config, .init(seed));
+fn newMembership(index: u8, config: Config, seed: u64) (Error || key.KeyError)!State {
+    return State.init(try sim.nodeIdFor(index), null, config, .init(seed));
 }
 
 // The deviation, first half: a `ForwardJoin` that has run out of walk sends a
@@ -2430,8 +2464,8 @@ fn newMembership(index: u8, config: Config, seed: u64) Error!State {
 // able to reach, drops an honest neighbour to make room, and ends up holding
 // a view the other end does not share. Every byte-level test still passes.
 test "a forward join at the end of its walk asks and does not insert" {
-    const walker = sim.nodeIdFor(1);
-    const target = sim.nodeIdFor(3);
+    const walker = try sim.nodeIdFor(1);
+    const target = try sim.nodeIdFor(3);
     var state: State = try newMembership(2, .{ .active_view_capacity = 2 }, 7);
     var out: Actions(SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
@@ -2463,13 +2497,13 @@ test "a forward join at the end of its walk asks and does not insert" {
 // The deviation, second half: the peer enters the active view only when it
 // answers, and answering is not answered again.
 test "a neighbor enters the active view when it replies, and a reply is not a request" {
-    const peer = sim.nodeIdFor(3);
+    const peer = try sim.nodeIdFor(3);
     var state: State = try newMembership(2, .{}, 11);
     var out: Actions(SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
     try prime(&state, &out);
 
-    const walker = sim.nodeIdFor(1);
+    const walker = try sim.nodeIdFor(1);
     try state.handle(.{ .recv_message = .{ .from = walker, .message = .{ .forward_join = .{
         .peer = .{ .id = peer, .data = null },
         .ttl = .{ .value = 0 },
@@ -2498,8 +2532,8 @@ test "a neighbor enters the active view when it replies, and a reply is not a re
 test "the active view is bidirectional once the neighbor exchange finishes" {
     const left_index: u8 = 2;
     const right_index: u8 = 3;
-    const left_id = sim.nodeIdFor(left_index);
-    const right_id = sim.nodeIdFor(right_index);
+    const left_id = try sim.nodeIdFor(left_index);
+    const right_id = try sim.nodeIdFor(right_index);
     var left: State = try newMembership(left_index, .{}, 1);
     var right: State = try newMembership(right_index, .{}, 2);
     var out: Actions(SwarmOutEvent) = .init(t.allocator);
@@ -2514,7 +2548,7 @@ test "the active view is bidirectional once the neighbor exchange finishes" {
 
     // Right receives it, cannot know it is a reply, so it accepts and answers.
     try prime(&right, &out);
-    const ask = Neighbor{ .priority = .high, .data = null };
+    const ask: Neighbor = .{ .priority = .high, .data = null };
     try right.handle(.{ .recv_message = .{
         .from = left_id,
         .message = .{ .neighbor = ask },
@@ -2533,7 +2567,7 @@ test "the active view is bidirectional once the neighbor exchange finishes" {
     // The asymmetry exists only between the two events. Left takes the reply
     // as the answer to its own request and both views agree.
     out.clear();
-    const reply = Neighbor{ .priority = .high, .data = null };
+    const reply: Neighbor = .{ .priority = .high, .data = null };
     try left.handle(.{ .recv_message = .{
         .from = right_id,
         .message = .{ .neighbor = reply },
@@ -2568,7 +2602,7 @@ fn stateNeighborRequest(
     peer: NodeId,
     out: *Actions(SwarmOutEvent),
 ) !void {
-    const walker = sim.nodeIdFor(1);
+    const walker = try sim.nodeIdFor(1);
     try state.handle(.{ .recv_message = .{ .from = walker, .message = .{ .forward_join = .{
         .peer = .{ .id = peer, .data = null },
         .ttl = .{ .value = 0 },
@@ -2579,7 +2613,7 @@ fn stateNeighborRequest(
 // A `Neighbor` nobody asked for is answered, because the other end has no way
 // to know it is a reply.
 test "a neighbor we did not ask for is answered" {
-    const peer = sim.nodeIdFor(3);
+    const peer = try sim.nodeIdFor(3);
     var state: State = try newMembership(2, .{}, 13);
     var out: Actions(SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
@@ -2603,8 +2637,8 @@ test "a neighbor we did not ask for is answered" {
 // A low-priority request into a full view is refused, and refused *properly*:
 // a `Disconnect` and a link teardown, not silence.
 test "a low-priority neighbor is refused when the view is full" {
-    const first = sim.nodeIdFor(2);
-    const second = sim.nodeIdFor(3);
+    const first = try sim.nodeIdFor(2);
+    const second = try sim.nodeIdFor(3);
     var state: State = try newMembership(1, .{ .active_view_capacity = 1 }, 17);
     var out: Actions(SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
@@ -2646,8 +2680,8 @@ test "a low-priority neighbor is refused when the view is full" {
 // A high-priority request into a full view evicts somebody, and the evicted
 // peer is told with a `Disconnect` and kept in the passive view.
 test "a high-priority neighbor evicts and the evicted peer is told" {
-    const first = sim.nodeIdFor(2);
-    const second = sim.nodeIdFor(3);
+    const first = try sim.nodeIdFor(2);
+    const second = try sim.nodeIdFor(3);
     var state: State = try newMembership(1, .{ .active_view_capacity = 1 }, 19);
     var out: Actions(SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
@@ -2692,8 +2726,8 @@ test "a high-priority neighbor evicts and the evicted peer is told" {
 // A `Neighbor` that is never answered times out, and the peer it was aimed at
 // is dropped from the passive view.
 test "a neighbor request that is never answered gives the peer up" {
-    const reachable = sim.nodeIdFor(2);
-    const stale = sim.nodeIdFor(3);
+    const reachable = try sim.nodeIdFor(2);
+    const stale = try sim.nodeIdFor(3);
     var state: State = try newMembership(1, .{}, 23);
     var out: Actions(SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
@@ -2701,7 +2735,7 @@ test "a neighbor request that is never answered gives the peer up" {
 
     // A shuffle reply hands us two passive peers and nothing else, so the
     // refill has somewhere to aim.
-    const gifter = sim.nodeIdFor(9);
+    const gifter = try sim.nodeIdFor(9);
     try state.handle(.{ .recv_message = .{ .from = gifter, .message = .{ .shuffle_reply = .{
         .nodes = try PeerInfos.init(&.{
             .{ .id = reachable, .data = null },
@@ -2715,7 +2749,7 @@ test "a neighbor request that is never answered gives the peer up" {
 
     // The shuffle timer found an active peer to aim at only if the view was
     // non-empty; force the situation by asking for a neighbour directly.
-    const walker = sim.nodeIdFor(8);
+    const walker = try sim.nodeIdFor(8);
     try state.handle(.{ .recv_message = .{ .from = walker, .message = .{ .forward_join = .{
         .peer = .{ .id = reachable, .data = null },
         .ttl = .{ .value = 0 },
@@ -2735,8 +2769,8 @@ test "a neighbor request that is never answered gives the peer up" {
 // A direct `Join` is the paper's rule and is inserted eagerly: the peer
 // reached us over a connection it already has, so there is nothing to prove.
 test "a direct join is inserted, and the walk it starts is forwarded" {
-    const contact = sim.nodeIdFor(2);
-    const already = sim.nodeIdFor(3);
+    const contact = try sim.nodeIdFor(2);
+    const already = try sim.nodeIdFor(3);
     var state: State = try newMembership(1, .{}, 29);
     var out: Actions(SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
@@ -2778,7 +2812,7 @@ test "a direct join is inserted, and the walk it starts is forwarded" {
 // teardown, which is upstream's own "I am not sure this is correct" comment
 // kept as behaviour because the simulator is compared against it.
 test "a message from a passive peer ends with a teardown" {
-    const stranger = sim.nodeIdFor(4);
+    const stranger = try sim.nodeIdFor(4);
     var state: State = try newMembership(1, .{}, 31);
     var out: Actions(SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
@@ -2821,8 +2855,8 @@ test "the shuffle timer is armed once, on the first call" {
 
 // A `Quit` disconnects every neighbour and leaves the view empty.
 test "a quit disconnects every neighbour" {
-    const first = sim.nodeIdFor(2);
-    const second = sim.nodeIdFor(3);
+    const first = try sim.nodeIdFor(2);
+    const second = try sim.nodeIdFor(3);
     var state: State = try newMembership(1, .{}, 41);
     var out: Actions(SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
@@ -2897,7 +2931,7 @@ test "contact data over the bound is refused" {
 // to be short.
 test "the contact table refuses what a record cannot spell" {
     var map: PeerDataMap = .{};
-    const peer = sim.nodeIdFor(2);
+    const peer = try sim.nodeIdFor(2);
     // One byte over the ceiling, and still a length a `u16` spells: only the
     // comparison refuses this one, so only the comparison keeps the copy in
     // bounds.
@@ -2938,7 +2972,7 @@ fn clobberStack() void {
 // tell the two apart.
 test "a node's own contact data outlives the frame it was read in" {
     var state = try State.init(
-        sim.nodeIdFor(0),
+        try sim.nodeIdFor(0),
         try PeerData.fromBytes("41234"),
         .{},
         Rng.init(1),
@@ -2950,20 +2984,22 @@ test "a node's own contact data outlives the frame it was read in" {
     @call(.never_inline, clobberStack, .{});
 
     // Snapshot with no call in between: the assertion is a call, and its frame
-    // lands on the region this test exists to inspect.
-    const held = [_]u8{ seen.?[0], seen.?[1], seen.?[2], seen.?[3], seen.?[4] };
+    // lands on the region this test exists to inspect. `orelse` is a branch and
+    // not a call, so capturing the optional here costs the read nothing.
+    const borrowed = seen orelse return error.TestUnexpectedResult;
+    const held = [_]u8{ borrowed[0], borrowed[1], borrowed[2], borrowed[3], borrowed[4] };
     try t.expectEqualSlices(u8, "41234", &held);
 
     // A node with no contact data says so, and says it from the address rather
     // than from a copy that happens to be empty.
-    var bare = try State.init(sim.nodeIdFor(1), null, .{}, Rng.init(2));
+    var bare = try State.init(try sim.nodeIdFor(1), null, .{}, Rng.init(2));
     try t.expectEqual(@as(?[]const u8, null), @call(.never_inline, State.myData, .{&bare}));
 }
 
 // A bootstrap list is bounded twice: by what a `u8` can count, and by
 // `max_bootstrap`. Either half on its own would let the other one past.
 test "a bootstrap list is refused by its count and by its length" {
-    const peer = sim.nodeIdFor(2);
+    const peer = try sim.nodeIdFor(2);
     const over = [_]NodeId{peer} ** (max_bootstrap + 1);
     const unspellable = [_]NodeId{peer} ** (std.math.maxInt(u8) + 1);
     try t.expectError(error.BootstrapListTooLong, Peers.init(over[0..]));
@@ -3068,8 +3104,8 @@ test "four nodes converge on the three links upstream does" {
     var index: u8 = 0;
     while (index < 4) : (index += 1) try network.insert(index);
 
-    try network.command(0, try joinOf(&.{ sim.nodeIdFor(1), sim.nodeIdFor(2) }));
-    try network.command(1, try joinOf(&.{sim.nodeIdFor(2)}));
+    try network.command(0, try joinOf(&.{ try sim.nodeIdFor(1), try sim.nodeIdFor(2) }));
+    try network.command(1, try joinOf(&.{try sim.nodeIdFor(2)}));
     try network.command(2, try joinOf(&.{}));
     try network.runTrips(3);
 
@@ -3104,13 +3140,13 @@ test "a node joining a full view evicts one peer, either one, and stays synchron
     const network = &simulator.network;
     var index: u8 = 0;
     while (index < 4) : (index += 1) try network.insert(index);
-    try network.command(0, try joinOf(&.{ sim.nodeIdFor(1), sim.nodeIdFor(2) }));
-    try network.command(1, try joinOf(&.{sim.nodeIdFor(2)}));
+    try network.command(0, try joinOf(&.{ try sim.nodeIdFor(1), try sim.nodeIdFor(2) }));
+    try network.command(1, try joinOf(&.{try sim.nodeIdFor(2)}));
     try network.command(2, try joinOf(&.{}));
     try network.runTrips(3);
 
     network.events.clearRetainingCapacity();
-    try network.command(3, try joinOf(&.{sim.nodeIdFor(0)}));
+    try network.command(3, try joinOf(&.{try sim.nodeIdFor(0)}));
     try network.runTrips(2);
 
     // The two possible neighbour-event lists, as upstream writes them. The
@@ -3152,15 +3188,18 @@ test "a node that quits leaves the swarm and the rest stay connected" {
     var index: u8 = 0;
     while (index < 4) : (index += 1) try network.insert(index);
     try network.command(0, try joinOf(&.{}));
-    try network.command(1, try joinOf(&.{sim.nodeIdFor(0)}));
-    try network.command(2, try joinOf(&.{sim.nodeIdFor(1)}));
-    try network.command(3, try joinOf(&.{sim.nodeIdFor(2)}));
+    try network.command(1, try joinOf(&.{try sim.nodeIdFor(0)}));
+    try network.command(2, try joinOf(&.{try sim.nodeIdFor(1)}));
+    try network.command(3, try joinOf(&.{try sim.nodeIdFor(2)}));
     try network.runTrips(2);
 
     var seen = [_]bool{false} ** sim.max_peers;
     index = 0;
     while (index < 4) : (index += 1) {
-        for (network.neighbors(index)) |neighbour| seen[network.peerIndexOf(neighbour).?] = true;
+        for (network.neighbors(index)) |neighbour| {
+            const found = network.peerIndexOf(neighbour) orelse return error.TestUnexpectedResult;
+            seen[found] = true;
+        }
     }
     for (seen[0..4]) |present| try t.expect(present);
     try t.expect(network.checkSynchronicity());
@@ -3175,7 +3214,10 @@ test "a node that quits leaves the swarm and the rest stay connected" {
     var after = [_]bool{false} ** sim.max_peers;
     index = 0;
     while (index < 3) : (index += 1) {
-        for (network.neighbors(index)) |neighbour| after[network.peerIndexOf(neighbour).?] = true;
+        for (network.neighbors(index)) |neighbour| {
+            const found = network.peerIndexOf(neighbour) orelse return error.TestUnexpectedResult;
+            after[found] = true;
+        }
     }
     try t.expect(after[0]);
     try t.expect(after[1]);
@@ -3201,11 +3243,11 @@ test "a broadcast reaches the whole swarm, once the halves are joined" {
     while (index < 6) : (index += 1) try network.insert(index);
 
     try network.command(0, try joinOf(&.{}));
-    try network.command(1, try joinOf(&.{sim.nodeIdFor(0)}));
-    try network.command(2, try joinOf(&.{sim.nodeIdFor(0)}));
+    try network.command(1, try joinOf(&.{try sim.nodeIdFor(0)}));
+    try network.command(2, try joinOf(&.{try sim.nodeIdFor(0)}));
     try network.command(3, try joinOf(&.{}));
-    try network.command(4, try joinOf(&.{sim.nodeIdFor(3)}));
-    try network.command(5, try joinOf(&.{sim.nodeIdFor(3)}));
+    try network.command(4, try joinOf(&.{try sim.nodeIdFor(3)}));
+    try network.command(5, try joinOf(&.{try sim.nodeIdFor(3)}));
     try network.runTrips(4);
     network.events.clearRetainingCapacity();
     try t.expect(network.checkSynchronicity());
@@ -3218,7 +3260,7 @@ test "a broadcast reaches the whole swarm, once the halves are joined" {
 
     // Join the two halves and broadcast again.
     network.events.clearRetainingCapacity();
-    try network.command(2, try joinOf(&.{sim.nodeIdFor(5)}));
+    try network.command(2, try joinOf(&.{try sim.nodeIdFor(5)}));
     try network.runTrips(3);
     network.events.clearRetainingCapacity();
     try network.command(1, .{ .broadcast = .{ .content = "hi2", .scope = .swarm } });
@@ -3323,12 +3365,12 @@ test "the simulator refuses a thirteenth node and a duplicate" {
 test "every simulated node has its own identity" {
     var index: u8 = 0;
     while (index < sim.max_peers) : (index += 1) {
-        const mine = sim.nodeIdFor(index);
-        try t.expect(sameNode(mine, sim.nodeIdFor(index)));
+        const mine = try sim.nodeIdFor(index);
+        try t.expect(sameNode(mine, try sim.nodeIdFor(index)));
         var other: u8 = 0;
         while (other < sim.max_peers) : (other += 1) {
             if (other == index) continue;
-            try t.expect(!sameNode(mine, sim.nodeIdFor(other)));
+            try t.expect(!sameNode(mine, try sim.nodeIdFor(other)));
         }
     }
 }

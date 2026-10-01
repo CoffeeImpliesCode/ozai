@@ -272,30 +272,51 @@ pub const Packet = struct {
 /// `iroh-dns/src/pkarr.rs` at n0-computer/iroh commit
 /// 187f59e80afdae6bd9866002b33d3365c00b06d8 is the same function.
 ///
-/// The length in the prefix is the body length, in decimal, and both integers
-/// are unsigned: a `u64` is at most twenty digits and a body at most 1000 is
-/// four, so the prefix is at most 35 bytes and `max_signable_length` is that
-/// plus the largest body. A test holds the bound to the last byte.
+/// The prefix is written into `out[0..max_prefix_length]` rather than into
+/// all of `out`: the format is given exactly the room its own worst case
+/// needs, so `NoSpaceLeft` is a property of `max_prefix_length` being wrong
+/// and of nothing else. A reader checks one constant, and it is checked.
 pub fn signableForm(
     timestamp: u64,
     dns: []const u8,
     out: *[max_signable_length]u8,
 ) []const u8 {
-    // `out` is `max_signable_length` bytes and the format writes at most 35
-    // of them, so `NoSpaceLeft` has no path here.
-    const prefix = std.fmt.bufPrint(out, "3:seqi{d}e1:v{d}:", .{
+    const prefix = std.fmt.bufPrint(out[0..max_prefix_length], "3:seqi{d}e1:v{d}:", .{
         timestamp,
         dns.len,
-    }) catch unreachable;
+    }) catch |err| switch (err) {
+        // The statement that `max_prefix_length` is wrong, made loud rather
+        // than made silent.
+        error.NoSpaceLeft => std.debug.panic(
+            "the pkarr signable prefix needs more than {d} bytes",
+            .{max_prefix_length},
+        ),
+    };
     // From `out`, not from `prefix`: `bufPrint` hands back only what it wrote.
     @memcpy(out[prefix.len..][0..dns.len], dns);
     return out[0 .. prefix.len + dns.len];
 }
 
+/// Longest prefix `signableForm` can write, bounded by the types it formats
+/// and by nothing else: the six literal bytes `3:seqi`, a `u64` in decimal at
+/// twenty digits, the four literal bytes `e1:v`, a `usize` in decimal at
+/// twenty, and the colon. Deliberately not the narrower width the body cap
+/// implies, because a bound that only holds for callers who already checked
+/// the cap is one `signableForm` cannot check for itself.
+pub const max_prefix_length = 6 + 20 + 4 + 20 + 1;
+
 /// Longest signable form any legal packet can produce: the prefix at its
 /// worst — twenty digits of timestamp, four of length, five of literal — plus
-/// the largest body the cap allows.
+/// the largest body the cap allows. Narrower than `max_prefix_length` plus
+/// the body, because a legal body length is at most four digits.
 pub const max_signable_length = 6 + 20 + 4 + 4 + 1 + max_dns_length;
+
+// The format writes into `out[0..max_prefix_length]`, so that slice has to
+// exist. A body over the cap would overrun `out` on the copy below whatever
+// this says; `fromParts` and `sign` are what refuse one.
+comptime {
+    std.debug.assert(max_prefix_length <= max_signable_length);
+}
 
 /// Sign `dns` with `secret` and write the whole wire form into `out`.
 ///

@@ -26,10 +26,10 @@ would break if it moved.
 │  frame codec          │  resolver, merge               │
 ├───────────────────────────────────────────────────────┤
 │  ozai.net             net report, NAT classification,  │
-│                       portmapper, direct-address set  │
+│                       holepunch gate, candidate paths │
 ├───────────────────────────────────────────────────────┤
 │  ozai.base            keys, addresses, base32.        │
-│                       Pure. No Io, no allocator.      │
+│                       Injected allocators and Io.    │
 └───────────────────────────────────────────────────────┘
 ```
 
@@ -67,9 +67,10 @@ well-meaning port.
 
 ## Boundaries that must not move
 
-**`ozai.base` is pure.** No `Io`, no allocator, no clock, no environment. The
-value types here are what a state machine carries *as* its state, and a state
-machine that carries an `Io` cannot be driven by a test.
+**`ozai.base` has no hidden resources.** Value types never store `Io` or an
+allocator, and never read a clock or the environment. Owned address storage
+takes an explicit allocator; secret-key generation takes an explicit `Io`
+for entropy. State machines carry the values, not those resource handles.
 
 **Wire codecs are pure and separate from the transport.** Relay framing, ticket
 encoding, pkarr signing, `RangeSpec` algebra: each is a function from bytes to a
@@ -171,6 +172,17 @@ prevents, and each belongs in a test.
 - **`RelayUrl` is owned, not `Arc`.** Fixed 253-byte host, no allocation, no
   borrowed lifetime. `hostSlice` takes a pointer receiver for exactly this reason:
   a 258-byte struct taken by value can hand back a slice into a dead temporary.
+  It becomes a socket address only when its host is an IP literal;
+  `socketAddr` answers `error.NotAnIpLiteral` for a name, because `base` has no
+  `Io`, no allocator and no clock and name resolution belongs to
+  `src/discovery/`. Upstream's DERP client parses `url.host` as a socket address
+  outright, so the literal case is its shape and the named case is our open half.
+  **Nothing in `src/` resolves a name today**: `dns.zig` builds only the
+  `_iroh.<z32>.<origin>` TXT query and there is no A/AAAA path. A relay URL
+  with a named host cannot yet be reached. A live transport
+  does exist — `discovery/lookup_live.zig` is the datagram seam over
+  `transport/socket.zig` — but it carries those questions rather than turning a
+  host into an address.
 - **Ticket and address encodings are explicit.** `parseHex` / `parseZ32` /
   `parseLocalTlsName` rather than one `FromStr` that guesses by length.
 - **The synthetic-ULA host bits are injected, not drawn.** Upstream's
@@ -179,9 +191,10 @@ prevents, and each belongs in a test.
   `Mutex` that retries on collision and memoises both directions. That is a
   process-global RNG, which AGENTS.md §2 forbids, and hidden state, which
   `base` forbids. `ula.syntheticSocketAddr` therefore takes the eight host bits
-  as an argument. The map that reuses them is transport-layer state and lands
-  with M7's transport seam. The `/l`, the global id, the subnets and the port
-  are upstream's bytes and are pinned by golden vectors in `base/ula.zig`.
+  as an argument. The map that reuses them is transport-layer state, and it
+  landed with M7's transport seam as `transport/addr_map.zig`. The `/l`, the
+  global id, the subnets and the port are upstream's bytes and are pinned by
+  golden vectors in `base/ula.zig`.
 - **A folded report names a global address, not the first one seen.**
   Upstream's `global_v4` / `global_v6` store the first address a probe reported
   and never replace it, so the published address is a function of the order the
@@ -212,6 +225,34 @@ prevents, and each belongs in a test.
   is rejected rather than accepted-and-normalised, so the
   `segment_size ⇔ batch` rule is a property of the codec instead of a property
   of a peer's cooperation.
+- **A relay's outbound text is bounded; upstream's is not.** Upstream bounds no
+  relay-authored text. `ServerDeniesAuth` is a bare `reason: String`
+  (`handshake.rs:105-107`) and `Health` a `problem: String` (`relay.rs:115`),
+  written into a `BytesMut::new()` that grows (`handshake.rs:558-561`), so a
+  relay there cannot fail to send a denial — it decides how large its own denial
+  is and pays in memory. Upstream's only size rule is inbound:
+  `ensure!(frame_len <= MAX_PACKET_SIZE)` at `relay.rs:404` and `:544`.
+
+  Two things differ here, and only the second needed a bound. Upstream's writer
+  allocates; this one appends into a buffer the caller owns, and a fixed buffer is
+  what turns an unbounded string into an unwritable frame. And upstream's reason
+  is the relay's own text, while ours is whatever an access-control trait
+  produced (`handshake.rs:495`, `:524`).
+
+  So `relay/frame.zig` owns `max_text_length` (255), `encode` refuses past it as
+  `TextTooLong` before writing a byte, and the maximum a caller may write is a
+  value in the type: `ServerDeniesAuth.max_reason_length`, with
+  `ServerDeniesAuth.max_frame_length` (258) for the buffer. `src/node/node.zig`
+  asserts at comptime that the room it reserves covers a denial at that bound, so
+  "the relay always has room for the denial it decided to send" is arithmetic
+  rather than a hope.
+
+  The same sweep closed two neighbours: a v1 `health` problem takes the same
+  constant, and the four datagram frames' payload is now refused by
+  `max_packet_size` on the way out as `decode` already refused it on the way in.
+  Recorded rather than matched because upstream has no rule to match — this is a
+  consequence of the port's fixed-buffer writer, not a different opinion about
+  how long a denial should be.
 - **The vendored core carries two paths; `ula` models three subnets.** The QUIC
   substrate holds `paths: [2]NetworkPath` with one `active_path_idx` — an active
   path and a candidate, which is RFC 9000 migration and nothing more, and is

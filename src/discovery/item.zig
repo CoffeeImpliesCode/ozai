@@ -498,7 +498,8 @@ fn single(
     last_updated: ?u64,
 ) !Item {
     var endpoint = addr.NodeAddr.init(id);
-    endpoint = (try endpoint.insert(alloc, transport)).?;
+    endpoint = (try endpoint.insert(alloc, transport)) orelse
+        return error.TestUnexpectedResult;
     return .init(endpoint, provenance, last_updated);
 }
 
@@ -604,7 +605,8 @@ test "the encoding order is the value order" {
     while (i < addresses.len) : (i += 1) {
         var j: usize = 0;
         while (j < addresses.len) : (j += 1) {
-            const by_bytes = compareAddr(addresses[i], addresses[j]).?;
+            const by_bytes = compareAddr(addresses[i], addresses[j]) orelse
+                return error.TestUnexpectedResult;
             try t.expectEqual(addresses[i].order(addresses[j]), by_bytes);
             try t.expectEqual(negate(compareAddr(addresses[j], addresses[i]).?), by_bytes);
         }

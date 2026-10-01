@@ -12,12 +12,34 @@ does not, ozai says so and diverges on the record.
 
 ## Status
 
-**Milestones 1–11 are built, and two endpoints have completed a QUIC
-handshake over a real socket.** `test/loopback_test.zig` dials a listener on
-loopback, verifies the peer's identity from the certificate rather than from
-configuration, moves bytes both ways and carries ECN across. What is *not* here
-is anything past one node reaching another: no relay is run, no discovery
-lookup does real I/O, and a peer's address is resolved by a test-supplied one.
+**Milestones 1–11 are built.** `test/loopback_test.zig` verifies peer identity
+from the certificate, moves bytes both ways, and carries ECN over a real socket.
+`test/relay_wire_test.zig` and `test/two_process_test.zig` exercise relay
+forwarding, payload delivery, and independent shutdown on loopback.
+
+External iroh interoperability and 0-RTT remain open. The gossip state machines
+run, but the node does not yet encode their messages on the wire.
+
+Verified on this node: the direct `zig-gate` passes all nine sections over the
+56-file non-vendored Zig tree, with zero lint/static-analysis findings.
+Debug and ReleaseSafe each pass 543/543 tests; the full GNU and musl rows
+also pass 543/543, with no build-only or missing-runner result. All seven
+decoder fuzz targets completed another 10 000 mutations without a crash.
+The actual CLI delivered exact payloads over IPv4 and IPv6. Under one-CPU
+load, all 30 process scenarios and 30 immediate-banner SIGTERM runs passed.
+
+The instrumented suite passes 543/543 with its matching node children.
+Progress measures 35/35 source lines; the CLI measures 172/310. These are PC
+line counts, not branch coverage. Accepted cold regions: unsupported-session
+ABI panics (0/16), exceptional kernel interruptions/refusals not forced by
+these runs, and compile-time/elided or fixture rows without owning counters.
+CLI refusal guards were separately smoke-tested; no duplicate tests were
+added to inflate counters. The two pre-existing map allocation-fault gaps
+are recorded with their trigger in [`TODO.md`](TODO.md).
+
+The local `devenv` launcher still cannot enter its missing shared sandbox at
+`/tmp/devenv-sbox`. The direct gate command below passed; no
+global temporary storage or launcher was repaired.
 
 | Module | What it is |
 |---|---|
@@ -50,18 +72,61 @@ left behind, and every patch ozai applies.
 
 ```sh
 direnv allow          # once
-zig build             # static library
+zig build             # static library + the node binary, both installed
 zig build test        # unit + integration tests
 zig build run-ozai-node-id
-devenv shell -- gate  # fmt, build, test, ast-check, zlint, zbc
+devenv shell -- gate  # fmt, build, test, ast-check, ziglint, zlint, zbc, zwanzig, cross-test
+devenv shell -- gate-strict  # same gate without zbc, plus coverage
 ```
 
 `zig build run-ozai-node-id` prints this machine's node id in every form ozai
 puts on the wire, and signs the rendered address to prove the text form is
 faithful to the value.
 
-`devenv shell -- gate` needs the pinned toolchain in `~/.local/bin`; outside
-devenv, run `zig-gate` from there directly for the same gate.
+`zig build run-ozai-node -- --progress --for 30000` emits live counter changes
+after completed passes. Each `progress:` line is flushed immediately. Supervisors
+can wait for a connection, delivery, or departure before sending SIGTERM.
+Without `--progress`, the node prints only its banner and final report.
+The SIGINT/SIGTERM handlers are installed before the listening banner is published.
+
+`devenv shell -- gate` needs the pinned toolchain in `~/.local/bin` and the
+shared devenv sandbox it wraps; both `nix` and the wrapper resolve to that one
+sandbox. Where it is absent, run the driver with the exclusions spelled out by
+hand, because `GATE_EXCLUDE` is what makes it the same gate, `.envrc` does not
+set it, and the driver takes no other source for it:
+
+```sh
+GATE_EXCLUDE='^[.]/vendor/ /[.]zig-cache/ /zig-out/ /zig-cache/ /zig-global-cache/' zig-gate
+```
+
+A bare `zig-gate` is not that configuration. With those exclusions it is the
+whole of `scripts.gate.exec` bar the version cross-check, which is one `zig
+version` against `.minimum_zig_version`.
+
+The driver runs the sections in the order above and prints one line for each:
+`OK`, or a count beside the tool's exit status. Any section that finds
+something marks the whole run failed — `zbc` is the one exception, advisory
+unless `ZBC_STRICT=1` — and the driver ends on `GATE FAILED` and exit 1. The
+section output names each failure; the exit status reports overall failure, not
+a standing claim that the tree is clean.
+
+`gate-strict` is that gate with exactly two changes: `--no-zbc` drops the `zbc`
+section and nothing else, so fmt, build, test, ast-check, ziglint, zlint,
+zwanzig and cross-test all still run, and `--cov` adds coverage on top, which
+is advisory until `ZIG_COV_FAIL_UNDER` is set. It is a design pass that a
+failing zbc advisory cannot block, not a cheaper gate.
+
+`GATE_EXCLUDE` names what is not this project's source: `vendor/quic`, plus
+`.zig-cache/`, `zig-out/`, `zig-cache/` and `zig-global-cache/`. It overrides
+the driver's built-in default rather than adding to it, which is why the
+default's patterns are spelled out here. `vendor/quic` is excluded on purpose
+and pays that back through `zig build quic-test`; the cache roots are there
+because a lint section reports whatever the file list hands it, and build
+output is not a defect.
+
+`cross-test.profile.sh` selects Linux `x86_64` with GNU libc and musl.
+Both rows built and ran the full 543-test suite with their matching node
+artifacts. This proves the two native libc ABIs, not foreign architectures.
 
 ## Layout
 
@@ -79,8 +144,9 @@ test instead of by a network.
 
 ## Reference material
 
-The Rust stack is checked out read-only beside this project and is never edited,
-committed, or given agent rules:
+Reference checkouts use the paths below when available. They are read-only:
+never edit them, commit them, or add agent rules. The iroh checkouts are absent
+on this node; the vectors cite GitHub primary sources pinned by commit.
 
 | Checkout | Crate |
 |---|---|

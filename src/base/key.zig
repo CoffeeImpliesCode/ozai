@@ -119,6 +119,10 @@ pub const NodeId = struct {
 
 /// The signing half of a node identity.
 ///
+/// The std secret key includes the canonical public bytes produced by key
+/// generation. Reading them needs neither a second validation nor another copy
+/// stored alongside the secret.
+///
 /// `deinit` zeroes the key. There is no `clone`: copying a secret key is a
 /// decision the caller must make at the call site, with the copy visible.
 pub const SecretKey = struct {
@@ -141,9 +145,7 @@ pub const SecretKey = struct {
     }
 
     pub fn nodeId(self: SecretKey) NodeId {
-        // A secret key built by `fromSeed` or `generate` always carries a key
-        // its own constructor accepted.
-        return .{ .key = Ed25519.PublicKey.fromBytes(self.key.publicKeyBytes()) catch unreachable };
+        return .{ .key = .{ .bytes = self.key.publicKeyBytes() } };
     }
 
     pub fn sign(self: SecretKey, message: []const u8) Signature {
@@ -154,7 +156,12 @@ pub const SecretKey = struct {
             .public_key = self.nodeId().key,
             .secret_key = self.key,
         };
-        const signature = Ed25519.KeyPair.sign(pair, message, null) catch unreachable;
+        // Both halves use the public bytes checked by key generation, excluding
+        // KeyMismatch and NonCanonical. The fixed base point excludes WeakPublicKey.
+        // IdentityElement remains possible if the deterministic nonce reduces to
+        // zero (about 2^-252). Preserve the total API with a defined abort, not UB.
+        const signature = Ed25519.KeyPair.sign(pair, message, null) catch
+            @panic("ed25519 sign failed on a key pair derived from one seed");
         return .{ .bytes = signature.toBytes() };
     }
 
@@ -164,6 +171,9 @@ pub const SecretKey = struct {
 
     /// Zero the key material. Must be called; a `SecretKey` left in freed heap
     /// is a `SecretKey` an attacker reads.
+    // The volatile whole-receiver wipe is the terminal state. The analyzer
+    // recognizes ordinary lifecycle assignments, not secureZero.
+    // ziglint-ignore: Z030
     pub fn deinit(self: *SecretKey) void {
         std.crypto.secureZero(u8, @volatileCast(std.mem.asBytes(self)));
     }
@@ -271,9 +281,10 @@ test "signatures verify only against the signing node and the signed bytes" {
     try signature.verify(message, node_id);
 
     try t.expectError(error.BadSignature, signature.verify("ozai!", node_id));
+    const other = try SecretKey.fromSeed([_]u8{10} ** SecretKey.seed_length);
     try t.expectError(
         error.BadSignature,
-        signature.verify(message, (try SecretKey.fromSeed([_]u8{10} ** SecretKey.seed_length)).nodeId()),
+        signature.verify(message, other.nodeId()),
     );
 }
 

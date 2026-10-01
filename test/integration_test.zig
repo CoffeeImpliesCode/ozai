@@ -32,9 +32,10 @@ test "a signed address verifies at the far end and nothing else does" {
         try ozai.RelayUrl.parse("https://use1-1.relay.iroh.network./"),
     );
     defer address.deinit(alloc);
-    address = (try address.insert(alloc, .{
-        .ip = .{ .ip = ozai.IpAddress.parse("192.0.2.7").?, .port = 41641 },
-    })).?;
+    const host = ozai.IpAddress.parse("192.0.2.7") orelse return error.TestUnexpectedResult;
+    const direct: ozai.TransportAddr = .{ .ip = .{ .ip = host, .port = 41641 } };
+    address = (try address.insert(alloc, direct)) orelse
+        return error.TestUnexpectedResult;
 
     var buffer: [256]u8 = undefined;
     const payload = try std.fmt.bufPrint(&buffer, "{f}", .{address});
@@ -60,20 +61,22 @@ test "an address renders to the same text every time" {
 
     const alloc = t.allocator;
     const relay = try ozai.RelayUrl.parse("https://derp.example./");
-    const direct = ozai.TransportAddr{ .ip = .{
-        .ip = ozai.IpAddress.parse("127.0.0.1").?,
-        .port = 1024,
-    } };
+    const host = ozai.IpAddress.parse("127.0.0.1") orelse return error.TestUnexpectedResult;
+    const direct: ozai.TransportAddr = .{ .ip = .{ .ip = host, .port = 1024 } };
 
     // The same two addresses, inserted in opposite orders.
     var relay_first = ozai.NodeAddr.init(node_id);
-    relay_first = (try relay_first.insert(alloc, .{ .relay = relay })).?;
-    relay_first = (try relay_first.insert(alloc, direct)).?;
+    relay_first = (try relay_first.insert(alloc, .{ .relay = relay })) orelse
+        return error.TestUnexpectedResult;
+    relay_first = (try relay_first.insert(alloc, direct)) orelse
+        return error.TestUnexpectedResult;
     defer relay_first.deinit(alloc);
 
     var ip_first = ozai.NodeAddr.init(node_id);
-    ip_first = (try ip_first.insert(alloc, direct)).?;
-    ip_first = (try ip_first.insert(alloc, .{ .relay = relay })).?;
+    ip_first = (try ip_first.insert(alloc, direct)) orelse
+        return error.TestUnexpectedResult;
+    ip_first = (try ip_first.insert(alloc, .{ .relay = relay })) orelse
+        return error.TestUnexpectedResult;
 
     var buffer: [256]u8 = undefined;
     const from_relay = try std.fmt.bufPrint(&buffer, "{f}", .{relay_first});

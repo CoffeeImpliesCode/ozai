@@ -115,15 +115,14 @@ const SocketAddr = base_addr.SocketAddr;
 const Manager = quic.connection_manager.ConnectionManager;
 const Entry = quic.connection_manager.ConnEntry;
 const quic_stream = quic.stream;
-const Tls13 = quic.tls13;
-const TlsConfig = Tls13.TlsConfig;
-const ClientAuth = Tls13.ClientAuth;
+const tls13 = quic.tls13;
+const ClientAuth = tls13.ClientAuth;
 
 /// The size of a peer certificate, in bytes: a DER `SubjectPublicKeyInfo`
 /// wrapping 32 bytes of ed25519 public key and nothing else. There is no
 /// chain behind it and there is no host name in it, which is the whole of
 /// the identity model — see `vendor/quic/VENDORED.md`.
-pub const spki_length = Tls13.ed25519_spki_len;
+pub const spki_length = tls13.ed25519_spki_len;
 
 /// The 32 bytes of a secret key that are the actual entropy source; what the
 /// core wants as `private_key_bytes` for `.ed25519`.
@@ -150,6 +149,23 @@ pub const Error = batch.Error || error{
     /// the core produced. Nothing was sent; the caller decides whether to
     /// grow the room and try again or to drop the connection.
     NoRoom,
+    /// The core had no stream id for this end to open: the peer's transport
+    /// parameters have not been applied yet, or it has granted no more streams
+    /// than this end has already used.
+    ///
+    /// **A recoverable refusal, and named apart from `CoreRefused` for that
+    /// reason.** `StreamsMap.setMaxStreams` runs only where
+    /// `hs.peer_transport_params` is set (`connection.zig:2650`), so a
+    /// connection whose peer has not been read yet has a limit of zero and
+    /// refuses every open; `MAX_STREAMS` raises the same limit later
+    /// (`connection.zig:2146`), so an exhausted limit looks identical. Both are
+    /// facts about *now* rather than faults, a later pass gets a different
+    /// answer, and a caller that treats this as fatal stops serving over a
+    /// refusal the protocol itself makes temporary. What is left in
+    /// `CoreRefused` is everything else the core can refuse with — an
+    /// allocator that will not make the send ledger above all — and that is
+    /// what a caller must still fail on.
+    NoStreamRoom,
     /// The core holds a peer address in a family this project does not
     /// model. Every address the core is given goes through `toSockaddr` and
     /// comes back through `fromSockaddr`, so this is reachable only from a
@@ -327,7 +343,7 @@ pub const Conn = struct {
     /// The bidirectional stream this connection's *peer* opened, or null when
     /// it has not opened one.
     ///
-    /// **A stream is read by whichever end opened it.** `Stream.take` reads
+    /// **A stream is read by whichever end opened it.** `Stream.drain` reads
     /// the stream it is called on and nothing else, so a protocol where both
     /// ends speak on one stream has only two shapes: this end opens one and
     /// finds the peer's, or the peer opens one and this end takes it. The
@@ -372,13 +388,20 @@ pub const Stream = struct {
     /// Open a new bidirectional stream on `conn`.
     ///
     /// The core's error set here is `anyerror` — `Connection.openStream`
-    /// (`connection.zig:3935`) carries no named set — so it is mapped onto
-    /// `Error.CoreRefused` for the reason that error gives, with the core's
-    /// own answer logged before the refusal is named.
+    /// (`connection.zig:3935`) carries no named set — so it is mapped onto this
+    /// file's own two answers, for the reason each of those gives. A stream
+    /// limit is `error.NoStreamRoom` and logs nothing, because it is the core
+    /// saying "not yet" and a warning a pass later contradicted would be a log
+    /// about a fact that has since changed. Anything else is
+    /// `Error.CoreRefused`, with the core's own answer logged before the
+    /// refusal is named, so nothing is dropped on the floor.
     pub fn open(conn: Conn) Error!Stream {
-        const opened = conn.entry.conn.openStream() catch |err| {
-            std.log.warn("quic bridge: the core refused to open a stream: {t}", .{err});
-            return error.CoreRefused;
+        const opened = conn.entry.conn.openStream() catch |err| switch (err) {
+            error.StreamLimitError => return error.NoStreamRoom,
+            else => {
+                std.log.warn("quic bridge: the core refused to open a stream: {t}", .{err});
+                return error.CoreRefused;
+            },
         };
         return .{ .entry = opened };
     }
@@ -401,27 +424,44 @@ pub const Stream = struct {
         self.entry.send.close();
     }
 
-    /// The next readable bytes, or null when none are ready.
+    /// Take everything this stream has ready, appending it to `sink`.
     ///
-    /// **A copy, into the caller's buffer.** The core hands its chunk to the
-    /// application to free (`ReceiveStream.read`, `stream.zig:523`), so
-    /// `gpa` is the allocator that made it — which is the bridge's own, and a
-    /// caller passes the one it created the bridge with. The bytes are copied
-    /// because a framed protocol parses a message in place and borrows into
-    /// it, and a borrow of the core's chunk is a borrow of memory the next
-    /// read has already reused. Copying is one pass over what arrived and no
-    /// allocation at all, which a per-read `dupe` would not be.
+    /// Returns whether anything was appended, so a caller can fold this into
+    /// its own "did this pass move anything" answer without a second read.
+    /// Nothing is ready is false rather than a refusal: a stream with nothing
+    /// on it yet is a peer that has not spoken, not a fault.
     ///
-    /// `error.NoRoom` rather than a short read: the core hands over whatever
-    /// chunk it holds, and a caller whose buffer is sized to the largest frame
-    /// the protocol permits is told so rather than handed a fragment that
-    /// would decode as a different frame.
-    pub fn take(self: *Stream, gpa: std.mem.Allocator, into: []u8) Error!?[]const u8 {
-        const chunk = self.entry.recv.read() orelse return null;
-        defer gpa.free(chunk);
-        if (chunk.len > into.len) return error.NoRoom;
-        @memcpy(into[0..chunk.len], chunk);
-        return into[0..chunk.len];
+    /// **The sink is the caller's and it grows, because a read has no length
+    /// worth guessing.** The core hands back whatever contiguous run it holds —
+    /// `FrameSorter.pop` returns a whole chunk, coalesced up to `MAX_COALESCED`
+    /// (`stream.zig:72`) — so the size of a read is a function of what the peer
+    /// sent and of nothing the caller can see coming. A caller that owned a
+    /// fixed buffer had two answers and both were wrong: sized to a frame it
+    /// refused the run *after* popping it, and the bytes were already gone
+    /// (`stream.zig:390-396` hands over ownership), and sized to the ceiling it
+    /// allocated the ceiling per stream for the whole life of the connection.
+    /// A sink that grows pays for what actually arrived and nothing for what a
+    /// peer might send.
+    ///
+    /// **One copy, not two.** The core hands its chunk to the application to
+    /// free (`ReceiveStream.read`, `stream.zig:523`), so `gpa` is the allocator
+    /// that made it — which is the bridge's own, and a caller passes the one it
+    /// created the bridge with. The append is the copy, and it has to be one:
+    /// a framed protocol parses a message in place and borrows into the bytes
+    /// it was handed, and those bytes must outlive the message, which a borrow
+    /// of the core's chunk cannot because the next read has already taken it.
+    pub fn drain(
+        self: *Stream,
+        gpa: std.mem.Allocator,
+        sink: *std.ArrayList(u8),
+    ) std.mem.Allocator.Error!bool {
+        var moved = false;
+        while (self.entry.recv.read()) |chunk| {
+            defer gpa.free(chunk);
+            try sink.appendSlice(gpa, chunk);
+            moved = true;
+        }
+        return moved;
     }
 
     /// Whether the peer has said everything it will say on this stream.
@@ -558,8 +598,8 @@ pub const Bridge = struct {
     ///
     /// The returned pointer is owned by `gpa` and freed by `destroy`.
     pub fn create(
-        io: std.Io,
         gpa: std.mem.Allocator,
+        io: std.Io,
         config: Config,
         random: std.Random,
     ) CreateError!*Bridge {
@@ -611,7 +651,10 @@ pub const Bridge = struct {
     ///
     /// Exposed because it is the translation, and a translation nobody can
     /// read is a translation nobody can check.
-    pub fn tlsConfig(self: *const Bridge) TlsConfig {
+    ///
+    /// The type is the core's own and is spelled in full: an alias for it here
+    /// would be private, and a public signature may not name a private type.
+    pub fn tlsConfig(self: *const Bridge) quic.tls13.TlsConfig {
         return self.manager.tls_config;
     }
 
@@ -631,8 +674,8 @@ pub const Bridge = struct {
     /// client handshake, so setting it would read as a second pin and enforce
     /// nothing; the pin a server enforces is `client_auth.expect_node_id`,
     /// set above.
-    fn buildTlsConfig(self: *Bridge, config: Config) TlsConfig {
-        self.spki = Tls13.ed25519Spki(&self.node_id.toBytes());
+    fn buildTlsConfig(self: *Bridge, config: Config) quic.tls13.TlsConfig {
+        self.spki = tls13.ed25519Spki(&self.node_id.toBytes());
         self.cert_chain = .{self.spki[0..]};
         self.alpn_list = .{config.alpn};
         return .{
@@ -986,7 +1029,7 @@ const Client = struct {
             .alpn_list = undefined,
             .seed = secret.toBytes()[0..seed_length].*,
         };
-        self.spki = Tls13.ed25519Spki(&secret.nodeId().toBytes());
+        self.spki = tls13.ed25519Spki(&secret.nodeId().toBytes());
         self.cert_chain = .{self.spki[0..]};
         self.alpn_list = .{alpn};
         self.conn = try t.allocator.create(quic.connection.Connection);
@@ -1022,6 +1065,13 @@ const Client = struct {
     fn deinit(self: *Client) void {
         self.conn.deinit();
         t.allocator.destroy(self.conn);
+
+        // The connection is freed, and nothing else in here outlives it: the
+        // handshake's config points at `spki` and `alpn_list`, which is why
+        // this struct was built in place rather than returned. Left standing,
+        // a second `deinit` or a read after the `defer` would walk a connection
+        // that is already back in the testing allocator.
+        self.* = undefined;
     }
 
     fn random(self: *Client) std.Random {
@@ -1120,7 +1170,7 @@ test "a node's identity reaches the core as a bare SPKI and the handshake finish
     defer client_secret.deinit();
 
     var engine = Prng.init(1);
-    const bridge = try Bridge.create(t.io, t.allocator, .{
+    const bridge = try Bridge.create(t.allocator, t.io, .{
         .secret = server_secret,
         .expect_peer = client_secret.nodeId(),
         .alpn = alpn,
@@ -1136,15 +1186,15 @@ test "a node's identity reaches the core as a bare SPKI and the handshake finish
     try t.expectEqual(@as(usize, spki_length), tls.cert_chain_der[0].len);
     try t.expectEqualSlices(
         u8,
-        &Tls13.ed25519Spki(&server_secret.nodeId().toBytes()),
+        &tls13.ed25519Spki(&server_secret.nodeId().toBytes()),
         tls.cert_chain_der[0],
     );
-    try t.expectEqual(Tls13.PrivateKeyAlgorithm.ed25519, tls.private_key_algorithm);
+    try t.expectEqual(tls13.PrivateKeyAlgorithm.ed25519, tls.private_key_algorithm);
     try t.expectEqual(@as(usize, 1), tls.alpn.len);
     try t.expectEqualStrings(alpn, tls.alpn[0]);
     try t.expectEqual(@as(?[32]u8, null), tls.expect_peer_node_id);
     try t.expectEqual(client_secret.nodeId().toBytes(), tls.client_auth.?.expect_node_id.?);
-    try t.expectEqual(Tls13.ClientAuth.Mode.required, tls.client_auth.?.mode);
+    try t.expectEqual(tls13.ClientAuth.Mode.required, tls.client_auth.?.mode);
 
     // The consequence of the translation above: a handshake completes, and
     // it completes over two synthetic addresses with no socket anywhere.
@@ -1156,7 +1206,7 @@ test "a node's identity reaches the core as a bare SPKI and the handshake finish
     try exchange(&client, bridge, &map, start);
 
     try t.expectEqual(@as(usize, 1), bridge.manager.connectionCount());
-    const conn = bridge.connectionAt(0).?;
+    const conn = bridge.connectionAt(0) orelse return error.TestUnexpectedResult;
     try t.expect(conn.established());
 
     // The answer to the question `docs/PLAN.md`'s mapping raises: the core
@@ -1178,7 +1228,7 @@ test "a node's identity reaches the core as a bare SPKI and the handshake finish
     // connection that used them.
     try t.expectEqualSlices(
         u8,
-        &Tls13.ed25519Spki(&client_secret.nodeId().toBytes()),
+        &tls13.ed25519Spki(&client_secret.nodeId().toBytes()),
         conn.entry.conn.peerCertificate().?,
     );
     try t.expectEqual(
@@ -1199,7 +1249,7 @@ test "a bridge that pins no node still learns which node it is talking to" {
     // still identified — the peer has proved possession of the id it
     // presented rather than being the node the caller asked for.
     var engine = Prng.init(3);
-    const bridge = try Bridge.create(t.io, t.allocator, .{
+    const bridge = try Bridge.create(t.allocator, t.io, .{
         .secret = server_secret,
         .alpn = alpn,
     }, engine.random());
@@ -1213,11 +1263,11 @@ test "a bridge that pins no node still learns which node it is talking to" {
     defer client.deinit();
     try exchange(&client, bridge, &map, start);
 
-    const conn = bridge.connectionAt(0).?;
+    const conn = bridge.connectionAt(0) orelse return error.TestUnexpectedResult;
     try t.expect(conn.established());
     try t.expectEqualSlices(
         u8,
-        &Tls13.ed25519Spki(&client_secret.nodeId().toBytes()),
+        &tls13.ed25519Spki(&client_secret.nodeId().toBytes()),
         conn.entry.conn.peerCertificate().?,
     );
     try t.expectEqual(@as(?[32]u8, null), conn.entry.conn.clientAuth().?.expect_node_id);
@@ -1230,7 +1280,7 @@ test "egress is the batcher's value, and a burst of one size is one send" {
     defer client_secret.deinit();
 
     var engine = Prng.init(5);
-    const bridge = try Bridge.create(t.io, t.allocator, .{
+    const bridge = try Bridge.create(t.allocator, t.io, .{
         .secret = server_secret,
         .expect_peer = client_secret.nodeId(),
         .alpn = alpn,
@@ -1243,7 +1293,7 @@ test "egress is the batcher's value, and a burst of one size is one send" {
     defer client.deinit();
     try exchange(&client, bridge, &map, start);
 
-    const conn = bridge.connectionAt(0).?;
+    const conn = bridge.connectionAt(0) orelse return error.TestUnexpectedResult;
     try t.expect(conn.established());
 
     // Enough payload for several datagrams, which is what makes the batching
@@ -1293,7 +1343,7 @@ test "a caller's instant reaches the core byte for byte" {
     defer server_secret.deinit();
 
     var engine = Prng.init(7);
-    const bridge = try Bridge.create(t.io, t.allocator, .{
+    const bridge = try Bridge.create(t.allocator, t.io, .{
         .secret = server_secret,
         .alpn = alpn,
     }, engine.random());
@@ -1328,7 +1378,7 @@ test "the same call at two instants gives two answers" {
     defer client_secret.deinit();
 
     var engine = Prng.init(11);
-    const bridge = try Bridge.create(t.io, t.allocator, .{
+    const bridge = try Bridge.create(t.allocator, t.io, .{
         .secret = server_secret,
         .expect_peer = client_secret.nodeId(),
         .alpn = alpn,
@@ -1341,7 +1391,7 @@ test "the same call at two instants gives two answers" {
     defer client.deinit();
     try exchange(&client, bridge, &map, start);
 
-    const conn = bridge.connectionAt(0).?;
+    const conn = bridge.connectionAt(0) orelse return error.TestUnexpectedResult;
     try t.expect(conn.established());
     const stream = try conn.entry.conn.openStream();
     try stream.send.writeData("a datagram to send");
@@ -1363,7 +1413,10 @@ test "the same call at two instants gives two answers" {
     // the only way a test can tell a threaded clock from a stored one.
     const later = start + 60 * std.time.ns_per_s;
     try t.expectEqual(Tick.finished, bridge.tick(conn, later, client.random()));
-    try t.expectEqual(@as(usize, 0), (try conn.drain(egress[0..], out[0..], later, client.random())).len);
+    try t.expectEqual(
+        @as(usize, 0),
+        (try conn.drain(egress[0..], out[0..], later, client.random())).len,
+    );
 
     bridge.sweep();
 }
@@ -1373,7 +1426,7 @@ test "an address that arrived off the wire is the path it stands for" {
     defer server_secret.deinit();
 
     var engine = Prng.init(13);
-    const bridge = try Bridge.create(t.io, t.allocator, .{
+    const bridge = try Bridge.create(t.allocator, t.io, .{
         .secret = server_secret,
         .alpn = alpn,
     }, engine.random());
@@ -1388,7 +1441,7 @@ test "an address that arrived off the wire is the path it stands for" {
 
     const probe = unsupportedVersionProbe();
     var scratch: [2 * max_datagram]u8 = undefined;
-    const from_relay = SocketAddr{ .ip = .{ .v6 = allocated }, .port = base_ula.mapped_port };
+    const from_relay: SocketAddr = .{ .ip = .{ .v6 = allocated }, .port = base_ula.mapped_port };
     const ingress = try bridge.recv(&map, .{
         .bytes = probe[0..],
         .from = from_relay,
@@ -1428,7 +1481,7 @@ test "a transport key the caller supplied is used, and one it did not is drawn f
     var engine = Prng.init(17);
 
     const supplied: [16]u8 = @splat(0x77);
-    const given = try Bridge.create(t.io, t.allocator, .{
+    const given = try Bridge.create(t.allocator, t.io, .{
         .secret = server_secret,
         .alpn = alpn,
         .retry_token_key = supplied,
@@ -1439,12 +1492,12 @@ test "a transport key the caller supplied is used, and one it did not is drawn f
     // Two bridges over one identity, drawn from one `std.Io`, are two
     // different bridges. A constant the bridge defaulted to would make these
     // equal; so would storing the generator.
-    const drawn_a = try Bridge.create(t.io, t.allocator, .{
+    const drawn_a = try Bridge.create(t.allocator, t.io, .{
         .secret = server_secret,
         .alpn = alpn,
     }, engine.random());
     defer drawn_a.destroy();
-    const drawn_b = try Bridge.create(t.io, t.allocator, .{
+    const drawn_b = try Bridge.create(t.allocator, t.io, .{
         .secret = server_secret,
         .alpn = alpn,
     }, engine.random());

@@ -26,14 +26,22 @@ pub fn main(init: std.process.Init) !void {
 
     // A relay path and a direct path for this node, as a peer would receive it.
     const alloc = init.gpa;
-    var address = ozai.NodeAddr.init(node_id);
-    address = (try address.insert(alloc, .{
-        .relay = try ozai.RelayUrl.parse("https://relay.ozai.invalid./"),
-    })).?;
-    address = (try address.insert(alloc, .{ .ip = .{
-        .ip = ozai.IpAddress.parse("192.0.2.1").?,
-        .port = 41641,
-    } })).?;
+    // WHY: a literal this example wrote, read back by the very parser it is
+    // here to demonstrate.
+    // zwanzig-disable-next-line: optional-unwrap
+    const host = ozai.IpAddress.parse("192.0.2.1").?;
+    const direct: ozai.TransportAddr = .{ .ip = .{ .ip = host, .port = 41641 } };
+
+    var address = try ozai.NodeAddr.withRelay(
+        alloc,
+        node_id,
+        try ozai.RelayUrl.parse("https://relay.ozai.invalid./"),
+    );
+    // `insert` answers `null` only for an address the list already holds, and
+    // the list holds exactly one relay, which a socket address cannot equal:
+    // `TransportAddr.order` compares the variant before anything inside it.
+    // zwanzig-disable-next-line: optional-unwrap
+    address = (try address.insert(alloc, direct)).?;
     defer address.deinit(alloc);
 
     try out_text.print("address     {f}\n", .{address});

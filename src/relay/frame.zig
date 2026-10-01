@@ -42,6 +42,27 @@
 //! message, because its payload is text and its length is being the rest of the
 //! message.
 //!
+//! # A relay can always send what it decided to send
+//!
+//! Every frame here has either a length its own type fixes or a bound `encode`
+//! enforces before it writes a byte. That is not upstream's rule, because
+//! upstream cannot need it: `ServerDeniesAuth` is a bare `reason: String`
+//! (`handshake.rs:106`) and `Health` a `problem: String` (`relay.rs:115`), both
+//! serialised into a `BytesMut` that grows (`handshake.rs:558-561`,
+//! `relay.rs:354-356`). A relay there decides how large its own denial is and
+//! pays for it in memory.
+//!
+//! Here a relay writes into a buffer it was handed and never grows, and the
+//! reason it writes is not only its own to choose: upstream's access control is
+//! a trait the operator implements (`handshake.rs:495`, `:524`), so the text in
+//! a denial is whatever that trait decided. **So the bound lives here, in
+//! `max_text_length`, and the maximum a caller may write is a value in the type
+//! it is writing — `ServerDeniesAuth.max_reason_length`, and the
+//! `ServerDeniesAuth.max_frame_length` a buffer has to be sized for.** Past it
+//! the answer is `error.TextTooLong` and nothing is written. The denial is
+//! never shortened, because a reason missing its end is a sentence the relay
+//! did not choose and the peer cannot tell it from one it did.
+//!
 //! # Purity
 //!
 //! Nothing here reads a clock, the environment, or a global, and nothing
@@ -102,6 +123,15 @@ pub const Error = error{
     /// the two halves of rule 7 in `docs/ARCHITECTURE.md` would stop being one
     /// fact.
     ZeroSegmentSize,
+    /// Relay-authored text longer than `max_text_length`: a denial's reason,
+    /// or a v1 health frame's problem.
+    ///
+    /// **Refused, never shortened.** A denial whose reason was cut short says
+    /// something the relay did not decide to say, and the peer reading it has
+    /// no way to tell it from the relay's real reason. A refusal the caller
+    /// cannot mistake for a denial is the honest outcome; a truncated one is
+    /// not.
+    TextTooLong,
     /// A writer with no room left in the buffer it was handed.
     BufferFull,
 };
@@ -115,6 +145,30 @@ pub const max_packet_size: usize = 64 * 1024;
 /// The largest frame the relay will accept, and therefore the smallest burst a
 /// rate limiter has to let through. Upstream's `MAX_FRAME_SIZE` (`relay.rs:29`).
 pub const max_frame_size: usize = 1024 * 1024;
+
+/// The most bytes of text a relay writes into one frame: a `server_denies_auth`
+/// reason, or a v1 `health` problem.
+///
+/// **Upstream bounds neither, and does not have to.** `ServerDeniesAuth` is a
+/// bare `reason: String` (`handshake.rs:106`) and `write_frame` serialises it
+/// into a `BytesMut` that grows (`handshake.rs:558-561`); `Health` is a
+/// `problem: String` (`relay.rs:115`) put into one the same way
+/// (`relay.rs:354-356`). Neither has a fixed buffer to miss, so there is
+/// nothing to bound. This codec appends into a buffer the caller owns and
+/// never grows, which is the whole difference between the two ports and the
+/// whole reason there is a number here.
+///
+/// 255 is a sentence rather than a payload. A denial is prose a person reads in
+/// a log line, and a health problem is the same, so neither has a use for more
+/// than a paragraph. It also keeps the postcard length prefix at two bytes, so
+/// the denial frame's length stops moving at
+/// `ServerDeniesAuth.max_frame_length` however long the reason is.
+///
+/// `encode` refuses anything longer as `error.TextTooLong` and does not
+/// shorten it. Truncation is the one answer worse than silence: a denial
+/// missing the end of its reason is a different sentence from the one the relay
+/// chose, and the peer reading it cannot tell.
+pub const max_text_length: usize = 255;
 
 /// The relay protocol version, as the `Sec-Websocket-Protocol` sub-protocol spells
 /// it.
@@ -163,7 +217,7 @@ pub fn negotiate(header_value: []const u8) ?ProtocolVersion {
     var best: ?ProtocolVersion = null;
     var rest = header_value;
     while (true) {
-        const comma = std.mem.indexOfScalar(u8, rest, ',');
+        const comma = std.mem.findScalar(u8, rest, ',');
         const token = if (comma) |at| rest[0..at] else rest;
         if (ProtocolVersion.parse(std.mem.trim(u8, token, &std.ascii.whitespace))) |version| {
             if (best == null or @intFromEnum(version) > @intFromEnum(best.?)) best = version;
@@ -355,7 +409,7 @@ pub const Datagrams = struct {
             self.contents = &.{};
             return .{ .ecn = self.ecn, .segment_size = null, .contents = contents };
         };
-        const size = @as(usize, segment_size);
+        const size: usize = segment_size;
         // Saturating rather than checked: this runs on every datagram a relay
         // forwards, and a `num_segments` a caller can name is no reason for it to
         // trap. A saturated `wanted` is clamped to the contents anyway.
@@ -448,9 +502,37 @@ pub const ClientAuth = struct {
 };
 
 /// The relay's refusal, frame 3.
+///
+/// **This is the frame a peer can make unwritable.** Its reason is the one
+/// payload in the relay half of this protocol whose length no field fixes: it
+/// comes from whatever the relay's access control decided, and upstream's
+/// access control is a trait the operator implements, so its text is not this
+/// codec's to assume. The two numbers below are how a caller that has to build
+/// one is told what it may write.
 pub const ServerDeniesAuth = struct {
+    /// The most bytes of reason a denial may carry. Upstream has no such
+    /// number and needs none; see `max_text_length` for why this one exists.
+    pub const max_reason_length: usize = max_text_length;
+    /// The most bytes the whole denial frame may occupy: the frame type, the
+    /// postcard length prefix over `max_reason_length`, and the reason.
+    ///
+    /// **A caller sizing a buffer for a denial uses this and not
+    /// `max_reason_length`,** because the prefix and the frame type are the two
+    /// bytes that turn a reason at the bound into a frame one byte longer than
+    /// the reason the caller was handed. It is the ceiling a relay can be
+    /// made to need, so it is what makes "the relay always has room for the
+    /// denial it decided to send" a fact about a number rather than a hope.
+    pub const max_frame_length: usize = FrameType.server_denies_auth.encodedLen() +
+        postcardVarIntLen(max_reason_length) + max_reason_length;
+
     /// Why the client did not authenticate. postcard-encoded, so this is a varint
     /// length and then UTF-8.
+    ///
+    /// **Longer than `max_reason_length` is refused by `encode` as
+    /// `error.TextTooLong` and never shortened.** The denial is the one frame a
+    /// peer is waiting to learn something from, so a truncated reason is worse
+    /// than no denial: the peer is told something the relay did not decide to
+    /// say, and a closed connection afterwards cannot be read as a correction.
     reason: []const u8,
 };
 
@@ -502,6 +584,19 @@ pub const Message = union(FrameType) {
 ///
 /// Upstream keeps an `encoded_len` beside every `write_to` and asserts the two
 /// agree. A size that is a guess is a size a caller sizes a buffer from.
+///
+/// **Six of this union's fourteen arms carry a length their type does not fix**,
+/// and `encode` bounds each before it writes: a denial's reason and a health
+/// problem by `max_text_length`, and the four datagram frames' payload by
+/// `max_packet_size`. That payload is every byte after the frame type and not
+/// the contents, so the four are not bounded alike — 65503 bytes of contents in
+/// a single datagram, 65501 in a batch, which spends two of the bound on its
+/// segment size. **A caller sizing one buffer for every frame it sends sizes it
+/// for the frame and not for the contents, and takes
+/// `max_packet_size + FrameType.client_to_relay_datagram_batch.encodedLen()`,
+/// which `ServerDeniesAuth.max_frame_length` does not come near.** The other
+/// eight arms are fixed by their own type, and `checkLengths` is where both
+/// halves of that statement are kept.
 pub fn encodedLen(message: Message) usize {
     const payload: usize = switch (message) {
         .server_challenge => ServerChallenge.challenge_length,
@@ -535,9 +630,22 @@ pub fn encodedLen(message: Message) usize {
 /// `Health` and `Status` are the two that differ, and refusing here is what keeps
 /// both versions emittable without either one sending a frame the far end has
 /// agreed not to understand.
+///
+/// **A frame carrying more than `max_text_length` of relay-authored text is
+/// `error.TextTooLong`, and no part of it is written.** `out` is untouched on
+/// the refusal, because the check runs before the frame type goes down, so a
+/// caller cannot find a denial's first bytes in its buffer and mistake them for
+/// one. A relay that cannot say why it refused has to say nothing rather than
+/// say something it chose not to: the peer closing the connection is a
+/// different event from the peer being told a truncated reason.
 pub fn encode(message: Message, version: ProtocolVersion, out: []u8) Error![]const u8 {
     const frame_type: FrameType = std.meta.activeTag(message);
     if (!frame_type.allowedIn(version)) return error.FrameNotAllowedInVersion;
+    // Every bound this frame has to meet, before the writer exists. One pass
+    // over the arms whose length the type does not fix, so a refusal leaves
+    // `out` exactly as the caller handed it over rather than holding the frame
+    // type and no payload.
+    try checkLengths(message);
     var writer = Writer.init(out);
     try writer.writeVarInt(@intFromEnum(frame_type));
     switch (message) {
@@ -573,6 +681,8 @@ pub fn encode(message: Message, version: ProtocolVersion, out: []u8) Error![]con
         .endpoint_gone => |node_id| try writer.write(&node_id.toBytes()),
         .ping => |data| try writer.write(&data),
         .pong => |data| try writer.write(&data),
+        // v1 only, and the other of the two frames whose length no field fixes.
+        // Its bound is `max_text_length` and `checkLengths` has already had it.
         .health => |problem| try writer.write(problem),
         .restarting => |restarting| {
             try writer.writeU32Be(restarting.reconnect_in_ms);
@@ -605,15 +715,14 @@ pub fn decode(bytes: []const u8, version: ProtocolVersion) Error!Message {
     return switch (frame_type) {
         .server_challenge => .{
             .server_challenge = .{
-                .challenge = try readArray(payload, ServerChallenge.challenge_length),
+                .challenge = try readArray(ServerChallenge.challenge_length, payload),
             },
         },
         .client_auth => blk: {
             const node_id = try readNodeId(payload);
-            const signature = Signature.fromBytes(try readExact(
-                payload[NodeId.byte_length..],
-                Signature.byte_length,
-            ));
+            const signature = Signature.fromBytes(
+                try readExact(Signature.byte_length, payload[NodeId.byte_length..]),
+            );
             break :blk .{ .client_auth = .{ .node_id = node_id, .signature = signature } };
         },
         .server_confirms_auth => if (payload.len == 0)
@@ -632,8 +741,8 @@ pub fn decode(bytes: []const u8, version: ProtocolVersion) Error!Message {
             .relay_to_client_datagram_batch,
         ),
         .endpoint_gone => .{ .endpoint_gone = try readNodeIdExact(payload) },
-        .ping => .{ .ping = try readExact(payload, 8) },
-        .pong => .{ .pong = try readExact(payload, 8) },
+        .ping => .{ .ping = try readExact(8, payload) },
+        .pong => .{ .pong = try readExact(8, payload) },
         .health => .{ .health = payload },
         .restarting => blk: {
             if (payload.len != 2 * @sizeOf(u32)) return error.InvalidFrame;
@@ -708,13 +817,78 @@ fn writeDatagramHeader(writer: *Writer, frame: DatagramFrame) Error!void {
     try writer.writeU8(if (frame.datagrams.ecn) |codepoint| codepoint.toBits() else 0);
 }
 
+/// Every bound `message` has to meet, checked before a byte of it is written.
+///
+/// **This is the sweep.** Six of the fourteen arms of `Message` carry a length
+/// their own type does not fix, in three kinds, and each is refused here by
+/// name: a `server_denies_auth` reason and a v1 `health` problem, both
+/// relay-authored text, by `max_text_length`, and the four datagram frames'
+/// payload by `max_packet_size`.
+///
+/// The other eight are the frame type's own width and cannot be anything else:
+/// the challenge's sixteen bytes, the client auth's node id and signature, the
+/// empty confirmation, the endpoint id, ping's and pong's eight bytes, the two
+/// durations, and the status discriminant. **A fifteenth arm carrying a
+/// peer-supplied length is the case this function exists to catch, and the
+/// switch below is where it lands** — an arm with no bound here is an arm whose
+/// length nothing checks.
+///
+/// The datagram bound is on the payload `decode` measures — every byte after the
+/// frame type, and not the contents alone — so it is the rule `decode` already
+/// applies to a payload it is handed (`relay.rs:404` and `:544`), now applied on
+/// the way out too, and this module cannot emit a frame its own decoder rejects.
+/// That is `max_packet_size` over a node id, an ECN byte and, on a batch, a
+/// segment size: 65503 bytes of contents in a single datagram, 65501 in a batch.
+/// Upstream checks it on decode only, because its `write_to` writes into a
+/// `BytesMut` that grows (`relay.rs:328`): a frame that is too large there is a
+/// large allocation rather than a fault.
+///
+/// It runs before the writer exists so that a refusal leaves `out` as the caller
+/// handed it over. A caller that kept the frame type and lost the payload would
+/// find a partial frame in its own buffer, and a partial denial is a denial
+/// whose reason stops early.
+fn checkLengths(message: Message) Error!void {
+    switch (message) {
+        .server_denies_auth => |denial| {
+            if (denial.reason.len > ServerDeniesAuth.max_reason_length) {
+                return error.TextTooLong;
+            }
+        },
+        .health => |problem| {
+            if (problem.len > max_text_length) return error.TextTooLong;
+        },
+        .client_to_relay_datagram,
+        .relay_to_client_datagram,
+        => |frame| {
+            const contents_limit = max_packet_size - DatagramFrame.header_length;
+            if (frame.datagrams.contents.len > contents_limit) return error.FrameTooLarge;
+        },
+        .client_to_relay_datagram_batch,
+        .relay_to_client_datagram_batch,
+        => |frame| {
+            const contents_limit = max_packet_size - DatagramFrame.header_length -
+                Datagrams.segment_size_length;
+            if (frame.datagrams.contents.len > contents_limit) return error.FrameTooLarge;
+        },
+        .server_challenge,
+        .client_auth,
+        .server_confirms_auth,
+        .endpoint_gone,
+        .ping,
+        .pong,
+        .restarting,
+        .status,
+        => {},
+    }
+}
+
 /// A node id and a datagram payload, under the length rules the four datagram
 /// types name between them.
 fn readDatagramFrame(payload: []const u8, frame_type: FrameType) Error!Message {
     if (payload.len < DatagramFrame.header_length) return error.InvalidFrame;
     // The slice starts after the node id and not after the whole header: the ECN
     // byte belongs to the datagram payload and `readDatagrams` is what reads it.
-    const frame = DatagramFrame{
+    const frame: DatagramFrame = .{
         .node_id = try readNodeId(payload),
         .datagrams = try readDatagrams(
             payload[NodeId.byte_length..],
@@ -731,7 +905,7 @@ fn readDatagramFrame(payload: []const u8, frame_type: FrameType) Error!Message {
 }
 
 fn readNodeId(payload: []const u8) Error!NodeId {
-    return NodeId.fromBytes(try readArray(payload, NodeId.byte_length)) catch
+    return NodeId.fromBytes(try readArray(NodeId.byte_length, payload)) catch
         return error.InvalidNodeId;
 }
 
@@ -806,12 +980,12 @@ fn fromPostcard(err: postcard.Error) Error {
 /// Upstream writes this check the same way for every fixed-width payload
 /// (`relay.rs:423`, `428`, `434`, `448`): a payload that is not the width its
 /// type names is not that type.
-fn readExact(payload: []const u8, comptime length: usize) Error![length]u8 {
+fn readExact(comptime length: usize, payload: []const u8) Error![length]u8 {
     if (payload.len != length) return error.InvalidFrame;
     return payload[0..length].*;
 }
 
-fn readArray(payload: []const u8, comptime length: usize) Error![length]u8 {
+fn readArray(comptime length: usize, payload: []const u8) Error![length]u8 {
     if (payload.len < length) return error.InvalidFrame;
     return payload[0..length].*;
 }
@@ -957,9 +1131,8 @@ const id_hex = "197f6b23e16c8532c6abc838" ++ "facd5ea789be0c76b2920334039bfa8b3d
 /// the field modulus, so `NodeId.fromBytes` rejects it.
 const non_canonical_id_hex = "ff" ** 32;
 
-/// Long enough for every hexdump above and for the largest frame a caller can
-/// build here: a `ClientAuth` is 97 bytes with its header, and a denial reason
-/// long enough to need a two-byte length prefix is 300 bytes more.
+/// Covers the captured hexdumps and the largest authentication frame tested here:
+/// ClientAuth is 97 bytes; ServerDeniesAuth.max_frame_length is 258.
 const scratch_len = 512;
 
 /// Every hexdump below is copied out of `iroh-relay/src/protos/relay.rs` at commit
@@ -1343,12 +1516,12 @@ test "batch invariant: a segment size is there if and only if the type is a batc
 
     for ([_]Direction{ .client_to_relay, .relay_to_client }) |direction| {
         for ([_]?u16{ null, 1, 6, 1200, 65535 }) |segment_size| {
-            const datagrams = Datagrams{
+            const datagrams: Datagrams = .{
                 .ecn = .ce,
                 .segment_size = segment_size,
                 .contents = hello_world,
             };
-            const frame = DatagramFrame{ .node_id = node_id, .datagrams = datagrams };
+            const frame: DatagramFrame = .{ .node_id = node_id, .datagrams = datagrams };
             const tag = datagrams.frameType(direction);
 
             // The two halves of rule 7 as one fact about a frame that is about to
@@ -1375,7 +1548,7 @@ test "batch invariant: draining to one datagram clears the segment size" {
     // the remainder is the asymmetry rule 7 names: one datagram left, so no
     // segment size, so it goes out as a single-datagram frame and not as a batch
     // of one.
-    var batch = Datagrams{
+    var batch: Datagrams = .{
         .ecn = .ce,
         .segment_size = 4,
         .contents = "abcdefghijklmnop",
@@ -1402,7 +1575,7 @@ test "batch invariant: draining to one datagram clears the segment size" {
 }
 
 test "batch invariant: a non-batch never acquires a segment size" {
-    var single = Datagrams{ .ecn = .ce, .segment_size = null, .contents = hello_world };
+    var single: Datagrams = .{ .ecn = .ce, .segment_size = null, .contents = hello_world };
     const taken = single.takeSegments(8);
     try std_testing.expectEqual(@as(?u16, null), taken.segment_size);
     try std_testing.expectEqualStrings(hello_world, taken.contents);
@@ -1420,7 +1593,7 @@ test "batch invariant: a segment size wider than the payload drains to one" {
     // type; draining it is where the claim collapses. Upstream's own
     // `is_datagram_batch` test (`relay.rs:248`) is the same strict less-than, so
     // the batch it hands back has no segment size either.
-    var oversized = Datagrams{
+    var oversized: Datagrams = .{
         .ecn = .ce,
         .segment_size = 1024,
         .contents = "\xde\xad\xbe\xef",
@@ -1447,7 +1620,7 @@ test "codec: frames 0 through 3, derived from the handshake structs" {
     // `ServerChallenge` (`handshake.rs:77`) is a `[u8; 16]`, and postcard writes a
     // fixed array inline with no length prefix, so a challenge is its header and
     // sixteen bytes.
-    const challenge = ServerChallenge{ .challenge = [_]u8{0x01} ** 16 };
+    const challenge: ServerChallenge = .{ .challenge = [_]u8{0x01} ** 16 };
     const challenge_bytes = try encode(.{ .server_challenge = challenge }, .v2, &out);
     try std_testing.expectEqual(@as(usize, 17), challenge_bytes.len);
     try std_testing.expectEqual(@as(u8, 0), challenge_bytes[0]);
@@ -1457,7 +1630,7 @@ test "codec: frames 0 through 3, derived from the handshake structs" {
 
     // `ClientAuth` (`handshake.rs:88`) is a 32-byte key and a 64-byte signature,
     // both fixed arrays, both inline: 96 bytes and a header.
-    const auth = ClientAuth{ .node_id = node_id, .signature = signature };
+    const auth: ClientAuth = .{ .node_id = node_id, .signature = signature };
     const auth_bytes = try encode(.{ .client_auth = auth }, .v2, &out);
     try std_testing.expectEqual(@as(usize, 97), auth_bytes.len);
     try std_testing.expectEqualSlices(u8, &node_id.toBytes(), auth_bytes[1..33]);
@@ -1673,11 +1846,11 @@ test "codec: encodedLen is the length, for every variant" {
     const node_id = secret.nodeId();
     var other = try key.SecretKey.fromSeed([_]u8{7} ** key.SecretKey.seed_length);
     defer other.deinit();
-    const batched = DatagramFrame{
+    const batched: DatagramFrame = .{
         .node_id = node_id,
         .datagrams = .{ .ecn = .ce, .segment_size = 6, .contents = hello_world },
     };
-    const single = DatagramFrame{
+    const single: DatagramFrame = .{
         .node_id = node_id,
         .datagrams = .{ .ecn = .ce, .segment_size = null, .contents = hello_world },
     };
@@ -1687,7 +1860,12 @@ test "codec: encodedLen is the length, for every variant" {
         .{ .client_auth = .{ .node_id = node_id, .signature = secret.sign("m") } },
         .{ .server_confirms_auth = {} },
         .{ .server_denies_auth = .{ .reason = "no" } },
-        .{ .server_denies_auth = .{ .reason = "x" ** 300 } },
+        // At the bound rather than above it, and still the case this entry is
+        // here for: a reason long enough to need a two-byte postcard length
+        // prefix, which is the one width where a reader and a writer disagree.
+        // `encode` refuses a longer one, so 300 is no longer a value this codec
+        // can write — see `max_text_length`.
+        .{ .server_denies_auth = .{ .reason = "x" ** ServerDeniesAuth.max_reason_length } },
         .{ .client_to_relay_datagram = single },
         .{ .client_to_relay_datagram_batch = batched },
         .{ .relay_to_client_datagram = single },
@@ -1710,6 +1888,154 @@ test "codec: encodedLen is the length, for every variant" {
         const bytes = try encode(message, version, &out);
         try std_testing.expectEqual(encodedLen(message), bytes.len);
         try std_testing.expect(eql(message, try decode(bytes, version)));
+    }
+}
+
+test "codec: a reason at the bound round-trips, and one byte over is refused" {
+    // The bound is a value in the type, and this is the two sides of it: the
+    // longest reason the codec will write goes out whole and comes back whole,
+    // and the next byte up is a named refusal rather than a shorter sentence.
+    const at_bound: Message = .{
+        .server_denies_auth = .{ .reason = "x" ** ServerDeniesAuth.max_reason_length },
+    };
+    var out: [scratch_len]u8 = undefined;
+    const written = try encode(at_bound, .v2, &out);
+    try std_testing.expectEqual(encodedLen(at_bound), written.len);
+    // The frame a caller must make room for is the reason at its bound plus the
+    // type byte and the prefix, which is what `max_frame_length` says it is.
+    try std_testing.expectEqual(ServerDeniesAuth.max_frame_length, written.len);
+    try std_testing.expect(eql(at_bound, try decode(written, .v2)));
+
+    // One byte over, and refused rather than cut: the reason that goes on the
+    // wire is never a prefix of the reason the caller chose.
+    const over: Message = .{
+        .server_denies_auth = .{ .reason = "x" ** (ServerDeniesAuth.max_reason_length + 1) },
+    };
+    var refusal: [scratch_len]u8 = undefined;
+    @memset(&refusal, 0xff);
+    try std_testing.expectError(error.TextTooLong, encode(over, .v2, &refusal));
+    // Nothing was written, so a caller cannot find a partial denial in its own
+    // buffer and mistake it for one.
+    for (refusal) |byte| try std_testing.expectEqual(@as(u8, 0xff), byte);
+    // And the refusal is the bound, not the buffer: a roomy buffer does not turn
+    // an over-long reason back into an encodable one.
+    var roomy: [ServerDeniesAuth.max_frame_length]u8 = undefined;
+    try std_testing.expectError(error.TextTooLong, encode(over, .v2, &roomy));
+}
+
+test "codec: the health problem is bounded by the same number as the reason" {
+    // v1's answer to the same question the denial answers, and the same rule:
+    // relay-authored text with no field fixing its length. Both are refused
+    // past `max_text_length` and neither is shortened.
+    const at_bound: Message = .{ .health = "x" ** max_text_length };
+    var out: [scratch_len]u8 = undefined;
+    const written = try encode(at_bound, .v1, &out);
+    try std_testing.expectEqual(encodedLen(at_bound), written.len);
+    try std_testing.expect(eql(at_bound, try decode(written, .v1)));
+
+    const over: Message = .{ .health = "x" ** (max_text_length + 1) };
+    var refusal: [scratch_len]u8 = undefined;
+    @memset(&refusal, 0xff);
+    try std_testing.expectError(error.TextTooLong, encode(over, .v1, &refusal));
+    for (refusal) |byte| try std_testing.expectEqual(@as(u8, 0xff), byte);
+}
+
+test "codec: a datagram over max_packet_size is refused on the way out too" {
+    // All four datagram arms go through the same check, so both directions and
+    // both the batch and single form are covered by one case. These contents are
+    // a whole packet over before the header they are written behind.
+    const alloc = std_testing.allocator;
+    const payload = try alloc.alloc(u8, max_packet_size + 1);
+    defer alloc.free(payload);
+    @memset(payload, 0x5a);
+    const node_id = try captureId();
+    const messages = [_]Message{
+        .{ .client_to_relay_datagram = .{
+            .node_id = node_id,
+            .datagrams = .{ .ecn = null, .segment_size = null, .contents = payload },
+        } },
+        .{ .relay_to_client_datagram = .{
+            .node_id = node_id,
+            .datagrams = .{ .ecn = null, .segment_size = null, .contents = payload },
+        } },
+        .{ .client_to_relay_datagram_batch = .{
+            .node_id = node_id,
+            .datagrams = .{ .ecn = null, .segment_size = 6, .contents = payload },
+        } },
+        .{ .relay_to_client_datagram_batch = .{
+            .node_id = node_id,
+            .datagrams = .{ .ecn = null, .segment_size = 6, .contents = payload },
+        } },
+    };
+    var out: [scratch_len]u8 = undefined;
+    for (messages) |message| {
+        try std_testing.expectError(error.FrameTooLarge, encode(message, .v2, &out));
+    }
+}
+
+test "codec: a datagram at the payload bound round-trips, and one byte over is refused" {
+    // The bound is on the payload, which is every byte after the frame type: the
+    // node id and the ECN byte all four of these types carry, plus the two bytes
+    // of segment size on a batch, and not the contents alone. 65536 bytes of
+    // payload is 65503 bytes of contents in a single-datagram frame and 65501 in
+    // a batch one.
+    const single_limit = max_packet_size - DatagramFrame.header_length;
+    const batch_limit = single_limit - Datagrams.segment_size_length;
+
+    const alloc = std_testing.allocator;
+    const contents = try alloc.alloc(u8, max_packet_size);
+    defer alloc.free(contents);
+    @memset(contents, 0x5a);
+    const node_id = try captureId();
+    // Room for the frame at the bound and not one byte more, so `BufferFull`
+    // cannot be the answer to the round trip, and a byte to spare, so the
+    // refusal below is the bound and not the buffer.
+    const out = try alloc.alloc(u8, max_packet_size + 1);
+    defer alloc.free(out);
+    const roomy = try alloc.alloc(u8, max_packet_size + 2);
+    defer alloc.free(roomy);
+
+    for ([_]FrameType{
+        .client_to_relay_datagram,
+        .relay_to_client_datagram,
+        .client_to_relay_datagram_batch,
+        .relay_to_client_datagram_batch,
+    }) |frame_type| {
+        const is_batch = FrameType.isDatagramBatch(frame_type);
+        const segment_size: ?u16 = if (is_batch) 6 else null;
+        const limit = if (is_batch) batch_limit else single_limit;
+
+        // At the bound: the payload is `max_packet_size` and not a byte over, so
+        // the datagram goes out whole and comes back whole.
+        const at_bound = try datagramMessage(frame_type, .{
+            .node_id = node_id,
+            .datagrams = .{
+                .ecn = null,
+                .segment_size = segment_size,
+                .contents = contents[0..limit],
+            },
+        });
+        const written = try encode(at_bound, .v2, out);
+        try std_testing.expectEqual(max_packet_size + 1, written.len);
+        try std_testing.expectEqual(encodedLen(at_bound), written.len);
+        try std_testing.expect(eql(at_bound, try decode(written, .v2)));
+
+        // One byte over, and refused before the writer exists: the buffer comes
+        // back holding what the caller put in it.
+        const over = try datagramMessage(frame_type, .{
+            .node_id = node_id,
+            .datagrams = .{
+                .ecn = null,
+                .segment_size = segment_size,
+                .contents = contents[0 .. limit + 1],
+            },
+        });
+        @memset(out, 0xff);
+        try std_testing.expectError(error.FrameTooLarge, encode(over, .v2, out));
+        for (out) |byte| try std_testing.expectEqual(@as(u8, 0xff), byte);
+        // And with a byte of room to spare it is still refused, which is what
+        // says the frame is too large and not the buffer too small.
+        try std_testing.expectError(error.FrameTooLarge, encode(over, .v2, roomy));
     }
 }
 

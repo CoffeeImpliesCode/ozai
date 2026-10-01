@@ -99,23 +99,39 @@ pub const linux = struct {
     /// `SOL_UDP`, 17. Not in the std tree; see above.
     pub const udp_level: u32 = 17;
     /// `UDP_SEGMENT`: the GSO segment size, carried per `sendmsg`.
+    // A number, not a type: the initializer is a value and `u32` its type.
+    // zwanzig-disable-next-line: identifier-style
     pub const segment: u32 = std.os.linux.UDP.SEGMENT;
     /// `UDP_GRO`: set once to ask the kernel to coalesce, and read back as a
     /// control message to learn a coalesced buffer's stride.
+    // A number, not a type: the initializer is a value and `u32` its type.
+    // zwanzig-disable-next-line: identifier-style
     pub const gro: u32 = std.os.linux.UDP.GRO;
     /// `SOL_IP`, 0.
+    // A number, not a type: the initializer is a value and `u32` its type.
+    // zwanzig-disable-next-line: identifier-style
     pub const ip_level: u32 = std.os.linux.SOL.IP;
     /// `IP_TOS`, where an IPv4 read's codepoint arrives.
+    // A number, not a type: the initializer is a value and `u32` its type.
+    // zwanzig-disable-next-line: identifier-style
     pub const ipv4_tos: u32 = std.os.linux.IP.TOS;
     /// `IP_RECVTOS`: the socket option that asks for it.
+    // A number, not a type: the initializer is a value and `u32` its type.
+    // zwanzig-disable-next-line: identifier-style
     pub const ipv4_recvtos: u32 = std.os.linux.IP.RECVTOS;
     /// `SOL_IPV6`, 41.
+    // A number, not a type: the initializer is a value and `u32` its type.
+    // zwanzig-disable-next-line: identifier-style
     pub const ipv6_level: u32 = std.os.linux.SOL.IPV6;
     /// `IPV6_TCLASS`, where an IPv6 read's codepoint arrives and where a send
     /// puts its own.
+    // A number, not a type: the initializer is a value and `u32` its type.
+    // zwanzig-disable-next-line: identifier-style
     pub const ipv6_tclass: u32 = std.os.linux.IPV6.TCLASS;
     /// `IPV6_RECVTCLASS`: the socket option that asks for it, and the reason
     /// an IPv6 read is no more self-delivering than an IPv4 one.
+    // A number, not a type: the initializer is a value and `u32` its type.
+    // zwanzig-disable-next-line: identifier-style
     pub const ipv6_recvtclass: u32 = std.os.linux.IPV6.RECVTCLASS;
 };
 
@@ -456,7 +472,7 @@ pub const Runs = struct {
     /// the runs concatenate back to the batch they came from.
     pub fn next(self: *Runs) ?Send {
         if (self.index >= self.total) return null;
-        const size = @as(usize, self.segment_size orelse 0);
+        const size: usize = self.segment_size orelse 0;
         // No segment size means one datagram, and it is the whole payload.
         if (size == 0) {
             self.index = self.total;
@@ -623,6 +639,10 @@ pub fn cmsg(send: Send, family: Family, out: *[max_cmsg]Cmsg) []const Cmsg {
         out[1] = .{
             .level = linux.udp_level,
             .kind = linux.segment,
+            // `isSegmented` and this read are one fact: it answers false for
+            // a null `segment_size` (`Send.isSegmented` unwraps with `orelse
+            // return false` first), so a true answer proves the value set.
+            // zwanzig-disable-next-line: optional-unwrap
             .value = .{ .short = send.segment_size.? },
         };
         len = max_cmsg;
@@ -785,7 +805,7 @@ test "one datagram is one run that carries no segment size" {
 
     var runs = try Runs.init(send, Capability.linux_full);
     try std_testing.expectEqual(@as(usize, 1), runs.count());
-    const run = runs.next().?;
+    const run = runs.next() orelse return error.TestUnexpectedResult;
     try std_testing.expectEqual(@as(?u16, null), run.segment_size);
     try std_testing.expectEqualSlices(u8, &datagram, run.contents);
     try std_testing.expectEqual(@as(usize, 1), run.datagramCount());
@@ -806,7 +826,7 @@ test "N same-size datagrams are one segmented run" {
 
     var runs = try Runs.init(send, Capability.linux_full);
     try std_testing.expectEqual(@as(usize, 1), runs.count());
-    const run = runs.next().?;
+    const run = runs.next() orelse return error.TestUnexpectedResult;
     try std_testing.expectEqual(@as(?u16, 100), run.segment_size);
     try std_testing.expectEqualSlices(u8, bytes, run.contents);
     try std_testing.expectEqual(@as(usize, 5), run.datagramCount());
@@ -823,7 +843,7 @@ test "a batch whose last datagram is short keeps it short" {
 
     var runs = try Runs.init(send, Capability.linux_full);
     try std_testing.expectEqual(@as(usize, 1), runs.count());
-    const run = runs.next().?;
+    const run = runs.next() orelse return error.TestUnexpectedResult;
     try std_testing.expectEqual(@as(usize, 407), run.contents.len);
     try std_testing.expectEqual(@as(usize, 5), run.datagramCount());
     try std_testing.expectEqual(@as(usize, 7), run.lastDatagramLen());
@@ -871,10 +891,10 @@ test "a run of one datagram carries no segment size, whatever the batch was" {
         .max_send_segments = 3,
         .max_recv_segments = 1,
     });
-    const first = runs.next().?;
+    const first = runs.next() orelse return error.TestUnexpectedResult;
     try std_testing.expectEqual(@as(?u16, 10), first.segment_size);
     try std_testing.expectEqual(@as(usize, 3), first.datagramCount());
-    const second = runs.next().?;
+    const second = runs.next() orelse return error.TestUnexpectedResult;
     // The remainder is one datagram, so it is a datagram and not a batch of
     // one. This is the send-side half of rule 7.
     try std_testing.expectEqual(@as(?u16, null), second.segment_size);

@@ -27,6 +27,7 @@ pub const discovery_dns = @import("discovery/dns.zig");
 pub const discovery_dial_source = @import("discovery/dial_source.zig");
 pub const pkarr = @import("discovery/pkarr.zig");
 pub const discovery_lookup_io = @import("discovery/lookup_io.zig");
+pub const discovery_lookup_live = @import("discovery/lookup_live.zig");
 
 pub const relay_frame = @import("relay/frame.zig");
 pub const relay_client = @import("relay/client.zig");
@@ -86,6 +87,7 @@ test {
     std.testing.refAllDecls(discovery_dial_source);
     std.testing.refAllDecls(discovery_dns);
     std.testing.refAllDecls(discovery_lookup_io);
+    std.testing.refAllDecls(discovery_lookup_live);
     std.testing.refAllDecls(postcard);
     std.testing.refAllDecls(pkarr);
     std.testing.refAllDecls(relay_frame);

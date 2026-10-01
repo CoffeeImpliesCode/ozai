@@ -43,9 +43,25 @@
 //! well is an error — `file exists in modules 'root' and 'root'` — because
 //! `--test-runner` puts the file into the root module rather than replacing
 //! what is in it.
+//!
+//! # Coverage
+//!
+//! Coverage reaches LLVM's counters through the `fuzz` switch, so an
+//! instrumented build of an artifact wearing this runner links the fuzz
+//! runtime with nothing driving it. That runtime calls back through seven
+//! `runner_*` exports, and they are defined once in `test/coverage_abi.zig`
+//! rather than in a copy here: `build.zig` hands that module to every
+//! artifact on its coverage list, this runner's among them, and the `comptime`
+//! block below is what brings it into this compilation.
+//!
+//! Every one of those seven refuses rather than answering, because
+//! `mainServer` refuses the start message that is the only way into
+//! `fuzzer_main`. `src/node/main.zig` wears the same module for the same
+//! reason and has no runner of its own to refuse anything.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const coverage_abi = @import("coverage_abi");
 
 const Io = std.Io;
 const testing = std.testing;
@@ -81,71 +97,9 @@ const runner_io: Io = Io.Threaded.global_single_threaded.io();
 var expected: std.ArrayList(Expected) = .empty;
 var unexpected: usize = 0;
 
-/// The fuzz runtime's half of the ABI, defined only in a fuzz build.
-///
-/// `-ffuzz` links `lib/fuzzer.zig` whether or not anything drives it, and that
-/// runtime calls back through these seven exports, so every fuzz build has to
-/// define them. None is reachable here: each one is called from inside
-/// `fuzzer_main`, and the only thing that calls `fuzzer_main` is the message
-/// this runner answers by refusing. Coverage instrumentation is why a fuzz
-/// build of an artifact with no fuzz test exists at all.
-const fuzz_abi_runner = if (builtin.fuzz) struct {
-    export fn runner_test_run(i: u32) void {
-        @disableInstrumentation();
-        noFuzzSession("runner_test_run", .{i});
-    }
-
-    export fn runner_test_name(i: u32) std.Build.abi.fuzz.Slice {
-        @disableInstrumentation();
-        noFuzzSession("runner_test_name", .{i});
-    }
-
-    export fn runner_broadcast_input(test_i: u32, bytes: std.Build.abi.fuzz.Slice) void {
-        @disableInstrumentation();
-        noFuzzSession("runner_broadcast_input", .{ test_i, bytes.len });
-    }
-
-    export fn runner_start_input_poller() void {
-        @disableInstrumentation();
-        noFuzzSession("runner_start_input_poller", .{});
-    }
-
-    export fn runner_stop_input_poller() void {
-        @disableInstrumentation();
-        noFuzzSession("runner_stop_input_poller", .{});
-    }
-
-    export fn runner_futex_wait(ptr: *const u32, value: u32) bool {
-        @disableInstrumentation();
-        noFuzzSession("runner_futex_wait", .{ ptr.*, value });
-    }
-
-    export fn runner_futex_wake(ptr: *const u32, waiters: u32) void {
-        @disableInstrumentation();
-        noFuzzSession("runner_futex_wake", .{ ptr.*, waiters });
-    }
-} else void;
-
+// Only coverage attaches this module; leave its import lazy in a plain build.
 comptime {
-    // Nothing in this file calls into that type, and a container-level type
-    // nothing references is never analysed — so its exports would never be
-    // emitted and the fuzz runtime's calls to them would be undefined at link
-    // time. Naming the type is what makes them exist.
-    _ = fuzz_abi_runner;
-}
-
-/// Why one of the exports above was reached, given as a name and whatever
-/// arguments say about which call it was. Reaching any of them means the
-/// fuzzer started a session this runner never agreed to, and that is worth a
-/// stack trace rather than a wrong answer.
-fn noFuzzSession(name: []const u8, args: anytype) noreturn {
-    @disableInstrumentation();
-    std.debug.panic(
-        "the fuzz runtime called {s}({any}), which this runner has no session " ++
-            "to serve: an artifact wearing it has no fuzz test, and the start " ++
-            "message is refused before the fuzzer runs",
-        .{ name, args },
-    );
+    if (builtin.fuzz) _ = coverage_abi;
 }
 
 /// The whole process. Errors travel out rather than through `std.debug.panic`

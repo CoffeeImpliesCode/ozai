@@ -289,26 +289,40 @@ pub const default_relay_queue_depth = 64;
 /// a datagram's payload, the frame header around it, and a varint length in
 /// front of that.
 ///
-/// Eight is the widest a QUIC varint can be, and `DatagramFrame.header_length`
-/// is the node id and the codepoint. A frame that does not fit is refused by
-/// `relay_frame.encode` as `BufferFull` rather than truncated, so the bound is
-/// a refusal and never a lie on the wire.
+/// **This is a write bound, and `encode` refuses rather than truncates**, so a
+/// frame that does not fit is `error.BufferFull` rather than a lie on the wire.
 ///
-/// **Every frame this node sends fits, and one frame it does not send is named
-/// here rather than left for whoever adds it.** A serving relay writes a
+/// Eight is the widest a QUIC varint can be, and `DatagramFrame.header_length`
+/// is the node id and the codepoint. That makes a datagram the widest frame
+/// this node sends, and every other frame narrower — a serving relay writes a
 /// challenge, a confirmation, a datagram, an `endpoint_gone`, a `status` and a
-/// `pong`; a relay client writes a `client_auth` and a datagram. All seven are
-/// bounded by a node id or by `max_datagram`, which is what this number is.
-/// The eighth — `server_denies_auth`, whose payload is a reason string — is
-/// bounded by nothing at all, and this node never sends it: `serveHandshake`
-/// answers `.access` with `.allow` and never `.deny`, because a relay's access
-/// decision is not something `Config` has a field for. **That is the hole, and
-/// it is a string length rather than a frame width:** the day access control
-/// exists, the reason it sends has to be bounded here, because a peer cannot be
-/// allowed to decide how large our denial is. Reserved worst-case room is the
-/// wrong answer — it would make every frame this node sends pay for a message
-/// it never sends, on the hottest path in the relay.
+/// `pong`; a relay client writes a `client_auth`, a datagram and a `pong`. All
+/// but one are bounded by a node id, by eight fixed bytes, or by the datagram.
+///
+/// **The eighth — `server_denies_auth`, whose payload is a reason string — was
+/// the hole, and it is closed in the codec rather than here.** Its length is
+/// the one in this protocol a peer can reach: upstream's access control is a
+/// trait the operator implements (`handshake.rs:495`, `:524`), so the reason is
+/// whatever that trait decided, and a buffer sized for whatever it said is not
+/// a bound. `relay_frame.max_text_length` is, and
+/// `relay_frame.encode` refuses past it as `error.TextTooLong` before writing a
+/// byte. So the widest denial this node can be handed is a number —
+/// `relay_frame.ServerDeniesAuth.max_frame_length` — and the assertion below is
+/// what says it fits here. **Reserving worst-case room instead would have been
+/// the wrong answer:** it is unbounded, so "worst case" is not a number, and
+/// sizing a buffer for an unbounded string is the same mistake with a bigger
+/// constant.
 pub const relay_frame_room = relay_frame.DatagramFrame.header_length + max_datagram + 8;
+
+comptime {
+    // The reason a relay sends is bounded by the codec, so this is arithmetic
+    // rather than a hope: if the bound or the datagram moves, this stops the
+    // build instead of letting a relay discover at run time that it has no room
+    // for the denial it just decided to send.
+    if (relay_frame.ServerDeniesAuth.max_frame_length > relay_frame_room) {
+        @compileError("the relay's frame room is narrower than the denial it may send");
+    }
+}
 
 /// How many clients a relay admits, how deep their queues are, and how far
 /// this node will read and write one connection in a single pass.
@@ -552,10 +566,6 @@ pub const Stats = struct {
     handler_connections: u64 = 0,
     handler_shutdowns: u64 = 0,
     accepts_cancelled: u64 = 0,
-    /// Retry tokens the endpoint asked for and this node did not send, split by
-    /// what the token would have meant. See `perform`.
-    retry_validation_asked: u64 = 0,
-    retry_cost_asked: u64 = 0,
     refusals: u64 = 0,
     ignores: u64 = 0,
     /// Connections the core finished with.
@@ -586,6 +596,18 @@ pub const Stats = struct {
     /// Accepted connections this relay had no room for. Upstream refuses
     /// rather than drops, for the reason `endpoint.zig` gives.
     relay_refused: u64 = 0,
+    /// Connections this pass could not be admitted **although a client slot was
+    /// free**, because the peer had granted no more bidi streams than this end
+    /// has already opened on that connection. **Not a refusal** — the
+    /// connection is re-offered on the next pass, and `MAX_STREAMS` raises the
+    /// grant — and it is counted apart from `relay_refused` because the two
+    /// answer opposite questions: that one is a client this relay has no room
+    /// for, this one is a client it had room for and no stream to speak on. A
+    /// counter that added them together could not say which relay it had.
+    relay_stream_deferred: u64 = 0,
+    /// Streams a peer finished in the middle of a frame, and the partial frame
+    /// dropped with them. See `discardTail`.
+    relay_stream_truncated: u64 = 0,
     /// Datagrams forwarded, read off clients, and handed to this node's own
     /// relay client.
     relay_forwarded: u64 = 0,
@@ -778,10 +800,13 @@ pub const Node = struct {
     /// not there is a fact about the network and not a reason to retry.
     relay_dialled: bool,
     /// Where a relay frame is encoded — the varint length first, then the
-    /// frame behind it — and where one is read into.
+    /// frame behind it. **The only relay buffer sized by `relay_frame_room`.**
+    /// A read used to have one too, and that conflation was the defect: a read
+    /// is a run of whatever arrived, not a frame, so sizing it by the frame
+    /// bound refused the run after the core had already handed the bytes over.
+    /// See `Stream.drain`.
     relay_out: []u8,
-    relay_in: []u8,
-    /// What a decoded relay frame borrows out of. See `takeMessage`.
+    /// What a decoded relay frame borrows out of. See `peekFrame`.
     relay_scratch: []u8,
 
     stats: Stats,
@@ -806,7 +831,7 @@ pub const Node = struct {
     /// it happens here once rather than at the call sites that would otherwise
     /// have to know both vocabularies. `quic_bridge.zig` gives the rule: "a
     /// translation nobody can read is a translation nobody can check".
-    pub fn create(io: std.Io, gpa: Allocator, config: Config, seed: u64) Error!*Node {
+    pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node {
         const self = try gpa.create(Node);
         errdefer gpa.destroy(self);
         self.* = .{
@@ -845,7 +870,6 @@ pub const Node = struct {
             .spoke = null,
             .relay_dialled = false,
             .relay_out = &.{},
-            .relay_in = &.{},
             .relay_scratch = &.{},
             .stats = .{},
         };
@@ -856,7 +880,7 @@ pub const Node = struct {
 
         self.socket = try Socket.create(config.listen, .{});
         errdefer self.shutdownSocket();
-        self.bridge = try Bridge.create(io, gpa, .{
+        self.bridge = try Bridge.create(gpa, io, .{
             // Null on purpose: one pin cannot name every peer, and the pin
             // that is enforced on this node's accepted connections is the
             // per-dial one the dialer carries.
@@ -869,9 +893,21 @@ pub const Node = struct {
             .secret = config.secret,
             .alpn = config.alpn,
         });
-        // A bridge that was created a moment ago has no entry for `destroy` to
-        // refuse, so this fires only on an allocation that followed it.
-        errdefer self.dialer.destroy() catch unreachable;
+        // `destroy` refuses only while a dialled connection is live, and this
+        // errdefer cannot meet one: the bridge above was created with an empty
+        // table, and every call between there and a failure here allocates,
+        // prints an address or builds a table — none of them dials. Asserted
+        // rather than assumed, and the arm below says so out loud instead of
+        // returning with the dialer's seed un-zeroed.
+        errdefer {
+            std.debug.assert(self.bridge.manager.entries.items.len == 0);
+            self.dialer.destroy() catch |err| switch (err) {
+                error.DialedConnectionsLive => std.debug.panic(
+                    "a dialled connection is live while building a node: {t}",
+                    .{err},
+                ),
+            };
+        }
         self.egress = try gpa.alloc(Egress, max_egress);
         errdefer gpa.free(self.egress);
         self.out = try gpa.alloc(u8, send_room);
@@ -891,13 +927,18 @@ pub const Node = struct {
         // is reachable at. Upstream carries opaque bytes and this is the one
         // that is true of every node in it.
         //
-        // `addr_text` is 64 bytes and the longest `SocketAddr` this project
-        // can print is a full IPv6 address and a port at 47, so the only way
-        // `bufPrint` refuses here is a format string this file owns.
-        var addr_text: [64]u8 = undefined;
+        // The buffer is `SocketAddr.max_text_length` and not a byte more, so
+        // the only way `bufPrint` refuses is a bound that is wrong; the arm
+        // below is the statement that it is, made loud rather than silent.
+        var addr_text: [SocketAddr.max_text_length]u8 = undefined;
         const advertised = std.fmt.bufPrint(&addr_text, "{f}", .{
             self.socket.address,
-        }) catch unreachable;
+        }) catch |err| switch (err) {
+            error.NoSpaceLeft => std.debug.panic(
+                "address text needs more than {d} bytes: max_text_length is wrong",
+                .{SocketAddr.max_text_length},
+            ),
+        };
         self.topic = try hyparview.TopicState.init(
             self.bridge.nodeId(),
             try hyparview.PeerData.fromBytes(advertised),
@@ -958,7 +999,22 @@ pub const Node = struct {
         // shutdown has already released every client, so this is the backstop
         // for the node that was dropped without one.
         self.freeRelay();
-        self.dialer.destroy() catch unreachable;
+        // The walk above already applied `destroy`'s own test — every entry
+        // with `!entry.conn.is_server` — to every entry there was, and
+        // `removeConnection` swap-removes the entry it is handed
+        // (`vendor/quic/src/quic/connection_manager.zig:447`), so there is
+        // nothing left for `destroy` to refuse on. Checked rather than
+        // assumed: an entry that survived the walk would have the bridge
+        // freed and the seed zeroed under a live handshake.
+        for (self.bridge.manager.entries.items) |entry| {
+            std.debug.assert(entry.conn.is_server);
+        }
+        self.dialer.destroy() catch |err| switch (err) {
+            error.DialedConnectionsLive => std.debug.panic(
+                "a dialled connection is live at teardown: {t}",
+                .{err},
+            ),
+        };
         self.bridge.destroy();
         self.gpa.free(self.egress);
         self.gpa.free(self.out);
@@ -1233,10 +1289,15 @@ pub const Node = struct {
         // into.
         const recv = try got.toRecv();
         self.stats.datagrams_in += recv.datagramCount();
+        // The walk ends where `datagram` answers null, which is the same place
+        // `datagramCount` would have ended it: the accessor goes null at
+        // `divCeil(len, stride)` and that is what the count is. One fact about
+        // the buffer, asked once, and no assertion that the accessor and the
+        // count still agree.
         var position: usize = 0;
-        while (position < recv.datagramCount()) : (position += 1) {
+        while (recv.datagram(position)) |datagram| : (position += 1) {
             const ingress = try self.bridge.recv(&self.map, .{
-                .bytes = recv.datagram(position).?,
+                .bytes = datagram,
                 .from = got.from,
                 .local = self.socket.address,
                 .ecn = recv.ecn,
@@ -1590,26 +1651,15 @@ pub const Node = struct {
                 std.debug.assert(self.accept.task(task.id) != null);
                 return null;
             },
-            // Upstream's `incoming.retry()` (`protocol.rs:583`), which is a
-            // per-attempt call into the QUIC core. The vendored core has no such
-            // hook and answers a Retry from a manager-wide `require_retry` or
-            // `retry_threshold` before any application code runs
-            // (`vendor/quic/src/quic/connection_manager.zig:606-645`). So the
-            // verdict is a fact this node records and the filter reads on the
-            // next attempt, which is what `endpoint.zig`'s module doc says of
-            // it and why it is a named divergence there.
-            // The two meanings are counted apart because they are different
-            // requests about a path: one says "prove the address you are
-            // writing from", the other says "pay for the relay you came
-            // through", and a reader told only that a retry was asked for
-            // cannot tell which was meant.
-            .send_token => |retry| {
-                switch (retry) {
-                    .source_validation => self.stats.retry_validation_asked += 1,
-                    .cost_imposition => self.stats.retry_cost_asked += 1,
-                }
-                return null;
-            },
+            // Upstream's `incoming.retry()` (`protocol.rs:583`) has no call in
+            // this stack to reach: the vendored core decides Retry from two
+            // manager-wide fields inside the call that accepts the connection
+            // (`vendor/quic/src/quic/connection_manager.zig:606-647`), so a
+            // verdict made by application code arrives after the point at which
+            // RFC 9000 §17.2.5 permits one. `endpoint.zig` refuses every retry
+            // for that reason and maps `.send_retry` to `.refuse`, so the arm
+            // that recorded this node's half of a retry that was never sent is
+            // gone with it rather than left reading zero.
             .refuse => {
                 self.stats.refusals += 1;
                 return null;
@@ -1783,13 +1833,50 @@ pub const Node = struct {
             if (self.servedFor(conn.id()) != null) continue;
             // The relay opens the stream it speaks on and reads the one the
             // client opened. See `Served.out` for why they are two.
-            const stream = try bridge_mod.Stream.open(conn);
+            //
+            // **The slot is taken before the stream is opened, and that order
+            // is what the refusal below survives on.** The core keeps every
+            // stream this end opens in `conn.streams` (`stream.zig:1396-1404`)
+            // and counts it against the peer's `initial_max_streams_bidi`
+            // (`stream.zig:1387`). A credit comes back only from a stream whose
+            // receive side the peer has closed (`connection.zig:2940-2946`),
+            // and a stream opened for a client this relay then refuses is one
+            // nothing will ever close. It is spent for good, and once a
+            // connection has spent its peer's whole grant — a hundred
+            // (`connection.zig:539`) — it refuses every open for the rest of
+            // its life, with nothing but this arm's own counter to say so.
+            // Asking for the slot first makes that unreachable: a stream is
+            // opened exactly when there is somewhere to put it, so the open
+            // streams and the occupied slots are one count and neither can
+            // outrun the other.
+            //
+            // **A refusal that still arrives costs this connection and not the
+            // pass.** The peer granted less than this end has used, and
+            // `MAX_STREAMS` raises that grant (`connection.zig:2146`), so a
+            // later pass gets a different answer. Failing the pass would take
+            // down every *other* connection in the table over one that is out
+            // of credit, and a relay that stopped serving for that would not
+            // be a relay.
+            //
+            // Everything else is `error.CoreRefused` — an allocator that will
+            // not make the core's send ledger above all — and it is propagated
+            // rather than caught, because that is a fault in *this node* and a
+            // relay that swallowed it would go on serving as though it had
+            // admitted a client it never admitted. The split is the whole of
+            // this arm; `error.NoStreamRoom` is named for it.
             const slot = self.freeClient() orelse {
                 // Upstream refuses rather than drops, for the reason
                 // `endpoint.zig` gives: an attempt accepted and then held
                 // nowhere is a client that believes it is connected.
                 self.stats.relay_refused += 1;
                 continue;
+            };
+            const stream = bridge_mod.Stream.open(conn) catch |err| switch (err) {
+                error.NoStreamRoom => {
+                    self.stats.relay_stream_deferred += 1;
+                    continue;
+                },
+                else => return err,
             };
             const owned = self.indexOf(slot);
             slot.* = .{
@@ -1837,7 +1924,8 @@ pub const Node = struct {
             self.serveRegister(slot);
             return true;
         }
-        return try self.serveAction(at, slot, stepped.action);
+        const served = try self.serveAction(at, slot, stepped.action);
+        return served;
     }
 
     /// Write the one thing a relay handshake step asked for.
@@ -1914,23 +2002,48 @@ pub const Node = struct {
             // which this connection does not hold until the client has written
             // something on it — so it is looked up afresh every pass, and a
             // client that has not spoken yet is a client with nothing to read.
+            //
+            // Straight onto the inbox, with no buffer in between: the bytes go
+            // there once instead of twice, and a read has no length to size a
+            // buffer against. See `Stream.drain`.
+            //
+            // **`drain`'s answer is not "this stream is empty".** It says
+            // whether it appended bytes and nothing about what came before
+            // them, so a stream the peer ended on a frame boundary and one it
+            // ended in the middle of a frame read the same. `discardTail` asks
+            // the other half, and it is asked *after* the whole messages are
+            // taken, because before that a full inbox is a message this relay
+            // has not acted on yet.
             var incoming = conn.peerStream() orelse continue;
-            while (try incoming.take(self.gpa, self.relay_in)) |chunk| {
-                try slot.inbox.appendSlice(self.gpa, chunk);
-                moved = true;
-            }
+            moved = try incoming.drain(self.gpa, &slot.inbox) or moved;
             moved = try self.serveMessages(slot) or moved;
+            if (discardTail(&slot.inbox, incoming.finished())) {
+                self.stats.relay_stream_truncated += 1;
+            }
         }
         return moved;
     }
 
-    /// Every whole message in a client's inbox, one at a time.
+    /// Every whole message in a client's inbox, acted on in turn.
     fn serveMessages(self: *Node, slot: *Served) Error!bool {
         var moved = false;
-        while (try takeMessage(&slot.inbox, self.relay_scratch)) |message| {
+        var consumed: usize = 0;
+        // Dropping what the walk has been over is one decision, taken on the
+        // way out and on the fault alike. The `try` in the condition below
+        // leaves this function without ever reaching the drop, so a walk that
+        // only dropped on success would hand back every frame it had already
+        // served for the next pass to serve again — the poison in front of a
+        // datagram being the worst of it, because it refuses first.
+        errdefer dropInbox(&slot.inbox, consumed);
+        while (try peekFrame(slot.inbox.items, consumed, self.relay_scratch)) |found| {
+            // The end before the meaning: `decode` is what can fail, and the
+            // frame it fails on arrived whole, so it is spent either way.
+            consumed = found.end;
+            const message = try relay_frame.decode(found.frame, .v2);
             try self.serveMessage(slot, message);
             moved = true;
         }
+        dropInbox(&slot.inbox, consumed);
         return moved;
     }
 
@@ -2094,8 +2207,9 @@ pub const Node = struct {
                 // healthy (`server/clients.rs:122-129`), and it goes on that
                 // client's control queue like every other control message.
                 const took_over = self.servedFor(promotion.took_over) orelse return;
-                took_over.queues.control.push(.{ .status = .healthy }) catch {
-                    self.stats.relay_queue_full += 1;
+                // Queue saturation drops the notification, not the promoted client.
+                took_over.queues.control.push(.{ .status = .healthy }) catch |err| switch (err) {
+                    error.QueueFull => self.stats.relay_queue_full += 1,
                 };
             },
             // The registry holds no such connection, which is what a second
@@ -2116,26 +2230,59 @@ pub const Node = struct {
 
     /// A relay client's pass: the handshake, then what the relay hands back.
     fn converse(self: *Node, at: Instant, random: std.Random) Error!bool {
-        if (self.spoke == null) return try self.converseOpen(at, random);
-        const conn = self.connFor(self.spoke.?.conn) orelse return false;
-        if (self.spoke.?.stream == null) {
+        // The stream opened below must be retained in the node, not a Spoke copy.
+        const spoke = if (self.spoke) |*held| held else {
+            const dialed = try self.converseOpen(at, random);
+            return dialed;
+        };
+        const conn = self.connFor(spoke.conn) orelse return false;
+        var stream = if (spoke.stream) |open| open else open_stream: {
             if (!conn.established()) return false;
-            self.spoke.?.stream = try bridge_mod.Stream.open(conn);
-        }
-        var stream = self.spoke.?.stream.?;
+            // `Spoke.stream`'s own note says the open is deferred past the
+            // dial, and it is deferred on the `try` rather than on a question:
+            // **by the time this runs the core has the peer's stream grant or
+            // it will not have it ever.** The grant is applied in the same call
+            // that marks the connection established — `setMaxStreams` at
+            // `connection.zig:2650`, and `isEstablished` is that state
+            // (`:4079`) — so an established connection has always had one, and
+            // the open below can only be refused for being out of credit. This
+            // node opens one stream in a connection's life and `sendThrough`
+            // reuses it, so a refusal here means the relay advertised none,
+            // and `MAX_STREAMS` raises a grant already made rather than
+            // granting from nothing. There is nothing to wait for and nothing
+            // to retry, and the pass says so by failing instead of answering
+            // `false` on every pass from here on with nothing to show for it.
+            const opened = try bridge_mod.Stream.open(conn);
+            spoke.stream = opened;
+            break :open_stream opened;
+        };
         var moved = false;
         // The relay's half arrives on the stream the *relay* opened, which is
-        // the mirror of `Served.out` and for the same reason.
-        if (conn.peerStream()) |found| {
-            var incoming = found;
-            while (try incoming.take(self.gpa, self.relay_in)) |chunk| {
-                try self.spoke.?.inbox.appendSlice(self.gpa, chunk);
-                moved = true;
-            }
+        // the mirror of `Served.out` and for the same reason. Straight onto the
+        // inbox, as `serveRead` does it and for the same reason, and asking
+        // `Stream.drain`'s second half for the same reason: what it appended is
+        // not what came before it. See `discardTail`.
+        var finished = false;
+        var inbound = conn.peerStream();
+        if (inbound) |*incoming| {
+            moved = try incoming.drain(self.gpa, &spoke.inbox) or moved;
+            finished = incoming.finished();
         }
-        while (try takeMessage(&self.spoke.?.inbox, self.relay_scratch)) |message| {
-            try self.converseMessage(&stream, message);
+        var consumed: usize = 0;
+        // The walk `serveMessages` does, down to why the two drops are one
+        // decision: a frame this node cannot decode is refused once rather
+        // than on every pass after it, and the frame in front of it is acted
+        // on once rather than once per pass.
+        errdefer dropInbox(&spoke.inbox, consumed);
+        while (try peekFrame(spoke.inbox.items, consumed, self.relay_scratch)) |found| {
+            consumed = found.end;
+            const message = try relay_frame.decode(found.frame, .v2);
+            try self.converseMessage(spoke, &stream, message);
             moved = true;
+        }
+        dropInbox(&spoke.inbox, consumed);
+        if (discardTail(&spoke.inbox, finished)) {
+            self.stats.relay_stream_truncated += 1;
         }
         return moved;
     }
@@ -2181,17 +2328,18 @@ pub const Node = struct {
     /// One relay frame, to this node's relay client.
     fn converseMessage(
         self: *Node,
+        spoke: *Spoke,
         stream: *bridge_mod.Stream,
         message: relay_frame.Message,
     ) Error!void {
-        switch (self.spoke.?.handshake) {
+        switch (spoke.handshake) {
             .awaiting_relay, .awaiting_verdict => {
                 const stepped = relay_client.step(
-                    self.spoke.?.handshake,
+                    spoke.handshake,
                     .{ .frame = message },
                     &self.config.secret,
                 );
-                self.spoke.?.handshake = stepped.state;
+                spoke.handshake = stepped.state;
                 if (stepped.action) |action| switch (action) {
                     .send_client_auth => |auth| {
                         try writeRelay(stream, self.relay_out, .{ .client_auth = auth });
@@ -2202,7 +2350,7 @@ pub const Node = struct {
                         self.stats.relay_closed += 1;
                     },
                 };
-                switch (self.spoke.?.handshake) {
+                switch (spoke.handshake) {
                     .established => self.stats.relay_established += 1,
                     else => {},
                 }
@@ -2215,7 +2363,7 @@ pub const Node = struct {
                 // Owned, because the frame borrows out of the bytes it was read
                 // from and those are reused by the next read.
                 const owned = try self.gpa.dupe(u8, frame.datagrams.contents);
-                try self.spoke.?.delivered.append(self.gpa, .{
+                try spoke.delivered.append(self.gpa, .{
                     .src = frame.node_id,
                     .data = owned,
                 });
@@ -2256,9 +2404,13 @@ pub const Node = struct {
     /// here. That is the whole of what a relay is for, and the drop is
     /// upstream's (`server/clients.rs:218-224`).
     pub fn sendThrough(self: *Node, peer: NodeId, bytes: []const u8) Error!void {
-        if (self.spoke == null) return error.NoRelay;
+        // Two refusals, asked in the order they are asked below: a node with no
+        // relay answers `NoRelay` whatever it was handed, and the payload bound
+        // is about the caller's bytes, which only matter once there is a relay
+        // to refuse them to.
+        const spoke = self.spoke orelse return error.NoRelay;
         if (bytes.len > max_datagram) return error.DatagramTooLarge;
-        const held = self.spoke.?.stream orelse return error.NoRelay;
+        const held = spoke.stream orelse return error.NoRelay;
         var stream: bridge_mod.Stream = held;
         try writeRelay(&stream, self.relay_out, .{
             .client_to_relay_datagram = .{
@@ -2285,8 +2437,6 @@ pub const Node = struct {
     /// one.
     fn initRelay(self: *Node) Error!void {
         const gpa = self.gpa;
-        self.relay_in = try gpa.alloc(u8, relay_frame_room);
-        errdefer gpa.free(self.relay_in);
         self.relay_out = try gpa.alloc(u8, relay_frame_room + varint_max);
         errdefer gpa.free(self.relay_out);
         self.relay_scratch = try gpa.alloc(u8, relay_frame_room);
@@ -2355,7 +2505,6 @@ pub const Node = struct {
         }
         self.spoke = null;
         self.gpa.free(self.relay_out);
-        self.gpa.free(self.relay_in);
         self.gpa.free(self.relay_scratch);
         self.gpa.free(self.ring);
         self.gpa.free(self.messages);
@@ -2410,7 +2559,7 @@ pub const Node = struct {
     /// Keep the peer an action named, for the report and for nothing else.
     fn noteNamed(self: *Node, peer: NodeId) void {
         if (self.named_len == named_ring) {
-            std.mem.copyForwards(NodeId, self.named[0 .. named_ring - 1], self.named[1..]);
+            @memmove(self.named[0 .. named_ring - 1], self.named[1..]);
             self.named_len -= 1;
         }
         self.named[self.named_len] = peer;
@@ -2450,36 +2599,83 @@ fn writeRelay(
     // front of it and its own width is not known until it has been written.
     // It is moved down over the gap the length did not use, so what goes on the
     // wire is the length and then the frame and nothing between them.
-    std.mem.copyForwards(u8, out[prefix..][0..written.len], written);
+    @memmove(out[prefix..][0..written.len], written);
     try stream.write(out[0 .. prefix + written.len]);
 }
 
-/// The next whole message in `inbox`, borrowed out of `scratch`, or null when
-/// there is not one yet.
+/// The next whole frame at or after `from` in `bytes`, copied into `scratch`,
+/// and where it ended — or null when there is not one yet.
+///
+/// **This delimits a frame and does not decode one.** The length alone says
+/// where the frame ends, and that end is a fact about the bytes rather than
+/// about what they mean. How many bytes a frame was is therefore known before
+/// anyone asks what it says, and the caller records that end before it asks:
+/// a frame `decode` refuses has still arrived whole, so it has to be walked
+/// over rather than met again on the next pass, and so has everything in
+/// front of it. A helper that answered both questions in one return could not
+/// hand back the end of a frame whose meaning turned out to be a fault.
 ///
 /// **Copied into `scratch`, and that is the whole of what makes the borrow
 /// sound.** `frame.decode` borrows its two variable-length payloads out of the
 /// bytes it is handed, so those bytes must outlive the message. They cannot be
-/// the inbox's, because taking a message off the inbox's front moves every
-/// byte behind it — a borrow into a buffer that is compacted under it is a
-/// borrow of nothing. One copy per message, into a buffer the caller owns, is
-/// the price of a borrow that points at something.
+/// the inbox's, because taking a message off the inbox's front moves every byte
+/// behind it — a borrow into a buffer that is compacted under it is a borrow of
+/// nothing. One copy per message, into a buffer the caller owns, is the price
+/// of a borrow that points at something.
 ///
-/// `scratch` has to be as long as the largest frame this node admits, which
-/// `relay_frame_room` is. One scratch serves a whole node because a pass takes
-/// at most one direction of the protocol: a serving relay reads its clients,
-/// and a client reads its relay.
-fn takeMessage(inbox: *std.ArrayList(u8), scratch: []u8) Error!?relay_frame.Message {
-    const head = readVarint(inbox.items) orelse return null;
+/// **A walk, and the caller compacts once.** A take that shrank the inbox per
+/// message moved everything behind that message every time, which is quadratic
+/// in the inbox: cheap while a read buffer capped the inbox at one frame, which
+/// is all it ever held, and a whole burst's worth of memmove now that a read
+/// goes straight onto the inbox. So this hands back an end offset and leaves
+/// the bytes where they are, and `dropInbox` moves what is left exactly once —
+/// on the way out of the walk and on the fault that ends it alike, because the
+/// two are one decision taken twice rather than two decisions.
+///
+/// `scratch` has to be as long as the largest frame this node admits, which is
+/// `relay_frame_room`. One scratch serves a whole node because a pass takes at
+/// most one direction of the protocol: a serving relay reads its clients, and a
+/// client reads its relay.
+fn peekFrame(
+    bytes: []const u8,
+    from: usize,
+    scratch: []u8,
+) Error!?struct { frame: []const u8, end: usize } {
+    const head = readVarint(bytes[from..]) orelse return null;
     const whole = std.math.cast(usize, head.value) orelse return error.FrameTooLarge;
-    const end = head.len +| whole;
-    if (inbox.items.len < end) return null;
+    const end = from +| head.len +| whole;
+    if (bytes.len < end) return null;
     if (whole > scratch.len) return error.FrameTooLarge;
-    @memcpy(scratch[0..whole], inbox.items[head.len..end]);
-    const rest = inbox.items[end..];
-    std.mem.copyForwards(u8, inbox.items[0..rest.len], rest);
+    @memcpy(scratch[0..whole], bytes[from + head.len ..][0..whole]);
+    return .{ .frame = scratch[0..whole], .end = end };
+}
+
+/// Drop the first `used` bytes of `inbox`, in one move.
+fn dropInbox(inbox: *std.ArrayList(u8), used: usize) void {
+    if (used == 0) return;
+    const rest = inbox.items[used..];
+    @memmove(inbox.items[0..rest.len], rest);
     inbox.shrinkRetainingCapacity(rest.len);
-    return try relay_frame.decode(scratch[0..whole], .v2);
+}
+
+/// Drop the frame a finished stream left half-written, and say whether it left
+/// one.
+///
+/// **This is the half of `Stream.drain`'s answer its caller has to ask for.**
+/// `drain` returns whether it appended bytes and says nothing about what came
+/// before them, so a stream the peer ended on a frame boundary and one it ended
+/// in the middle of a frame read the same, and only `Stream.finished` tells
+/// them apart. What is left in `inbox` after that is a frame that will never
+/// arrive, so it is dropped and counted rather than kept for a message that is
+/// not coming.
+///
+/// Asked after `dropInbox`, never before: until the whole messages are taken,
+/// an inbox with bytes in it is this node behind rather than a peer that
+/// stopped early.
+fn discardTail(inbox: *std.ArrayList(u8), finished: bool) bool {
+    if (!finished or inbox.items.len == 0) return false;
+    inbox.clearRetainingCapacity();
+    return true;
 }
 
 /// A queued control message as the frame that carries it.
@@ -2670,11 +2866,10 @@ fn briskTopic() hyparview.TopicConfig {
         .neighbor_request_timeout = 2 * hyparview.nanos_per_milli,
     } };
 }
-
 test "a node dials a peer, both ends finish a handshake, and every action is performed" {
     // The listener first: its ephemeral port is only known once the socket
     // exists, and the dialer is given that address rather than one made up.
-    const listener = try Node.create(t.io, t.allocator, .{
+    const listener = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0x51),
         .listen = loopback,
         .topic = briskTopic(),
@@ -2685,7 +2880,7 @@ test "a node dials a peer, both ends finish a handshake, and every action is per
         .id = listener.nodeId(),
         .addr = .{ .ip = listener.address() },
     }};
-    const dialer = try Node.create(t.io, t.allocator, .{
+    const dialer = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0xc1),
         .listen = loopback,
         .peers = &peers,
@@ -2773,6 +2968,132 @@ test "a node dials a peer, both ends finish a handshake, and every action is per
     // artifact, so reaching here is itself part of what is asserted.
 }
 
+test "a node that dials two peers reaches both of them" {
+    // The shape one node dialling one peer cannot see. Two dials out of one
+    // process are two connections with connection ids minted from one
+    // generator, two peers on one socket, and two accepts that each owe the
+    // endpoint an arrival — so this is the only shape in which a datagram can
+    // be written for one peer and go to the other.
+    const gate = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x33),
+        .listen = loopback,
+        .topic = briskTopic(),
+    }, 0x3333);
+    defer gate.deinit();
+    const listener = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x51),
+        .listen = loopback,
+        .topic = briskTopic(),
+    }, 0x1111);
+    defer listener.deinit();
+
+    const peers = [_]Peer{
+        .{ .id = gate.nodeId(), .addr = .{ .ip = gate.address() } },
+        .{ .id = listener.nodeId(), .addr = .{ .ip = listener.address() } },
+    };
+    const dialer = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xc1),
+        .listen = loopback,
+        .peers = &peers,
+        .topic = briskTopic(),
+    }, 0x2222);
+    defer dialer.deinit();
+
+    var at: Instant = start_ns;
+    try dialer.start(at, dialer.generator());
+
+    var passes: usize = 0;
+    while (passes < max_passes) : (passes += 1) {
+        at += time_quantum;
+        _ = try dialer.step(t.io, at, dialer.generator());
+        _ = try gate.step(t.io, at, gate.generator());
+        _ = try listener.step(t.io, at, listener.generator());
+    }
+
+    // Both dials went out and neither was refused, which is a count of what
+    // `start` did rather than of what the wire did.
+    try t.expectEqual(@as(u64, 2), dialer.stats.dials);
+    try t.expectEqual(@as(u64, 0), dialer.stats.dials_refused);
+
+    // And the wire: both handshakes completed, and each peer admitted exactly
+    // one arrival. A peer that saw no byte has no attempt and no handler
+    // connection, which is the whole of what "the dial found nobody" is.
+    try t.expectEqual(@as(usize, 2), dialer.establishedCount());
+    try t.expectEqual(@as(usize, 1), gate.establishedCount());
+    try t.expectEqual(@as(usize, 1), listener.establishedCount());
+    try t.expectEqual(@as(u64, 1), gate.stats.attempts);
+    try t.expectEqual(@as(u64, 1), gate.stats.handler_connections);
+    try t.expectEqual(@as(u64, 1), listener.stats.attempts);
+    try t.expectEqual(@as(u64, 1), listener.stats.handler_connections);
+    // Closed rather than abandoned: an abandoned node is logged at error level
+    // by `deinit`, which fails the artifact on its own.
+    try dialer.close(t.io, at, dialer.generator());
+    try gate.close(t.io, at, gate.generator());
+    try listener.close(t.io, at, listener.generator());
+}
+test "a node that dialled two peers notices both of them close" {
+    // The shape one peer cannot show. Two dials out of one process are two
+    // connections on one socket, and this is the claim that has to hold for
+    // both: a peer that shuts down says so with a CONNECTION_CLOSE, and a node
+    // still running has to finish that connection rather than sit on it until
+    // the core's idle timeout — thirty seconds, six times the window
+    // `test/two_process_test.zig` gives a survivor.
+    const gate = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x33),
+        .listen = loopback,
+        .topic = briskTopic(),
+    }, 0x3333);
+    defer gate.deinit();
+    const listener = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x51),
+        .listen = loopback,
+        .topic = briskTopic(),
+    }, 0x1111);
+    defer listener.deinit();
+    const peers = [_]Peer{
+        .{ .id = gate.nodeId(), .addr = .{ .ip = gate.address() } },
+        .{ .id = listener.nodeId(), .addr = .{ .ip = listener.address() } },
+    };
+    const dialer = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xc1),
+        .listen = loopback,
+        .peers = &peers,
+        .topic = briskTopic(),
+    }, 0x2222);
+    defer dialer.deinit();
+
+    var at: Instant = start_ns;
+    try dialer.start(at, dialer.generator());
+    var passes: usize = 0;
+    while (passes < max_passes) : (passes += 1) {
+        at += time_quantum;
+        _ = try dialer.step(t.io, at, dialer.generator());
+        _ = try gate.step(t.io, at, gate.generator());
+        _ = try listener.step(t.io, at, listener.generator());
+    }
+    // Both dials reached a peer before either peer is taken away: a run that
+    // never got here would be asserting about a handshake that did not happen.
+    try t.expectEqual(@as(usize, 2), dialer.establishedCount());
+
+    // Both peers close, as a process whose `--for` expired does.
+    try gate.close(t.io, at, gate.generator());
+    try listener.close(t.io, at, listener.generator());
+
+    // The dialer keeps running. Two passes is the floor — the close arrives in
+    // one pass and the core needs a later instant to leave the draining period
+    // — and the bound is generous because the claim is that the connections
+    // finish at all, not how many passes that took.
+    passes = 0;
+    while (passes < max_passes and dialer.stats.connections_finished < 2) : (passes += 1) {
+        at += time_quantum;
+        _ = try dialer.step(t.io, at, dialer.generator());
+    }
+    try t.expectEqual(@as(u64, 2), dialer.stats.connections_finished);
+    try t.expectEqual(@as(usize, 0), dialer.establishedCount());
+
+    try dialer.close(t.io, at, dialer.generator());
+}
+
 test "a close cancels an accept that is still running before it closes the endpoint" {
     // The branch the ordering exists for. `router.zig:642-650` says why: a
     // handler's `shutdown` closes connections its own `accept` is still using,
@@ -2780,7 +3101,7 @@ test "a close cancels an accept that is still running before it closes the endpo
     // closing the endpoint first does the same damage a step later. A test
     // that only ever closes an idle node cannot tell the three steps apart, so
     // this one closes a node that still holds an accept.
-    const listener = try Node.create(t.io, t.allocator, .{
+    const listener = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0x51),
         .listen = loopback,
     }, 0x1111);
@@ -2790,7 +3111,7 @@ test "a close cancels an accept that is still running before it closes the endpo
         .id = listener.nodeId(),
         .addr = .{ .ip = listener.address() },
     }};
-    const dialer = try Node.create(t.io, t.allocator, .{
+    const dialer = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0xc1),
         .listen = loopback,
         .peers = &peers,
@@ -2837,7 +3158,7 @@ test "a close cancels an accept that is still running before it closes the endpo
 }
 
 test "a stop asked for before the loop is entered ends it and closes the node" {
-    const node = try Node.create(t.io, t.allocator, .{
+    const node = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0x7a),
         .listen = loopback,
         .topic = briskTopic(),
@@ -2930,7 +3251,7 @@ test "a relay admits two clients, forwards both ways, and reports each once" {
     // numbers are the whole reason the two queues can be told apart below: a
     // flood of three fills the data queue and the message that goes with it
     // still leaves before the datagrams do.
-    const relay = try Node.create(t.io, t.allocator, .{
+    const relay = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0x5e),
         .listen = loopback,
         .alpn = relay_alpn,
@@ -2946,14 +3267,14 @@ test "a relay admits two clients, forwards both ways, and reports each once" {
         .id = relay.nodeId(),
         .addr = .{ .ip = relay.address() },
     }};
-    const a = try Node.create(t.io, t.allocator, .{
+    const a = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0xa1),
         .listen = loopback,
         .alpn = relay_alpn,
         .relay = .{ .role = .{ .client = relay_peer[0] } },
     }, 0xa1a1);
     defer a.deinit();
-    const b = try Node.create(t.io, t.allocator, .{
+    const b = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0xb2),
         .listen = loopback,
         .alpn = relay_alpn,
@@ -2977,7 +3298,26 @@ test "a relay admits two clients, forwards both ways, and reports each once" {
             "  a: dials {d} refused {d} auth {d} est {d} established {d}\n" ++
             "  b: dials {d} refused {d} auth {d} est {d} established {d}\n" ++
             "  relay refused {d} oversize {d} unknown {d}\n",
-        .{ at, relay.clientCount(), relay.stats.relay_admitted, relay.stats.attempts, relay.stats.handler_connections, a.stats.relay_dials, a.stats.relay_dials_refused, a.stats.relay_auth_sent, a.stats.relay_established, a.establishedCount(), b.stats.relay_dials, b.stats.relay_dials_refused, b.stats.relay_auth_sent, b.stats.relay_established, b.establishedCount(), relay.stats.relay_refused, relay.stats.relay_oversized, relay.stats.relay_unknown_target },
+        .{
+            at,
+            relay.clientCount(),
+            relay.stats.relay_admitted,
+            relay.stats.attempts,
+            relay.stats.handler_connections,
+            a.stats.relay_dials,
+            a.stats.relay_dials_refused,
+            a.stats.relay_auth_sent,
+            a.stats.relay_established,
+            a.establishedCount(),
+            b.stats.relay_dials,
+            b.stats.relay_dials_refused,
+            b.stats.relay_auth_sent,
+            b.stats.relay_established,
+            b.establishedCount(),
+            relay.stats.relay_refused,
+            relay.stats.relay_oversized,
+            relay.stats.relay_unknown_target,
+        },
     );
     try t.expect(admitted);
     try t.expectEqual(@as(usize, 2), relay.clientCount());
@@ -3072,6 +3412,520 @@ test "a relay admits two clients, forwards both ways, and reports each once" {
     try t.expectEqual(@as(u64, 0), relay.stats.relay_promoted);
     try t.expectEqual(@as(u64, 0), relay.stats.relay_double_reports);
     try t.expectEqual(@as(u64, 1), relay.stats.handler_shutdowns);
+}
+
+/// One pass over every node, virtual time one quantum further on.
+fn passOnce(nodes: []const *Node, at: *Instant) Error!void {
+    at.* += time_quantum;
+    for (nodes) |node| _ = try node.step(t.io, at.*, node.generator());
+}
+
+test "a relay with no room spends no stream, and admits again once a slot frees" {
+    // **One client slot and three clients.** That is the shape that leaves two
+    // connections established and unserved on every pass, and it is where an
+    // open before a slot would spend the peer's whole grant on connections that
+    // never become clients. `a` is the one the relay takes: the table is walked
+    // in the order the clients dialled, and they are stepped in that order.
+    const relay = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x5f),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .serve = .{
+            .clients = 1,
+            .queue_depth = 4,
+            .drain_room = 4,
+        } } },
+    }, 0x5f5f);
+    defer relay.deinit();
+
+    const relay_peer = [_]Peer{.{
+        .id = relay.nodeId(),
+        .addr = .{ .ip = relay.address() },
+    }};
+    const a = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xa1),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .client = relay_peer[0] } },
+    }, 0xa1a1);
+    defer a.deinit();
+    const b = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xb2),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .client = relay_peer[0] } },
+    }, 0xb2b2);
+    defer b.deinit();
+    const c = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xc3),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .client = relay_peer[0] } },
+    }, 0xc3c3);
+    defer c.deinit();
+    const nodes = [_]*Node{ a, b, c, relay };
+
+    var at: Instant = start_ns;
+    var pass: usize = 0;
+
+    // ── one admitted, the other two refused for want of a slot ──
+    while (pass < max_passes) : (pass += 1) {
+        try passOnce(&nodes, &at);
+        if (a.stats.relay_established == 1 and relay.stats.relay_refused > 1) break;
+    }
+    try t.expectEqual(@as(u64, 1), a.stats.relay_established);
+    try t.expectEqual(@as(usize, 1), relay.clientCount());
+    try t.expectEqual(@as(u64, 1), relay.stats.relay_admitted);
+    try t.expectEqual(@as(usize, 3), relay.establishedCount());
+
+    // ── and the refusals spent nothing ──
+    //
+    // A peer grants a hundred bidi streams (`connection.zig:539`) and the core
+    // counts every stream this end opens against that grant for the life of the
+    // connection, so a hundred and twenty-eight passes is more than either
+    // refused connection could afford if this relay opened before it asked.
+    //
+    // The two counters say which of those happened: the refusal counter moves
+    // every pass and the deferral counter does not move at all, because a relay
+    // with no room never reaches the open. That is `serveAdmit`'s order, and it
+    // is the whole difference between a client turned away and a connection
+    // spent.
+    const refused_before = relay.stats.relay_refused;
+    pass = 0;
+    while (pass < max_passes / 2) : (pass += 1) try passOnce(&nodes, &at);
+    try t.expect(relay.stats.relay_refused > refused_before);
+    try t.expectEqual(@as(u64, 0), relay.stats.relay_stream_deferred);
+    try t.expectEqual(@as(u64, 1), relay.stats.relay_admitted);
+    try t.expectEqual(@as(usize, 3), relay.establishedCount());
+
+    // ── and a freed slot still finds a client ──
+    //
+    // The client this relay admitted goes away, which is the only thing that
+    // frees a slot, and the connections refused on every pass since are still
+    // admissible. Under an open before the slot they spent their grants in the
+    // passes above and neither could be served at all — which is a relay that
+    // refuses forever and says nothing but a counter.
+    try a.close(t.io, at, a.generator());
+    const rest = [_]*Node{ b, c, relay };
+    pass = 0;
+    while (pass < max_passes and relay.stats.relay_admitted < 2) : (pass += 1) {
+        try passOnce(&rest, &at);
+    }
+    try t.expectEqual(@as(u64, 2), relay.stats.relay_admitted);
+    try t.expectEqual(@as(usize, 1), relay.clientCount());
+    try t.expectEqual(@as(u64, 0), relay.stats.relay_stream_deferred);
+
+    // Every node is wound down through the router's shutdown rather than
+    // dropped on the floor: a node deinit while still serving logs an error, and
+    // four of those would fail this test for a reason that has nothing to do
+    // with the passes above.
+    for (nodes) |node| try node.close(t.io, at, node.generator());
+}
+
+test "a refused stream costs a connection and not the pass, a fault the pass" {
+    // Built from an allocator this test can break at a chosen pass, because the
+    // fault arm below has to fail *inside* a pass rather than before one: a
+    // relay built on an allocator that is already refusing cannot be built at
+    // all, and a fault that arrives at construction says nothing about whether
+    // the accept path swallows one.
+    var failing = t.FailingAllocator.init(t.allocator, .{});
+    // **Two client slots and three clients.** That is the shape that leaves a
+    // connection established and unserved *while a slot is free*, and it is the
+    // only shape in which `serveAdmit` reaches `Stream.open` at all: the slot is
+    // asked for first, so a connection refused for want of one is never asked
+    // for a stream. Three rather than two because the refusal arm needs a
+    // client left over to make the pass worth spending.
+    const relay = try Node.create(failing.allocator(), t.io, .{
+        .secret = try identityOf(0x5e),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .serve = .{
+            .clients = 2,
+            .queue_depth = 4,
+            .drain_room = 4,
+        } } },
+    }, 0x5150);
+    defer relay.deinit();
+
+    const relay_peer = [_]Peer{.{
+        .id = relay.nodeId(),
+        .addr = .{ .ip = relay.address() },
+    }};
+    const a = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xa1),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .client = relay_peer[0] } },
+    }, 0xa1a1);
+    defer a.deinit();
+    const b = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xb2),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .client = relay_peer[0] } },
+    }, 0xb2b2);
+    defer b.deinit();
+    const c = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xc3),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .client = relay_peer[0] } },
+    }, 0xc3c3);
+    defer c.deinit();
+    const nodes = [_]*Node{ a, b, c, relay };
+
+    var at: Instant = start_ns;
+    var pass: usize = 0;
+
+    // ── two admitted, the third established and unserved ──
+    while (pass < max_passes) : (pass += 1) {
+        try passOnce(&nodes, &at);
+        if (relay.stats.relay_admitted == 2 and relay.establishedCount() == 3) break;
+    }
+    try t.expectEqual(@as(u64, 2), relay.stats.relay_admitted);
+    try t.expectEqual(@as(usize, 2), relay.clientCount());
+    try t.expectEqual(@as(usize, 3), relay.establishedCount());
+
+    // The connection this relay is not serving, named by that rather than by the
+    // slot the core keeps it in: which slot a connection occupies is the core's
+    // ordering, not this test's to assume.
+    var idle: ?bridge_mod.Conn = null;
+    var index: usize = 0;
+    while (relay.bridge.connectionAt(index)) |conn| : (index += 1) {
+        if (!conn.entry.conn.is_server) continue;
+        if (relay.servedFor(conn.id()) != null) continue;
+        idle = conn;
+        break;
+    }
+    const held = idle orelse return error.NoUnservedConnection;
+
+    // ── and no stream either ──
+    //
+    // Zeroing the core's limit turns "a slot is free" into "and the core has no
+    // stream id to give", which is the refusal the bridge names and the accept
+    // path has to survive.
+    //
+    // **It has to be now and not a pass earlier.** The core re-applies the
+    // peer's transport parameters at the instant the handshake completes
+    // (`connection.zig:2650`) — in the same pass, immediately before
+    // `serveAdmit` runs — so a limit set before that handshake is a limit the
+    // handshake overwrites before anything reads it.
+    held.entry.conn.streams.setMaxStreams(0, 8);
+
+    // ── the refusal costs that connection and nothing else ──
+    //
+    // Closing a served client is the only thing that frees a slot, and the pass
+    // after it is the first one that asks for a stream at all. The relay keeps
+    // the client it had, the connection it could not open a stream on is
+    // counted as deferred rather than refused, and it is counted again on the
+    // next pass — which is the whole claim, because these are phases of one
+    // pass and the first of them used to end it.
+    try a.close(t.io, at, a.generator());
+    const rest = [_]*Node{ b, c, relay };
+    pass = 0;
+    while (pass < max_passes and relay.stats.relay_stream_deferred < 2) : (pass += 1) {
+        try passOnce(&rest, &at);
+    }
+    try t.expect(relay.stats.relay_stream_deferred >= 2);
+    try t.expectEqual(@as(u64, 2), relay.stats.relay_admitted);
+    try t.expectEqual(@as(usize, 1), relay.clientCount());
+
+    // And a pass that got past `serveAdmit` is a pass that went on to read: a
+    // datagram this relay has to route to a peer it does not hold is routed on
+    // one of them, and the client that sent it is told.
+    const stranger = (try identityOf(0x77)).nodeId();
+    try b.sendThrough(stranger, "nowhere");
+    pass = 0;
+    while (pass < max_passes and b.stats.relay_peer_gone == 0) : (pass += 1) {
+        try passOnce(&rest, &at);
+    }
+    try t.expectEqual(@as(u64, 1), relay.stats.relay_unknown_target);
+    try t.expectEqual(@as(u64, 1), b.stats.relay_peer_gone);
+
+    // ── a genuine fault, at the same call, still fails the pass ──
+    //
+    // The same connection, still unserved and now holding a stream of credit,
+    // so `Stream.open` gets past the limit check and allocates. That allocation
+    // is the whole difference between this call and the one above: a refusal the
+    // protocol makes temporary, and a fault in this node. The allocator behind
+    // this relay refuses the very next allocation.
+    held.entry.conn.streams.setMaxStreams(1, 8);
+    failing.fail_index = failing.alloc_index;
+    const deferred_at_fault = relay.stats.relay_stream_deferred;
+    // `CoreRefused` and not `NoStreamRoom`, on the same connection and the same
+    // call: the refusal arm above cost this connection a pass and the fault
+    // costs the pass, which is the difference the two arms exist to draw.
+    try t.expectError(error.CoreRefused, relay.step(t.io, at, relay.generator()));
+    try t.expectEqual(deferred_at_fault, relay.stats.relay_stream_deferred);
+
+    // Every node is wound down through the router's shutdown rather than
+    // dropped on the floor: a node deinit while still serving logs an error, and
+    // four of those would fail this test for a reason that has nothing to do
+    // with the arms above it.
+    for (nodes) |node| try node.close(t.io, at, node.generator());
+}
+
+test "a frame a peer stopped writing is counted and dropped, never read as a message" {
+    const relay = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x60),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .serve = .{
+            .clients = 1,
+            .queue_depth = 4,
+            .drain_room = 4,
+        } } },
+    }, 0x6060);
+    defer relay.deinit();
+
+    const relay_peer = [_]Peer{.{
+        .id = relay.nodeId(),
+        .addr = .{ .ip = relay.address() },
+    }};
+    const a = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xa4),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .client = relay_peer[0] } },
+    }, 0xa4a4);
+    defer a.deinit();
+    const nodes = [_]*Node{ a, relay };
+
+    var at: Instant = start_ns;
+    var pass: usize = 0;
+    while (pass < max_passes) : (pass += 1) {
+        try passOnce(&nodes, &at);
+        if (a.stats.relay_established == 1 and relay.clientCount() == 1) break;
+    }
+    try t.expectEqual(@as(u64, 1), a.stats.relay_established);
+    try t.expectEqual(@as(usize, 1), relay.clientCount());
+
+    // Half a frame, and then the end of the stream: a length whose bytes the
+    // writer never sent. **This is what `Stream.drain` cannot report.** It
+    // answers whether it appended bytes and nothing about what came before them,
+    // so a stream that ended here and a stream with nothing on it read the same,
+    // and `discardTail` is what tells them apart.
+    const half = [_]u8{ 8, 0x51, 0x50 };
+    // Both established above, so an absent spoke or stream here is a defect in
+    // the path that got here and not a condition this test allows for. It is
+    // returned rather than unwrapped so the runner reports which test broke
+    // and the assertions below still say what was true of the wire.
+    const spoke = a.spoke orelse return error.TestUnexpectedResult;
+    var out = spoke.stream orelse return error.TestUnexpectedResult;
+    try out.write(&half);
+    out.close();
+
+    pass = 0;
+    while (pass < max_passes and relay.stats.relay_stream_truncated == 0) : (pass += 1) {
+        try passOnce(&nodes, &at);
+    }
+    try t.expectEqual(@as(u64, 1), relay.stats.relay_stream_truncated);
+    // And it was never a message: a length this relay could not read is a
+    // length it refuses rather than one it decodes.
+    try t.expectEqual(@as(u64, 0), relay.stats.relay_datagrams_in);
+
+    // Counted once, not on every pass after it: the bytes are gone.
+    const truncated = relay.stats.relay_stream_truncated;
+    pass = 0;
+    while (pass < 8) : (pass += 1) try passOnce(&nodes, &at);
+    try t.expectEqual(truncated, relay.stats.relay_stream_truncated);
+
+    for (nodes) |node| try node.close(t.io, at, node.generator());
+}
+
+/// Three bytes that are a whole relay frame and not the beginning of one: a
+/// QUIC varint length of two, then the frame type of `server_confirms_auth`
+/// and one payload byte behind it. `relay/frame.zig:725` reads that frame only
+/// when its payload is empty and answers `error.InvalidFrame` when it is not,
+/// so `peekFrame` has a complete frame to hand over and the answer comes
+/// back from `decode` rather than from the length.
+///
+/// **This is not the half-written frame the test above covers.** There the
+/// length names bytes that never arrive and the reader must wait for them;
+/// here every byte the length names has arrived, so the frame is this node's
+/// to decide about and the decision is made once. A reader that leaves it on
+/// the inbox decides about it again on the next pass, and on every pass after
+/// that, for as long as the connection lives.
+const poison_frame = [_]u8{ 2, 2, 0 };
+
+/// The one client this relay is serving, named by the slot that is live rather
+/// than by which connection the core happened to give it.
+fn liveSlot(relay: *Node) ?*Served {
+    for (relay.clients) |*slot| {
+        if (slot.live) return slot;
+    }
+    return null;
+}
+
+test "a relay reads past a frame it cannot decode and does not serve one twice" {
+    // **One datagram, then the poison, on one stream.** Both halves of a relay
+    // read in one run of bytes and in that order, so the relay has acted on a
+    // message and met a frame it cannot decode in a single pass, and whatever
+    // it does with the second says what it does with the first.
+    const relay = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x61),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .serve = .{
+            .clients = 1,
+            .queue_depth = 4,
+            .drain_room = 4,
+        } } },
+    }, 0x6161);
+    defer relay.deinit();
+
+    const relay_peer = [_]Peer{.{
+        .id = relay.nodeId(),
+        .addr = .{ .ip = relay.address() },
+    }};
+    const a = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xb1),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .client = relay_peer[0] } },
+    }, 0xb1b1);
+    defer a.deinit();
+    const nodes = [_]*Node{ a, relay };
+
+    var at: Instant = start_ns;
+    var pass: usize = 0;
+    while (pass < max_passes) : (pass += 1) {
+        try passOnce(&nodes, &at);
+        if (a.stats.relay_established == 1 and relay.clientCount() == 1) break;
+    }
+    try t.expectEqual(@as(u64, 1), a.stats.relay_established);
+    try t.expectEqual(@as(usize, 1), relay.clientCount());
+
+    // A datagram for a node id this relay holds nobody for, and then the frame
+    // that cannot be decoded. The datagram is the one the counters can be read
+    // against, which is why it goes first: a frame this relay has already
+    // served is told apart from one it has not by what it counted, and not by
+    // the pass it counted it in.
+    const stranger = (try identityOf(0x77)).nodeId();
+    try a.sendThrough(stranger, "one");
+    // Established above, as in the test above: absent here is a defect in the
+    // path that got here, reported rather than unwrapped.
+    const spoke = a.spoke orelse return error.TestUnexpectedResult;
+    var out = spoke.stream orelse return error.TestUnexpectedResult;
+    try out.write(&poison_frame);
+
+    // The relay is stepped one pass at a time and its refusals are counted
+    // rather than returned, because the claim is about the passes *after* the
+    // one that fails: a frame read whole and not decodable is answered once,
+    // taken off the inbox, and every pass after it is a pass with nothing left
+    // to do. `refused < 2` is what stops this loop on a reader that has not
+    // done that — one refusal is the claim and a second is the defect.
+    var refused: usize = 0;
+    var clean: usize = 0;
+    pass = 0;
+    while (pass < max_passes and refused < 2) : (pass += 1) {
+        at += time_quantum;
+        _ = try a.step(t.io, at, a.generator());
+        if (relay.step(t.io, at, relay.generator())) |_| {
+            // Either the frame has not been drained yet or it is gone, and
+            // only the second of those ends this loop, so only the second is
+            // counted towards leaving it.
+            if (refused == 1) clean += 1;
+        } else |err| {
+            try t.expectEqual(Error.InvalidFrame, err);
+            refused += 1;
+            clean = 0;
+        }
+        if (refused == 1 and clean == 4) break;
+    }
+    try t.expectEqual(@as(usize, 1), refused);
+
+    // Acted on once: not zero, because the datagram was read whole and served
+    // before the poison was met, and not once per pass, because the pass that
+    // met the poison is not a pass that gave the datagram back.
+    try t.expectEqual(@as(u64, 1), relay.stats.relay_datagrams_in);
+    try t.expectEqual(@as(u64, 1), relay.stats.relay_unknown_target);
+    // And nothing is left on the inbox, which is the state those two counters
+    // are otherwise re-derived from on the next pass.
+    const slot = liveSlot(relay) orelse return error.NoLiveClient;
+    try t.expectEqual(@as(usize, 0), slot.inbox.items.len);
+
+    for (nodes) |node| try node.close(t.io, at, node.generator());
+}
+
+test "a relay client reads past a frame it cannot decode and acts on one frame once" {
+    // The same three bytes in the other direction, and the same claim. The
+    // client half of the protocol is a second copy of the walk `serveMessages`
+    // does — framing, decode, act, compact — and a defect in one is not
+    // evidence about the other, so both are named here.
+    const relay = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x62),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .serve = .{
+            .clients = 1,
+            .queue_depth = 4,
+            .drain_room = 4,
+        } } },
+    }, 0x6262);
+    defer relay.deinit();
+
+    const relay_peer = [_]Peer{.{
+        .id = relay.nodeId(),
+        .addr = .{ .ip = relay.address() },
+    }};
+    const a = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xb2),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .client = relay_peer[0] } },
+    }, 0xb2b2);
+    defer a.deinit();
+    const nodes = [_]*Node{ a, relay };
+
+    var at: Instant = start_ns;
+    var pass: usize = 0;
+    while (pass < max_passes) : (pass += 1) {
+        try passOnce(&nodes, &at);
+        if (a.stats.relay_established == 1 and relay.clientCount() == 1) break;
+    }
+    try t.expectEqual(@as(u64, 1), a.stats.relay_established);
+    try t.expectEqual(@as(usize, 1), relay.clientCount());
+
+    // The relay writes both frames itself, on the stream it opened to this
+    // client, because a client only ever learns what a relay holds from what
+    // the relay sends it. `endpoint_gone` is the cheapest frame that is
+    // counted when it is acted on and writes nothing back.
+    const slot = liveSlot(relay) orelse return error.NoLiveClient;
+    const stranger = (try identityOf(0x78)).nodeId();
+    try writeRelay(&slot.out, relay.relay_out, .{ .endpoint_gone = stranger });
+    try slot.out.write(&poison_frame);
+
+    // Counted, not returned, for the reason the test above gives: the pass
+    // that fails is the one the claim is not about, and the four clean passes
+    // after it are.
+    var refused: usize = 0;
+    var clean: usize = 0;
+    pass = 0;
+    while (pass < max_passes and refused < 2) : (pass += 1) {
+        at += time_quantum;
+        _ = try relay.step(t.io, at, relay.generator());
+        if (a.step(t.io, at, a.generator())) |_| {
+            if (refused == 1) clean += 1;
+        } else |err| {
+            try t.expectEqual(Error.InvalidFrame, err);
+            refused += 1;
+            clean = 0;
+        }
+        if (refused == 1 and clean == 4) break;
+    }
+    try t.expectEqual(@as(usize, 1), refused);
+
+    // Told once, not once per pass: the frame in front of the poison was read
+    // whole and acted on, and a pass that fails on the frame behind it does
+    // not take the one in front of it back.
+    try t.expectEqual(@as(u64, 1), a.stats.relay_peer_gone);
+    // And the inbox holds nothing, which is the state that counter is
+    // re-derived from on every pass that reads again.
+    const inbox = (a.spoke orelse return error.TestUnexpectedResult).inbox;
+    try t.expectEqual(@as(usize, 0), inbox.items.len);
+
+    for (nodes) |node| try node.close(t.io, at, node.generator());
 }
 
 test "a message length round-trips at every varint width" {

@@ -26,10 +26,12 @@ demands. The plan front-loads that half and defers the half that needs QUIC.
    verification reduces to a byte comparison against the id you expected. That is
    a requirement on the *chosen* QUIC rather than on ozai's own code, and it is
    what eliminated two of the three candidates outright.
-3. **`std.Io` is the only I/O vocabulary.** Zig 0.16 threads `io: std.Io` through
-   every I/O-capable call. ozai never caches an `Io` in a struct, never reaches
-   for a global, and never calls a syscall directly except through `Io` or
-   `zio.ev`. That is what makes a whole endpoint deterministically simulatable.
+3. **I/O is injected at the drivers.** Zig 0.16 threads `io: std.Io` through
+   the I/O-capable drivers rather than caching it or reaching for a global.
+   `transport/socket.zig` is the Linux bridge: it uses libc for ancillary
+   messages, polling and eventfd, and the injected `Io` for cancellation.
+   The network state machines remain pure over messages, state and supplied time;
+   the real-socket runs are not a claim of whole-endpoint I/O simulation.
 4. **Interop is a test, not an intention.** Every wire format below ships with
    bytes captured from the Rust implementation. A claim of compatibility with no
    golden vector attached is an unverified claim and gets deleted.
@@ -71,7 +73,7 @@ dependency to adopt; it is a byte format to reproduce. In scope:
 - the postcard field order for every type listed in M3–M6
 - `RangeSpec` / `RangeSpecSeq` from iroh-blobs' `range_spec.rs`: alternating
   OFF/ON span widths, with an odd element count meaning open-ended ON
-- fuzzed at every decoder boundary, with three properties as the oracle:
+- fuzz the postcard and range decoders, with three properties as the oracle:
   - round-trip: `encode(decode(encode(x))) == encode(x)`, so the pair is a
     fixed point
   - round-trip stability: decoding is order-independent. An encoder is
@@ -173,14 +175,15 @@ including all of IPv4. Every constant is a byte captured from
 them. A direct IP path is **not** mapped: it is already a socket address and
 upstream types it `MultipathMappedAddr::Ip`.
 
-**Still plan: the allocation.** Upstream fills the eight host bits from
+**Done: the allocation.** Upstream fills the eight host bits from
 `rand::rng()` and memoises both directions in an `AddrMap` behind a `Mutex`. It
 is not a derivation from the node id and upstream makes no such claim; stability
 comes from the map. ozai injects the host bits instead — a deliberate
 divergence, recorded under "Divergences from upstream" in
 [`ARCHITECTURE.md`](ARCHITECTURE.md) — so that the map stays deterministic and
-the seam can be tested. The map itself is transport-layer state and arrives with
-the transport.
+the seam can be tested. The map itself is transport-layer state, and it landed
+with the transport: `src/transport/addr_map.zig` is that map with the entropy
+injected and no `Mutex`, and [`TODO.md`](../TODO.md) lists it under M7 Done.
 
 Get the /l, the global id, or a subnet discriminator wrong and two paths to one
 peer land on one address with no error anywhere: the receiver has no way to tell
@@ -188,7 +191,7 @@ them apart.
 
 ### M8 — the QUIC substrate ✅
 
-**Done 2026-09-30, with three items still open.** The decision and its price are
+**Done 2026-09-30, with two items still open.** The decision and its price are
 in [`DECISIONS/0001`](DECISIONS/0001-transport-substrate.md); the
 [execution record](DECISIONS/0001-transport-substrate.md#execution-record-of-2026-09-30)
 says what was built, what it cost against what was predicted, and what was not
@@ -199,9 +202,15 @@ of native multipath, mitigated by M7's synthetic-ULA map at the price of
 slower convergence.
 
 **What is in the tree.** `vendor/quic/`, vendored from
-`endel/quic-zig@14b9dc3e5e8429d07e7ed18619c7b4f4baaa3719` — 33 `.zig` files and
-30,279 lines, against upstream's 74 files and 65,164. It is a module of its own
-at `build.zig:36-40` and its suite runs under `zig build quic-test`.
+`endel/quic-zig@14b9dc3e5e8429d07e7ed18619c7b4f4baaa3719` — 33 `.zig` files.
+The `quic` module is declared in `build.zig`, and its suite runs under
+`zig build quic-test`.
+
+**Consumed from `src/` since M9.** The module is no longer compiled and left
+alone. `transport/quic_bridge.zig` drives it as a server, and
+`transport/dial.zig` opens the client half `ConnectionManager` has no arm for;
+`discovery/dial_source.zig` imports it in its own test harness, where a dial is
+closed against a bridge that answered.
 
 The socket-owning layers were **never copied** — `event_loop.zig` (5,211 lines),
 `ecn_socket.zig` (584), `http1/socket.zig` (364), `http1/timers.zig` (194),
@@ -258,9 +267,6 @@ no nonce at all.
   repository — upstream's runner is a git submodule outside the published
   package. M8 did not re-run it, so requirement 3 is re-established against
   this fork or not at all.
-- **Nothing under `src/` imports `quic` yet.** The module is declared and
-  compiled at `build.zig:36-40`; `ozai.transport` does not consume it. M9 builds
-  on that seam.
 
 **One divergence to know before touching TLS.** `Tls13Handshake.step` takes
 `now_s`, and it is a second on the **caller's** clock, not the epoch. The

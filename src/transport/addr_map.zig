@@ -129,7 +129,7 @@ pub const GetError = error{
 /// find each other. Only the bytes a relay URL is made of are hashed, and the
 /// integers go in native order because the hash never leaves the process.
 pub const KeyContext = struct {
-    pub fn hash(_: @This(), key: Key) u64 {
+    pub fn hash(_: KeyContext, key: Key) u64 {
         var hasher = std.hash.Wyhash.init(0);
         // The arm, so two keys whose payloads collide do not share a bucket on
         // the strength of the tag alone.
@@ -150,7 +150,7 @@ pub const KeyContext = struct {
         return hasher.final();
     }
 
-    pub fn eql(_: @This(), a: Key, b: Key) bool {
+    pub fn eql(_: KeyContext, a: Key, b: Key) bool {
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
             .any_path => |node| node.order(b.any_path) == .eq,
@@ -164,7 +164,11 @@ pub const KeyContext = struct {
 
 /// One direction of the map. Unmanaged, because the allocator belongs to the
 /// caller on every call and an empty map allocates nothing.
+// HashMapUnmanaged returns a type; PascalCase is required for this binding.
+// zwanzig-disable-next-line: identifier-style
 const Forward = std.HashMapUnmanaged(Key, Ula, KeyContext, max_load);
+// This reverse index is another type returned by the same factory.
+// zwanzig-disable-next-line: identifier-style
 const Reverse = std.HashMapUnmanaged(Ula, Key, std.hash_map.AutoContext(Ula), max_load);
 
 /// The bidirectional map between a key and the synthetic address it answers
@@ -179,9 +183,16 @@ pub const MappedAddrs = struct {
         return .{ .by_key = .empty, .by_addr = .empty };
     }
 
+    /// Free both tables and leave the map empty: a `deinit`ed map is still a
+    /// value, and saying so keeps a second `deinit` a second no-op rather
+    /// than a double free.
+    // Both tables are reset to empty by init; Z030 does not recognize a
+    // whole-receiver constructor assignment as a terminal empty state.
+    // ziglint-ignore: Z030
     pub fn deinit(self: *MappedAddrs, gpa: std.mem.Allocator) void {
         self.by_key.deinit(gpa);
         self.by_addr.deinit(gpa);
+        self.* = .init();
     }
 
     /// The address `key` answers with, the same one for the life of the map.
@@ -294,19 +305,26 @@ const t = std.testing;
 const host_a: HostBits = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
 const host_b: HostBits = .{ 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10 };
 
-/// A key from a fixed seed, so a test names the same node on every run. The
-/// only failure `fromSeed` has is a degenerate seed, and finding one takes a
-/// specific byte pattern rather than any uniform fill.
-fn testNodeId(seed: u8) NodeId {
-    return (base_key.SecretKey.fromSeed(@splat(seed)) catch unreachable).nodeId();
+/// A key from a fixed seed, so a test names the same node on every run.
+///
+/// The only failure `fromSeed` has is a degenerate seed, and finding one takes
+/// a specific byte pattern rather than any uniform fill. It is propagated
+/// anyway: a test that cannot name the node it meant to name is a failing
+/// test, and it fails as one here rather than taking the binary with it.
+fn testNodeId(seed: u8) base_key.KeyError!NodeId {
+    return (try base_key.SecretKey.fromSeed(@splat(seed))).nodeId();
 }
 
-/// Compare two keys the way the map does. `KeyContext.eql` is the definition
+/// Compare two keys the way the map does, failing the test rather than the
+/// runner when a lookup answers nothing. `KeyContext.eql` is the definition
 /// of key sameness here, and `==` is not: `RelayUrl.parse` leaves everything
 /// past the host unwritten, so two equal relay URLs from two calls can differ
 /// in bytes no comparison of a key is allowed to look at.
-fn expectSameKey(want: Key, got: Key) !void {
-    try t.expect(KeyContext.eql(.{}, want, got));
+fn expectSameKey(want: Key, got: ?Key) !void {
+    // The address under test came out of this map, so a null answer is a
+    // failed assertion and not a reason to take the test binary with it.
+    const found = got orelse return error.TestUnexpectedResult;
+    try t.expect(KeyContext.eql(.{}, want, found));
 }
 
 /// A generator that walks a fixed script of host values and then repeats its
@@ -319,7 +337,7 @@ const ScriptedBits = struct {
     at: usize = 0,
     drawn: usize = 0,
 
-    fn fill(self: *@This(), buf: []u8) void {
+    fn fill(self: *ScriptedBits, buf: []u8) void {
         std.debug.assert(buf.len == @sizeOf(HostBits));
         const step = @min(self.at, self.script.len - 1);
         self.at = step + 1;
@@ -327,7 +345,7 @@ const ScriptedBits = struct {
         @memcpy(buf, &self.script[step]);
     }
 
-    fn random(self: *@This()) std.Random {
+    fn random(self: *ScriptedBits) std.Random {
         std.debug.assert(self.script.len > 0);
         return std.Random.init(self, fill);
     }
@@ -338,7 +356,7 @@ test "one key is allocated once, however often it is asked" {
     var map: MappedAddrs = .init();
     defer map.deinit(t.allocator);
 
-    const path_key: Key = .{ .any_path = testNodeId(1) };
+    const path_key: Key = .{ .any_path = try testNodeId(1) };
     const first = try map.get(t.allocator, path_key, script.random());
     const second = try map.get(t.allocator, path_key, script.random());
     try t.expectEqual(first, second);
@@ -354,8 +372,8 @@ test "a candidate the reverse index holds is drawn again, not handed out twice" 
     var map: MappedAddrs = .init();
     defer map.deinit(t.allocator);
 
-    const one: Key = .{ .any_path = testNodeId(1) };
-    const two: Key = .{ .any_path = testNodeId(2) };
+    const one: Key = .{ .any_path = try testNodeId(1) };
+    const two: Key = .{ .any_path = try testNodeId(2) };
     const first = try map.get(t.allocator, one, script.random());
     const second = try map.get(t.allocator, two, script.random());
 
@@ -364,13 +382,13 @@ test "a candidate the reverse index holds is drawn again, not handed out twice" 
     try t.expectEqual(host_b, hostBitsOf(second));
     // One wasted draw, and not one more.
     try t.expectEqual(@as(usize, 3), script.drawn);
-    try expectSameKey(one, map.lookup(first).?);
-    try expectSameKey(two, map.lookup(second).?);
+    try expectSameKey(one, map.lookup(first));
+    try expectSameKey(two, map.lookup(second));
 }
 
 test "an address that arrives off the wire names the key that owns it" {
     const url = try base_addr.RelayUrl.parse("https://use1-1.relay.iroh.network./");
-    const path_key: Key = .{ .relay = .{ .relay = url, .node = testNodeId(1) } };
+    const path_key: Key = .{ .relay = .{ .relay = url, .node = try testNodeId(1) } };
     var prng: std.Random.DefaultPrng = .init(0x5eed);
     var map: MappedAddrs = .init();
     defer map.deinit(t.allocator);
@@ -379,7 +397,7 @@ test "an address that arrives off the wire names the key that owns it" {
     // The address as the QUIC stack carries it, and back out of the wire.
     const socket = ula.syntheticSocketAddr(.{ .relay = url }, hostBitsOf(allocated));
     try t.expectEqual(ula.Classification{ .relay = allocated }, ula.classify(socket));
-    try expectSameKey(path_key, map.lookup(allocated).?);
+    try expectSameKey(path_key, map.lookup(allocated));
 }
 
 test "an address the map never handed out has no key" {
@@ -389,7 +407,7 @@ test "an address the map never handed out has no key" {
 
     const live = try map.get(
         t.allocator,
-        .{ .any_path = testNodeId(1) },
+        .{ .any_path = try testNodeId(1) },
         prng.random(),
     );
     try t.expect(map.lookup(live) != null);
@@ -406,8 +424,8 @@ test "a generator that repeats forever is refused, and the map keeps working" {
     var map: MappedAddrs = .init();
     defer map.deinit(t.allocator);
 
-    const one: Key = .{ .any_path = testNodeId(1) };
-    const two: Key = .{ .any_path = testNodeId(2) };
+    const one: Key = .{ .any_path = try testNodeId(1) };
+    const two: Key = .{ .any_path = try testNodeId(2) };
     // The first draw is free: nothing holds it yet.
     const first = try map.get(t.allocator, one, stuck.random());
     try t.expectEqual(host_a, hostBitsOf(first));
@@ -428,8 +446,8 @@ test "a generator that repeats forever is refused, and the map keeps working" {
     var script: ScriptedBits = .{ .script = &.{host_b} };
     const second = try map.get(t.allocator, two, script.random());
     try t.expectEqual(host_b, hostBitsOf(second));
-    try expectSameKey(one, map.lookup(first).?);
-    try expectSameKey(two, map.lookup(second).?);
+    try expectSameKey(one, map.lookup(first));
+    try expectSameKey(two, map.lookup(second));
     try t.expectEqual(@as(u32, 2), map.by_key.count());
     try t.expectEqual(@as(u32, 2), map.by_addr.count());
 }
@@ -439,10 +457,10 @@ test "the same injected sequence allocates the same addresses" {
     // generator, and therefore the same addresses on every run. Two engines
     // seeded alike are the same sequence.
     const keys = [_]Key{
-        .{ .any_path = testNodeId(1) },
+        .{ .any_path = try testNodeId(1) },
         .{ .relay = .{
             .relay = try base_addr.RelayUrl.parse("https://a.example./"),
-            .node = testNodeId(2),
+            .node = try testNodeId(2),
         } },
         .{ .custom = try CustomKey.from(.{ .id = 0x2a, .data = &.{ 0xab, 0xcd } }) },
     };
@@ -458,7 +476,7 @@ test "the same injected sequence allocates the same addresses" {
         const first = try first_map.get(t.allocator, path_key, first_prng.random());
         const second = try second_map.get(t.allocator, path_key, second_prng.random());
         try t.expectEqual(first, second);
-        try expectSameKey(path_key, first_map.lookup(first).?);
+        try expectSameKey(path_key, first_map.lookup(first));
     }
 }
 
@@ -471,10 +489,10 @@ test "the three key arms are three addresses even on one host value" {
     defer map.deinit(t.allocator);
 
     const keys = [_]Key{
-        .{ .any_path = testNodeId(1) },
+        .{ .any_path = try testNodeId(1) },
         .{ .relay = .{
             .relay = try base_addr.RelayUrl.parse("https://a.example./"),
-            .node = testNodeId(1),
+            .node = try testNodeId(1),
         } },
         .{ .custom = try CustomKey.from(.{ .id = 0x2a, .data = &.{ 0xab, 0xcd } }) },
     };

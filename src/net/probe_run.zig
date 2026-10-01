@@ -389,14 +389,14 @@ pub fn drive(
     var slot: u8 = 0;
     while (slot < step.sends_len) : (slot += 1) {
         const task = step.sends[slot];
-        const index = (try sendIndex(&step, task)) orelse return error.Unattributable;
+        const filed = (try sendIndex(&step, task)) orelse return error.Unattributable;
         try transport.vtable.open(transport.ctx, .{
             .task = task,
             .relay = step.next.plan.relays[task.relay],
             .at = now,
             .deadline = probeBudget(step.next),
         });
-        in_flight.open[index] = task;
+        in_flight.open[filed.index] = task;
         opened += 1;
     }
 
@@ -427,14 +427,18 @@ pub fn drive(
     while (answered < open_before and current.outcome == null) {
         const reply = transport.vtable.poll(transport.ctx, now) orelse break;
         const filed = (try sendIndex(&step, reply.task)) orelse return error.Unattributable;
-        const open = in_flight.open[filed] orelse return error.Unattributable;
-        const task = (try step.next.plan.taskAt(filed)).?;
-        const result = try resultFor(task, step.next.plan.relays[task.relay], now, reply.value);
+        const open = in_flight.open[filed.index] orelse return error.Unattributable;
+        const result = try resultFor(
+            filed.task,
+            step.next.plan.relays[filed.task.relay],
+            now,
+            reply.value,
+        );
         // Cleared only once the answer is a result: a shape the task cannot
         // hold refuses the turn, and a probe the refusal took off the open set
         // would never be closed.
-        in_flight.open[filed] = null;
-        current = try probe.observe(current, filed, result);
+        in_flight.open[filed.index] = null;
+        current = try probe.observe(current, filed.index, result);
         transport.vtable.close(transport.ctx, open, .answered);
         answered += 1;
     }
@@ -526,21 +530,28 @@ fn checkBudget(runner: probe.Runner) Nanos {
     return runner.start +| probe.captive_portal_delay +| probe.captive_portal_timeout;
 }
 
-/// Which plan task index `task` is, or null when the plan holds no such task.
+/// Where in the plan `task` was sent, or null when the plan holds no such
+/// task.
 ///
 /// `Step.sends` is compacted — `sends_len` entries in plan order, with the
 /// indices left behind in `Step.next.sent` — and `probe.observe` files an
 /// answer against an index. Recovering it by walking the plan and matching the
-/// task is deliberate: a second copy of `step`'s due-and-unsent rule would be
-/// a second opinion about when a probe is sent, and the two would disagree the
+/// task is deliberate: a second copy of `step`'s due-and-unsent rule would be a
+/// second opinion about when a probe is sent, and the two would disagree the
 /// first time that rule changed. Matching needs only two properties of the loop
 /// in `step` — that it emits in plan order, and that it never emits one index
 /// twice — and a task that is in the plan is a task that was sent.
-fn sendIndex(step: *const probe.Step, task: probe.Task) Error!?probe.TaskIndex {
+///
+/// The plan's own copy of the task rides back with the index, so the caller
+/// attributes against the plan rather than against the answer's own claim
+/// about itself, and the walk happens once.
+fn sendIndex(step: *const probe.Step, task: probe.Task) Error!?struct {
+    index: probe.TaskIndex,
+    task: probe.Task,
+} {
     var index: probe.TaskIndex = 0;
-    while (index < try step.next.plan.taskCount()) : (index += 1) {
-        const candidate = (try step.next.plan.taskAt(index)).?;
-        if (std.meta.eql(candidate, task)) return index;
+    while (try step.next.plan.taskAt(index)) |candidate| : (index += 1) {
+        if (std.meta.eql(candidate, task)) return .{ .index = index, .task = candidate };
     }
     return null;
 }
@@ -692,10 +703,13 @@ const Fake = struct {
     /// Answer every probe with a latency and no address, whatever it ran as.
     /// A transport bug rather than a relay: the shapes do not correspond.
     wrong_shape: bool = false,
-    /// A probe this fake was never asked to open, handed back as though it had
-    /// answered. The only way to reach a refusal for an answer that names
+    /// An answer this fake hands back for a probe it was never asked to
+    /// open. The value rides with the task because that is what an answer
+    /// is: the impostor's job is to name a probe the round did not send, and
+    /// a name this fake owes no address for cannot be dressed up as one it
+    /// does. The only way to reach a refusal for an answer that names
     /// something the round did not send.
-    impostor: ?probe.Task = null,
+    impostor: ?Reply = null,
     /// Every probe handed to `open`, in the order it was sent.
     sent: [probe.max_tasks]Live = undefined,
     sent_len: usize = 0,
@@ -727,25 +741,28 @@ const Fake = struct {
         return total;
     }
 
-    fn ready(self: Fake, live: Live, now: Nanos) bool {
-        if (self.silent[live.task.relay]) return false;
-        if (now -| live.at < self.think[live.task.relay]) return false;
-        const family = @intFromEnum(live.task.proto);
+    /// The answer this fake has for `live` at `now`, or null while it has
+    /// none: a silent relay, a probe still in flight, or a relay that
+    /// reports no address for the family the probe asked about.
+    fn answer(self: Fake, live: Live, now: Nanos) ?Observation {
+        if (self.silent[live.task.relay]) return null;
+        if (now -| live.at < self.think[live.task.relay]) return null;
         // An HTTPS probe reads no address because it reports none; the two
         // address-discovery families read one per relay, and a relay with none
-        // is a relay that does not answer that family at all.
-        return live.task.proto == .https or self.reported[live.task.relay][family] != null;
-    }
-
-    fn observation(self: Fake, task: probe.Task) Observation {
-        if (self.wrong_shape) return .{ .https = self.think[task.relay] };
-        return switch (task.proto) {
-            .https => .{ .https = self.think[task.relay] },
+        // is a relay that does not answer that family at all. The refusal is
+        // here rather than in the `qad` arm so that `wrong_shape` is handed
+        // only a probe this relay does answer — the mismatch these two
+        // fields exist for is in the shape, not in the silence.
+        const value: Observation = switch (live.task.proto) {
+            .https => .{ .https = self.think[live.task.relay] },
             .qad_ipv4, .qad_ipv6 => .{ .qad = .{
-                .latency = self.think[task.relay],
-                .reported = self.reported[task.relay][@intFromEnum(task.proto)].?,
+                .latency = self.think[live.task.relay],
+                .reported = self.reported[live.task.relay][@intFromEnum(live.task.proto)] orelse
+                    return null,
             } },
         };
+        if (self.wrong_shape) return .{ .https = self.think[live.task.relay] };
+        return value;
     }
 };
 
@@ -758,14 +775,15 @@ fn onOpen(ctx: *anyopaque, at: Open) SendError!void {
 
 fn onPoll(ctx: *anyopaque, now: Nanos) ?Reply {
     const self: *Fake = @ptrCast(@alignCast(ctx));
-    if (self.impostor) |task| {
+    if (self.impostor) |reply| {
         self.impostor = null;
-        return .{ .task = task, .value = self.observation(task) };
+        return reply;
     }
     for (self.sent[0..self.sent_len]) |*live| {
-        if (live.answered or !self.ready(live.*, now)) continue;
+        if (live.answered) continue;
+        const value = self.answer(live.*, now) orelse continue;
         live.answered = true;
-        return .{ .task = live.task, .value = self.observation(live.task) };
+        return .{ .task = live.task, .value = value };
     }
     return null;
 }
@@ -1049,7 +1067,10 @@ test "an answer for a probe this round did not open is refused" {
 
     // A rung this round has not sent: the plan holds it and the round has not
     // reached it, so nothing about the answer can be attributed.
-    wire.impostor = .{ .proto = .https, .relay = 1, .attempt = 2 };
+    wire.impostor = .{
+        .task = .{ .proto = .https, .relay = 1, .attempt = 2 },
+        .value = .{ .https = millis(9) },
+    };
     try t.expectError(
         error.Unattributable,
         drive(runner, wire.transport(), &in_flight, .{ .now = start }),
@@ -1059,8 +1080,10 @@ test "an answer for a probe this round did not open is refused" {
     // and the fourth was never one of them.
     var other: Fake = .{};
     other.think = speeds(millis(9), millis(11), millis(9));
-    other.reported[4][v4_slot] = public_v4;
-    other.impostor = .{ .proto = .qad_ipv4, .relay = 4, .attempt = 0 };
+    other.impostor = .{
+        .task = .{ .proto = .qad_ipv4, .relay = 4, .attempt = 0 },
+        .value = .{ .qad = .{ .latency = millis(9), .reported = public_v4 } },
+    };
     try t.expectError(
         error.Unattributable,
         drive(runner, other.transport(), &in_flight, .{ .now = start }),

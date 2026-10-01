@@ -468,11 +468,11 @@ pub const Stats = struct {
 /// order rather than sorted order send the same bytes to the same peers in a
 /// different order, and under load that is the difference between a peer being
 /// reached by the first retransmission and the last.
-fn PeerSet(comptime N: usize) type {
+fn PeerSet(comptime capacity: usize) type {
     return struct {
         const Self = @This();
 
-        items: [N]NodeId = undefined,
+        items: [capacity]NodeId = undefined,
         len: usize = 0,
 
         pub fn count(self: *const Self) usize {
@@ -504,9 +504,8 @@ fn PeerSet(comptime N: usize) type {
                     break;
                 }
             }
-            if (self.len == N) return error.PeerSetFull;
-            std.mem.copyBackwards(
-                NodeId,
+            if (self.len == capacity) return error.PeerSetFull;
+            @memmove(
                 self.items[slot + 1 .. self.len + 1],
                 self.items[slot..self.len],
             );
@@ -525,9 +524,8 @@ fn PeerSet(comptime N: usize) type {
         }
 
         fn removeAt(self: *Self, index: usize) void {
-            std.mem.copyForwards(
-                NodeId,
-                self.items[index..self.len],
+            @memmove(
+                self.items[index .. self.len - 1],
                 self.items[index + 1 .. self.len],
             );
         }
@@ -537,13 +535,13 @@ fn PeerSet(comptime N: usize) type {
 /// Upstream `TimeBoundCache<MessageId, ()>`: ids with an expiry, checked
 /// against `now` only when a sweep runs. A re-insert overwrites in place,
 /// which is upstream's "the entry was re-added with a later time" case.
-fn IdCache(comptime N: usize) type {
+fn IdCache(comptime capacity: usize) type {
     return struct {
         const Self = @This();
 
         const Entry = struct { id: MessageId, expires_at: Nanos };
 
-        entries: [N]Entry = undefined,
+        entries: [capacity]Entry = undefined,
         len: usize = 0,
 
         pub fn count(self: *const Self) usize {
@@ -583,7 +581,7 @@ fn IdCache(comptime N: usize) type {
         /// expires soonest. A forgotten id costs one duplicate delivery, which
         /// the receiving end also tolerates, so evicting is not a failure.
         fn evictSlot(self: *Self) usize {
-            if (self.len < N) {
+            if (self.len < capacity) {
                 defer self.len += 1;
                 return self.len;
             }
@@ -599,7 +597,7 @@ fn IdCache(comptime N: usize) type {
 /// The payload half of `TimeBoundCache`: a copy of each message, kept so a
 /// peer that grafts late can still be answered. The copy is what lets a
 /// `Graft` reply borrow from the state rather than from the caller.
-fn MessageCache(comptime Slots: usize) type {
+fn MessageCache(comptime capacity: usize) type {
     return struct {
         const Self = @This();
 
@@ -611,7 +609,7 @@ fn MessageCache(comptime Slots: usize) type {
             bytes: [max_content]u8,
         };
 
-        entries: [Slots]Stored = undefined,
+        entries: [capacity]Stored = undefined,
         len: usize = 0,
 
         pub fn count(self: *const Self) usize {
@@ -645,14 +643,14 @@ fn MessageCache(comptime Slots: usize) type {
                 return error.MessageTooLarge;
             if (length > max_content) return error.MessageTooLarge;
 
-            var at: ?usize = null;
-            for (self.entries[0..self.len], 0..) |*entry, index| {
-                if (!entry.id.eql(gossip.id)) continue;
-                at = index;
-                break;
-            }
-            if (at == null) at = self.evictSlot();
-            const entry = &self.entries[at.?];
+            const at: usize = slot: {
+                for (self.entries[0..self.len], 0..) |*entry, index| {
+                    if (!entry.id.eql(gossip.id)) continue;
+                    break :slot index;
+                }
+                break :slot self.evictSlot();
+            };
+            const entry = &self.entries[at];
             entry.id = gossip.id;
             entry.expires_at = expires_at;
             entry.scope = gossip.scope;
@@ -674,7 +672,7 @@ fn MessageCache(comptime Slots: usize) type {
         /// See `IdCache.evictSlot`: a full cache drops the payload that expires
         /// soonest rather than failing a broadcast.
         fn evictSlot(self: *Self) usize {
-            if (self.len < Slots) {
+            if (self.len < capacity) {
                 defer self.len += 1;
                 return self.len;
             }
@@ -890,18 +888,27 @@ pub const State = struct {
             return;
         }
 
-        if (isSwarm(message.scope)) {
-            const arrived_at = message.round().?.value;
-            self.received_messages.put(message.id, now + self.config.message_id_retention);
-            const forwarded = message.nextRound().?;
-            try self.cache.put(forwarded, now + self.config.message_cache_retention);
-            try self.eagerPush(forwarded, sender, out);
-            try self.lazyPush(forwarded, sender, out);
-            self.forgetGraftTimer(message.id);
-            if (self.takeMissing(message.id)) |claims| {
-                try self.optimizeTree(sender, forwarded, claims, out);
-            }
-            self.stats.max_last_delivery_hop = @max(self.stats.max_last_delivery_hop, arrived_at);
+        switch (message.scope) {
+            .swarm => |arrived| {
+                const next = arrived.next();
+                const forwarded: Gossip = .{
+                    .id = message.id,
+                    .content = message.content,
+                    .scope = .{ .swarm = next },
+                };
+                self.received_messages.put(message.id, now + self.config.message_id_retention);
+                try self.cache.put(forwarded, now + self.config.message_cache_retention);
+                try self.eagerPush(forwarded, sender, out);
+                try self.lazyPush(forwarded, sender, out);
+                self.forgetGraftTimer(message.id);
+                var claims: [max_claims]Claim = undefined;
+                if (self.takeMissing(message.id, &claims)) |drained| {
+                    try self.optimizeTree(sender, next, drained, out);
+                }
+                self.stats.max_last_delivery_hop =
+                    @max(self.stats.max_last_delivery_hop, arrived.value);
+            },
+            .neighbors => {},
         }
 
         try out.push(.{ .emit_event = .{
@@ -918,11 +925,10 @@ pub const State = struct {
     fn optimizeTree(
         self: *State,
         gossip_sender: NodeId,
-        message: Gossip,
+        round: Round,
         claims: []const Claim,
         out: *Actions(OutEvent),
     ) (Error || Allocator.Error)!void {
-        const round = message.round().?;
         var best: ?Claim = null;
         for (claims) |claim| {
             if (best == null or claim.round.value < best.?.round.value) best = claim;
@@ -960,9 +966,10 @@ pub const State = struct {
     ) (Error || Allocator.Error)!void {
         for (ihaves) |ihave| {
             if (self.received_messages.contains(ihave.id)) continue;
-            try self.pushClaim(ihave.id, .{ .peer = sender, .round = ihave.round });
-            if (self.graftTimerScheduled(ihave.id)) continue;
-            self.rememberGraftTimer(ihave.id);
+            const claim: Claim = .{ .peer = sender, .round = ihave.round };
+            const entry = try self.pushClaim(ihave.id, claim);
+            if (entry.graft_timer_scheduled) continue;
+            entry.graft_timer_scheduled = true;
             try out.push(.{ .schedule_timer = .{
                 .after = self.config.graft_timeout_1,
                 .timer = .{ .send_graft = ihave.id },
@@ -1058,8 +1065,7 @@ pub const State = struct {
                 } });
                 sent += n;
             }
-            std.mem.copyForwards(
-                QueueEntry,
+            @memmove(
                 self.lazy_push_queue[0 .. self.lazy_push_queue_len - 1],
                 self.lazy_push_queue[1..self.lazy_push_queue_len],
             );
@@ -1145,13 +1151,17 @@ pub const State = struct {
         return null;
     }
 
-    fn pushClaim(self: *State, id: MessageId, claim: Claim) Error!void {
+    /// The entry the claim landed in, which is also the entry a graft timer is
+    /// owed against. It is handed back rather than looked up again because the
+    /// caller has just created or found it, so the write that follows cannot
+    /// miss; that is what lets the graft timer need no error of its own.
+    fn pushClaim(self: *State, id: MessageId, claim: Claim) Error!*MissingEntry {
         if (self.findMissing(id)) |entry| {
             if (entry.count == max_claims) return error.MissingTableFull;
             entry.peers[entry.count] = claim.peer;
             entry.rounds[entry.count] = claim.round;
             entry.count += 1;
-            return;
+            return entry;
         }
         if (self.missing_messages_len == max_missing) return error.MissingTableFull;
         const entry = &self.missing_messages[self.missing_messages_len];
@@ -1161,24 +1171,29 @@ pub const State = struct {
         entry.peers[0] = claim.peer;
         entry.rounds[0] = claim.round;
         self.missing_messages_len += 1;
+        return entry;
     }
 
-    fn takeMissing(self: *State, id: MessageId) ?[]const Claim {
+    /// Drain one id's claims into the caller's buffer and return the filled
+    /// part of it. The entry is gone after the call, so the list cannot borrow
+    /// it, and a buffer in this frame would be dead before `optimizeTree` is
+    /// done reading it.
+    fn takeMissing(self: *State, id: MessageId, storage: *[max_claims]Claim) ?[]const Claim {
         const index = self.missingIndex(id) orelse return null;
-        var claims: [max_claims]Claim = undefined;
-        const entry = self.missing_messages[index];
-        for (entry.peers[0..entry.count], entry.rounds[0..entry.count], 0..) |peer, round, at| {
-            claims[at] = .{ .peer = peer, .round = round };
+        const entry = &self.missing_messages[index];
+        const count = entry.count;
+        for (entry.peers[0..count], entry.rounds[0..count], 0..) |peer, round, at| {
+            storage[at] = .{ .peer = peer, .round = round };
         }
         self.removeMissing(index);
-        return claims[0..entry.count];
+        return storage[0..count];
     }
 
     /// Pop the front of one id's claim queue, which is the peer we graft next.
     fn takeOldestClaim(self: *State, id: MessageId) ?Claim {
         const index = self.missingIndex(id) orelse return null;
         const entry = &self.missing_messages[index];
-        const claim = Claim{ .peer = entry.peers[0], .round = entry.rounds[0] };
+        const claim: Claim = .{ .peer = entry.peers[0], .round = entry.rounds[0] };
         var at: usize = 1;
         while (at < entry.count) : (at += 1) {
             entry.peers[at - 1] = entry.peers[at];
@@ -1197,23 +1212,11 @@ pub const State = struct {
     }
 
     fn removeMissing(self: *State, index: usize) void {
-        std.mem.copyForwards(
-            MissingEntry,
+        @memmove(
             self.missing_messages[index .. self.missing_messages_len - 1],
             self.missing_messages[index + 1 .. self.missing_messages_len],
         );
         self.missing_messages_len -= 1;
-    }
-
-    fn graftTimerScheduled(self: *State, id: MessageId) bool {
-        const entry = self.findMissing(id) orelse return false;
-        return entry.graft_timer_scheduled;
-    }
-
-    /// The caller has just created or found the entry, so the write cannot
-    /// miss; that is the whole reason this takes no error.
-    fn rememberGraftTimer(self: *State, id: MessageId) void {
-        self.findMissing(id).?.graft_timer_scheduled = true;
     }
 
     fn forgetGraftTimer(self: *State, id: MessageId) void {
@@ -1238,16 +1241,24 @@ const t = std.testing;
 /// Node ids from fixed seeds, as `discovery/item.zig` does them. A `NodeId`
 /// cannot be built from arbitrary bytes — `fromBytes` rejects a non-point — so
 /// a test pool draws from seeds.
-fn testNodeId(index: u8) NodeId {
+///
+/// Fallible, because a seed that derives the identity point is a `u8` value
+/// away and nothing about `0xa5` rules it out. A test that hit one says
+/// `error.DegenerateSeed` and names its seed; a `unreachable` here would take
+/// the whole test binary down and say nothing.
+fn testNodeId(index: u8) key.KeyError!NodeId {
     var seed: [key.SecretKey.seed_length]u8 = undefined;
     @memset(&seed, 0xa5);
     seed[0] = index;
-    return (key.SecretKey.fromSeed(seed) catch unreachable).nodeId();
+    return (try key.SecretKey.fromSeed(seed)).nodeId();
 }
 
 /// The input of a BLAKE3 test-vector case: 0, 1, ... 250 repeating.
-fn blake3Input(len: usize) []u8 {
-    const input = t.allocator.alloc(u8, len) catch unreachable;
+///
+/// Fallible for the ordinary reason: the testing allocator runs out like any
+/// other, and a test that cannot say so is a test that reports a crash.
+fn blake3Input(len: usize) ![]u8 {
+    const input = try t.allocator.alloc(u8, len);
     for (input, 0..) |*byte, index| byte.* = @intCast(index % 251);
     return input;
 }
@@ -1342,7 +1353,7 @@ const blake3_vectors = [_]Blake3Vector{
 // published vectors rather than against this implementation's own output.
 test "a message id is blake3 of the content, and nothing else" {
     for (blake3_vectors) |vector| {
-        const input = blake3Input(vector.len);
+        const input = try blake3Input(vector.len);
         defer t.allocator.free(input);
         try t.expectEqualStrings(vector.hash, &std.fmt.bytesToHex(
             MessageId.fromContent(input).toBytes(),
@@ -1357,14 +1368,14 @@ test "a message id is blake3 of the content, and nothing else" {
 // context string. It is a different value for the same content, so it is not
 // an id, and a message carrying one is dropped.
 test "a domain-separated id is not a message id" {
-    const content = blake3Input(2);
+    const content = try blake3Input(2);
     defer t.allocator.free(content);
     const context = "BLAKE3 2019-12-27 16:29:52 test vectors context";
     const separated = domainSeparatedId(context, content);
     try t.expect(!MessageId.fromContent(content).eql(separated));
 
     for (blake3_vectors) |vector| {
-        const input = blake3Input(vector.len);
+        const input = try blake3Input(vector.len);
         defer t.allocator.free(input);
         const wrong = messageIdFromHex(vector.derive_key);
         const gossip: Gossip = .{
@@ -1380,9 +1391,9 @@ test "a domain-separated id is not a message id" {
 // does not touch the peer that sent it. A path that also punished would let
 // one bad frame per neighbour empty a victim's iTree.
 test "a spoofed message id is dropped without penalising the peer" {
-    const me = testNodeId(1);
-    const peer = testNodeId(2);
-    const content = blake3Input(2);
+    const me = try testNodeId(1);
+    const peer = try testNodeId(2);
+    const content = try blake3Input(2);
     defer t.allocator.free(content);
     const id = MessageId.fromContent(content);
 
@@ -1440,11 +1451,11 @@ test "a spoofed message id is dropped without penalising the peer" {
 // a lazy edge. A payload arriving from `2` goes whole to `3` and by id to
 // `4`, and nothing goes back to `2`.
 test "the iTree forwards along eager edges and announces along lazy ones" {
-    const me = testNodeId(1);
-    const from = testNodeId(2);
-    const eager_child = testNodeId(3);
-    const lazy_child = testNodeId(4);
-    const content = blake3Input(3);
+    const me = try testNodeId(1);
+    const from = try testNodeId(2);
+    const eager_child = try testNodeId(3);
+    const lazy_child = try testNodeId(4);
+    const content = try blake3Input(3);
     defer t.allocator.free(content);
     const id = MessageId.fromContent(content);
 
@@ -1498,9 +1509,9 @@ test "the iTree forwards along eager edges and announces along lazy ones" {
 // The first half of the recovery path: a peer advertises a message this node
 // never received, the timer fires, and the peer is grafted and asked for it.
 test "an iHave that is not followed by a payload becomes a graft" {
-    const me = testNodeId(1);
-    const peer = testNodeId(2);
-    const content = blake3Input(8);
+    const me = try testNodeId(1);
+    const peer = try testNodeId(2);
+    const content = try blake3Input(8);
     defer t.allocator.free(content);
     const id = MessageId.fromContent(content);
 
@@ -1537,10 +1548,10 @@ test "an iHave that is not followed by a payload becomes a graft" {
 // directly, and the cache is what answers. The payload is copied on the way in
 // precisely so that this reply can be made after the original message is gone.
 test "a graft is answered from the cache" {
-    const me = testNodeId(1);
-    const holder = testNodeId(3);
-    const asker = testNodeId(2);
-    const content = blake3Input(8);
+    const me = try testNodeId(1);
+    const holder = try testNodeId(3);
+    const asker = try testNodeId(2);
+    const content = try blake3Input(8);
     defer t.allocator.free(content);
     const id = MessageId.fromContent(content);
 
@@ -1576,9 +1587,9 @@ test "a graft is answered from the cache" {
 // A graft for a message this node has itself is a no-op beyond the promotion,
 // and one for a message the cache has already swept is silent.
 test "a graft the cache cannot answer is silent" {
-    const me = testNodeId(1);
-    const peer = testNodeId(2);
-    const content = blake3Input(2);
+    const me = try testNodeId(1);
+    const peer = try testNodeId(2);
+    const content = try blake3Input(2);
     defer t.allocator.free(content);
     const id = MessageId.fromContent(content);
 
@@ -1604,13 +1615,13 @@ test "a graft the cache cannot answer is silent" {
 // armed once across both, which is what makes the second run's expected list
 // shorter than the first's.
 test "the tree optimises towards the shortest path anybody claimed" {
-    const me = testNodeId(1);
-    const claimant = testNodeId(2);
-    const sender = testNodeId(3);
+    const me = try testNodeId(1);
+    const claimant = try testNodeId(2);
+    const sender = try testNodeId(3);
 
-    const near = blake3Input(2);
+    const near = try blake3Input(2);
     defer t.allocator.free(near);
-    const far = blake3Input(3);
+    const far = try blake3Input(3);
     defer t.allocator.free(far);
     const near_id = messageIdFromHex(blake3_vectors[2].hash);
     const far_id = messageIdFromHex(blake3_vectors[3].hash);
@@ -1665,12 +1676,159 @@ test "the tree optimises towards the shortest path anybody claimed" {
     try t.expect(state.lazy_push_peers.contains(sender));
 }
 
+// `takeMissing` hands its result to `optimizeTree`, which reads it after the
+// call returns, so the claim list has to outlive the drain. Upstream borrows
+// the map entry; here the entry is removed by the drain, so the copy belongs
+// to a buffer the caller owns. A drain that built the copy in its own frame
+// returned a pointer to a dead slot, and the caller cannot see that — it is
+// the next drain, into its own buffer, that reads whatever the dead frame
+// left behind. So: two ids, two buffers, and the shortest claim of the second
+// id is the one a shared buffer would hand to the first.
+test "a drained claim list lives in the caller's buffer" {
+    const me = try testNodeId(1);
+    const near_peer = try testNodeId(2);
+    const far_peer = try testNodeId(3);
+    const other_peer = try testNodeId(4);
+    const sender = try testNodeId(5);
+
+    const first_id = messageIdFromHex(blake3_vectors[2].hash);
+    const second_id = messageIdFromHex(blake3_vectors[3].hash);
+    const unclaimed_id = messageIdFromHex(blake3_vectors[4].hash);
+
+    var state: State = .init(me, .{});
+    var out: Actions(OutEvent) = .init(t.allocator);
+    defer out.deinit();
+
+    _ = try state.pushClaim(first_id, .{ .peer = near_peer, .round = .{ .value = 4 } });
+    _ = try state.pushClaim(first_id, .{ .peer = far_peer, .round = .{ .value = 12 } });
+    _ = try state.pushClaim(second_id, .{ .peer = other_peer, .round = .{ .value = 1 } });
+
+    var first_buffer: [max_claims]Claim = undefined;
+    const maybe_first = state.takeMissing(first_id, &first_buffer);
+    try t.expect(maybe_first != null);
+    const first_claims = maybe_first.?;
+    try t.expectEqual(@as(usize, 2), first_claims.len);
+    try t.expect(first_claims.ptr == @as([*]const Claim, first_buffer[0..].ptr));
+    try t.expect(sameNode(first_claims[0].peer, near_peer));
+    try t.expectEqual(@as(u16, 4), first_claims[0].round.value);
+    try t.expect(sameNode(first_claims[1].peer, far_peer));
+    try t.expectEqual(@as(u16, 12), first_claims[1].round.value);
+
+    var second_buffer: [max_claims]Claim = undefined;
+    const maybe_second = state.takeMissing(second_id, &second_buffer);
+    try t.expect(maybe_second != null);
+    const second_claims = maybe_second.?;
+    try t.expectEqual(@as(usize, 1), second_claims.len);
+    try t.expect(sameNode(second_claims[0].peer, other_peer));
+    try t.expectEqual(@as(u16, 1), second_claims[0].round.value);
+
+    // The second drain wrote the second buffer and left the first list
+    // readable, unchanged, and its own.
+    try t.expectEqual(@as(usize, 2), first_claims.len);
+    try t.expect(sameNode(first_claims[0].peer, near_peer));
+    try t.expectEqual(@as(u16, 4), first_claims[0].round.value);
+    try t.expect(sameNode(first_claims[1].peer, far_peer));
+    try t.expectEqual(@as(u16, 12), first_claims[1].round.value);
+
+    // And the retained list still drives the optimisation: `near_peer`, the
+    // shortest claim of the first id, not the shorter claim of the second.
+    try state.optimizeTree(sender, .{ .value = 20 }, first_claims, &out);
+    try t.expectEqual(@as(usize, 2), out.count());
+    try t.expect(out.at(0) == .send_message);
+    try t.expect(sameNode(out.at(0).send_message.to, near_peer));
+    try t.expect(out.at(0).send_message.message.graft.id == null);
+    try t.expectEqual(@as(u16, 4), out.at(0).send_message.message.graft.round.value);
+    try t.expect(out.at(1) == .send_message);
+    try t.expect(sameNode(out.at(1).send_message.to, sender));
+    try t.expect(out.at(1).send_message.message == .prune);
+    try t.expect(state.eager_push_peers.contains(near_peer));
+    try t.expect(state.lazy_push_peers.contains(sender));
+
+    // An id nobody claimed drains to nothing and writes nothing: the buffer
+    // the caller handed in is still the caller's.
+    var spare_buffer: [max_claims]Claim = undefined;
+    @memset(&spare_buffer, Claim{ .peer = me, .round = .{ .value = 999 } });
+    try t.expect(state.takeMissing(unclaimed_id, &spare_buffer) == null);
+    try t.expect(sameNode(spare_buffer[0].peer, me));
+    try t.expectEqual(@as(u16, 999), spare_buffer[0].round.value);
+
+    // And a drained id is drained: the second attempt has nothing to give.
+    var drained_buffer: [max_claims]Claim = undefined;
+    try t.expect(state.takeMissing(first_id, &drained_buffer) == null);
+}
+
+// The same isolation through the public path, where no caller ever holds a
+// claim list: two ids are pending, the second arrives and is optimised
+// towards the peer that claimed *it*, and the first id's claim is still
+// queued when its own graft timer fires. A drain that took the wrong id's
+// claims would graft the wrong peer and leave the first id with nobody to
+// ask.
+test "one id's optimisation leaves another id's claim queued" {
+    const me = try testNodeId(1);
+    const near_claimant = try testNodeId(2);
+    const far_claimant = try testNodeId(3);
+    const sender = try testNodeId(4);
+
+    const far = try blake3Input(3);
+    defer t.allocator.free(far);
+    const near_id = messageIdFromHex(blake3_vectors[2].hash);
+    const far_id = messageIdFromHex(blake3_vectors[3].hash);
+
+    var state: State = .init(me, .{});
+    var out: Actions(OutEvent) = .init(t.allocator);
+    defer out.deinit();
+
+    try state.handle(.{ .recv_message = .{
+        .from = near_claimant,
+        .message = .{ .i_have = try IHaves.init(&.{.{ .id = near_id, .round = .{ .value = 4 } }}) },
+    } }, 0, &out);
+    out.clear();
+    try state.handle(.{ .recv_message = .{
+        .from = far_claimant,
+        .message = .{ .i_have = try IHaves.init(&.{.{ .id = far_id, .round = .{ .value = 1 } }}) },
+    } }, 0, &out);
+    out.clear();
+
+    try state.handle(.{ .recv_message = .{
+        .from = sender,
+        .message = .{ .gossip = .{
+            .id = far_id,
+            .content = far,
+            .scope = .{ .swarm = .{ .value = 20 } },
+        } },
+    } }, 0, &out);
+    // The dispatch flush `lazyPush` latches, then this id's graft and its
+    // sender's prune.
+    try t.expectEqual(@as(usize, 4), out.count());
+    try t.expect(out.at(0) == .schedule_timer);
+    try t.expect(out.at(0).schedule_timer.timer == .dispatch_lazy_push);
+    try t.expect(out.at(1) == .send_message);
+    try t.expect(sameNode(out.at(1).send_message.to, far_claimant));
+    try t.expect(out.at(1).send_message.message.graft.id == null);
+    try t.expectEqual(@as(u16, 1), out.at(1).send_message.message.graft.round.value);
+    try t.expect(out.at(2) == .send_message);
+    try t.expect(sameNode(out.at(2).send_message.to, sender));
+    try t.expect(out.at(2).send_message.message == .prune);
+    try t.expect(out.at(3) == .emit_event);
+
+    // The first id never arrived, so its graft timer still has its claimant.
+    out.clear();
+    try state.handle(.{ .timer_expired = .{ .send_graft = near_id } }, 0, &out);
+    try t.expectEqual(@as(usize, 2), out.count());
+    try t.expect(out.at(0) == .send_message);
+    try t.expect(sameNode(out.at(0).send_message.to, near_claimant));
+    try t.expect(out.at(0).send_message.message.graft.id.?.eql(near_id));
+    try t.expectEqual(@as(u16, 4), out.at(0).send_message.message.graft.round.value);
+    try t.expect(out.at(1) == .schedule_timer);
+    try t.expect(out.at(1).schedule_timer.timer == .send_graft);
+}
+
 // A second copy of a message already held is not forwarded and not announced;
 // it costs the sender its eager edge.
 test "a duplicate moves the sender to the lazy side" {
-    const me = testNodeId(1);
-    const sender = testNodeId(2);
-    const content = blake3Input(2);
+    const me = try testNodeId(1);
+    const sender = try testNodeId(2);
+    const content = try blake3Input(2);
     defer t.allocator.free(content);
     const id = messageIdFromHex(blake3_vectors[2].hash);
     const gossip: Gossip = .{
@@ -1704,9 +1862,9 @@ test "a duplicate moves the sender to the lazy side" {
 
 // A neighbour that goes away leaves both sets and the claim table.
 test "a neighbour down leaves the tree" {
-    const me = testNodeId(1);
-    const eager = testNodeId(2);
-    const content = blake3Input(2);
+    const me = try testNodeId(1);
+    const eager = try testNodeId(2);
+    const content = try blake3Input(2);
     defer t.allocator.free(content);
     const id = messageIdFromHex(blake3_vectors[2].hash);
 
@@ -1715,8 +1873,8 @@ test "a neighbour down leaves the tree" {
     defer out.deinit();
 
     try state.handle(.{ .neighbor_up = eager }, 0, &out);
-    try state.addLazy(testNodeId(3));
-    try state.pushClaim(id, .{ .peer = eager, .round = .{ .value = 2 } });
+    try state.addLazy(try testNodeId(3));
+    _ = try state.pushClaim(id, .{ .peer = eager, .round = .{ .value = 2 } });
     out.clear();
     try state.handle(.{ .neighbor_down = eager }, 0, &out);
     try t.expectEqual(@as(usize, 0), out.count());
@@ -1729,9 +1887,9 @@ test "a neighbour down leaves the tree" {
 // Upstream `plumtree::test::cache_is_evicted`: the payload cache holds a
 // message for `message_cache_retention` and not one tick longer.
 test "the payload cache is evicted on its own clock" {
-    const me = testNodeId(1);
-    const peer = testNodeId(2);
-    const content = blake3Input(2);
+    const me = try testNodeId(1);
+    const peer = try testNodeId(2);
+    const content = try blake3Input(2);
     defer t.allocator.free(content);
     const id = messageIdFromHex(blake3_vectors[2].hash);
 
@@ -1768,19 +1926,19 @@ test "the payload cache is evicted on its own clock" {
 // The eager and lazy sets are sorted, and a fan-out follows that order, so
 // two implementations agree on who is asked first.
 test "the iTree sets are sorted" {
-    const me = testNodeId(9);
+    const me = try testNodeId(9);
     var state: State = .init(me, .{});
     var out: Actions(OutEvent) = .init(t.allocator);
     defer out.deinit();
 
-    for ([_]u8{ 5, 1, 8, 3 }) |index| try state.addEager(testNodeId(index));
+    for ([_]u8{ 5, 1, 8, 3 }) |index| try state.addEager(try testNodeId(index));
     try t.expectEqual(@as(usize, 4), state.eagerPeers().len);
     var at: usize = 1;
     while (at < state.eagerPeers().len) : (at += 1) {
         try t.expect(state.eagerPeers()[at - 1].order(state.eagerPeers()[at]) == .lt);
     }
 
-    const content = blake3Input(1);
+    const content = try blake3Input(1);
     defer t.allocator.free(content);
     out.clear();
     try state.broadcast(content, .swarm, 0, &out);
@@ -1799,7 +1957,7 @@ test "the iTree sets are sorted" {
 // A payload over the cache's bound is refused rather than truncated, because
 // a truncated payload with the right id is a message nobody can verify.
 test "a payload over the bound is refused" {
-    const me = testNodeId(1);
+    const me = try testNodeId(1);
     const content = try t.allocator.alloc(u8, max_content + 1);
     defer t.allocator.free(content);
     @memset(content, 0x5a);
@@ -1819,7 +1977,7 @@ test "a payload over the bound is refused" {
 // cache: an oversized gossip off the wire must be refused there, never
 // truncated into an entry whose id is the hash of a longer message.
 test "a received payload over the bound is refused" {
-    const me = testNodeId(1);
+    const me = try testNodeId(1);
     const content = try t.allocator.alloc(u8, max_content + 1);
     defer t.allocator.free(content);
     @memset(content, 0x5a);
@@ -1830,7 +1988,7 @@ test "a received payload over the bound is refused" {
 
     try t.expectError(
         error.MessageTooLarge,
-        state.handle(.{ .recv_message = .{ .from = testNodeId(2), .message = .{ .gossip = .{
+        state.handle(.{ .recv_message = .{ .from = try testNodeId(2), .message = .{ .gossip = .{
             .id = MessageId.fromContent(content),
             .content = content,
             .scope = .{ .swarm = Round.zero },
@@ -1845,7 +2003,7 @@ test "a received payload over the bound is refused" {
 // traps in this one — either way the entry ends up an empty payload under the
 // hash of 65536 bytes.
 test "a received payload too long to record is refused" {
-    const me = testNodeId(1);
+    const me = try testNodeId(1);
     const content = try t.allocator.alloc(u8, std.math.maxInt(u16) + 1);
     defer t.allocator.free(content);
     @memset(content, 0x5a);
@@ -1856,7 +2014,7 @@ test "a received payload too long to record is refused" {
 
     try t.expectError(
         error.MessageTooLarge,
-        state.handle(.{ .recv_message = .{ .from = testNodeId(2), .message = .{ .gossip = .{
+        state.handle(.{ .recv_message = .{ .from = try testNodeId(2), .message = .{ .gossip = .{
             .id = MessageId.fromContent(content),
             .content = content,
             .scope = .{ .swarm = Round.zero },

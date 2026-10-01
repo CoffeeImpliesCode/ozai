@@ -5,53 +5,75 @@
 //! and files every answer into a `probe.Results`. `probe.zig` folds those
 //! into a `report.Report`. `holepunch.zig` decides whether to ask the QUIC
 //! stack for a NAT-traversal round, from a candidate set, an instant and a
-//! connection. Nothing joins them: every `report.Report` in this project was
-//! written by a test, and so is every `holepunch.PunchState`. This file is
-//! the producer's other half. It turns a folded report into the gate's
-//! inputs, hands the gate's answer back, and restates none of the three
-//! modules above it.
+//! connection. This file is the producer's other half: it turns a folded
+//! report and a peer's published record into the gate's inputs, hands the
+//! gate's answer back, and restates none of the three modules above it.
 //!
-//! # What a probe round can supply, and what it cannot
+//! # The seven inputs, and where each one comes from
 //!
 //! A probe round measures **this node**, from the inside, over QUIC. The gate
-//! asks about **one connection**, from the outside. The overlap is real, it is
-//! small, and it is this section in full — a reader without it reads a gap as
-//! a rule, and then wonders why the gap is never closed.
+//! asks about **one connection**, from the outside. Three of its seven inputs
+//! have a producer here and four do not, and each of the four is named below
+//! with what would close it. A reader without this section reads a gap as a
+//! rule, and then wonders why the gap is never closed.
 //!
 //! ```text
-//! gate input                          | from a probe round
+//! gate input                          | where it comes from
 //! -------------------------------------|----------------------------------
-//! local: where this node is reachable | yes: `global_v4`, `global_v6`
-//! the mapping verdict                  | yes: `mappingVariesByDest`
-//! remote: where the peer is reachable | no: the peer's own report
-//! the connection to punch on           | no: the connection table
-//! what the stack said about a round    | no: `initiate_nat_traversal_round`
-//! whether a path carried traffic       | no: the multipath layer
-//! the socket's interface addresses     | no: the socket
+//! local: where this node is reachable | `observeReport`
+//! the mapping verdict                  | `observeReport`
+//! remote: where the peer is reachable | `observePeer`
+//! the connection to punch on          | gap: the transport's table
+//! what the stack said about a round   | gap: no QNT in the vendored core
+//! whether a path carried traffic      | gap: no multipath layer
+//! the socket's interface addresses    | gap: no interface enumeration
 //! ```
 //!
-//! Every "no" is where a caller is, and each is a thing a probe physically
-//! cannot do rather than one this file declines to do:
+//! **The connection.** `holepunch.selectPunchConnection` turns a table into
+//! the one connection a round runs on, and `Join.selectConnection` is its
+//! pass-through. The table belongs to the transport — it is
+//! `transport/quic_bridge.Bridge.manager.entries`, one layer above this one
+//! (`docs/ARCHITECTURE.md`) — and nothing under `src/net/` imports
+//! `src/transport/`, which is what keeps this layer drivable with no QUIC
+//! substrate at all. `probe_run.Transport` is how the layer reaches the
+//! transport when it has to: a vtable the transport side fills, never an
+//! import, and no implementation of one for a connection table exists on the
+//! other side of it yet.
 //!
-//! - **The peer's addresses** are the peer's own report, published through
-//!   discovery, or what its path table has already seen. A probe answers a
-//!   relay's question about *us*; nothing in a round sees across the wire.
-//! - **The connection** is `holepunch.selectPunchConnection` over a table the
-//!   transport owns, and it is the one input the gate needs on every round.
-//! - **The stack's answer** is `initiate_nat_traversal_round`, the call
-//!   `docs/DECISIONS/0001` sends away and this milestone never makes. Its
-//!   refusal is classified by `holepunch.classify`, which is where a retry
-//!   delay and a fatal error are decided, not here.
-//! - **A path's status** is what the multipath layer saw on it. A probe
-//!   learns an address and never learns whether anything was sent over it, so
-//!   every candidate this file records arrives `unknown`, and only the caller
-//!   can say otherwise.
+//! The side is one field away for whoever writes that implementation:
+//! `quic_bridge.Conn.entry` is public and `conn.entry.conn.is_server`
+//! (`vendor/quic/src/quic/connection.zig:608`) is what `transport/dial.zig`
+//! and `src/node/node.zig` already read. What this layer could not do with
+//! it is narrow the table to one peer, because the table holds every
+//! connection this node has and a `Join` is one peer's.
 //!
-//! The socket's interface addresses are the other half of the local set: a
-//! relay reports the address this node came *from* and cannot report the
-//! addresses on the interfaces underneath, so they arrive as an argument.
+//! **The stack's answer.** `initiate_nat_traversal_round` is
+//! `draft-seemann-quic-nat-traversal-02`, and the vendored core has no QNT:
+//! `qnt`, `traversal` and `path_id` appear nowhere under `vendor/quic/src`,
+//! and `docs/DECISIONS/0001` gives the reason — iroh's QUIC is n0's own fork
+//! and this is endel/quic-zig. So `holepunch.Outcome` is a value the caller
+//! brings back from a call this project cannot make, `settle` is where it
+//! arrives, and `holepunch.classify` stays the only thing that reads it.
 //!
-//! # The mapping
+//! **A path's status.** Nothing in this tree watches traffic per path. The
+//! core keeps `paths: [2]NetworkPath` under one `active_path_idx`
+//! (`vendor/quic/src/quic/connection.zig:626`) — an active/candidate register
+//! rather than a path set, which `DECISIONS/0001` measured and recorded — and
+//! `Conn.drain` sends every datagram at the one peer address it holds. So
+//! `observe` is handed its status and `absorb` files `unknown`, and no rule
+//! about which status follows which is written here.
+//!
+//! **The socket's interface addresses.** The half of the local set no round
+//! measures, and the one argument of `observeReport` a caller has to find.
+//! The socket knows a single address and it is not one of these:
+//! `transport/socket.zig:885` reads it back with `getsockname`, which on a
+//! wildcard bind is `0.0.0.0` or `::` with the ephemeral port — where this
+//! node is *bound*, not where a peer may reach it, and advertising it would
+//! be worse than advertising nothing. The addresses behind it need
+//! `getifaddrs` or a netlink route dump, and neither appears anywhere under
+//! `src/`: there is no netwatcher here to call one.
+//!
+//! # The two mappings
 //!
 //! `global_v4` and `global_v6` are the addresses a relay saw this node come
 //! from, and they are the only form of "where am I reachable" a round can
@@ -59,6 +81,16 @@
 //! Order is not a rule — `holepunch.hasNewAddress` compares sets, and
 //! `holepunch.decide` cannot tell which of the two sources a candidate came
 //! from.
+//!
+//! The peer's candidates come the other way round: from the record the peer
+//! published, and only from its `.ip` entries. A relay is the fallback path
+//! rather than a way in, and a custom transport is not an IP socket, so
+//! neither is something to punch at and both are counted rather than dropped
+//! in silence. Every direct address is filed twice — once in the advertised
+//! set the gate compares, once in the path table the caller learns from —
+//! because upstream those are one record (`PathEntry` in
+//! `iroh/src/socket/remote_map/remote_state/path_state.rs`) and this file
+//! keeps them apart: the gate borrows a set while the table owns one.
 //!
 //! The verdict is carried and consulted by nothing here, and that is not an
 //! omission. `holepunch.decide` takes no verdict, and a rule that consulted
@@ -68,18 +100,19 @@
 //! this node may be published as directly reachable, and only two probes to
 //! *different* relays can produce it.
 //!
-//! # Two buffers, because the gate compares against the last round
+//! # Three buffers, because the gate compares against the last round
 //!
 //! `holepunch.PunchState.last` borrows the candidates the last round was
-//! started with, and `holepunch.decide` compares this round's set against
+//! started with, and `holepunch.decide` compares this round's sets against
 //! them. One buffer would be rewritten under that comparison, and a slice
 //! into storage the caller owns would make the caller's bookkeeping part of
-//! the gate's invariant. So the live set and the recorded set are two
-//! buffers: `settle` copies the live one into the recorded one and hands the
-//! gate *that* slice, and only an accepted round does so, because it is the
-//! only outcome that records a set at all. The copy is a few hundred bytes
-//! once a round, and it is what makes "a borrowed slice outlives its turn" a
-//! property of this type rather than of its caller's care.
+//! the gate's invariant. So each set this file keeps is its own buffer: live
+//! local, recorded local, and the peer's. `settle` copies the live local set
+//! into the recorded one and hands the gate *that* slice, and only an
+//! accepted round does so, because it is the only outcome that records a set
+//! at all. The copy is a few hundred bytes once a round, and it is what
+//! makes "a borrowed slice outlives its turn" a property of this type rather
+//! than of its caller's care.
 //!
 //! # What the gate already decides, and what this file adds
 //!
@@ -94,26 +127,28 @@
 //!   before the gate is consulted at all and refuses the round itself.
 //! - **Where the gate's borrowed slices live.** `Join` owns them, so a
 //!   caller cannot hand the gate a buffer it is about to rewrite.
-//! - **What the burst did.** `absorb` files candidates and prunes as it
-//!   goes, and hands back what the prune dropped, so the plan's rule — a
-//!   burst of untested address-lookup results must not evict the paths that
-//!   work — is observable from the caller's side of the seam rather than
-//!   only from `holepunch.prune`'s own tests.
+//! - **What the burst did.** `absorb` and `observePeer` file candidates and
+//!   prune as they go, and hand back what the prune dropped, so the plan's
+//!   rule — a burst of untested address-lookup results must not evict the
+//!   paths that work — is observable from the caller's side of the seam
+//!   rather than only from `holepunch.prune`'s own tests.
 //!
 //! Freshness is deliberately absent from that list. `report.ProbeResult`
 //! carries the instant it was observed and `report.fold` ages it against
 //! `report.max_report_age` for the preferred-relay window, but nothing here
-//! ages the candidate set: a caller holding an old report is a caller that
-//! has already decided that report is worth handing over.
+//! ages the candidate sets: a caller holding an old report or an old record
+//! is a caller that has already decided it is worth handing over.
 //!
 //! # No clock, no thread, no socket, no allocator
 //!
 //! Every instant is an argument — `ready(now)` and `settle(now, outcome)` —
 //! and a test drives the whole chain on one, from a probe round that opened
 //! no socket to a punch decision nobody acted on. `Join` is a value: it holds
-//! no pointer to the transport, no task and no allocator, and it can be
-//! copied and moved without invalidating anything, because the only slice it
-//! keeps is the peer's candidate list, which is the caller's to begin with.
+//! no pointer to the transport, no task and no allocator, and every set in
+//! it is its own storage, so it can be copied and moved without invalidating
+//! anything. The one slice it still borrows is the candidate list the QUIC
+//! stack returned, which `settle` records on the caller's word — and the
+//! stack is one of the gaps above.
 //!
 //! Upstream at n0-computer/iroh commit
 //! 187f59e80afdae6bd9866002b33d3365c00b06d8 — the pin `net/holepunch.zig`
@@ -234,10 +269,35 @@ pub const Filed = struct {
 pub const Absorbed = struct {
     /// Candidates the table did not already carry.
     added: usize,
-    /// Candidates the table had no room for. See `Set.overflow`'s rule.
+    /// Candidates the path table had no room for. The advertised set has its
+    /// own ceiling and counts it on itself; see `Peered`.
     refused: usize,
     /// What the whole burst cost the table.
     pruned: holepunch.Pruned,
+};
+
+/// What one peer's published record did to the join.
+///
+/// Two counts and a tally, because one record reaches two sets that have
+/// separate ceilings: `candidates` is the path table's, and what the
+/// advertised set could not hold is counted on the set itself
+/// (`Join.remote.overflow`), which is the one `ready` asks the stack's ceiling
+/// about.
+pub const Peered = struct {
+    /// What the record's direct addresses cost the path table.
+    candidates: Absorbed,
+    /// Addresses in the record that were not candidates: a relay URL and a
+    /// custom transport. Counted, because a record carrying nothing else
+    /// leaves no candidate at all, and that is not the same fact as a peer
+    /// that published none.
+    not_candidates: usize,
+};
+
+/// The tally of a burst that has filed nothing yet.
+const none_pruned: holepunch.Pruned = .{
+    .kept = 0,
+    .unusable_dropped = 0,
+    .inactive_dropped = 0,
 };
 
 /// One peer's NAT traversal as this file keeps it.
@@ -246,8 +306,8 @@ pub const Absorbed = struct {
 /// to punch, how long to wait and which error is fatal belongs to
 /// `holepunch.zig`, and a copy of one of those rules here would be a second
 /// opinion about it. What this value adds is the storage the gate borrows, the
-/// verdict the report carries, and the three questions neither of the two
-/// modules above is asked.
+/// producers for both candidate sets and the verdict, and the three questions
+/// neither of the two modules above is asked.
 pub const Join = struct {
     /// The gate's own state.
     punch: holepunch.PunchState = .{},
@@ -273,11 +333,11 @@ pub const Join = struct {
     /// its own.
     previous: Set = .{},
 
-    /// The peer's candidates. The caller's, and the one slice this value
-    /// keeps — see the module doc on what a probe round cannot supply. It has
-    /// to outlive the state, because `holepunch.PunchState.last` borrows it
-    /// for exactly as long as the gate compares against it.
-    remote: []const SocketAddr = &.{},
+    /// The peer's candidates, as the gate compares them. This file's storage
+    /// for the lifetime reason in the module doc: rewritten by every record
+    /// and never by `settle`, which records the stack's own answer against
+    /// `local` instead.
+    remote: Set = .{},
 
     /// The peer's path table. Inline because a per-peer table is what the
     /// gate prunes and nothing below `ozai.base` takes an allocator; see
@@ -290,6 +350,10 @@ pub const Join = struct {
     /// A pass-through to `holepunch.selectPunchConnection`, which owns the
     /// rule: the lowest client connection, and none at all when every
     /// connection is server-side.
+    ///
+    /// The table is the caller's because this layer has none to give: it
+    /// lives in the transport, one layer up, and the side the rule turns on
+    /// does not cross it. See the module doc.
     pub fn selectConnection(self: *Join, conns: []const holepunch.Connection) void {
         self.punch.punch = holepunch.selectPunchConnection(conns);
     }
@@ -304,7 +368,8 @@ pub const Join = struct {
     /// local set no round can measure. An empty slice is a host that has
     /// published none, not a host with none: the gate is handed what was
     /// known and answers about it, and the stack's `not_enough_addresses` is
-    /// the answer to a set it cannot use.
+    /// the answer to a set it cannot use. The module doc says why nothing in
+    /// this tree produces them.
     pub fn observeReport(
         self: *Join,
         folded: *const report.Report,
@@ -315,6 +380,46 @@ pub const Join = struct {
         if (folded.global_v4) |public| self.local.append(public);
         if (folded.global_v6) |public| self.local.append(public);
         for (socket) |candidate| self.local.append(candidate);
+    }
+
+    /// Record what the peer's own published record says it can be reached at.
+    ///
+    /// The one source of a peer's candidates this layer can read without
+    /// asking anything: a `NodeAddr` is what discovery, a ticket and a peer's
+    /// own announcement all hand over, and this reads it with no allocator.
+    ///
+    /// Only the `.ip` entries are candidates. A relay is the fallback path
+    /// rather than a way in, and a custom transport is not an IP socket;
+    /// neither is something to punch at, and both are counted rather than
+    /// dropped in silence.
+    ///
+    /// Each direct address is filed twice — in the peer's advertised set and
+    /// in the path table — by this one call, so the two cannot disagree: every
+    /// candidate the gate is handed is a path the caller has been told about.
+    /// A path the table does not carry arrives `unknown`, the status the module
+    /// doc's multipath gap leaves it with; one the table already carries keeps
+    /// the status it has, because a record names addresses and says nothing
+    /// about what happened over them. Either way `observe` is the seam that
+    /// changes a status, for the caller that learned the peer answered on one.
+    ///
+    /// `remote` is cleared first, for `local`'s reason: a record replaces the
+    /// record before it, and an address the peer has withdrawn must stop being
+    /// punched at.
+    pub fn observePeer(self: *Join, reported: *const addr.NodeAddr) Peered {
+        var result: Peered = .{
+            .candidates = .{ .added = 0, .refused = 0, .pruned = none_pruned },
+            .not_candidates = 0,
+        };
+        self.remote.clear();
+        for (reported.addrs) |entry| switch (entry) {
+            .ip => |socket| {
+                self.remote.append(socket);
+                self.file(&result.candidates, socket);
+            },
+            .relay, .custom => result.not_candidates += 1,
+        };
+        result.candidates.pruned.kept = self.path_count;
+        return result;
     }
 
     /// Ask whether a round should start now.
@@ -328,11 +433,12 @@ pub const Join = struct {
     /// By pointer: `Join` holds `max_paths` paths, and a turn that copied it
     /// would copy the whole table to read three fields of it.
     pub fn ready(self: *const Join, now: Nanos) Action {
-        const advertised = self.local.len + self.local.overflow + self.remote.len;
+        const advertised = self.local.len + self.local.overflow +
+            self.remote.len + self.remote.overflow;
         if (!holepunch.mayAdvertise(advertised)) return .{ .tooManyAddresses = advertised };
         // The gate's turn reads its state and leaves it as it was, so only its
         // instruction is wanted here.
-        const step = holepunch.decide(self.punch, now, self.local.slice(), self.remote);
+        const step = holepunch.decide(self.punch, now, self.local.slice(), self.remote.slice());
         return instruction(step.action);
     }
 
@@ -366,9 +472,12 @@ pub const Join = struct {
 
     /// Record one path and enforce the ceiling over the table.
     ///
-    /// An address the table already carries has its status replaced and gets
-    /// no second entry: a path table is a map keyed by address, and two
-    /// entries for one address would make the prune count one path twice.
+    /// An address the table already carries has its status replaced by the one
+    /// this call names, and gets no second entry: a path table is a map keyed
+    /// by address, and two entries for one address would make the prune count
+    /// one path twice. This is the only call that replaces a status — `absorb`
+    /// and `observePeer` file a candidate the table already carries without
+    /// touching one, because neither can name a status.
     ///
     /// The status is the caller's to know. `unknown` is what a candidate
     /// arrives as, because a probe round learns an address and never learns
@@ -395,27 +504,52 @@ pub const Join = struct {
         return .{ .stored = true, .pruned = self.prune() };
     }
 
+    /// File one untried candidate, and add what it cost to a running tally.
+    ///
+    /// A candidate the table already carries keeps the status it has. Filing
+    /// it `unknown` again would answer for a status this producer cannot name:
+    /// a record says where the peer is and says nothing about what happened
+    /// over the path, so a path that was open would read back as one nobody
+    /// has tried — and `holepunch.prune` reads that status to decide what a
+    /// burst may not evict. `observe` is the seam that changes one; this is
+    /// not it.
+    ///
+    /// `unknown` for a candidate the table does not carry, because that is
+    /// what the module doc's multipath gap leaves every candidate with, and
+    /// the prune runs on every candidate rather than only on the ones that
+    /// inserted: `paths` is public storage a caller can write into, so the
+    /// ceiling is enforced whatever the table's last change was.
+    fn file(self: *Join, into: *Absorbed, candidate: SocketAddr) void {
+        // Read before the change, because `Absorbed.added` counts candidates
+        // the table did not already carry, and an address it does carry is
+        // not filed again below.
+        const known = self.find(.{ .ip = candidate }) != null;
+        const filed: Filed = if (known)
+            .{ .stored = true, .pruned = self.prune() }
+        else
+            self.observe(.{ .addr = .{ .ip = candidate }, .status = .unknown });
+        if (!filed.stored) {
+            into.refused += 1;
+        } else if (!known) {
+            into.added += 1;
+        }
+        into.pruned.unusable_dropped += filed.pruned.unusable_dropped;
+        into.pruned.inactive_dropped += filed.pruned.inactive_dropped;
+    }
+
     /// File a burst of candidates, and hand back what the burst cost.
     ///
-    /// One `observe` per candidate rather than one at the end, because the
+    /// One filed candidate per entry rather than one at the end, because the
     /// prune runs on every change: the rule is that an unusable path goes
     /// first and always, and a single prune at the end of a burst would leave
     /// a burst's unusable paths sitting in the table for the whole of it.
     ///
-    /// Every candidate arrives `unknown`, which is the status the gap in the
-    /// module doc's table leaves it with.
+    /// Every candidate the table does not carry arrives `unknown` through
+    /// `file`, which is the status the module doc's multipath gap leaves it
+    /// with; one the table already carries keeps the status it has.
     pub fn absorb(self: *Join, candidates: []const SocketAddr) Absorbed {
-        var result: Absorbed = .{
-            .added = 0,
-            .refused = 0,
-            .pruned = .{ .kept = 0, .unusable_dropped = 0, .inactive_dropped = 0 },
-        };
-        for (candidates) |candidate| {
-            const filed = self.observe(.{ .addr = .{ .ip = candidate }, .status = .unknown });
-            if (filed.stored) result.added += 1 else result.refused += 1;
-            result.pruned.unusable_dropped += filed.pruned.unusable_dropped;
-            result.pruned.inactive_dropped += filed.pruned.inactive_dropped;
-        }
+        var result: Absorbed = .{ .added = 0, .refused = 0, .pruned = none_pruned };
+        for (candidates) |candidate| self.file(&result, candidate);
         result.pruned.kept = self.path_count;
         return result;
     }
@@ -506,6 +640,26 @@ const interface: [2]SocketAddr = .{ ip(9000), ip(9001) };
 /// to have somewhere to punch.
 const client_conns: []const holepunch.Connection = &.{.{ .id = 4, .side = .client }};
 
+/// The node id a peer's record is published under: one fixed key, so a test
+/// is about the addresses in a record and not about who published them.
+///
+/// Resolved at comptime. The bytes are a constant, so whether they name a
+/// curve point is a fact about the build and not about the run: a constant
+/// that stopped being one stops the build, where a `catch unreachable` would
+/// abort the first test that read it and say nothing about why.
+const peer_node: addr.NodeId = addr.NodeId.fromBytes([_]u8{7} ** 32) catch
+    @compileError("the fixed test peer is not a canonical ed25519 point");
+
+/// A published record carrying exactly `addrs`.
+///
+/// `NodeAddr.addrs` is a mutable slice the type keeps sorted through
+/// `insert`, and a test hands over its own array instead: the borrow lasts
+/// the length of the test, which is the same borrow `NodeAddr.withRelay`
+/// makes into the heap and the reason the type is careful about it.
+fn peerRecord(addrs: []addr.TransportAddr) addr.NodeAddr {
+    return .{ .node_id = peer_node, .addrs = addrs };
+}
+
 /// A transport with relays in it, so the chain below runs with no socket.
 ///
 /// One address and one service time per relay, measured from the instant a
@@ -546,18 +700,16 @@ const Wire = struct {
         self.closed = 0;
     }
 
-    fn ready(self: *const Wire, open: probe_run.Open, now: Nanos) bool {
-        if (now -| open.at < self.think[open.task.relay]) return false;
-        if (open.task.proto == .https) return true;
-        return self.reported[open.task.relay] != null;
-    }
-
-    fn observation(self: *const Wire, open: probe_run.Open) probe_run.Observation {
+    /// The answer this wire has for `open` at `now`, or null while it has
+    /// none: the relay has not finished thinking, or it reports no address
+    /// for the family the probe asked about.
+    fn answer(self: *const Wire, open: probe_run.Open, now: Nanos) ?probe_run.Observation {
+        if (now -| open.at < self.think[open.task.relay]) return null;
         return switch (open.task.proto) {
             .https => .{ .https = self.think[open.task.relay] },
             .qad_ipv4, .qad_ipv6 => .{ .qad = .{
                 .latency = self.think[open.task.relay],
-                .reported = self.reported[open.task.relay].?,
+                .reported = self.reported[open.task.relay] orelse return null,
             } },
         };
     }
@@ -574,9 +726,10 @@ fn onOpen(ctx: *anyopaque, at: probe_run.Open) probe_run.SendError!void {
 fn onPoll(ctx: *anyopaque, now: Nanos) ?probe_run.Reply {
     const self: *Wire = @ptrCast(@alignCast(ctx));
     for (self.live[0..self.live_len], 0..) |open, index| {
-        if (self.answered[index] or !self.ready(open, now)) continue;
+        if (self.answered[index]) continue;
+        const value = self.answer(open, now) orelse continue;
         self.answered[index] = true;
-        return .{ .task = open.task, .value = self.observation(open) };
+        return .{ .task = open.task, .value = value };
     }
     return null;
 }
@@ -786,8 +939,8 @@ test "a rebind inside the interval is a punch and an unchanged report is not" {
     // no probe round reaches: a peer address that was not there then is a
     // punch for the same reason, because `holepunch.decide` compares both
     // sets the same way and only one of them is this file's.
-    var seen: [2]SocketAddr = .{ peer[0], ip(7001) };
-    join.remote = &seen;
+    var seen = [_]addr.TransportAddr{ .{ .ip = peer[0] }, .{ .ip = ip(7001) } };
+    _ = join.observePeer(&peerRecord(&seen));
     try t.expect(std.meta.eql(Action{ .punch = 4 }, join.ready(start + millis(3))));
 }
 
@@ -866,8 +1019,8 @@ test "the advertised ceiling is refused before the gate is asked" {
     ));
     // The peer's addresses count towards the same ceiling, because it is one
     // connection's advertised set.
-    const peer: [1]SocketAddr = .{ip(7000)};
-    join.remote = &peer;
+    var published = [_]addr.TransportAddr{.{ .ip = ip(7000) }};
+    _ = join.observePeer(&peerRecord(&published));
     try t.expect(std.meta.eql(
         Action{ .tooManyAddresses = holepunch.max_qnt_addresses + 2 },
         join.ready(start),
@@ -939,6 +1092,129 @@ test "a burst of untested candidates does not evict the paths that work" {
     try t.expectEqual(join.path_count, absorbed.pruned.kept);
 }
 
+test "a burst through the peer's record does not evict the paths that work" {
+    var scratch: [192]u8 = undefined;
+    const relays = try relaySet(&scratch);
+    var wire = varyingWire();
+    const peer = [_]SocketAddr{ip(7000)};
+
+    // The same table the burst test above builds, reached the same way: a
+    // round, a fold, a punch, an accepted answer, ten paths that worked and
+    // five that did not, and the relay fallback.
+    const folded = try probeRound(
+        &wire,
+        &relays,
+        start,
+        .{ .have_v4 = true, .have_v6 = false },
+        .{ .https = false, .qad_ipv4 = true, .qad_ipv6 = false },
+    );
+    var join: Join = .{};
+    join.selectConnection(client_conns);
+    join.observeReport(&folded, &interface);
+    try t.expect(std.meta.eql(Action{ .punch = 4 }, join.ready(start)));
+    _ = join.settle(start, .{ .accepted = &peer });
+
+    for (0..10) |index| {
+        const port: u16 = @intCast(3000 + index);
+        try t.expect(join.observe(.{
+            .addr = .{ .ip = ip(port) },
+            .status = .{ .inactive = start -| millis(10 - index) },
+        }).stored);
+    }
+    for (0..5) |index| {
+        const port: u16 = @intCast(3100 + index);
+        try t.expect(join.observe(.{ .addr = .{ .ip = ip(port) }, .status = .unusable }).stored);
+    }
+    _ = join.observe(.{ .addr = .{ .relay = relays[0] }, .status = .unusable });
+
+    // The same forty untried candidates, this time as the second way into the
+    // table: one peer's own record, published all at once. This is the path
+    // the module doc promises, so the rule the test above pins is re-pinned
+    // here — a producer that bypassed the prune would be worse than none.
+    var published: [40]addr.TransportAddr = undefined;
+    for (&published, 0..) |*slot, index| slot.* = .{ .ip = ip(@intCast(4000 + index)) };
+    const filed = join.observePeer(&peerRecord(&published));
+
+    try t.expectEqual(@as(usize, 40), filed.candidates.added);
+    try t.expectEqual(@as(usize, 0), filed.candidates.refused);
+    // Same order, same survivors: what failed went first and nothing that had
+    // been tried was taken for it.
+    try t.expectEqual(@as(usize, 5), filed.candidates.pruned.unusable_dropped);
+    try t.expectEqual(@as(usize, 0), filed.candidates.pruned.inactive_dropped);
+    try t.expectEqual(@as(usize, 10), working(&join, 3000, 10));
+    try t.expectEqual(@as(usize, 40), carries(&join, 4000, 40));
+    try t.expectEqual(@as(usize, 0), carries(&join, 3100, 5));
+    try t.expectEqual(@as(usize, 1), relayPaths(&join));
+    try t.expectEqual(@as(usize, 51), join.path_count);
+    try t.expectEqual(join.path_count, filed.candidates.pruned.kept);
+
+    // The two ceilings are separate, and this record is over the advertised
+    // one: the set holds what the stack will accept, the rest is counted, and
+    // the round is refused before the gate is asked. Three local candidates —
+    // one seen by a relay, two by the socket — and all forty of these.
+    try t.expectEqual(@as(usize, holepunch.max_qnt_addresses), join.remote.len);
+    try t.expectEqual(@as(usize, 8), join.remote.overflow);
+    try t.expect(std.meta.eql(
+        Action{ .tooManyAddresses = 3 + holepunch.max_qnt_addresses + 8 },
+        join.ready(start),
+    ));
+}
+
+test "the peer's published record is the producer for its candidates" {
+    var scratch: [64]u8 = undefined;
+    var join: Join = .{};
+    join.selectConnection(client_conns);
+
+    // Everything a record may carry, and only one of it a way to punch at: a
+    // relay is the fallback path, a custom transport is not an IP socket.
+    var published = [_]addr.TransportAddr{
+        .{ .relay = try namedRelay(scratch[0..32], 0) },
+        .{ .custom = .{ .id = 3, .data = &.{} } },
+        .{ .ip = ip(7000) },
+        .{ .ip = ip(7001) },
+    };
+    const filed = join.observePeer(&peerRecord(&published));
+
+    try t.expectEqual(@as(usize, 2), join.remote.len);
+    try t.expectEqual(@as(usize, 0), join.remote.overflow);
+    try t.expect(std.meta.eql(ip(7000), join.remote.slice()[0]));
+    try t.expect(std.meta.eql(ip(7001), join.remote.slice()[1]));
+    // The two that are not candidates are counted rather than dropped: a peer
+    // that published nothing but a fallback is not the same fact as a peer
+    // that published nothing, and both leave an empty set.
+    try t.expectEqual(@as(usize, 2), filed.not_candidates);
+
+    // Every advertised candidate is also a path the caller has been told
+    // about, `unknown` until something is sent over it — the whole of what
+    // this layer cannot say about one of them on its own.
+    try t.expectEqual(@as(usize, 2), join.path_count);
+    try t.expectEqual(@as(usize, 2), filed.candidates.added);
+    try t.expectEqual(join.path_count, filed.candidates.pruned.kept);
+    for (join.table()) |path| try t.expect(path.status == .unknown);
+
+    // A later record replaces the one before it: the address the peer
+    // withdrew stops being punched at, and the one it kept is a path the table
+    // already carries, so it is filed once and not twice.
+    var withdrawn = [_]addr.TransportAddr{.{ .ip = ip(7001) }};
+    const second = join.observePeer(&peerRecord(&withdrawn));
+    try t.expectEqual(@as(usize, 1), join.remote.len);
+    try t.expectEqual(@as(usize, 0), second.candidates.added);
+    try t.expectEqual(@as(usize, 2), join.path_count);
+    try t.expect(std.meta.eql(ip(7001), join.remote.slice()[0]));
+
+    // And a record carrying nothing but a fallback still punches, for the same
+    // reason an empty report does: the set is handed over as it is and
+    // `not_enough_addresses` is the stack's answer, not this file's.
+    var fallback = [_]addr.TransportAddr{
+        .{ .relay = try namedRelay(scratch[32..64], 1) },
+    };
+    const empty = join.observePeer(&peerRecord(&fallback));
+    try t.expectEqual(@as(usize, 0), join.remote.len);
+    try t.expectEqual(@as(usize, 1), empty.not_candidates);
+    try t.expectEqual(@as(usize, 0), empty.candidates.added);
+    try t.expect(std.meta.eql(Action{ .punch = 4 }, join.ready(start)));
+}
+
 test "a path the table already carries is updated, not duplicated" {
     var join: Join = .{};
     _ = join.observe(.{ .addr = .{ .ip = ip(7000) }, .status = .unknown });
@@ -948,6 +1224,121 @@ test "a path the table already carries is updated, not duplicated" {
     // prune count one path twice.
     try t.expectEqual(@as(usize, 1), join.path_count);
     try t.expect(join.table()[0].status == .unusable);
+}
+
+test "a republished candidate keeps the status its path already carries" {
+    var join: Join = .{};
+    var published = [_]addr.TransportAddr{ .{ .ip = ip(7000) }, .{ .ip = ip(7001) } };
+    const first = join.observePeer(&peerRecord(&published));
+    try t.expectEqual(@as(usize, 2), first.candidates.added);
+
+    // What only the caller's own traffic can say: one path is open and
+    // carrying, the other was punched once and closed at a known instant. A
+    // record names addresses and nothing about what happened over them.
+    try t.expect(join.observe(.{ .addr = .{ .ip = ip(7000) }, .status = .open }).stored);
+    try t.expect(join.observe(.{
+        .addr = .{ .ip = ip(7001) },
+        .status = .{ .inactive = start },
+    }).stored);
+
+    // The peer re-announces the same two addresses, which is an ordinary
+    // thing for a peer to do and arrives through the same producer.
+    const again = join.observePeer(&peerRecord(&published));
+
+    // The record is not a second copy of the table: nothing was added, nothing
+    // was refused, and the table is the same two paths it was.
+    try t.expectEqual(@as(usize, 0), again.candidates.added);
+    try t.expectEqual(@as(usize, 0), again.candidates.refused);
+    try t.expectEqual(@as(usize, 2), join.path_count);
+    try t.expectEqual(join.path_count, again.candidates.pruned.kept);
+
+    // What each path is known to be survives the republish, the close instant
+    // included. A status the record cannot carry must not be answered for by
+    // the producer that filed the address: `table` is what a caller reads to
+    // see what survived, and a path that was open reads back as never tried.
+    try t.expect(join.table()[0].status == .open);
+    switch (join.table()[1].status) {
+        .inactive => |closed| try t.expectEqual(start, closed),
+        else => return error.PathIsNotClosed,
+    }
+    // The prune's rule reads that status — a closed path is one to keep and
+    // `unknown` is one nobody has tried — and a caller reads it out of `table`
+    // for the same reason.
+    try t.expectEqual(@as(usize, 1), working(&join, 7000, 2));
+
+    // And `observe` is still the seam that changes a status, and the only one:
+    // a republish that leaves a status alone does not make it unreachable.
+    try t.expect(join.observe(.{ .addr = .{ .ip = ip(7000) }, .status = .unusable }).stored);
+    try t.expect(join.table()[0].status == .unusable);
+    try t.expectEqual(@as(usize, 2), join.path_count);
+}
+
+test "a peer's record is refused what a full path table cannot hold" {
+    var join: Join = .{};
+    // A client connection, so that the refusal below is one the gate would
+    // otherwise have punched at this very instant.
+    join.selectConnection(client_conns);
+
+    // One path short of what the table holds: one that was punched and
+    // worked, and the rest nobody has tried. None of them is a candidate for
+    // eviction, so the prune leaves the table where the caller left it.
+    try t.expect(join.observe(.{
+        .addr = .{ .ip = ip(7000) },
+        .status = .{ .inactive = start },
+    }).stored);
+    for (0..max_paths - 2) |index| {
+        const port: u16 = @intCast(7001 + index);
+        try t.expect(join.observe(.{ .addr = .{ .ip = ip(port) }, .status = .unknown }).stored);
+    }
+    try t.expectEqual(@as(usize, max_paths - 1), join.path_count);
+
+    // The peer's own record: the address the table already carries, and one
+    // address more than the stack will advertise to a peer, none of them seen
+    // before.
+    var published: [holepunch.max_qnt_addresses + 1]addr.TransportAddr = undefined;
+    published[0] = .{ .ip = ip(7000) };
+    for (published[1..], 0..) |*slot, index| slot.* = .{ .ip = ip(@intCast(8000 + index)) };
+    const filed = join.observePeer(&peerRecord(&published));
+
+    // One slot was left, so exactly one of the thirty-two fits. The rest are
+    // counted as refused rather than dropped in silence or written over a
+    // path the table already holds.
+    try t.expectEqual(@as(usize, 1), filed.candidates.added);
+    try t.expectEqual(@as(usize, 31), filed.candidates.refused);
+    try t.expectEqual(@as(usize, max_paths), join.path_count);
+    try t.expectEqual(join.path_count, filed.candidates.pruned.kept);
+    // The prune ran at the ceiling and dropped nothing, which is what the
+    // storage ceiling is sized against: a path nobody has tried is not a path
+    // that does not work, so a full table of them is a full table.
+    try t.expectEqual(@as(usize, 0), filed.candidates.pruned.unusable_dropped);
+    try t.expectEqual(@as(usize, 0), filed.candidates.pruned.inactive_dropped);
+
+    // Every path the table already held is still one of its paths, and the
+    // one that fitted is the first address nobody had tried. The thirty-one
+    // that did not fit are in the tally and nowhere else.
+    try t.expectEqual(@as(usize, max_paths - 1), carries(&join, 7000, max_paths - 1));
+    try t.expectEqual(@as(usize, 1), carries(&join, 8000, 1));
+    try t.expectEqual(@as(usize, 0), carries(&join, 8001, 31));
+    // And the republished address keeps what the caller's own traffic said
+    // about it, close instant included: a record names addresses and says
+    // nothing about what happened over them, and the prune's rule reads that
+    // status back.
+    try t.expectEqual(@as(usize, 1), working(&join, 7000, 1));
+    try t.expect(std.meta.eql(ip(7000), join.table()[0].addr.ip));
+    switch (join.table()[0].status) {
+        .inactive => |closed| try t.expectEqual(start, closed),
+        else => return error.PathIsNotClosed,
+    }
+
+    // Both ends of the connection share one advertised ceiling and this
+    // record is over it, so the round is refused here rather than asked and
+    // refused by the stack.
+    try t.expectEqual(@as(usize, holepunch.max_qnt_addresses), join.remote.len);
+    try t.expectEqual(@as(usize, 1), join.remote.overflow);
+    try t.expect(std.meta.eql(
+        Action{ .tooManyAddresses = 1 + holepunch.max_qnt_addresses },
+        join.ready(start),
+    ));
 }
 
 /// The one instruction the gate produced, or the failure that it produced none.

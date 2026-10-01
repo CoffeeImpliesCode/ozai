@@ -241,14 +241,15 @@ pub fn decide(
     // beats having nothing new. Both halves matter: drop the first and every
     // address event becomes a round, which floods the relay; drop the second
     // and a peer whose NAT mapping simply aged out is never tried again.
-    const appeared = last == null or
-        hasNewAddress(local, last.?.local) or
-        hasNewAddress(remote, last.?.remote);
-    if (!appeared) {
-        // Saturating, so a timeline within five seconds of its ceiling waits
-        // rather than wrapping into a round that is always due.
-        const due = last.?.when +| punch_interval;
-        if (due > now) return .{ .next = state, .action = .{ .wakeAt = due } };
+    if (last) |previous| {
+        const appeared = hasNewAddress(local, previous.local) or
+            hasNewAddress(remote, previous.remote);
+        if (!appeared) {
+            // Saturating, so a timeline within five seconds of its ceiling waits
+            // rather than wrapping into a round that is always due.
+            const due = previous.when +| punch_interval;
+            if (due > now) return .{ .next = state, .action = .{ .wakeAt = due } };
+        }
     }
     return .{ .next = state, .action = .{ .initiateNatTraversalRound = conn } };
 }
@@ -663,7 +664,7 @@ test "neither a new address nor an expired interval is not a punch" {
         .last = .{ .when = 1_000, .local = &local, .remote = &remote },
     };
     const step = decide(state, 1_000 + punch_interval - 1, &local, &remote);
-    const wanted = Action{ .wakeAt = 1_000 + punch_interval };
+    const wanted: Action = .{ .wakeAt = 1_000 + punch_interval };
     try t.expect(std.meta.eql(wanted, try onlyAction(step)));
 }
 
@@ -734,7 +735,7 @@ test "an accepted round records the candidates it was started with" {
     // change, the scheduled wakeup it may already hold, or the periodic
     // connection check.
     try t.expect(step.action == null);
-    const last = step.next.last.?;
+    const last = step.next.last orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(Nanos, 7_000), last.when);
     try expectSameAddrs(&local, last.local);
     try expectSameAddrs(&discovered, last.remote);
@@ -761,7 +762,7 @@ test "a selected relay path does not suppress a punch" {
     // A millisecond after the last round: inside the interval, with a remote
     // candidate that was not there then.
     const now = 1_000 + std.time.ns_per_ms;
-    const wanted = Action{ .initiateNatTraversalRound = 3 };
+    const wanted: Action = .{ .initiateNatTraversalRound = 3 };
 
     const on_relay = decide(
         .{ .punch = 3, .last = last, .selected = .{ .relay = relay_url } },
@@ -783,7 +784,7 @@ test "a selected relay path does not suppress a punch" {
     // the same instant. Selecting a relay is not a reason to stop trying to
     // leave it.
     const held: Attempt = .{ .when = 1_000, .local = &local, .remote = &remote };
-    const waited = Action{ .wakeAt = 1_000 + punch_interval };
+    const waited: Action = .{ .wakeAt = 1_000 + punch_interval };
     const relay_wait = decide(
         .{ .punch = 3, .last = held, .selected = .{ .relay = relay_url } },
         now,

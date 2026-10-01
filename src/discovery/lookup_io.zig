@@ -142,6 +142,9 @@ const addr = @import("../base/addr.zig");
 const dns = @import("dns.zig");
 const resolve = @import("resolve.zig");
 
+// The section rule is 77 columns wide, which is the width this file is held
+// to; Z024 counts UTF-8 bytes, and the box-drawing glyphs are three each.
+// ziglint-ignore: Z024
 // ───────────────────────────────────────────────────────────────── the wire
 
 /// The header, in bytes: RFC 1035 §4.1.1's `ID`, its flags, and four counts.
@@ -303,7 +306,7 @@ pub const Query = struct {
 /// function free of the offset bookkeeping a pointer needs. The reader below
 /// understands them either way, because every implementation must.
 pub fn writeQuery(name: []const u8, query: Query, out: []u8) WireError![]const u8 {
-    const advertises = query.udp_payload != null;
+    const payload = query.udp_payload;
     if (out.len < header_length) return error.BufferTooSmall;
     put16(out, 0, query.id);
     // `RD` and nothing else: `QR` is 0 because this is a question, and the
@@ -312,21 +315,26 @@ pub fn writeQuery(name: []const u8, query: Query, out: []u8) WireError![]const u
     put16(out, 4, 1);
     put16(out, 6, 0);
     put16(out, 8, 0);
-    put16(out, 10, if (advertises) 1 else 0);
+    put16(out, 10, if (payload != null) 1 else 0);
     const written = try writeName(name, out[header_length..]);
     var at = header_length + written;
     if (at + question_length > out.len) return error.BufferTooSmall;
     put16(out, at, query.qtype);
     put16(out, at + 2, class_in);
     at += question_length;
-    if (!advertises) return out[0..at];
-    if (at + opt_length > out.len) return error.BufferTooSmall;
-    out[at] = 0;
-    put16(out, at + 1, type_opt);
-    put16(out, at + 3, query.udp_payload.?);
-    put32(out, at + 5, 0);
-    put16(out, at + 9, 0);
-    return out[0 .. at + opt_length];
+    // The OPT record, and only for a query that advertises a size: the count
+    // above says one additional record, so the record has to be written
+    // whenever the count was raised.
+    if (payload) |advertised| {
+        if (at + opt_length > out.len) return error.BufferTooSmall;
+        out[at] = 0;
+        put16(out, at + 1, type_opt);
+        put16(out, at + 3, advertised);
+        put32(out, at + 5, 0);
+        put16(out, at + 9, 0);
+        at += opt_length;
+    }
+    return out[0..at];
 }
 
 /// What one lookup came to, with the answer already copied out of the read
@@ -382,11 +390,11 @@ pub const Answer = union(enum) {
 /// message over an alias we did not ask to chase would lose the records behind
 /// it.
 pub fn readAnswer(
+    alloc: std.mem.Allocator,
     message: []const u8,
     name: []const u8,
     id: u16,
     owner: []u8,
-    alloc: std.mem.Allocator,
 ) Error!Answer {
     const counts = try readHeader(message, id);
     var at: usize = header_length;
@@ -398,7 +406,7 @@ pub fn readAnswer(
     var records: std.ArrayList(u8) = .empty;
     defer records.deinit(alloc);
     for (0..counts.answers) |_| {
-        at = try walkRecord(message, at, name, owner, &records, alloc);
+        at = try walkRecord(alloc, message, at, name, owner, &records);
     }
     // The authority and additional sections carry no `_iroh` records, and the
     // OPT this query advertised is answered with one in the second of them.
@@ -465,12 +473,12 @@ fn readHeader(message: []const u8, id: u16) WireError!Counts {
 /// record for the name asked about contributes its records; every other record
 /// contributes its length and nothing else.
 fn walkRecord(
+    alloc: std.mem.Allocator,
     message: []const u8,
     at: usize,
     name: []const u8,
     owner: []u8,
     records: *std.ArrayList(u8),
-    alloc: std.mem.Allocator,
 ) Error!usize {
     const decoded = try readName(message, at, owner);
     const fixed = try recordBody(message, decoded.end);
@@ -480,7 +488,7 @@ fn walkRecord(
     const ours = kind == type_txt and
         class == class_in and
         std.ascii.eqlIgnoreCase(owner[0..decoded.written], name);
-    if (ours) try appendTxt(message[fixed..][0..rdlength], records, alloc);
+    if (ours) try appendTxt(alloc, message[fixed..][0..rdlength], records);
     return fixed + rdlength;
 }
 
@@ -513,9 +521,9 @@ fn recordBody(message: []const u8, at: usize) WireError!usize {
 /// shape, and the reason a publisher's output and a resolver's input are the
 /// same value.
 fn appendTxt(
+    alloc: std.mem.Allocator,
     rdata: []const u8,
     records: *std.ArrayList(u8),
-    alloc: std.mem.Allocator,
 ) Error!void {
     var at: usize = 0;
     while (at < rdata.len) {
@@ -596,13 +604,15 @@ fn readName(message: []const u8, at: usize, out: []u8) WireError!Decoded {
             name_label => {
                 cursor += 1;
                 if (lead == 0) {
-                    if (end == null) end = cursor;
                     // Every label already wrote the dot that follows it, so the
                     // root's terminator adds one only for a name that was the
                     // root all along — which is how `"."` comes out of a name
                     // with no labels rather than an empty string.
                     if (capture and written == 0) try writeByte(out, &written, '.');
-                    return .{ .end = end.?, .written = written };
+                    // `end` is null only when no pointer was taken, and then it
+                    // is this cursor: a name that ends at its own terminator
+                    // ends one past it, which is where a record's `TYPE` is.
+                    return .{ .end = end orelse cursor, .written = written };
                 }
                 if (cursor + lead > message.len) return error.ShortMessage;
                 if (capture) {
@@ -646,6 +656,9 @@ fn put32(bytes: []u8, at: usize, value: u32) void {
     std.mem.writeInt(u32, bytes[at..][0..4], value, .big);
 }
 
+// The section rule is 78 columns wide, which is the width this file is held
+// to; Z024 counts UTF-8 bytes, and the box-drawing glyphs are three each.
+// ziglint-ignore: Z024
 // ───────────────────────────────────────────────────────────── the retrieval
 
 /// Everything an injected datagram can fail with here, in three arms, because a
@@ -779,8 +792,8 @@ pub const Retrieval = struct {
     /// comes back is this call's to free with `Answer.deinit`.
     pub fn ask(
         self: *Retrieval,
-        io: std.Io,
         alloc: std.mem.Allocator,
+        io: std.Io,
         request: Request,
     ) Error!Answer {
         if (self.stopped) return error.Canceled;
@@ -804,7 +817,7 @@ pub const Retrieval = struct {
         // A datagram that landed after the resolve was abandoned is nobody's
         // answer, and parsing it would make an abandoned resolve produce one.
         if (self.stopped) return error.Canceled;
-        return readAnswer(reply.bytes, request.name, self.id, self.owner[0..], alloc);
+        return readAnswer(alloc, reply.bytes, request.name, self.id, self.owner[0..]);
     }
 };
 
@@ -877,6 +890,10 @@ const Scripted = struct {
 
     fn send(
         ctx: *anyopaque,
+        // `ctx` is the vtable slot itself, not an ordinary parameter:
+        // `Datagram.send` names it first and a reordered one is a different
+        // function type. Z023 reads `*anyopaque` as a plain runtime value.
+        // ziglint-ignore: Z023
         _: std.Io,
         to: addr.SocketAddr,
         bytes: []const u8,
@@ -891,6 +908,10 @@ const Scripted = struct {
 
     fn receive(
         ctx: *anyopaque,
+        // `ctx` is the vtable slot itself, not an ordinary parameter:
+        // `Datagram.receive` names it first and a reordered one is a different
+        // function type. Z023 reads `*anyopaque` as a plain runtime value.
+        // ziglint-ignore: Z023
         _: std.Io,
         into: []u8,
         deadline_ms: ?i32,
@@ -929,6 +950,9 @@ const elsewhere: addr.SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 2 } }, .port 
 /// An engine, so the transaction id is the same every run.
 const Prng = std.Random.DefaultPrng;
 
+// The section rule is 77 columns wide, which is the width this file is held
+// to; Z024 counts UTF-8 bytes, and the box-drawing glyphs are three each.
+// ziglint-ignore: Z024
 // ────────────────────────────────────────────────────────────────── vectors
 
 /// The query RFC 8484 §4.1.1 prints, byte for byte: an `IN A` question for
@@ -1005,7 +1029,7 @@ test "golden: a query is the RFC's own bytes" {
     // The same layout for the question this file actually asks, which differs
     // from the RFC's in two fields and two bytes of name: `ID` and `QTYPE`.
     var asked: [asked_len]u8 = undefined;
-    const text = dns.queryName(&asked, nodeOf(upstream_id), dns.prod_origin);
+    const text = dns.queryName(&asked, try nodeOf(upstream_id), dns.prod_origin);
     var wire: [asked_bytes]u8 = undefined;
     const ask_wire = try writeQuery(text, .{ .id = 0x1234 }, &wire);
     try t.expectEqual(header_length + asked_len + 1 + question_length, ask_wire.len);
@@ -1016,7 +1040,7 @@ test "golden: a query is the RFC's own bytes" {
 
 test "the header is the one RFC 1035 draws, field by field" {
     var name: [asked_len]u8 = undefined;
-    const text = dns.queryName(&name, nodeOf(upstream_id), dns.prod_origin);
+    const text = dns.queryName(&name, try nodeOf(upstream_id), dns.prod_origin);
     // `discovery/dns.zig` holds this string against upstream's own test; here
     // it is the bytes that leave, which is a different claim.
     try t.expectEqualStrings(
@@ -1066,7 +1090,7 @@ test "golden: a captured answer decodes into the records it carried" {
     const asked = capturedName(secret.nodeId(), &name);
 
     var owner: [max_name_length]u8 = undefined;
-    const read = try readAnswer(answer, asked, 0, &owner, t.allocator);
+    const read = try readAnswer(t.allocator, answer, asked, 0, &owner);
     defer read.deinit(t.allocator);
     const records = switch (read) {
         .records => |set| set,
@@ -1085,7 +1109,7 @@ test "golden: a captured answer decodes into the records it carried" {
 test "a query is framed, sent, and its answer parsed, with no network" {
     var engine: Prng = Prng.init(7);
     var name: [asked_len]u8 = undefined;
-    const text = dns.queryName(&name, nodeOf(upstream_id), dns.prod_origin);
+    const text = dns.queryName(&name, try nodeOf(upstream_id), dns.prod_origin);
 
     var script: Scripted = .{ .from = nameserver };
     var retrieval = Retrieval.begin(script.datagram(), nameserver, engine.random());
@@ -1099,7 +1123,7 @@ test "a query is framed, sent, and its answer parsed, with no network" {
     };
 
     // Nothing answers yet, so this run observes the framing and the send.
-    try t.expectEqual(Answer.timeout, retrieval.ask(t.io, t.allocator, request));
+    try t.expectEqual(Answer.timeout, retrieval.ask(t.allocator, t.io, request));
     try t.expectEqual(@as(u32, 1), script.sends);
     try t.expectEqual(nameserver, script.sent_to);
     try t.expectEqual(queryLength(text), script.sent_len);
@@ -1121,7 +1145,7 @@ test "a query is framed, sent, and its answer parsed, with no network" {
     // own id: §4.1.1's `ID` is copied into the reply, so a real nameserver
     // echoes it and the vector has to be told what to echo.
     put16(script.reply.?, 0, retrieval.id);
-    const read = try retrieval.ask(t.io, t.allocator, .{
+    const read = try retrieval.ask(t.allocator, t.io, .{
         .name = capturedName(sender.nodeId(), &published),
         .wire = &wire,
         .reply = &reply,
@@ -1145,7 +1169,7 @@ test "a query is framed, sent, and its answer parsed, with no network" {
 test "an abandoned resolve stops the query that was in flight" {
     var engine: Prng = Prng.init(9);
     var name: [asked_len]u8 = undefined;
-    const text = dns.queryName(&name, nodeOf(upstream_id), dns.prod_origin);
+    const text = dns.queryName(&name, try nodeOf(upstream_id), dns.prod_origin);
     var script: Scripted = .{ .from = nameserver };
     var retrieval = Retrieval.begin(script.datagram(), nameserver, engine.random());
     var wire: [asked_bytes]u8 = undefined;
@@ -1158,7 +1182,7 @@ test "an abandoned resolve stops the query that was in flight" {
     };
 
     // A resolve whose query is now in flight and is about to be dropped.
-    try t.expectEqual(Answer.timeout, retrieval.ask(t.io, t.allocator, request));
+    try t.expectEqual(Answer.timeout, retrieval.ask(t.allocator, t.io, request));
     try t.expectEqual(@as(u32, 1), script.sends);
 
     // `Stream.deinit` fires it, and the abort reaches the socket rather than a
@@ -1175,21 +1199,21 @@ test "an abandoned resolve stops the query that was in flight" {
 
     // And nothing more goes out: an abandoned resolve cannot leave a query
     // pending, which is the whole of what `resolve.Cancellation` is for.
-    try t.expectError(error.Canceled, retrieval.ask(t.io, t.allocator, request));
+    try t.expectError(error.Canceled, retrieval.ask(t.allocator, t.io, request));
     try t.expectEqual(@as(u32, 1), script.sends);
 }
 
 test "a lookup that got no answer in time is not a node that published nothing" {
     var engine: Prng = Prng.init(11);
     var name: [asked_len]u8 = undefined;
-    const text = dns.queryName(&name, nodeOf(upstream_id), dns.prod_origin);
+    const text = dns.queryName(&name, try nodeOf(upstream_id), dns.prod_origin);
     var script: Scripted = .{ .from = nameserver };
     var retrieval = Retrieval.begin(script.datagram(), nameserver, engine.random());
     var wire: [asked_bytes]u8 = undefined;
     var reply: [reply_length]u8 = undefined;
 
     // Nothing answered inside the deadline.
-    const late = try retrieval.ask(t.io, t.allocator, .{
+    const late = try retrieval.ask(t.allocator, t.io, .{
         .name = text,
         .wire = &wire,
         .reply = &reply,
@@ -1205,13 +1229,13 @@ test "a lookup that got no answer in time is not a node that published nothing" 
     put16(&empty, 0, retrieval.id);
     put16(&empty, 2, flag_response);
     var owner: [max_name_length]u8 = undefined;
-    const nothing = try readAnswer(&empty, text, retrieval.id, &owner, t.allocator);
+    const nothing = try readAnswer(t.allocator, &empty, text, retrieval.id, &owner);
     try t.expectEqual(Answer.nothing, nothing);
 
     // A third answer, and it is an error: `NXDOMAIN` says the name was never
     // published, which upstream reports rather than answering empty.
     put16(&empty, 2, flag_response | 3);
-    try t.expectError(error.NameError, readAnswer(&empty, text, retrieval.id, &owner, t.allocator));
+    try t.expectError(error.NameError, readAnswer(t.allocator, &empty, text, retrieval.id, &owner));
 
     // The three are three. A caller that read a timeout as `nothing` would tell
     // the world this node published nothing, having learned nothing at all.
@@ -1233,7 +1257,7 @@ test "a datagram that is not this question's answer is refused" {
     // catch: the answer is real and it is not ours.
     try t.expectError(
         error.ForeignTransaction,
-        readAnswer(answer, asked, 1, &owner, t.allocator),
+        readAnswer(t.allocator, answer, asked, 1, &owner),
     );
 
     // This one's own transaction, read against a name it is not about: the
@@ -1241,11 +1265,11 @@ test "a datagram that is not this question's answer is refused" {
     var other: [max_name_length]u8 = @splat('x');
     other[0] = '_';
     const wrong = try readAnswer(
+        t.allocator,
         answer,
         other[0..asked.len],
         0,
         &owner,
-        t.allocator,
     );
     defer wrong.deinit(t.allocator);
     try t.expectEqual(Answer.nothing, wrong);
@@ -1253,14 +1277,14 @@ test "a datagram that is not this question's answer is refused" {
     // A question arriving where an answer was wanted.
     var query: [header_length]u8 = @splat(0);
     put16(&query, 4, 1);
-    try t.expectError(error.NotAResponse, readAnswer(&query, asked, 0, &owner, t.allocator));
+    try t.expectError(error.NotAResponse, readAnswer(t.allocator, &query, asked, 0, &owner));
 
     // An answer that did not fit its datagram, which is the one a TCP retry
     // would be for.
     var cut: [reply_length]u8 = undefined;
     const truncated = try hexBytes(&cut, captured_answer_hex);
     put16(truncated[0..], 2, flag_response | flag_truncated);
-    try t.expectError(error.Truncated, readAnswer(truncated, asked, 0, &owner, t.allocator));
+    try t.expectError(error.Truncated, readAnswer(t.allocator, truncated[0..], asked, 0, &owner));
 }
 
 test "an answer from somewhere else is not this query's answer" {
@@ -1278,7 +1302,7 @@ test "an answer from somewhere else is not this query's answer" {
     // A TXT answer carries no signature, so the source address is the only
     // thing telling this datagram from a forged one. A datagram off the queried
     // server is refused even though it echoes the right transaction id.
-    try t.expectError(error.ForeignSource, retrieval.ask(t.io, t.allocator, .{
+    try t.expectError(error.ForeignSource, retrieval.ask(t.allocator, t.io, .{
         .name = capturedName(secret.nodeId(), &published),
         .wire = &wire,
         .reply = &reply,
@@ -1304,7 +1328,7 @@ test "every response code is named, and a name that loops is refused" {
     };
     inline for (cases) |case| {
         put16(&message, 2, flag_response | case.code);
-        const read = readAnswer(&message, name, 0, &owner, t.allocator);
+        const read = readAnswer(t.allocator, &message, name, 0, &owner);
         if (case.expect) |wanted| {
             try t.expectError(wanted, read);
         } else {
@@ -1316,7 +1340,7 @@ test "every response code is named, and a name that loops is refused" {
         put16(&message, 2, flag_response | @as(u16, @intCast(code)));
         try t.expectError(
             error.UnknownResponseCode,
-            readAnswer(&message, name, 0, &owner, t.allocator),
+            readAnswer(t.allocator, &message, name, 0, &owner),
         );
     }
 
@@ -1331,11 +1355,11 @@ test "every response code is named, and a name that loops is refused" {
     const alias = looping[0 .. header_length + 2];
     looping[at] = name_pointer;
     looping[at + 1] = @intCast(at);
-    try t.expectError(error.BadName, readAnswer(alias, name, 0, &owner, t.allocator));
+    try t.expectError(error.BadName, readAnswer(t.allocator, alias, name, 0, &owner));
     looping[at] = 0x40;
-    try t.expectError(error.BadName, readAnswer(alias, name, 0, &owner, t.allocator));
+    try t.expectError(error.BadName, readAnswer(t.allocator, alias, name, 0, &owner));
     looping[at] = 0x80;
-    try t.expectError(error.BadName, readAnswer(alias, name, 0, &owner, t.allocator));
+    try t.expectError(error.BadName, readAnswer(t.allocator, alias, name, 0, &owner));
 
     // A message cut short inside a record is refused rather than read past.
     var cut: [header_length + 4]u8 = @splat(0);
@@ -1343,13 +1367,19 @@ test "every response code is named, and a name that loops is refused" {
     put16(&cut, 2, flag_response);
     put16(&cut, 6, 1);
     cut[header_length] = 0;
-    try t.expectError(error.ShortMessage, readAnswer(cut[0 .. at + 4], name, 0, &owner, t.allocator));
-    try t.expectError(error.ShortMessage, readAnswer(cut[0..4], name, 0, &owner, t.allocator));
+    try t.expectError(
+        error.ShortMessage,
+        readAnswer(t.allocator, cut[0 .. at + 4], name, 0, &owner),
+    );
+    try t.expectError(error.ShortMessage, readAnswer(t.allocator, cut[0..4], name, 0, &owner));
 
     // A count a 64-octet message cannot hold is a header to refuse, not a loop.
     put16(&cut, 2, flag_response);
     put16(&cut, 6, max_section_records + 1);
-    try t.expectError(error.ShortMessage, readAnswer(cut[0 .. at + 4], name, 0, &owner, t.allocator));
+    try t.expectError(
+        error.ShortMessage,
+        readAnswer(t.allocator, cut[0 .. at + 4], name, 0, &owner),
+    );
 }
 
 test "a compression pointer is followed and a bad one is refused" {
@@ -1404,7 +1434,7 @@ test "a compression pointer is followed and a bad one is refused" {
 
     // And the whole message reads: past the pointer, through the names it
     // expands to, and into the record the pointer stands in for.
-    const read = try readAnswer(message[0..at], "foo.f.isi.arpa.", 0, &owner, t.allocator);
+    const read = try readAnswer(t.allocator, message[0..at], "foo.f.isi.arpa.", 0, &owner);
     defer read.deinit(t.allocator);
     try t.expectEqualStrings("bar\x00", switch (read) {
         .records => |set| set.bytes,
@@ -1458,8 +1488,12 @@ test "a name has to be a name" {
     try t.expectEqual(@as(usize, 32), queryLength("a.b."));
 }
 
-fn nodeOf(hex: []const u8) key.NodeId {
-    return key.NodeId.parseHex(hex) catch unreachable;
+/// The node a wire vector is about, from the hex constant the vector names.
+/// Fallible: a literal that is not a canonical curve point is a typo in the
+/// vector, and the test that carries it should say so rather than take the
+/// process down on the way to saying anything at all.
+fn nodeOf(hex: []const u8) key.KeyError!key.NodeId {
+    return key.NodeId.parseHex(hex);
 }
 
 fn expectHex(expected: []const u8, actual: []const u8) !void {

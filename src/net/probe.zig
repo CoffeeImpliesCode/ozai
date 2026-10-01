@@ -843,7 +843,7 @@ pub fn new(input: Input, results: *Results) Runner {
 ///
 /// A runner from `new` cannot name more relays than `max_relays` — `plan`
 /// truncates there and nowhere else — so this arm is for a runner assembled by
-/// hand, and it is the same arm `Plan.taskCount` names.
+/// hand, and it is the same arm `Plan.taskAt` names.
 pub fn step(runner: Runner, now: Nanos) PlanError!Step {
     var out: Step = .{ .next = runner };
     if (runner.outcome) |why| {
@@ -867,8 +867,7 @@ pub fn step(runner: Runner, now: Nanos) PlanError!Step {
     }
 
     var index: TaskIndex = 0;
-    while (index < try runner.plan.taskCount()) : (index += 1) {
-        const task = (try runner.plan.taskAt(index)).?;
+    while (try runner.plan.taskAt(index)) |task| : (index += 1) {
         if (runner.sent[index] or runner.satisfied(task)) continue;
         const due = runner.start +| delayFor(task.proto, task.attempt);
         if (now < due) continue;
@@ -948,8 +947,7 @@ fn wakeAt(runner: *const Runner, now: Nanos) PlanError!Nanos {
     var wake = runner.start +| overall_timeout;
     var in_flight = false;
     var index: TaskIndex = 0;
-    while (index < try runner.plan.taskCount()) : (index += 1) {
-        const task = (try runner.plan.taskAt(index)).?;
+    while (try runner.plan.taskAt(index)) |task| : (index += 1) {
         if (runner.sent[index]) {
             in_flight = true;
             continue;
