@@ -16,6 +16,16 @@ post-implementation reviewer workflow. Zig version is pinned in
   `verification-before-completion`, `code-review`, `jj-core`,
   `using-git-worktrees`
 
+- `zig build test` prints a `failed command:` block above a **green** summary
+  for the loopback artifact, and that is not a failure. `Step.result_failed_command`
+  is documented as "may be populated even if the step succeeded" and is filled
+  before the child is spawned; the build runner prints it whenever a step wrote
+  to stderr. `test/expected_log_runner.zig` prints the one error-level log it
+  was told to expect, so its step always writes. **The step table and the exit
+  code are the truth** — `9/9 steps succeeded`, exit 0. Add
+  `--error-style minimal` to drop the command line around it; nothing suppresses
+  the message itself, which is correct, since the message is the evidence.
+
 ## 1. Golden rules (loose Tiger Style)
 
 Safety > Performance > Developer Experience.

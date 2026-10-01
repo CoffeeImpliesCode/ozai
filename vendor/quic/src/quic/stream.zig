@@ -358,6 +358,11 @@ pub const FrameSorter = struct {
 
     /// Pop the next contiguous chunk of data from the read position.
     /// Returns null if there's no data available at the current read position.
+    ///
+    /// The caller owns what this returns and must free it with
+    /// `self.allocator`. The chunk has left `chunks` and nothing else refers
+    /// to the allocation, so `deinit` cannot free it: a caller that copies the
+    /// bytes and drops the slice leaks them.
     pub fn pop(self: *FrameSorter) ?[]const u8 {
         if (self.chunks.items.len == 0) return null;
 
@@ -510,6 +515,11 @@ pub const ReceiveStream = struct {
 
     /// Read contiguous data from the stream.
     /// Returns the data slice or null if no data is available.
+    ///
+    /// A non-null result is owned by the caller, who must free it with the
+    /// allocator this stream was built with. It is not a view into the stream
+    /// and it stays valid past `deinit`, because nothing in the stream holds
+    /// it any more. See `FrameSorter.pop`.
     pub fn read(self: *ReceiveStream) ?[]const u8 {
         if (self.reset_err != null) return null;
 
@@ -1946,6 +1956,38 @@ test "FrameSorter: in-order data" {
 
     try testing.expect(sorter.pop() == null);
     try testing.expect(sorter.isComplete());
+}
+
+test "FrameSorter: what pop returns is the caller's, not the sorter's" {
+    // Two halves of one contract, and the allocator is what proves both.
+    //
+    // A chunk the sorter still holds is freed by `deinit`, which is why the
+    // leak checker stays quiet on the first half. The second half is the half
+    // that leaks: `pop` hands the chunk's allocation over, so nothing in the
+    // sorter refers to it afterwards and the caller's free is the only one
+    // that ever runs. Dropping it here instead of freeing it is what the
+    // checker reports, at the `push` line that allocated it.
+    var held = FrameSorter.init(testing.allocator);
+    defer held.deinit();
+    try held.push(0, "hello", false);
+    try testing.expectEqual(@as(usize, 1), held.chunks.items.len);
+
+    var popped = FrameSorter.init(testing.allocator);
+    defer popped.deinit();
+    try popped.push(0, "hello", false);
+
+    // A fast-path push leaves `buf` empty, so `data` is the allocation
+    // itself. Equal pointers are what say `pop` transferred ownership rather
+    // than handing back a view the sorter still holds.
+    const before = popped.chunks.items[0].data.ptr;
+    const got = popped.pop().?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("hello", got);
+    try testing.expectEqual(before, got.ptr);
+
+    // The chunk left the sorter, so its bytes outlive it: reading them after
+    // `deinit` is defined, and that is what makes the free the caller's job.
+    try testing.expectEqual(@as(usize, 0), popped.chunks.items.len);
 }
 
 test "FrameSorter: out-of-order data" {

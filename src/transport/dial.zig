@@ -67,13 +67,26 @@
 //! socket layer ever sees and `ownerOf` is how it turns one back into a key.
 //!
 //! **One target, one address, one connection.** The core holds two
-//! `NetworkPath`s and indexes one as active (`connection.zig:626`), and a
-//! datagram from any other address becomes a migration challenge rather than a
-//! second path (`connection.zig:1541`). So the multipath cost `DECISIONS/0001`
-//! records is observable here as a hard one: a peer reachable over a relay and
-//! a direct path is **two dials**, and the caller owns the policy that says
-//! which. Nothing in this file can widen it, and pretending otherwise would be
-//! a second core.
+//! `NetworkPath`s and indexes one as active (`connection.zig:626`), and a 1-RTT
+//! packet carrying at least one non-probing frame, from any other address,
+//! becomes a migration rather than a second path (`connection.zig:1540`). So
+//! the multipath cost `DECISIONS/0001` records is observable here as a hard one:
+//! a peer reachable over a relay and a direct path is **two dials**, and the
+//! caller owns the policy that says which. Nothing in this file can widen it,
+//! and pretending otherwise would be a second core.
+//!
+//! The migration adds no path and queues none either: `handleMigration` writes
+//! the alternate slot (`connection.zig:3442`) and promotes it (`:3452`), so the
+//! address that was active is written over rather than kept. The moment the peer
+//! answers on the second address the first stops being used at all — measured,
+//! the client sent nothing further to the address it left — which makes a
+//! second address a hazard on a live connection rather than spare capacity on it.
+//! Only non-probing frames do this: padding, PATH_CHALLENGE, PATH_RESPONSE and
+//! NEW_CONNECTION_ID from an address the connection has never heard of are
+//! answered and otherwise ignored, so an address that has not spoken is never
+//! discovered and the candidate slot is never filled for one. Nothing in a
+//! resolved address distinguishes those two kinds, which is why the choice
+//! belongs to the dial and not to the connection.
 //!
 //! Two further things the core does with an address, both found by reading it:
 //!

@@ -9,10 +9,10 @@ The QUIC substrate for M8. Third-party code, vendored, patched, and pinned.
 | Version | `0.5.0` (`build.zig.zon:3`) — the repository publishes no tags, so a commit SHA is the only pin available |
 | Licence | MIT — `LICENSE`, byte-identical to upstream's |
 | `minimum_zig_version` | `0.16.0` (upstream `build.zig.zon:13`) |
-| Vendored | 32 of upstream's 74 `.zig` files under `src/`: 29,776 lines upstream, 30,236 here |
+| Vendored | 32 of upstream's 74 `.zig` files under `src/`: 29,776 lines upstream, 30,278 here |
 | Written here | `src/test_all.zig` — upstream's test root, rebuilt (43 lines) |
 | Not vendored | 42 files, 35,388 lines — see below |
-| Patched | 13 files, +2,707 / −2,247; 1 file deleted outright |
+| Patched | 14 files, +2,749 / −2,247; 1 file deleted outright |
 
 Fetched 2026-09-30 with `gh api` against the pinned SHA. No clone is kept in this
 repository; `docs/PLAN.md` and `README.md` point at read-only checkouts under
@@ -270,6 +270,79 @@ fork and consume the dependency directly" has nothing to consume. The pinned
 revision is not a working 0.16 build, and this fork is not a fork of a working
 state.
 
+### 5. `FrameSorter.pop` hands the caller an allocation, and now says so
+
+`FrameSorter.pop` (`stream.zig:366`) returns a slice the caller owns. It is not
+a view into the sorter: the chunk leaves `chunks`, the headroom a grown chunk
+carries is shrunk away or copied out, and the result is a whole allocation. Once
+it has been returned, `FrameSorter.deinit` cannot free it, because it walks
+`chunks` and that chunk is no longer in it.
+
+**Upstream had this and said nothing.** `pop`'s doc comment read "Returns null
+if there's no data available at the current read position" and stopped there.
+Every in-tree caller freed the result — `connection.zig:2404` and `:2443` both
+`defer self.allocator.free(data)`, and so does every test that pops — but the
+contract lived only in that convention. `ReceiveStream.read` (`:513`) forwarded
+the same owning pointer under "Returns the data slice or null if no data is
+available", and `CryptoStream.read` (`crypto_stream.zig:64`) forwarded it again
+under "Returns null if no complete data is available". A reader of any of the
+three could reasonably conclude the slice is borrowed.
+
+**This is inherited, not introduced.** `diff` against the pinned commit's
+`src/quic/stream.zig` is empty at the three hunks' preimages: 3,767 lines, byte
+for byte, before this patch. Upstream leaks the same way, and will again — the
+signature is what invites it.
+
+**The patch is +42 / −0 across three hunks, all additive**, and it is
+documentation plus one test. No signature changed, no caller changed, and no
+behaviour changed:
+
+- `stream.zig:359-365` — `pop`'s doc comment now states that the caller owns
+  the result and must free it with `self.allocator`, and why `deinit` will not
+  do it.
+- `stream.zig:516-522` — `ReceiveStream.read` says the same and points at
+  `FrameSorter.pop`.
+- `stream.zig:1961-1991` — one test, `FrameSorter: what pop returns is the
+  caller's, not the sorter's`, pinning both halves. It asserts the returned
+  pointer equals the allocation `push` made (ownership moved, rather than a
+  view handed back), that the chunk is gone from `chunks`, and it frees the
+  result — so the leak checker is what enforces the second half. 457 tests
+  now, from 456.
+
+**`CryptoStream.read` is still undocumented, and deliberately so.** It forwards
+the identical owning pointer and the identical unstated contract, and it is the
+same defect. It is recorded here rather than patched: this patch is scoped to
+the file the leak trace named, and `crypto_stream.zig` is a second file. Every
+caller of it frees correctly — `connection.zig`'s handshake feeds are the only
+two, and both `defer`-free. Fixing it is a four-line doc comment and belongs
+with whoever next touches that file.
+
+**The leak this was found through, and where it is fixed.** ozai's
+`test/protocol_loopback_test.zig` leaked 23 `dupe` blocks across the two tests
+that open streams — 20 in the gossip convergence test, 3 in the blobs EOF test.
+The `std.testing.allocator` trace names the allocation site
+unambiguously — `stream.zig:214`, inside `FrameSorter.push`'s append fast path,
+reached from `Bridge.recv` through `recvDatagram` → `route` → `recv` →
+processFrame → `recvStreamFrame` → `handleStreamFrame` → `push`, and every one
+of the 23 carried that same stack — two distinct frames, `push` and
+`handleStreamFrame`. Three probes against the vendored core decided the owner,
+not an argument:
+
+1. push, never pop, `deinit` — **no leak**. `FrameSorter.deinit` frees every
+   chunk the sorter still holds, so the teardown the previous investigation
+   checked is correct.
+2. push, pop, free — **no leak**.
+3. push, pop, no free — **one leak**, traced to `stream.zig:214`.
+
+So the block left the sorter through `pop` and was never freed. Both leaking
+call sites are in `test/protocol_loopback_test.zig` and both are the same shape:
+`readStream` (`:1040`) and `BlobLink.drain` (`:1790`) iterate
+`while (stream.recv.read()) |chunk|`, copy the bytes out, and never free
+`chunk`. The fix belongs in those two loops and **not** in this directory —
+patching the core to suit a caller that drops a documented owning pointer would
+be the wrong trade. What this directory owed was the sentence that says so,
+and that is what the patch above adds.
+
 ## Measured cost
 
 | | Predicted | Measured |
@@ -301,6 +374,7 @@ Per file, against the pinned commit:
 | `src/quic/ack_handler.zig` | +70 / −8 | entropy into the challenge |
 | `src/quic/packet_packer.zig` | +55 / −9 | time and entropy |
 | `src/quic/transport_params.zig` | +48 / −14 | `encode` takes the generator, for the grease draw |
+| `src/quic/stream.zig` | +42 / −0 | the `pop` ownership contract, documented and pinned |
 | `src/lib.zig` | +29 / −35 | four layers of re-exports gone, `sys` gone |
 | `src/quic/stateless_reset.zig` | +29 / −7 | entropy into the reset token |
 | `src/quic/quic_lb.zig` | +25 / −13 | entropy into CID generation |
@@ -318,6 +392,12 @@ qlog, `tls13.zig` gave up the X.509 walk. The remaining two, `lib.zig` and
 original decision record did not anticipate this, and a decision record that
 understates its own cost is worse than one that declines.
 
+The fourteenth is `src/quic/stream.zig`, and it is the one patch here that is
+not a response to a project requirement. It adds 42 lines and removes none: two
+doc comments and one test. See §5 — the short version is that `FrameSorter.pop`
+returns an allocation the caller owns, every caller in this tree already freed
+it, and upstream's doc comment never said so.
+
 ## Not gated on purpose, and not unchecked
 
 `devenv.nix` runs the house gate as `GATE_EXCLUDE=vendor zig-gate` (`:86`) and
@@ -330,7 +410,7 @@ this project's rules would report findings nobody intends to fix.
 "Not gated" must never mean "unchecked". Three things stand in for it:
 
 1. **The vendored suite runs.** `zig build quic-test` (`build.zig:56-58`)
-   compiles `vendor/quic/src/test_all.zig` and runs the 455 `test` blocks spread
+   compiles `vendor/quic/src/test_all.zig` and runs the 456 `test` blocks spread
    across 26 of the 29 vendored files. The module is declared and then compiled
    (`build.zig:36-40`) because a vendored tree nothing references is a vendored
    tree nobody has proved still builds.

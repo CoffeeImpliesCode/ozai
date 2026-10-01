@@ -1288,7 +1288,13 @@ pub const State = struct {
     }
 
     fn myData(self: *const State) ?[]const u8 {
-        const data = self.me_data orelse return null;
+        // `&`, not a copy. The slice goes into a `Neighbor`, a `Join` and a
+        // `Shuffle`, every one of which outlives this frame; a local
+        // `const data` would hand back a pointer into a frame that dies on
+        // return. Nothing here reports it — the bytes read back are whatever
+        // the next call left in the dead slot — so the address is the fix and
+        // this line is not load-bearing to tidy away.
+        const data = &(self.me_data orelse return null);
         if (data.isEmpty()) return null;
         return data.slice();
     }
@@ -2913,6 +2919,45 @@ test "the contact table refuses what a record cannot spell" {
     @memset(exact, 0x66);
     try map.put(peer, exact);
     try t.expectEqualSlices(u8, exact, map.get(peer).?.slice());
+}
+
+/// Fill a frame big enough to cover whatever the reader below unwound, so a
+/// slice into a dead frame reads back as poison instead of as the bytes it
+/// happened to leave behind. `never_inline` is load-bearing: an inlined
+/// helper would poison the caller's own live locals rather than the dead
+/// region.
+fn clobberStack() void {
+    var poison: [2048]u8 = undefined;
+    @memset(&poison, 0xcd);
+    std.mem.doNotOptimizeAway(&poison);
+}
+
+// The contact data a node advertises is read into a frame, and the messages it
+// goes into outlive that frame. Reading it back with nothing in between finds
+// the right bytes either way, which is why this needs a frame in between to
+// tell the two apart.
+test "a node's own contact data outlives the frame it was read in" {
+    var state = try State.init(
+        sim.nodeIdFor(0),
+        try PeerData.fromBytes("41234"),
+        .{},
+        Rng.init(1),
+    );
+    // `never_inline` on the read as well as the clobber: inlined, the frame
+    // this test is about would be this test's own and the poison would miss
+    // it. The same shape as `CustomAddr` in `src/base/addr.zig`.
+    const seen = @call(.never_inline, State.myData, .{&state});
+    @call(.never_inline, clobberStack, .{});
+
+    // Snapshot with no call in between: the assertion is a call, and its frame
+    // lands on the region this test exists to inspect.
+    const held = [_]u8{ seen.?[0], seen.?[1], seen.?[2], seen.?[3], seen.?[4] };
+    try t.expectEqualSlices(u8, "41234", &held);
+
+    // A node with no contact data says so, and says it from the address rather
+    // than from a copy that happens to be empty.
+    var bare = try State.init(sim.nodeIdFor(1), null, .{}, Rng.init(2));
+    try t.expectEqual(@as(?[]const u8, null), @call(.never_inline, State.myData, .{&bare}));
 }
 
 // A bootstrap list is bounded twice: by what a `u8` can count, and by

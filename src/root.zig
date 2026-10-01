@@ -22,6 +22,7 @@ pub const net_probe = @import("net/probe.zig");
 pub const discovery_item = @import("discovery/item.zig");
 pub const discovery_resolve = @import("discovery/resolve.zig");
 pub const discovery_dns = @import("discovery/dns.zig");
+pub const discovery_dial_source = @import("discovery/dial_source.zig");
 pub const pkarr = @import("discovery/pkarr.zig");
 
 pub const relay_frame = @import("relay/frame.zig");
@@ -76,6 +77,7 @@ test {
     std.testing.refAllDecls(net_probe);
     std.testing.refAllDecls(discovery_item);
     std.testing.refAllDecls(discovery_resolve);
+    std.testing.refAllDecls(discovery_dial_source);
     std.testing.refAllDecls(discovery_dns);
     std.testing.refAllDecls(postcard);
     std.testing.refAllDecls(pkarr);

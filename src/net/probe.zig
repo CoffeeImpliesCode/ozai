@@ -349,6 +349,23 @@ pub const Input = struct {
 /// Index into a plan's task list. `u8`, because `max_tasks` is 25.
 pub const TaskIndex = u8;
 
+// Every fixed-size array in this file is indexed by a narrow integer, and each
+// bound is proved here, where the constant and the index type meet: a constant
+// that outgrew its index turns `sent[index]`, `answers[task.relay]` and
+// `items[self.len]` into three ways to walk off an array, and no use site could
+// see it coming.
+comptime {
+    if (max_relays > std.math.maxInt(TaskIndex)) {
+        @compileError("a relay index is wider than `Task.relay`");
+    }
+    if (max_tasks > std.math.maxInt(TaskIndex)) {
+        @compileError("a task count is wider than `TaskIndex`");
+    }
+    if (max_results > std.math.maxInt(u8)) {
+        @compileError("a results length is wider than `Results.len`");
+    }
+}
+
 /// One scheduled probe: what to run, against which relay, and where in its
 /// ladder it sits. Upstream's `(delay, relay)` pair inside a `ProbeSet`.
 pub const Task = struct {
@@ -411,17 +428,33 @@ comptime {
     }
 }
 
+/// The one answer a plan cannot give.
+///
+/// A `Plan` is a public struct, so a caller can build one with a literal and
+/// nothing in the type stops its relay list from being longer than the arrays
+/// below. Every function that turns a relay count into an index refuses one
+/// rather than wrapping it, and this is that one answer: a relay past the
+/// bound is an index past the end of `Runner.answers` and of a turn's `sends`.
+pub const PlanError = error{
+    RelaysTooMany,
+};
+
 /// One round's plan: which relays, which families, and nothing else.
 pub const Plan = struct {
-    /// The relays, truncated to `max_relays`. Borrowed; see `Round.last`.
+    /// The relays, truncated to `max_relays` by `plan`. Borrowed; see
+    /// `Round.last`. Nothing in the type keeps that bound, so every reader of
+    /// this field's length proves it for itself; see `relayCount`.
     relays: []const RelayUrl,
     /// `do_full`. See `isFull`.
     full: bool,
-    /// `min(relays.len, enough_endpoints)`. Upstream's `enough_relays`. The
-    /// truncation to `max_relays` does not touch it: `max_relays` is 5 and
-    /// `enough_endpoints` is 3, so `min(min(len, 5), 3)` and `min(len, 3)`
-    /// are the same number for every `len`.
-    enough_relays: u8,
+    /// `min(relays.len, enough_endpoints)`. Upstream's `enough_relays`, in
+    /// upstream's own `usize`: the ceiling is applied by the `min` that
+    /// computes this one value and nothing narrows it afterwards, so there is
+    /// no bound here to prove. The truncation to `max_relays` does not touch
+    /// it: `max_relays` is 5 and `enough_endpoints` is 3, so
+    /// `min(min(len, 5), 3)` and `min(len, 3)` are the same number for every
+    /// `len`.
+    enough_relays: usize,
     /// Which families this round runs, by `@intFromEnum`.
     ///
     /// A family that cannot run is absent rather than present and skipped:
@@ -434,14 +467,42 @@ pub const Plan = struct {
     /// (`reportgen.rs:287`).
     captive: bool,
 
-    /// How many tasks this plan holds.
-    pub fn taskCount(self: Plan) u8 {
-        return @intCast(self.relays.len * self.stride());
+    /// How many relays this plan holds, in the width every index below is
+    /// spelled with.
+    ///
+    /// The bound is proved here, at the only place a relay length is read, and
+    /// proved against `max_relays` rather than against the width of the
+    /// integer: a length a `u8` holds is not a length this module indexes by.
+    /// The cast arm is the one this file cannot reach — `max_relays` is 5, and
+    /// the guard above fails the build if it is ever not — while the comparison
+    /// is the arm a caller holding a struct literal can reach.
+    fn relayCount(self: Plan) PlanError!TaskIndex {
+        const count: TaskIndex = std.math.cast(TaskIndex, self.relays.len) orelse
+            return error.RelaysTooMany;
+        if (@as(usize, count) > max_relays) return error.RelaysTooMany;
+        return count;
     }
 
-    /// The most tasks one relay contributes.
-    fn stride(self: Plan) u8 {
-        var count: u8 = 0;
+    /// How many tasks this plan holds.
+    ///
+    /// The product is narrowed by a cast that carries its own refusal rather
+    /// than by a bound this file asserts: `stride` is at most
+    /// `2 + https_attempts` and the relay count is at most `max_relays`, so the
+    /// two together are `max_tasks`, which the guard above keeps inside a
+    /// `TaskIndex`. A ladder that outgrew it is refused rather than wrapped
+    /// into a count that quietly drops work.
+    pub fn taskCount(self: Plan) PlanError!TaskIndex {
+        const relays = try self.relayCount();
+        const tasks = @as(usize, relays) * self.stride();
+        return std.math.cast(TaskIndex, tasks) orelse error.RelaysTooMany;
+    }
+
+    /// The most tasks one relay contributes: one rung per QAD family and
+    /// `https_attempts` of ladder for HTTPS, so at most `2 + https_attempts`.
+    /// That is the bound `max_tasks` is built from, and it is what makes the
+    /// product in `taskCount` fit.
+    fn stride(self: Plan) TaskIndex {
+        var count: TaskIndex = 0;
         for (family_order) |proto| {
             if (self.run[@intFromEnum(proto)]) count += ladder(proto);
         }
@@ -450,17 +511,25 @@ pub const Plan = struct {
 
     /// The task at `index`, in plan order: for each relay, its QAD probes and
     /// then its HTTPS ladder.
-    pub fn taskAt(self: Plan, index: TaskIndex) ?Task {
+    pub fn taskAt(self: Plan, index: TaskIndex) PlanError!?Task {
+        const relays = try self.relayCount();
         var seen: TaskIndex = 0;
-        for (self.relays, 0..) |_, relay| {
+        // Both counters are declared rather than borrowed: a range loop's
+        // index is a `usize`, so the relay and rung counts would have to be
+        // cast back into a `u8` on the way into a `Task` — and a plan wide
+        // enough to need that cast is the one `relayCount` refuses rather
+        // than truncates.
+        var relay: TaskIndex = 0;
+        while (relay < relays) : (relay += 1) {
             for (family_order) |proto| {
                 if (!self.run[@intFromEnum(proto)]) continue;
-                for (0..ladder(proto)) |attempt| {
+                var attempt: TaskIndex = 0;
+                while (attempt < ladder(proto)) : (attempt += 1) {
                     if (seen == index) {
                         return .{
                             .proto = proto,
-                            .relay = @intCast(relay),
-                            .attempt = @intCast(attempt),
+                            .relay = relay,
+                            .attempt = attempt,
                         };
                     }
                     seen += 1;
@@ -477,6 +546,10 @@ pub const Plan = struct {
 /// input describing a node that can do nothing produces an empty one rather
 /// than an error: the relays are already configured, and upstream's answer to
 /// "is this relay suitable" is not to probe it.
+///
+/// The relay list is truncated here and nowhere else, which is what makes a
+/// plan this function returns one the rest of the file can index. A plan a
+/// caller assembles by hand is not, and is refused; see `PlanError`.
 pub fn plan(input: Input) Plan {
     const full = isFull(input.round, input.now);
     // A full round closes the QUIC connections (`net_report.rs:456-459`), so a
@@ -511,7 +584,9 @@ pub fn plan(input: Input) Plan {
     return .{
         .relays = input.relays[0..@min(input.relays.len, max_relays)],
         .full = full,
-        .enough_relays = @intCast(@min(input.relays.len, enough_endpoints)),
+        // The min is the whole proof: a length of any size lands on one of
+        // three values, and nothing narrows the result on the way out.
+        .enough_relays = @min(input.relays.len, enough_endpoints),
         .run = run,
         .captive = input.round.captive_portal_check and input.round.last == null,
     };
@@ -540,8 +615,13 @@ fn isEmpty(latencies: *const report.RelayLatencies) bool {
 /// `spawn_qad_probes` truncates to `MAX_RELAYS` and `QadConns::current_v4`
 /// does not. The count therefore has to be over relay URLs and not over plan
 /// positions.
-pub fn measured(probe: Probe, results: []const ProbeResult) u8 {
-    var count: u8 = 0;
+///
+/// A `usize`, not a `u8`: the only ceiling on a results slice is the one its
+/// caller brought. `Results.push` caps this module's own results at
+/// `max_results`, and a count narrowed below even that would be a bound proved
+/// nowhere for a list this module did not fill.
+pub fn measured(probe: Probe, results: []const ProbeResult) usize {
+    var count: usize = 0;
     for (results, 0..) |result, index| {
         if (result.kind() != probe) continue;
         if (countedBefore(results[0..index], probe, result.relay())) continue;
@@ -600,13 +680,16 @@ pub fn haveEnough(
     results: []const ProbeResult,
     if_state: IfState,
     full: bool,
-    enough_relays: u8,
+    enough_relays: usize,
 ) bool {
+    // The counts are `usize` because a count is however many answers the
+    // caller's list holds, and the quota is a `u8` because a shape is
+    // something this module writes.
     const ipv4 = measured(.qad_ipv4, results);
     const ipv6 = measured(.qad_ipv6, results);
     const https = measured(.https, results);
     for (quotas(if_state, full)) |quota| {
-        if (ipv4 >= quota.ipv4 and ipv6 >= quota.ipv6) return true;
+        if (ipv4 >= @as(usize, quota.ipv4) and ipv6 >= @as(usize, quota.ipv6)) return true;
     }
     return https >= enough_relays;
 }
@@ -757,7 +840,11 @@ pub fn new(input: Input, results: *Results) Runner {
 /// (`net_report.rs:369-373`) and a probe that has come due in the same instant
 /// is one that never ran. The overall deadline comes second, for the same
 /// reason: a round that has spent its budget sends nothing more.
-pub fn step(runner: Runner, now: Nanos) Step {
+///
+/// A runner from `new` cannot name more relays than `max_relays` — `plan`
+/// truncates there and nowhere else — so this arm is for a runner assembled by
+/// hand, and it is the same arm `Plan.taskCount` names.
+pub fn step(runner: Runner, now: Nanos) PlanError!Step {
     var out: Step = .{ .next = runner };
     if (runner.outcome) |why| {
         out.outcome = why;
@@ -780,8 +867,8 @@ pub fn step(runner: Runner, now: Nanos) Step {
     }
 
     var index: TaskIndex = 0;
-    while (index < runner.plan.taskCount()) : (index += 1) {
-        const task = runner.plan.taskAt(index).?;
+    while (index < try runner.plan.taskCount()) : (index += 1) {
+        const task = (try runner.plan.taskAt(index)).?;
         if (runner.sent[index] or runner.satisfied(task)) continue;
         const due = runner.start +| delayFor(task.proto, task.attempt);
         if (now < due) continue;
@@ -798,7 +885,7 @@ pub fn step(runner: Runner, now: Nanos) Step {
         }
     }
 
-    out.wake_at = wakeAt(&out.next, now);
+    out.wake_at = try wakeAt(&out.next, now);
     return out;
 }
 
@@ -817,9 +904,12 @@ pub fn step(runner: Runner, now: Nanos) Step {
 /// those too: `QadConns::watch_v4` yields every address a live connection
 /// observes for as long as it is open (`net_report.rs:205-223`), and
 /// `update_relay` keeps the faster of the two.
-pub fn observe(runner: Runner, task: TaskIndex, result: ProbeResult) Runner {
+///
+/// The same refusal as `step`, one step earlier: an answer cannot be filed
+/// against a plan whose relay list this module cannot index.
+pub fn observe(runner: Runner, task: TaskIndex, result: ProbeResult) PlanError!Runner {
     if (runner.outcome != null) return runner;
-    const spec = runner.plan.taskAt(task) orelse return runner;
+    const spec = (try runner.plan.taskAt(task)) orelse return runner;
     if (!runner.sent[task]) return runner;
     // A caller that answers one task with another family's result would have
     // its round counted against a family it never probed, which is a caller
@@ -854,12 +944,12 @@ fn settle(runner: Runner) Runner {
 ///
 /// The overall deadline is always a candidate, so while a round is unfinished
 /// there is always something to wait for.
-fn wakeAt(runner: *const Runner, now: Nanos) Nanos {
+fn wakeAt(runner: *const Runner, now: Nanos) PlanError!Nanos {
     var wake = runner.start +| overall_timeout;
     var in_flight = false;
     var index: TaskIndex = 0;
-    while (index < runner.plan.taskCount()) : (index += 1) {
-        const task = runner.plan.taskAt(index).?;
+    while (index < try runner.plan.taskCount()) : (index += 1) {
+        const task = (try runner.plan.taskAt(index)).?;
         if (runner.sent[index]) {
             in_flight = true;
             continue;
@@ -928,6 +1018,14 @@ fn relaySet(scratch: []u8) ![3]RelayUrl {
     };
 }
 
+/// `out.len` relay URLs, one 64-byte host each, so a relay list longer than
+/// `max_relays` can be built at all.
+fn fillRelays(out: []RelayUrl, scratch: []u8) !void {
+    for (out, 0..) |*relay, index| {
+        relay.* = try namedRelay(scratch[index * 64 ..][0..64], index);
+    }
+}
+
 /// A round that is not full: nothing asks for one and the age rule does not
 /// force it. Every test of an incremental rule needs one of these first,
 /// because `isFull` is what upstream's incremental rules are defined against.
@@ -968,8 +1066,8 @@ test "a full round probes every relay over QUIC and ladders every relay over HTT
         .now = test_start,
     });
     try t.expect(planned.full);
-    try t.expectEqual(@as(u8, enough_endpoints), planned.enough_relays);
-    try t.expectEqual(@as(u8, 3 * 5), planned.taskCount());
+    try t.expectEqual(@as(usize, enough_endpoints), planned.enough_relays);
+    try t.expectEqual(@as(u8, 3 * 5), try planned.taskCount());
 
     const want = [_]Task{
         .{ .proto = .qad_ipv4, .relay = 0, .attempt = 0 },
@@ -989,9 +1087,9 @@ test "a full round probes every relay over QUIC and ladders every relay over HTT
         .{ .proto = .https, .relay = 2, .attempt = 2 },
     };
     for (want, 0..) |task, index| {
-        try t.expectEqualDeep(task, planned.taskAt(@intCast(index)).?);
+        try t.expectEqualDeep(task, (try planned.taskAt(@intCast(index))).?);
     }
-    try t.expect(planned.taskAt(@intCast(want.len)) == null);
+    try t.expect((try planned.taskAt(@intCast(want.len))) == null);
 }
 
 test "the ladder is 200, 300 and 400 milliseconds, and QUIC has no ladder" {
@@ -1008,7 +1106,7 @@ test "the ladder is 200, 300 and 400 milliseconds, and QUIC has no ladder" {
     // At the start of the round every relay's QUIC probe is due and not one
     // rung of any ladder is: upstream spawns the QAD fan-out in full and holds
     // the HTTPS set back by `HTTPS_OFFSET`.
-    const first = step(runner, test_start);
+    const first = try step(runner, test_start);
     try t.expectEqual(@as(u8, 3), first.sends_len);
     try t.expectEqualDeep(
         Task{ .proto = .qad_ipv4, .relay = 0, .attempt = 0 },
@@ -1024,7 +1122,7 @@ test "the ladder is 200, 300 and 400 milliseconds, and QUIC has no ladder" {
     // Each rung comes due at its own instant, and a turn picks up only what
     // has come due since the last one.
     for ([_]u8{ 0, 1, 2 }) |rung| {
-        const turn = step(runner, test_start + https_offset + initial_retransmit * rung);
+        const turn = try step(runner, test_start + https_offset + initial_retransmit * rung);
         try t.expectEqual(@as(u8, 3), turn.sends_len);
         for (turn.sends[0..3], 0..) |task, relay| {
             try t.expectEqualDeep(
@@ -1037,7 +1135,7 @@ test "the ladder is 200, 300 and 400 milliseconds, and QUIC has no ladder" {
 
     // Nothing is left to send, and the last rung is in flight, so the round
     // waits for the budget rather than for the deadline.
-    const spent = step(runner, test_start + millis(400));
+    const spent = try step(runner, test_start + millis(400));
     try t.expectEqual(@as(u8, 0), spent.sends_len);
     try t.expectEqual(test_start + probe_timeout, spent.wake_at);
     try t.expect(spent.outcome == null);
@@ -1122,13 +1220,13 @@ test "an incremental round with one live connection on a v4-only host sends noth
 
     // No HTTPS ladder, because the last report measured something, and no QUIC
     // probe, because the v4 connection is already up and the host has no v6.
-    try t.expectEqual(@as(u8, 0), runner.plan.taskCount());
+    try t.expectEqual(@as(u8, 0), try runner.plan.taskCount());
     try t.expect(!runner.plan.full);
     // The carried observation is the round, and one of them is all a v4-only
     // host needs on an incremental round.
     try t.expectEqual(@as(u8, 1), results.len);
     try t.expectEqual(Outcome.enough, runner.outcome.?);
-    const turn = step(runner, test_start);
+    const turn = try step(runner, test_start);
     try t.expectEqual(@as(u8, 0), turn.sends_len);
 
     const folded = fold(turn.next, .{}, test_start);
@@ -1148,7 +1246,7 @@ test "a v6 address from a v4 probe keeps its latency and declines to classify" {
         .protocols = .{ .https = false, .qad_ipv4 = true, .qad_ipv6 = false },
         .now = test_start,
     }, &results);
-    const sent = step(runner, test_start);
+    const sent = try step(runner, test_start);
     try t.expectEqual(@as(u8, 3), sent.sends_len);
 
     // A relay that answers a v4 probe with an IPv6 address. The tag is the
@@ -1156,14 +1254,14 @@ test "a v6 address from a v4 probe keeps its latency and declines to classify" {
     // only thing the module knows how to say.
     const crossed = qadResult(.v4, relays[0], test_start, millis(9), public_v6);
     try t.expectEqual(Probe.qad_ipv4, crossed.kind());
-    runner = observe(sent.next, 0, crossed);
+    runner = try observe(sent.next, 0, crossed);
 
     // The measurement is kept: it is in the v4 family's latency list, and the
     // round counts the answer as a v4 answer, which is what upstream does by
     // filing it under the probe's protocol before it checks the address.
     try t.expectEqual(@as(u8, 1), results.len);
-    try t.expectEqual(@as(u8, 1), measured(.qad_ipv4, results.slice()));
-    try t.expectEqual(@as(u8, 0), measured(.qad_ipv6, results.slice()));
+    try t.expectEqual(@as(usize, 1), measured(.qad_ipv4, results.slice()));
+    try t.expectEqual(@as(usize, 0), measured(.qad_ipv6, results.slice()));
     try t.expectEqual(millis(9), runner.results.slice()[0].latency());
 
     const folded = fold(runner, .{}, test_start);
@@ -1188,18 +1286,18 @@ test "the same address in the right family classifies, and that is the only diff
         .protocols = .{ .https = false, .qad_ipv4 = true, .qad_ipv6 = false },
         .now = test_start,
     }, &results);
-    const sent = step(runner, test_start);
+    const sent = try step(runner, test_start);
 
     // Two v4 answers with different addresses from different relays: the
     // mapping varies by destination, and now it can be said.
-    const answered = observe(sent.next, 0, qadResult(
+    const answered = try observe(sent.next, 0, qadResult(
         .v4,
         relays[0],
         test_start,
         millis(9),
         public_v4,
     ));
-    const varied = observe(answered, 1, qadResult(
+    const varied = try observe(answered, 1, qadResult(
         .v4,
         relays[1],
         test_start,
@@ -1217,7 +1315,7 @@ test "an incremental round ends at one answer per family, a full one at two" {
     var scratch: [192]u8 = undefined;
     const relays = try relaySet(&scratch);
     const dual: IfState = .{ .have_v4 = true, .have_v6 = true };
-    const enough: u8 = enough_endpoints;
+    const enough: usize = enough_endpoints;
 
     const v4_a = qadResult(.v4, relays[0], test_start, millis(9), public_v4);
     const v4_b = qadResult(.v4, relays[1], test_start, millis(9), other_v4);
@@ -1270,9 +1368,9 @@ test "two answers to one relay count once, as upstream's map does" {
         .{ .https = .{ .relay = relays[1], .instant = test_start, .latency = millis(30) } },
         qadResult(.v4, relays[0], test_start, millis(9), public_v4),
     };
-    try t.expectEqual(@as(u8, 2), measured(.https, &results));
-    try t.expectEqual(@as(u8, 1), measured(.qad_ipv4, &results));
-    try t.expectEqual(@as(u8, 0), measured(.qad_ipv6, &results));
+    try t.expectEqual(@as(usize, 2), measured(.https, &results));
+    try t.expectEqual(@as(usize, 1), measured(.qad_ipv4, &results));
+    try t.expectEqual(@as(usize, 0), measured(.qad_ipv6, &results));
 }
 
 test "the first answer to a relay kills the rest of its ladder" {
@@ -1286,20 +1384,20 @@ test "the first answer to a relay kills the rest of its ladder" {
         .now = test_start,
     }, &results);
 
-    const first = step(runner, test_start);
+    const first = try step(runner, test_start);
     try t.expectEqual(@as(u8, 0), first.sends_len);
     try t.expectEqual(test_start + https_offset, first.wake_at);
     runner = first.next;
 
-    const due = step(runner, test_start + https_offset);
+    const due = try step(runner, test_start + https_offset);
     try t.expectEqual(@as(u8, 3), due.sends_len);
-    const answered = observe(due.next, 0, .{
+    const answered = try observe(due.next, 0, .{
         .https = .{ .relay = relays[0], .instant = test_start, .latency = millis(12) },
     });
     try t.expectEqual(@as(u8, 1), results.len);
 
     // Relay 0's second rung is not sent, and the other two relays are.
-    const later_turn = step(answered, test_start + https_offset + initial_retransmit);
+    const later_turn = try step(answered, test_start + https_offset + initial_retransmit);
     try t.expectEqual(@as(u8, 2), later_turn.sends_len);
     try t.expectEqualDeep(
         Task{ .proto = .https, .relay = 1, .attempt = 1 },
@@ -1321,8 +1419,8 @@ test "a round that runs out of time folds what it has" {
         .protocols = .{ .https = true, .qad_ipv4 = true, .qad_ipv6 = false },
         .now = test_start,
     }, &results);
-    const sent = step(runner, test_start);
-    runner = observe(sent.next, 0, qadResult(
+    const sent = try step(runner, test_start);
+    runner = try observe(sent.next, 0, qadResult(
         .v4,
         relays[0],
         test_start,
@@ -1331,11 +1429,11 @@ test "a round that runs out of time folds what it has" {
     ));
 
     // The ladder ran, nothing answered, and the deadline arrives.
-    const ended = step(runner, test_start + overall_timeout);
+    const ended = try step(runner, test_start + overall_timeout);
     try t.expectEqual(Outcome.timeout, ended.outcome.?);
     try t.expectEqual(@as(u8, 0), ended.sends_len);
     // A turn after the end says the same thing and sends nothing.
-    const after = step(ended.next, test_start + overall_timeout + millis(1));
+    const after = try step(ended.next, test_start + overall_timeout + millis(1));
     try t.expectEqual(Outcome.timeout, after.outcome.?);
     try t.expectEqual(@as(u8, 0), after.sends_len);
 
@@ -1372,33 +1470,33 @@ test "the captive-portal check waits, and a round that is already good enough sk
 
     var results: Results = .{};
     var runner = new(base, &results);
-    const start = step(runner, test_start);
+    const start = try step(runner, test_start);
     try t.expect(!start.captive);
     try t.expectEqual(test_start + captive_portal_delay, start.wake_at);
     runner = start.next;
 
     // Two answers, one of each family, end an incremental-sized round long
     // before the check's 200 ms delay is up.
-    runner = observe(runner, 0, qadResult(
+    runner = try observe(runner, 0, qadResult(
         .v4,
         relays[0],
         test_start,
         millis(9),
         public_v4,
     ));
-    runner = observe(runner, 1, qadResult(
+    runner = try observe(runner, 1, qadResult(
         .v6,
         relays[0],
         test_start,
         millis(9),
         public_v6,
     ));
-    const ended = step(runner, test_start + millis(20));
+    const ended = try step(runner, test_start + millis(20));
     try t.expectEqual(Outcome.enough, ended.outcome.?);
     try t.expectEqual(@as(u8, 0), ended.sends_len);
     // The ladder was planned and never sent a rung: the round was over before
     // the first one came due.
-    try t.expectEqual(@as(u8, 0), measured(.https, results.slice()));
+    try t.expectEqual(@as(usize, 0), measured(.https, results.slice()));
     try t.expect(!ended.captive);
     try t.expect(!ended.next.captive_sent);
     // Null, not false: a portal nobody looked for has not been ruled out.
@@ -1415,9 +1513,9 @@ test "the captive-portal check waits, and a round that is already good enough sk
         .now = test_start,
     }, &other);
     // Nothing can run, so the only thing left is the check.
-    const waiting = step(idle, test_start);
+    const waiting = try step(idle, test_start);
     try t.expect(!waiting.captive);
-    const checked = step(waiting.next, test_start + captive_portal_delay);
+    const checked = try step(waiting.next, test_start + captive_portal_delay);
     try t.expect(checked.captive);
     try t.expect(checked.outcome == null);
     try t.expectEqual(
@@ -1478,15 +1576,15 @@ test "an answer for a probe that was never sent is dropped" {
         .protocols = .{ .https = true, .qad_ipv4 = true, .qad_ipv6 = false },
         .now = test_start,
     }, &results);
-    const turn = step(runner, test_start);
+    const turn = try step(runner, test_start);
 
     // Task 3 is the first rung of relay 0's ladder, which is not due yet.
-    const ignored = observe(turn.next, 3, .{
+    const ignored = try observe(turn.next, 3, .{
         .https = .{ .relay = relays[0], .instant = test_start, .latency = millis(12) },
     });
     try t.expectEqual(@as(u8, 0), results.len);
     // An index past the plan is not a task at all.
-    const past = observe(ignored, 200, .{
+    const past = try observe(ignored, 200, .{
         .https = .{ .relay = relays[0], .instant = test_start, .latency = millis(12) },
     });
     try t.expectEqual(@as(u8, 0), results.len);
@@ -1501,8 +1599,8 @@ test "a round with no relays to probe ends at once and claims nothing" {
         .protocols = .{ .https = true, .qad_ipv4 = true, .qad_ipv6 = true },
         .now = test_start,
     }, &results);
-    try t.expectEqual(@as(u8, 0), runner.plan.taskCount());
-    try t.expectEqual(@as(u8, 0), runner.plan.enough_relays);
+    try t.expectEqual(@as(u8, 0), try runner.plan.taskCount());
+    try t.expectEqual(@as(usize, 0), runner.plan.enough_relays);
     try t.expectEqual(Outcome.enough, runner.outcome.?);
 
     const folded = fold(runner, .{}, test_start);
@@ -1523,43 +1621,43 @@ test "a round this module planned folds into a report" {
     }, &results);
 
     // The whole QUIC fan-out goes at once, six probes, and the ladder waits.
-    const sent = step(runner, test_start);
+    const sent = try step(runner, test_start);
     try t.expectEqual(@as(u8, 6), sent.sends_len);
     runner = sent.next;
 
     // A v4 answer and a v6 answer from the first relay are not enough on their
     // own: a full round wants two of one family and one of the other.
-    runner = observe(runner, 0, qadResult(
+    runner = try observe(runner, 0, qadResult(
         .v4,
         relays[0],
         test_start,
         millis(12),
         public_v4,
     ));
-    runner = observe(runner, 1, qadResult(
+    runner = try observe(runner, 1, qadResult(
         .v6,
         relays[0],
         test_start,
         millis(11),
         public_v6,
     ));
-    const waiting = step(runner, test_start + millis(5));
+    const waiting = try step(runner, test_start + millis(5));
     try t.expect(waiting.outcome == null);
     try t.expectEqual(test_start + https_offset, waiting.wake_at);
 
     // The second relay's v4 answer, and this one disagrees about the address.
-    runner = observe(waiting.next, 5, qadResult(
+    runner = try observe(waiting.next, 5, qadResult(
         .v4,
         relays[1],
         test_start + millis(6),
         millis(9),
         other_v4,
     ));
-    const ended = step(runner, test_start + millis(7));
+    const ended = try step(runner, test_start + millis(7));
     try t.expectEqual(Outcome.enough, ended.outcome.?);
     try t.expectEqual(@as(u8, 0), ended.sends_len);
     // The ladder never ran, so nothing was ever measured over HTTPS.
-    try t.expectEqual(@as(u8, 0), measured(.https, results.slice()));
+    try t.expectEqual(@as(usize, 0), measured(.https, results.slice()));
 
     const folded = fold(ended.next, .{}, test_start + millis(7));
     try t.expect(folded.udp_v4);
@@ -1576,4 +1674,107 @@ test "a round this module planned folds into a report" {
     try t.expectEqual(std.math.Order.eq, folded.preferred_relay.?.order(relays[1]));
     try t.expectEqual(millis(9), folded.relay_latency.get(relays[1]).?);
     try t.expect(folded.captive_portal == null);
+}
+
+test "the widest relay list a plan admits serves every index it has" {
+    // Eight in, five out. `plan` truncates, so the round runs at the width the
+    // arrays are sized for and the largest count a `TaskIndex` is ever asked to
+    // carry is served rather than refused.
+    var many: [max_relays + 3]RelayUrl = undefined;
+    var scratch: [(max_relays + 3) * 64]u8 = undefined;
+    try fillRelays(&many, &scratch);
+    var results: Results = .{};
+    const runner = new(.{
+        .relays = &many,
+        .if_state = .{ .have_v4 = true, .have_v6 = true },
+        .protocols = .{ .https = true, .qad_ipv4 = true, .qad_ipv6 = true },
+        .now = test_start,
+    }, &results);
+    try t.expectEqual(@as(usize, max_relays), runner.plan.relays.len);
+    try t.expectEqual(@as(u8, max_tasks), try runner.plan.taskCount());
+
+    // The last rung of the last relay, and nothing after it.
+    try t.expectEqualDeep(
+        Task{ .proto = .https, .relay = max_relays - 1, .attempt = https_attempts - 1 },
+        (try runner.plan.taskAt(max_tasks - 1)).?,
+    );
+    try t.expect((try runner.plan.taskAt(max_tasks)) == null);
+
+    // Every planned relay's QUIC probe goes at once and the ladder waits for
+    // its offset, so a turn fills ten of the twenty-five send slots and stops.
+    const sent = try step(runner, test_start);
+    try t.expectEqual(@as(u8, 2 * max_relays), sent.sends_len);
+    try t.expectEqual(test_start + https_offset, sent.wake_at);
+
+    // The last relay's QAD probe is the first of the five tasks it owns, and
+    // its answer files in the last mask slot — the relay index one below the
+    // count above.
+    const last_qad: u8 = (max_relays - 1) * (2 + https_attempts);
+    const answered = try observe(sent.next, last_qad, qadResult(
+        .v4,
+        many[max_relays - 1],
+        test_start,
+        millis(9),
+        public_v4,
+    ));
+    try t.expectEqual(bit(Probe.qad_ipv4), answered.answers[max_relays - 1]);
+    try t.expectEqual(millis(9), answered.results.slice()[0].latency());
+    try t.expect(answered.outcome == null);
+}
+
+test "a plan wider than the arrays that hold it is refused, not wrapped" {
+    // A `Plan` is a public struct with public fields, so a caller can build one
+    // by literal and nothing in the type stops the list from outrunning
+    // `max_relays`. Wrapped instead of refused, the count would be 30 for a
+    // round whose arrays hold 25, and the sixth relay's `Task.relay` would be 5
+    // into a `[max_relays]u8`: a walk off the end of `Runner.answers` and of a
+    // turn's `sent`, on the first turn, in Debug.
+    var many: [max_relays + 1]RelayUrl = undefined;
+    var scratch: [(max_relays + 1) * 64]u8 = undefined;
+    try fillRelays(&many, &scratch);
+    const wide: Plan = .{
+        .relays = &many,
+        .full = true,
+        .enough_relays = enough_endpoints,
+        .run = .{ true, true, true },
+        .captive = false,
+    };
+    try t.expectError(error.RelaysTooMany, wide.taskCount());
+    try t.expectError(error.RelaysTooMany, wide.taskAt(0));
+    try t.expectError(error.RelaysTooMany, wide.taskAt(max_tasks));
+
+    // The other arm of the same proof, and the one the guard cannot reach: a
+    // list one relay past what a `TaskIndex` spells never gets as far as the
+    // comparison. A caller's length is not one of this file's constants, so
+    // the cast is the only thing standing between it and a `u8` of relays.
+    const too_wide: [std.math.maxInt(TaskIndex) + 1]RelayUrl = @splat(many[0]);
+    const widest: Plan = .{
+        .relays = &too_wide,
+        .full = true,
+        .enough_relays = 0,
+        .run = .{ true, true, true },
+        .captive = false,
+    };
+    try t.expectError(error.RelaysTooMany, widest.taskCount());
+    try t.expectError(error.RelaysTooMany, widest.taskAt(0));
+
+    var results: Results = .{};
+    const runner: Runner = .{
+        .plan = wide,
+        .start = test_start,
+        .if_state = .{ .have_v4 = true, .have_v6 = true },
+        .results = &results,
+        .sent = @splat(false),
+        .answers = @splat(0),
+        .captive_sent = false,
+        .captive = null,
+        .outcome = null,
+    };
+    try t.expectError(error.RelaysTooMany, step(runner, test_start));
+    const answer = qadResult(.v4, many[0], test_start, millis(9), public_v4);
+    try t.expectError(error.RelaysTooMany, observe(runner, 0, answer));
+    // The refusal does not depend on the index: an answer one past the widest
+    // task a legal plan holds is refused the same way, and nothing is filed.
+    try t.expectError(error.RelaysTooMany, observe(runner, max_tasks, answer));
+    try t.expectEqual(@as(u8, 0), results.len);
 }

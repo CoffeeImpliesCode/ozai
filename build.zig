@@ -154,12 +154,73 @@ pub fn build(b: *std.Build) void {
     const integration_tests = b.addTest(.{ .root_module = integration_mod });
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
+    // The loopback test gets its own module for the same reason, and one more
+    // reason of its own: it is the only artifact that runs both halves of the
+    // stack against a kernel, so a failure in it is a finding about the stack
+    // rather than about a module boundary.
+    const loopback_mod = b.createModule(.{
+        .root_source_file = b.path("test/loopback_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    loopback_mod.addImport("ozai", lib_mod);
+    loopback_mod.link_libc = true;
+
+    // It is driven by `test/expected_log_runner.zig` rather than by the runner
+    // `zig test` generates, because one of its two tests makes the vendored
+    // core refuse a certificate at error level and the generated runner fails
+    // any binary that logged one. `--test-runner` puts that file in the
+    // compilation as the thing that runs the tests, so its `std_options` is
+    // the one `std.options` reads and the generated runner is not in the
+    // picture at all.
+    const loopback_tests = b.addTest(.{
+        .root_module = loopback_mod,
+        .test_runner = .{ .path = b.path("test/expected_log_runner.zig"), .mode = .server },
+    });
+    const run_loopback_tests = b.addRunArtifact(loopback_tests);
+    // The one error-level log this artifact provokes on purpose, named in
+    // full rather than by severity: the refusal the core reports for a
+    // certificate it will not accept, which the wrong-peer test asserts. The
+    // runner prints it either way and fails on any other error log, and it
+    // fails if this message stops being said at all.
+    run_loopback_tests.addArgs(&.{
+        "--expect-log",
+        "default",
+        "TLS 1.3 handshake error: error.BadCertificate",
+    });
+
+    // The first application protocol over a real connection, in its own module
+    // for the same reason as the loopback artifact, and with the same
+    // `link_libc`: it opens sockets, reaches into `blobs/protocol.zig` and
+    // `gossip/`, and its codec borrows `postcard`'s varints rather than
+    // inventing a width.
+    //
+    // It runs under the same custom runner, and declares no `--expect-log`:
+    // nothing in it provokes an error-level log on purpose, so an error log
+    // here is a finding rather than an expectation. The runner is what turns
+    // that finding into a failed run, and the generated runner would have
+    // failed the artifact for the same reason.
+    const protocol_mod = b.createModule(.{
+        .root_source_file = b.path("test/protocol_loopback_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    protocol_mod.addImport("ozai", lib_mod);
+    protocol_mod.link_libc = true;
+    const protocol_tests = b.addTest(.{
+        .root_module = protocol_mod,
+        .test_runner = .{ .path = b.path("test/expected_log_runner.zig"), .mode = .server },
+    });
+    const run_protocol_tests = b.addRunArtifact(protocol_tests);
+
     // Coverage instrumentation is opt-in because it pins the LLVM backend,
     // links the zig-cov runtime into the test binary, and makes that binary
     // write a `.zcov` file on exit; none of that belongs in a plain build.
-    // `zig-cov test` turns it on by passing both options below. Both test
-    // artifacts are instrumented because they reach different code, and an
-    // uninstrumented one under-reports in silence rather than failing.
+    // `zig-cov test` turns it on by passing both options below. Every test
+    // artifact is instrumented, the loopback one included: it reaches code
+    // nothing else reaches — the socket, and both halves of the stack around
+    // it — and an uninstrumented one under-reports in silence rather than
+    // failing.
     const coverage = b.option(bool, "coverage", "Instrument the test binaries") orelse false;
     const coverage_rt = b.option([]const u8, "coverage-rt", "Path to zig-cov-rt.o");
     if (coverage) {
@@ -168,7 +229,12 @@ pub fn build(b: *std.Build) void {
                 "Run coverage through `zig-cov test`, which passes both.",
             .{},
         );
-        for ([_]*std.Build.Step.Compile{ lib_unit_tests, integration_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{
+            lib_unit_tests,
+            integration_tests,
+            loopback_tests,
+            protocol_tests,
+        }) |artifact| {
             // The self-hosted backends emit no counters, `fuzz` is the only
             // switch that makes LLVM emit them, and the runtime flushes from a
             // libc atexit handler, so all three settings are load-bearing.
@@ -182,6 +248,8 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests and integration tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&run_loopback_tests.step);
+    test_step.dependOn(&run_protocol_tests.step);
     test_step.dependOn(&run_invariants_tests.step);
 
     // fuzzing

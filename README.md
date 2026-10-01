@@ -12,19 +12,21 @@ does not, ozai says so and diverges on the record.
 
 ## Status
 
-**Milestones 1–11 are built.** Every wire format, state machine and pure half
-of the stack, plus the QUIC substrate itself. What is *not* here is a
-connection to a live peer: the endpoint drives an accept loop over the vendored
-core, and nothing yet runs two of them against each other over a real socket.
+**Milestones 1–11 are built, and two endpoints have completed a QUIC
+handshake over a real socket.** `test/loopback_test.zig` dials a listener on
+loopback, verifies the peer's identity from the certificate rather than from
+configuration, moves bytes both ways and carries ECN across. What is *not* here
+is anything past one node reaching another: no relay is run, no discovery
+lookup does real I/O, and a peer's address is resolved by a test-supplied one.
 
 | Module | What it is |
 |---|---|
 | `src/base/` | `NodeId`, `SecretKey`, `Signature`, `RelayUrl`, `IpAddress`, `SocketAddr`, `CustomAddr`, `TransportAddr`, `NodeAddr`, and the two base32 alphabets. A sorted, duplicate-free address set, which is what makes a ticket a stable identifier. |
 | `src/wire/`, `src/blobs/` | The postcard codec, `RangeSpec`, and the blobs protocol. |
-| `src/ticket/`, `src/discovery/` | Both ticket kinds, the pkarr signed packet, the item model, and the resolvers. |
+| `src/ticket/`, `src/discovery/` | Both ticket kinds, the pkarr signed packet, the item model, the resolvers, and the fan-in that runs them and dials the address the merge picks. |
 | `src/relay/` | The relay frame codec and both relay state machines. |
 | `src/net/` | The net report fold, the NAT classifier, and the holepunch gate. |
-| `src/transport/` | The synthetic-ULA allocation, the GSO/GRO/ECN seam, and the bridge to the QUIC core. |
+| `src/transport/` | The synthetic-ULA allocation, the GSO/GRO/ECN seam and its socket, the bridge to the QUIC core, and the dial path. |
 | `src/router/`, `src/endpoint/` | ALPN dispatch, the accept loop, and the incoming filter. |
 | `src/gossip/` | HyParView, PlumTree, and a deterministic in-process simulator. |
 | `vendor/quic/` | The sans-IO QUIC core, 33 files, pinned by commit. No socket, no clock, no global entropy, no libc. |

@@ -29,6 +29,13 @@
 //!   them, and a generator seeded with a constant is what makes a test
 //!   repeatable.
 //!
+//! That line is drawn by what a function mentions, and it is drawn in one
+//! direction. An imprecision there can cost a complaint about a test helper,
+//+//! which a reader dismisses, or it can cost a library PRNG nobody reports,
+//! which nothing catches. Which of the two it is turns on whether a brace has
+//! been mistaken for a function body, so the pass that draws the line has to
+//! know which `fn` keywords are declarations at all — see `Scanner.classify`.
+//!
 //! The library/test boundary is drawn from the token stream, never from line
 //! numbers: a `test` declaration's body ends where brace depth returns to the
 //! level the declaration opened at, so library code after a test block is
@@ -401,6 +408,14 @@ const Scanner = struct {
     /// stays structural: it is decided by what the function mentions, not by
     /// where the function sits in the file.
     ///
+    /// So a `fn` keyword has to be known to be in *declaration* position,
+    /// because a `fn` with no body — a function type in a field, a parameter
+    /// or a type alias — would otherwise hand its mark to the next brace,
+    /// which is not a function body and would then be read as test
+    /// scaffolding. That is the one direction this gate cannot afford: every
+    /// other imprecision here costs a complaint about a test helper, and this
+    /// one costs a library PRNG nobody reports.
+    ///
     /// The same pass records the names this file declares, because a syscall is
     /// only a syscall by what stands in front of it, and a declaration is only
     /// a declaration by its own `fn`.
@@ -408,7 +423,11 @@ const Scanner = struct {
         const Frame = struct { is_fn: bool, first: usize, uses_testing: bool };
         var frames: std.ArrayList(Frame) = .empty;
         defer frames.deinit(alloc);
+        // Set by a `fn` keyword and spent by the brace that opens its body.
         var want_fn_body = false;
+        // `(` depth, so the `;` and `,` that end a declaration are told apart
+        // from the ones inside a parameter list or a call.
+        var paren: u32 = 0;
 
         self.scaffolding.clearRetainingCapacity();
         try self.scaffolding.appendNTimes(alloc, false, self.tokens.items.len);
@@ -422,6 +441,10 @@ const Scanner = struct {
                 }
             }
             switch (tok.tag) {
+                .l_paren => paren += 1,
+                .r_paren => {
+                    if (paren > 0) paren -= 1;
+                },
                 .l_brace => {
                     try frames.append(alloc, .{
                         .is_fn = want_fn_body,
@@ -431,6 +454,7 @@ const Scanner = struct {
                     want_fn_body = false;
                 },
                 .r_brace => {
+                    if (paren == 0) want_fn_body = false;
                     if (frames.pop()) |frame| {
                         if (frame.is_fn and frame.uses_testing) {
                             for (self.scaffolding.items[frame.first .. i + 1]) |*slot| {
@@ -440,9 +464,26 @@ const Scanner = struct {
                     }
                 },
                 else => {
-                    if (frames.items.len == 0) continue;
+                    // A `;` or a `,` at depth zero ends the declaration a
+                    // pending `fn` belongs to, exactly as the `}` above does.
+                    // Three of these are live in the tree today — the
+                    // `?*const fn` fields in `connection.zig` and
+                    // `connection_manager.zig` — so this is not a shape
+                    // that might arrive later.
+                    if (paren == 0 and (tok.tag == .semicolon or tok.tag == .comma)) {
+                        want_fn_body = false;
+                    }
                     if (self.reachesTesting(i)) {
-                        frames.items[frames.items.len - 1].uses_testing = true;
+                        // The bound is restated in the expression the read
+                        // sits in. Being outside every brace is a real state
+                        // and a common one — every vendored file opens with
+                        // top-level declarations — and this read used to sit
+                        // behind a `continue` that proved it here and nowhere
+                        // else, which zbc cannot follow. A gate that reports
+                        // itself is a gate nobody keeps running.
+                        if (frames.items.len > 0) {
+                            frames.items[frames.items.len - 1].uses_testing = true;
+                        }
                     }
                 },
             }
@@ -454,6 +495,13 @@ const Scanner = struct {
         return self.tokens.items[i];
     }
 
+    /// `back > i` reads token zero rather than nothing, which is a lie the
+    /// callers have to be able to survive. `beforeChain` is: at `i` below two,
+    /// both its reads land on the same token, so its condition asks one token to
+    /// be both a period and an identifier, and the walk stops. Getting that
+    /// wrong costs a hit this gate did not have to report — a type position read
+    /// as something else is the safe direction — which is why it is left as a
+    /// saturating read rather than a checked one.
     fn tagAt(self: *const Scanner, i: usize, back: usize) ?std.zig.Token.Tag {
         const ahead = self.token(i -| back) orelse return null;
         return ahead.tag;
@@ -605,6 +653,11 @@ const Scanner = struct {
         // tokenization above.
         try self.classify(alloc);
 
+        // Braces in a token stream balance, so `depth` never reaches zero on a
+        // `}` and the decrement cannot wrap. Were it to, the trap is the answer:
+        // a `depth` wrong in either direction moves lines between library and
+        // test code, and a panic says which build broke where a wrong answer
+        // would only say the gate went quiet.
         var depth: u32 = 0;
         // The depth the current test body opened at, or `null` outside one. A
         // test body ends where that depth closes, not where the file ends.
@@ -747,6 +800,32 @@ const Scanner = struct {
     }
 };
 
+/// The first pair of `files` that breaks it being sorted and duplicate-free,
+/// or null when there is none. `before` and `after` are indices into `files`.
+///
+/// The pair is what the reader needs: naming the two entries says which file
+/// came and which went, which an index alone would not.
+///
+/// The first entry has nothing before it, so the walk starts at one and an
+/// empty list and a one-entry list are both in order — there is no pair to
+/// compare in either, which is the whole answer for both. The bound is
+/// restated in the expression the read sits in, the shape
+/// `RangeSpecSeq.isInfinite` uses for the same last-element read.
+///
+/// This lives here rather than inside `audit`'s `inline for` so that a test
+/// can reach it: the `inline for` exists because `@embedFile` needs a
+/// comptime-known path, and nothing in a comptime-only loop can be tested for
+/// the case where the walk runs off the front of the list.
+fn unsortedAt(files: []const []const u8) ?struct { before: usize, after: usize } {
+    var index: usize = 1;
+    while (index < files.len) : (index += 1) {
+        if (index > 0 and std.mem.order(u8, files[index - 1], files[index]) != .lt) {
+            return .{ .before = index - 1, .after = index };
+        }
+    }
+    return null;
+}
+
 fn audit(alloc: std.mem.Allocator) AuditError!void {
     var scanner: Scanner = .{};
     defer scanner.tokens.deinit(alloc);
@@ -757,19 +836,21 @@ fn audit(alloc: std.mem.Allocator) AuditError!void {
     defer facts.deinit(alloc);
 
     var test_root_src: []const u8 = "";
+    // Checked before anything is embedded, so a list that is out of order says
+    // so rather than failing on a path first.
+    if (unsortedAt(&vendored_files)) |pair| {
+        std.debug.print(
+            "vendored_files is not sorted and duplicate-free: {s} then {s}\n" ++
+                "    A repeated entry checks one file twice while an omitted " ++
+                "one is invisible. Keep the list sorted so that a diff of " ++
+                "it shows exactly which file came and went.\n",
+            .{ vendored_files[pair.before], vendored_files[pair.after] },
+        );
+        return error.VendoredInvariantViolated;
+    }
     // `inline for` because `@embedFile` takes a comptime-known path: naming the
     // whole tree in one expression is what the builtin's limits force.
-    inline for (vendored_files, 0..) |embedded, i| {
-        if (i > 0 and std.mem.order(u8, vendored_files[i - 1], embedded) != .lt) {
-            std.debug.print(
-                "vendored_files is not sorted and duplicate-free: {s} then {s}\n" ++
-                    "    A repeated entry checks one file twice while an omitted " ++
-                    "one is invisible. Keep the list sorted so that a diff of " ++
-                    "it shows exactly which file came and went.\n",
-                .{ vendored_files[i - 1], embedded },
-            );
-            return error.VendoredInvariantViolated;
-        }
+    inline for (vendored_files) |embedded| {
         const src: [:0]const u8 = @embedFile("../" ++ embedded);
         const path = embedded;
         const tests = try scanner.scanFile(alloc, src, path);
@@ -815,4 +896,124 @@ fn audit(alloc: std.mem.Allocator) AuditError!void {
 
 test "the vendored QUIC core reaches for nothing its caller did not hand it" {
     try audit(t.allocator);
+}
+
+/// Scan one synthetic source and report what the gate made of it. The hits are
+/// what the rules found, the tests what the scanner counted as a test block.
+///
+/// A fresh `Scanner` each time because `hits` accumulates across a tree on
+/// purpose, which is exactly what a per-case count cannot reuse.
+fn scanSynthetic(
+    alloc: std.mem.Allocator,
+    src: [:0]const u8,
+    path: []const u8,
+) !struct { hits: u32, tests: u32 } {
+    var scanner: Scanner = .{};
+    defer scanner.tokens.deinit(alloc);
+    defer scanner.scaffolding.deinit(alloc);
+    defer scanner.local_fns.deinit(alloc);
+    const tests = try scanner.scanFile(alloc, src, path);
+    return .{ .hits = scanner.hits, .tests = tests };
+}
+
+test "a `testing.` reference outside every brace neither traps nor hides" {
+    // `reachesTesting` marks the innermost frame that is open, and at container
+    // scope there is none — the read is `frames[len - 1]` over an empty list.
+    // Being outside every brace is the common state, not a curiosity: every
+    // vendored file opens with top-level declarations, and `testing.` is the
+    // spelling this gate itself hunts for. Drop the bound on that read and this
+    // source traps the whole test suite before it reports anything.
+    //
+    // The PRNG is what keeps the assertion from being satisfied by a scanner
+    // that stopped early: a file whose only violation is below the empty stack
+    // still has to be reported.
+    const src: [:0]const u8 =
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\const Probe = testing.Nested;
+        \\
+        \\const Generator = struct {
+        \\    pub fn draw() std.Random.Xoshiro256 {
+        \\        return undefined;
+        \\    }
+        \\};
+        \\
+    ;
+    const result = try scanSynthetic(t.allocator, src, "synthetic/top_level.zig");
+    try t.expectEqual(1, result.hits);
+    try t.expectEqual(0, result.tests);
+}
+
+test "a `fn` with no body does not make the next brace a function body" {
+    // `*const fn (u64) void` is a function *type*. Three of them are live in
+    // the tree today, in `connection.zig` and `connection_manager.zig`, so the
+    // brace that follows one belongs to whatever encloses it — a struct here.
+    // Marking that brace as a function body makes the code inside count as test
+    // scaffolding, and the PRNG below goes unreported. This is the one
+    // imprecision in this file that costs coverage rather than noise, which is
+    // why the `;` and `,` that end a declaration clear the pending mark.
+    const src: [:0]const u8 =
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\const Timer = *const fn (u64) void;
+        \\
+        \\const Registry = struct {
+        \\    const alloc = testing.allocator;
+        \\    pub fn draw() std.Random.Xoshiro256 {
+        \\        _ = alloc;
+        \\        return undefined;
+        \\    }
+        \\};
+        \\
+    ;
+    const result = try scanSynthetic(t.allocator, src, "synthetic/function_type.zig");
+    try t.expectEqual(1, result.hits);
+}
+
+test "a function body that reaches the testing namespace is scaffolding" {
+    // The other side of the same boundary, and the reason the boundary exists:
+    // a helper between two test blocks allocates from the testing allocator
+    // and cannot run outside a test, so counting it as library code would make
+    // the gate fail on the tree it is auditing.
+    const src: [:0]const u8 =
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\
+        \\pub fn helper() void {
+        \\    _ = testing.allocator;
+        \\    var gen: std.Random.Xoshiro256 = undefined;
+        \\    _ = &gen;
+        \\}
+        \\
+    ;
+    const result = try scanSynthetic(t.allocator, src, "synthetic/helper.zig");
+    try t.expectEqual(0, result.hits);
+}
+
+test "a list with no pair in it is in order" {
+    // `unsortedAt` walks from one, so these two are the arms where the walk
+    // never runs and `index - 1` would have nothing in front of it.
+    const empty = [_][]const u8{};
+    const one = [_][]const u8{"only.zig"};
+    try t.expect(unsortedAt(&empty) == null);
+    try t.expect(unsortedAt(&one) == null);
+}
+
+test "the sortedness check names the pair that is out of order" {
+    const sorted = [_][]const u8{ "a.zig", "b.zig", "c.zig" };
+    try t.expect(unsortedAt(&sorted) == null);
+
+    // Out of order in the middle, not at an end: a check that only compared
+    // the first entry against the rest would pass this list.
+    const unsorted = [_][]const u8{ "a.zig", "c.zig", "b.zig" };
+    const pair = unsortedAt(&unsorted).?;
+    try t.expectEqual(@as(usize, 1), pair.before);
+    try t.expectEqual(@as(usize, 2), pair.after);
+
+    // A repeated entry is the same defect from the other side: that file is
+    // checked twice while the one it displaced is checked never.
+    const repeated = [_][]const u8{ "a.zig", "b.zig", "b.zig" };
+    const dup = unsortedAt(&repeated).?;
+    try t.expectEqual(@as(usize, 1), dup.before);
+    try t.expectEqual(@as(usize, 2), dup.after);
 }

@@ -389,18 +389,46 @@ of the X.509 machinery rather than patched.
 up to 8 concurrent paths per connection. The maintainer says so in
 `SPEC/STATUS.md` and does not list it as in progress.
 
+**The structural fact, which the estimate below did not state.** Those two slots
+are an **active/candidate register, not a path set**, and accepting a second
+address *is* abandoning the first. `handleMigration`
+(`vendor/quic/src/quic/connection.zig:3426`) writes the new address into the
+inactive slot at `:3442-3443` and flips `active_path_idx` at `:3452`; the old
+slot keeps its counters, unread, until the next migration overwrites it. At the
+bridge there is literally one destination per connection: `Conn.drain` stamps
+every egress datagram from `conn.peer()` (`src/transport/quic_bridge.zig:702`),
+which is `Connection.peerAddress`
+(`vendor/quic/src/quic/connection.zig:4327-4328`) —
+`&self.paths[self.active_path_idx].peer_addr`.
+
+So **a peer reachable two ways is two connections**, not one connection with two
+paths, and that is not an inference from the array's length alone.
+`src/transport/dial.zig` reached it independently from the dial side and tests
+it: *"two targets to one peer are two connections, because the core has one
+path"* (`:1376`), asserting two live connection ids over one peer.
+
 The mitigation is iroh's own, and it is the reason the design is survivable:
 the synthetic-ULA map presents relay and custom paths as RFC 4193 unique local
 addresses (`fd15:070a:510b:0000/0001/0003::/64`, fixed port 12345) so that one
 connection carries a relay path and N direct paths **without the QUIC stack
-knowing**. So the cost is not correctness, it is convergence speed: with two
-network paths ozai holds a relay path and one direct path at a time, where iroh
-holds up to eight. A peer behind a hostile NAT may take longer to reach a direct
-path, and `MAX_QNT_ADDRESSES` pruning becomes the tuning knob that matters.
+knowing**. With two slots ozai holds a relay path and one direct path at a time,
+where iroh holds up to eight. A peer behind a hostile NAT may take longer to
+reach a direct path, and `MAX_QNT_ADDRESSES` pruning becomes the tuning knob
+that matters. **That is the cost this record originally priced — convergence
+speed, and a path that is one of two rather than one of eight.** It is real, it
+is small, and it is not the whole cost. A peer that *migrates* pays that price
+and little else; a peer that *uses both addresses at once* pays something an
+order of magnitude larger, in a different unit — see
+[Multipath, measured 2026-10-01](#multipath-measured-2026-10-01). The two must
+not be described in the same words, and the first version of this record
+described only the first.
 
 If that turns out not to be good enough, the follow-up is to extend quic-zig's
 path table rather than to reimplement QUIC. It is recorded here so the decision
-is revisited on evidence rather than on frustration.
+is revisited on evidence rather than on frustration. **The evidence now
+exists**, and it points the same way. The honest size of that follow-up is in
+[The follow-up, and its honest size](#the-follow-up-and-its-honest-size), and it
+is not one line.
 
 **Fork maintenance.** quic-zig is one small project with no tags, at 57 stars,
 last pushed 2026-09-29. The fork has to be rebased when it moves, and the patch
@@ -411,6 +439,104 @@ permanently.
 
 **No QUIC v2, no DPLPMTUD on the vendored path.** `SPEC/STATUS.md` marks QUIC v2
 (RFC 9369) ✅ Complete. DPLPMTUD is not claimed. Neither blocks an iroh peer.
+
+### Multipath, measured 2026-10-01
+
+**How this was measured.** Driven directly over `Connection` with hand-built
+`posix.sockaddr` values, no socket, injected clock and seeded entropy, in the
+shape of `vendor/quic/src/quic/lossy_link_test.zig`'s `Pair` (`:339`): client
+and server `ConnectionManager`, two addresses A and B on loopback, 10 ms one-way
+delay. Every figure below was printed by that harness and repeats identically.
+The harness was throwaway and has been deleted. These are measurements of
+**this substrate on this harness** — not a general property of RFC 9000
+migration, and not a claim about any other stack.
+
+**A peer that migrates once, or a handful of times, is cheap.** Bounded, small,
+and paid once per switch:
+
+| case | datagrams | |
+|---|---|---|
+| idle connection | 2 | one PATH_CHALLENGE, one PATH_RESPONSE, zero retries |
+| saturated, 77 KB cwnd, 1 MiB queued | 71 | ~3 RTTs at 20 ms; the surplus is bulk already queued, not machinery — the challenge is exempt from congestion control (`vendor/quic/src/quic/packet_packer.zig:437-440`) |
+| NAT rebinding, port only, saturated | 109 | the other branch of `handleMigration` |
+| worst case | 8 | 1 + 3 challenge re-sends each way, `PathValidator.MAX_RETRIES = 3` (`connection.zig:52`) |
+
+The convergence concern this record priced is real and it is this size. A peer
+behind a hostile NAT pays a few datagrams and a few RTTs to reach a direct path,
+and `MAX_QNT_ADDRESSES` pruning is the knob.
+
+**A peer that uses both addresses concurrently is not cheap at all.** Same
+400 ms window, same deterministic start, the two addresses alternating every
+60 ms:
+
+| | migrations | datagrams | delivered |
+|---|---:|---:|---:|
+| one address | 0 | 12,147 | 15,167 KiB |
+| two, alternating | 8 | 814 | 969 KiB — **6% of the single-address case** |
+
+**It never leaves slow start, because every IP change puts the congestion window
+back to 12,000** — a fresh `Cubic.init()` is
+`initialWindow(1200)` = 12,000 (`vendor/quic/src/quic/congestion.zig:16`,
+`:244`). **It oscillates; it does not converge.** That is a different failure
+from slow convergence, and it is the one a deployment that expects a peer to
+be reachable two ways actually hits. Two of the ten switches in that run cost
+nothing at all, because a switch only counts as a migration when a
+non-probing packet from the new address arrives before the peer moves back.
+
+**What a migration throws away, and what it does not.** Discarded on an IP
+change: congestion window (77,005 → 12,000), RTT history (`has_measurement`
+true → false, `vendor/quic/src/quic/rtt.zig:31`), MTU search (1326 → 1200
+`BASE_PLPMTU`, `mtu.zig:5`), ECN validator state, and the pacer budget
+(`connection.zig:3461-3468`). **Kept:** `bytes_in_flight` — 72,930 before the
+flip and 72,930 after, same turn — and the sent-packet map with its loss
+timers. In-flight packets are not dropped, re-pathed or retransmitted. A
+port-only change is the better case: it keeps cwnd, MTU and RTT and instead
+calls `cc.enterRecoveryForMigration(now)`
+(`vendor/quic/src/quic/congestion.zig:387`), so pre-migration losses stop
+counting.
+
+**Two results that are benign, recorded so this section does not teach a reader
+to fear a thing that is often free.** A second address the peer never speaks
+from costs nothing: 400 ms, 12,147 datagrams, 0 migrations, `paths[1]`
+untouched, no probe sent. Nothing is learned about it and nothing is spent on
+it. And the trigger is narrow — the address only has to send a **non-probing**
+frame. A probing-only packet leaves `has_non_probing` false at
+`connection.zig:1540` and changes nothing, and `Frame.isProbing`
+(`vendor/quic/src/quic/frame.zig:727-732`) covers exactly PADDING,
+NEW_CONNECTION_ID, PATH_CHALLENGE and PATH_RESPONSE.
+
+### The follow-up, and its honest size
+
+The remedy is unchanged: **extend quic-zig's path table rather than reimplement
+QUIC.** It was recorded so the decision would be revisited on evidence rather
+than on frustration, and the evidence now exists. It says extend the table, for
+any deployment that expects a peer to *use* both paths rather than choose
+between them. [Revisit if](#revisit-if) already names the trigger; the trigger's
+remedy is the one this measurement reaches for.
+
+It is not a one-line change and must not be quoted as one. `active_path_idx` is
+load-bearing across `connection.zig`, not a field with one reader: it indexes
+the active path for received-byte accounting (`:1185`, `:1429`), the
+anti-amplification lift (`:1387`), the preferred-address switch
+(`:2721-2729`), the connection-ID rewrite (`:1603`) and egress
+(`peerAddress`, `:4327-4328`). Widening the array is the mechanical half.
+Making those per-path instead of per-active-path is the other half, and it is
+the half that decides whether the measurement above is fixable:
+
+- **Congestion, RTT and ECN state would have to become per-path.** Today a
+  migration *discards* them (`connection.zig:3461-3468`) precisely because
+  there was only one live path to move them to. With N live paths they must be
+  retained per path; if they are not, every path change still costs a fresh
+  Cubic and the 6% is the ceiling rather than the current state.
+- **Bytes-in-flight would have to be attributed per path.** It is one `u64`
+  today (`vendor/quic/src/quic/ack_handler.zig:639`) and the sent-packet map
+  has no path dimension at all — which is why the total survives a migration
+  untouched. That is correct only while one path exists.
+- **Path validation becomes a set of validators**, not the single
+  `PathValidator` (`connection.zig:52`) the inactive slot currently borrows.
+- **`draft-ietf-quic-multipath` itself stays unimplemented.** Widening the
+  table is what the follow-up above has always meant; it is a precondition for
+  the draft, not a claim to have implemented it.
 
 ### The estimate, restated
 
@@ -922,3 +1048,46 @@ the next reader's decision, not this record's to assume.
 either carries a verified client identity or fails the handshake, and a test
 in this tree says which. Until then, treat the two `client_auth == null`
 guards as load-bearing, and do not "fix" `:2027` before the guard above it.
+
+**5. A peer that uses both paths concurrently is broken, and this is the
+measurement of how. Open.** Added 2026-10-01; full method and numbers in
+[Multipath, measured 2026-10-01](#multipath-measured-2026-10-01). Recorded
+here as an open item and not left in the cost prose, because there it reads as
+an acceptable trade and it is not one.
+
+**What is broken.** One `Connection` holds two `NetworkPath` slots
+(`vendor/quic/src/quic/connection.zig:626`) and one `active_path_idx` (`:627`),
+and a non-probing packet from a second peer address is a migration, not a
+second path (`:1540-1544`). So there is no configuration of this substrate in
+which one connection carries two paths. Accepting a second address abandons the
+first, and egress has exactly one destination
+(`Connection.peerAddress`, `:4327-4328`). The cost prose called this
+convergence speed; the measurement says the convergence part is a few
+datagrams and the concurrency part is the whole picture.
+
+**The evidence.** Over the same 400 ms window from an identical deterministic
+start, one address gives 0 migrations, 12,147 datagrams and 15,167 KiB
+delivered; two addresses alternating every 60 ms give 8 migrations, 814
+datagrams and 969 KiB — 6% of the single-address case. It oscillates and never
+converges, because every IP change discards the congestion window and the RTT
+history (`connection.zig:3461-3468`), putting the window back to 12,000.
+Measured on `lossy_link_test.zig`'s `Pair` shape with an injected clock,
+seeded entropy and no socket; harness deleted. Not a general property of QUIC
+migration.
+
+**What works today.** `src/transport/dial.zig` works around it rather than
+being broken by it: two dials, two connections, and the caller owns the policy
+that says which — asserted by its test *"two targets to one peer are two
+connections, because the core has one path"* (`:1376`). That is a correct
+workaround for a peer reached over one path at a time. It is not a substitute
+for a peer that sends on both, because such a peer migrates every time it
+switches and pays a whole congestion window each time it does.
+
+*Closes when* `Connection.paths` holds more than an active slot and a
+candidate, `active_path_idx` is gone or no longer the only way a path is named,
+and congestion, RTT and ECN state are retained per path rather than reset on
+use (`connection.zig:3461-3468`) — with a test in this tree that drives one
+connection from two addresses at once and asserts both are carried and neither
+restarts slow start. Until then, operate the two-path peer as two peers, each on
+one path, and see [the follow-up's scope](#the-follow-up-and-its-honest-size)
+before pricing it as a small change.
