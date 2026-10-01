@@ -8,57 +8,66 @@ what "next" means.
 
 - **M1 — identity and addressing.** `src/base/`. Pinned against iroh's
   published vectors.
-- **M7, pure half — the synthetic-ULA construction and its inverse.**
-  `src/base/ula.zig`, vector-pinned to iroh `1.3.0`. The allocation of an
-  address to a key is `src/transport/addr_map.zig`; the socket is not built.
 - **M2 — wire codecs.** `src/wire/postcard.zig`, `src/blobs/range_spec.zig`,
   and a fuzz harness that runs at every decoder boundary.
 - **M3 — tickets and discovery records.** `src/ticket/`, `src/discovery/pkarr.zig`.
 - **M4 — relay wire protocol.** `src/relay/frame.zig`, `client.zig`, `server.zig`.
-- **M5 — address lookup.** `src/discovery/item.zig`, `resolve.zig`, `dns.zig`.
-- **M6 — net report and NAT classification.** `src/net/report.zig`.
-- **M8 — the QUIC substrate.** `vendor/quic/`, 33 files, no socket, no clock,
-  no global entropy, no libc. See
+- **M5 — address lookup.** `src/discovery/item.zig`, `resolve.zig`, `dns.zig`,
+  and `dial_source.zig`, which asks every resolver, merges with `item.merge`,
+  takes `item.winner` and dials what the network said.
+- **M6 — net report and NAT classification.** `src/net/report.zig`, and
+  `probe_run.zig`, which executes a probe `Step` against an injected transport
+  and folds what it measured.
+- **M7 — the transport seam.** `src/base/ula.zig` (the synthetic-ULA
+  construction, vector-pinned), `src/transport/addr_map.zig` (the memoised
+  allocation, entropy injected), and `src/transport/socket.zig` (the
+  `sendmsg`/`recvmsg` layer with the GSO/GRO/ECN model and the capability
+  probe).
+- **M8 — the QUIC substrate.** `vendor/quic/`, no socket, no clock, no global
+  entropy, no libc, guarded by `test/vendored_invariants.zig`. See
   [`DECISIONS/0001-transport-substrate.md`](DECISIONS/0001-transport-substrate.md)
   for the execution record and what it cost.
-- **M9 — dispatch, and the endpoint over it.** `src/router/router.zig`,
-  `src/endpoint/endpoint.zig`, `src/endpoint/incoming_filter.zig`. The filter
-  is a vtable. The accept loop is a function of `(state, event)` and takes no
-  `Io` at all: the two operations that need a runtime — spawning a task and
-  cancelling one — are named as `Action`s and performed by the caller with
-  the `Io` it already holds for the socket.
-- **M10 — the holepunch gate.** `src/net/holepunch.zig`.
+- **M9 — dispatch, the endpoint, and the dial path.**
+  `src/router/router.zig`, `src/endpoint/`, `src/transport/dial.zig`, and
+  `src/discovery/lookup_io.zig` for the retrieval seam the dial named and
+  stopped at.
+- **M10 — the holepunch gate, and the join that feeds it.**
+  `src/net/holepunch.zig` and `holepunch_run.zig`.
 - **M11 — gossip and blobs.** `src/gossip/`, `src/blobs/protocol.zig`.
+- **A program.** `src/node/` — owns sockets, drives its own loop, performs
+  every `Action` the endpoint owes a caller, runs the relay, and winds down in
+  the router's order. `zig build run-ozai-node`.
+- **Proof over a real wire.** `test/loopback_test.zig` (handshake, identity from
+  the DER encoding, streams, ECN), `test/protocol_loopback_test.zig` (four
+  endpoints converging on one membership), `test/blobs_transfer_test.zig`
+  (bytes, ranges, framing, EOF), and `test/two_process_test.zig` (two processes,
+  independent teardown, both directions).
 
 ## Next
 
-The stack accepts a QUIC connection and cannot originate one, and nothing
-under `src/` owns a socket. Both halves are next, and neither is visible from
-the module list.
+Everything below is reachable on this node. The one thing that is not is at the
+bottom of this file.
 
-- **A dial path.** There is none anywhere under `src/`. `quic_bridge.zig`
-  owns a `quic.ConnectionManager`, which only ever runs a server, so the
-  bridge is accept-side: `recv` (`:555`) takes a datagram the core did not
-  have and hands back an `Ingress`, and `Conn.drain` (`:279`) hands back
-  `batch.Send` values. Nothing originates a connection. The client half that
-  does exist is a test helper — `Client` (`quic_bridge.zig:854`) builds a
-  peer end with `quic.connection.connectInto` (`:888`) and is reachable only
-  from test blocks. Promoting it is the first act, and one field decides
-  whether it works: `TlsConfig.expect_peer_node_id` is client-only, so the
-  pin a dialler needs is not the pin an acceptor enforces
-  (`ClientAuth.expect_node_id`), and the translation has to set the right one
-  on each side rather than the one that looks like a pin.
-- **A socket.** `batch.zig` models what a socket is to be asked for —
-  `Capability`, `Send`, `Runs`, `Recv`, `Cmsg`, `Refused`, `Report` — and
-  stops before the `sendmsg` thin on purpose. Its module doc says "There is
-  no socket here", and `Capability`'s own doc says the probe "needs a
-  socket, so it is not here". So no one has asked the kernel what it can do:
-  every batch falls back a segment at a time, and no `EIO` or `EINVAL` ever
-  comes back to demote a `Capability`. What closes this is one file that
-  opens a UDP socket, answers the two probes into a `Capability`, applies
-  `socketOptions(family, coalesce)`, turns each run of a `Send` into one
-  `sendmsg` carrying the `Cmsg`s `cmsg` already built, and reports a refusal
-  as the `Refused` that `report` already turns into a `Report`.
+- **A relay reachable over a real network.** The relay runs inside one process
+  and is driven by `src/node/`, but nothing has yet put a relay on one side and a
+  client on the other across an actual socket pair. That is the shortest path to
+  proving the two-queue invariant and the admit-once guard against traffic
+  rather than against a loopback pair that already trusts itself.
+- **The gate inputs probes cannot supply.** `src/net/holepunch_run.zig` names
+  them: a probe can give the local set and the varies-by-destination verdict,
+  and cannot give the peer's candidate addresses, the connection, what the QUIC
+  stack said, a path's status, or the socket's interface addresses. Each needs a
+  producer or an explicit admission that it is out of scope.
+- **`send_token` is recorded, not performed.** The endpoint's action for a retry
+  token has nowhere to go: the vendored core exposes no per-attempt retry hook.
+  Either the core grows one — which is a vendor patch and needs a
+  `VENDORED.md` entry — or the action is removed as unperformable. **Leaving an
+  action named but unreachable is the kind of thing this project's own rules
+  call dead weight.**
+- **The relay's outbound frame bound.** `.close`'s denial frame carries a
+  peer-controlled reason string with no bound, and `relay_out` is sized so a
+  frame longer than `room - varint_max` cannot be written. Decide what a relay
+  may send: bounded reason, or reserved worst-case room.
 
 ## Open, and not yet closable here
 
