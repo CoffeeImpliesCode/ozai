@@ -114,6 +114,37 @@ pub fn build(b: *std.Build) void {
         ).dependOn(&run.step);
     }
 
+    // The first program in the project. A separate module rooted at
+    // `src/node/main.zig` and not an entry under `examples`, because it is not
+    // an example: it is the thing `src/node/node.zig` exists to make runnable,
+    // and an example directory would say it is a demonstration of something
+    // else. `link_libc` is here for the reason `socket.zig`'s module doc gives
+    // — `socket`, `bind`, `sendmsg`, `recvmsg` and `close` are libc's.
+    //
+    // It is installed rather than only run, because a binary that can only be
+    // reached through the build runner is a binary nobody can put in a
+    // supervisor.
+    const node_main_mod = b.createModule(.{
+        .root_source_file = b.path("src/node/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    node_main_mod.addImport("ozai", lib_mod);
+    node_main_mod.link_libc = true;
+    const node_exe = b.addExecutable(.{
+        .name = "ozai-node",
+        .root_module = node_main_mod,
+    });
+    b.installArtifact(node_exe);
+
+    const run_node = b.addRunArtifact(node_exe);
+    run_node.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_node.addArgs(args);
+    b.step(
+        "run-ozai-node",
+        "Run an ozai node until it is stopped",
+    ).dependOn(&run_node.step);
+
     // testing
 
     // The unit tests get a root module no other compilation imports: coverage
@@ -213,6 +244,51 @@ pub fn build(b: *std.Build) void {
     });
     const run_protocol_tests = b.addRunArtifact(protocol_tests);
 
+    // The first *transfer* over a real connection, in its own module for the
+    // same reason as the two artifacts above, and with the same `link_libc`:
+    // it opens sockets and reaches into `blobs/protocol.zig`. Its provider half
+    // is its own, because the module is a codec and has no server.
+    //
+    // It runs under the same custom runner and declares no `--expect-log`:
+    // nothing in it provokes an error-level log on purpose, so an error log
+    // here is a finding rather than an expectation.
+    const transfer_mod = b.createModule(.{
+        .root_source_file = b.path("test/blobs_transfer_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    transfer_mod.addImport("ozai", lib_mod);
+    transfer_mod.link_libc = true;
+    const transfer_tests = b.addTest(.{
+        .root_module = transfer_mod,
+        .test_runner = .{ .path = b.path("test/expected_log_runner.zig"), .mode = .server },
+    });
+    const run_transfer_tests = b.addRunArtifact(transfer_tests);
+
+    // The first test that puts two nodes in two *processes*, wired like the
+    // three above and for the same reason: it opens real sockets and needs
+    // `link_libc`. Its isolation is the point of it — one process means one
+    // allocator, one cancellation scope and one lifetime, so every path that
+    // only bites when two things die independently is never reached — and that
+    // is worth a step of its own rather than another `addTest` folded into the
+    // ones above.
+    const two_process_mod = b.createModule(.{
+        .root_source_file = b.path("test/two_process_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    two_process_mod.addImport("ozai", lib_mod);
+    two_process_mod.link_libc = true;
+    const two_process_tests = b.addTest(.{
+        .root_module = two_process_mod,
+        .test_runner = .{ .path = b.path("test/expected_log_runner.zig"), .mode = .server },
+    });
+    const run_two_process_tests = b.addRunArtifact(two_process_tests);
+    // The binary it runs is the one `zig build` installs, so installing it is a
+    // dependency of the run step rather than something the test builds a second
+    // copy of.
+    run_two_process_tests.step.dependOn(b.getInstallStep());
+
     // Coverage instrumentation is opt-in because it pins the LLVM backend,
     // links the zig-cov runtime into the test binary, and makes that binary
     // write a `.zcov` file on exit; none of that belongs in a plain build.
@@ -234,6 +310,8 @@ pub fn build(b: *std.Build) void {
             integration_tests,
             loopback_tests,
             protocol_tests,
+            transfer_tests,
+            two_process_tests,
         }) |artifact| {
             // The self-hosted backends emit no counters, `fuzz` is the only
             // switch that makes LLVM emit them, and the runtime flushes from a
@@ -250,6 +328,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_loopback_tests.step);
     test_step.dependOn(&run_protocol_tests.step);
+    test_step.dependOn(&run_transfer_tests.step);
+    test_step.dependOn(&run_two_process_tests.step);
     test_step.dependOn(&run_invariants_tests.step);
 
     // fuzzing

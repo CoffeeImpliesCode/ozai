@@ -343,6 +343,67 @@ patching the core to suit a caller that drops a documented owning pointer would
 be the wrong trade. What this directory owed was the sentence that says so,
 and that is what the patch above adds.
 
+### 6. A pinned client identity and a resumable session ticket
+
+`DECISIONS/0001` item 4 measured, on a throwaway copy, that lifting upstream's
+two `client_auth == null` guards turns into a **silent authentication
+bypass**: a server configured with `ClientAuth{ .expect_node_id = …,
+.required }` completes a resumed handshake with `peer_cert == null` and
+`peer_node_id == null` while its pin is in force. The record's stated reason —
+that the ticket format is too small to carry a node id — is wrong. The
+plaintext is `[64]u8` and the sealed form `[80]u8`, both sized in this file, and
+growing them by 33 bytes is mechanical. The real block is that TLS has one
+client-identity acquisition path and resumption skipped it.
+
+**The decision.** Resumption and a pin are not mutually exclusive; what is
+mutually exclusive is *a ticket as identity* and *a pin*. TLS 1.3 does not
+currently send a CertificateRequest on a PSK handshake (RFC 8446 Appendix
+E.3), and the combination that appendix calls unsafe is an **external** PSK,
+which two endpoints may share and authenticate each other with. A PSK out of a
+NewSessionTicket is the case it singles out as sound, because the binder makes
+the client's signature cover the server's certificate transitively. So a pinned
+client keeps its ticket and its resumption. What it loses is the right to be
+authenticated **by** the ticket: a session ticket is bearer material —
+replayable, and handed to the client in the clear — so a node id recovered from
+one would be a credential rather than a proof of possession, and an iroh peer's
+identity is possession of the private key. A resumed connection therefore
+answers the CertificateRequest exactly as a full one does, and every connection
+proves its certificate afresh. What the PSK removes is the server's own
+Certificate and CertificateVerify, which is where the cost was.
+
+**This is a recorded interop deviation, not a claim of conformance.** RFC 8446
+describes no exchange in which a CertificateRequest follows a PSK, so a peer
+that speaks it will read this flight as a protocol error. The tree's only PSKs
+are its own tickets and its only peers are ozai, so the deviation has nothing
+to break today; the `resumption` value is where a later decision to be strict
+again would go.
+
+`tls13.zig`:
+
+| Line | Change | Why |
+|---|---|---|
+| `:2040` `serverBuildEncryptedExtensions` | routes to `server_send_certificate_request` on a policy in force, PSK or not, and only skips the server's own Certificate | the two `using_psk` sites disagreed, and the disagreement was the bypass. Which one is wrong is decided once, here. |
+| `:2059` `serverBuildCertificateRequest` | skips to `server_send_finished` on a PSK instead of sending a Certificate the PSK already replaced | the other half of the same disagreement |
+| `:2179` `serverTicketKey` | one accessor for the sealing key | the writer and the PSK reader have to agree on it |
+| `:2194` `serverIdentityEstablished` / `:2201` `serverFinish` | both writers of `.connected` ask one predicate, and it refuses a policy in force with no identity | the invariant is structural rather than a flag; `serverProcessClientCertificate` stays the sole writer of `peer_node_id` |
+| `:1273` dispatcher, `:1501` `clientProcessCertificate` | the resumed client reads a CertificateRequest and answers it, instead of skipping the state on `using_psk` | the client half of the same hole: skipping the state left the server waiting for a Certificate the client had been told not to send |
+| `:2603` `peekHandshakeMsg` | `readHandshakeMsg` split into a peek and a take | the resumed client must know the next message is a Finished *before* it changes state, and `readHandshakeMsg` steps past it by the time it knows |
+| `:597` `sealed_ticket_len`, `:2424` | the sealed-ticket size named once, and the offered identity length bounded by it | `tryProcessPsk` copied `identity_len` bytes into two fixed buffers with only a lower bound; the length is attacker-chosen and reaches this from any ClientHello. The path is now also reachable under a client-auth policy, so the bound is part of this patch. |
+| `:609` `TicketKey`, `:632` `Resumption`, `:827` `TlsConfig.resumption` | `ticket_key: ?[16]u8` becomes one `Resumption` value, `union(enum) { server: TicketKey, client: *const SessionTicket }` | `DECISIONS/0001` item 1. A ticket and the key that opens it are one fact, and two fields let a caller name a ticket from one key and a key from another without either noticing. `TlsConfig.session_ticket` stays — `connection.zig:4671` reads it for 0-RTT remembered transport parameters, which cost a resumption its remembered limits and nothing else — and is no longer the handshake's resumption input, so it cannot influence whether a handshake resumes. |
+
+Four tests close it: a pinned client resuming across two connections against a
+constant key with the pin still holding on the second; a rotated key refusing
+the ticket rather than resuming; a resumed connection with a pin in force
+failing `certificate_required` rather than completing with no identity; and a
+server handed a ticket issuing none.
+
+461 tests now, from 457.
+
+**One defect found on the way and not fixed here.** A client that offers a
+ticket the server declines cannot fall back, so the rotated-key test records a
+refusal rather than a full handshake. Pre-existing, client-side, and written
+up under "What is still not settled" below rather than here.
+
 ## Measured cost
 
 | | Predicted | Measured |
@@ -350,6 +411,7 @@ and that is what the patch above adds.
 | Socket layer | 7 files, 7,194 lines | 5 never copied (6,384), plus `c_api.zig` and `fuzz.zig` (2,391) because both drive the stack through the event loop. No `xev`, no `link_libc`. |
 | Clock and CSPRNG | 60 sites | 85 reads removed (46 clock, 39 entropy), 109 new parameters (42 `now`, 6 `now_s`, 61 `random`) across 11 files, both public entry points changed, no design change |
 | Certificate work | four functions, `TlsConfig`, `ClientAuth`, a flag split | 24 named functions, the `ChainError` set, the `X509Extensions` struct and two `ClientAuth` size constants deleted outright, the flag gone with them, plus `keylog_file` and `ca_bundle`, which this record never mentioned |
+| Resumption and client auth | two guards lifted, ticket format grown | neither. The guards were the bug: a resumed handshake now asks for the client certificate exactly as a full one does, the ticket carries no identity at all, and the ticket and the key that opens it became one `Resumption` value. `tls13.zig` 4,809 → 5,191 lines: 225 of tests and helpers, 157 of code. |
 | The seam file | "splits rather than deletes" | split, then emptied by the threading patch, then deleted. There is no seam file. |
 | Module root | "cut in the same pass" | `lib.zig` 47 → 41 lines, four layers of re-exports gone |
 | Interop matrix | re-run at our SHA | **not done** |
@@ -382,7 +444,9 @@ Per file, against the pinned commit:
 
 Diff size is not a measure of this patch. `tls13.zig` went 4,866 → 4,809 lines
 and `connection.zig` 6,666 → 6,762: the deleted walk and the added lift, doc
-comments and tests are of about the same size.
+comments and tests are of about the same size. §6 grew it again, to 5,191,
+which is the other half of the same point — a security invariant costs lines,
+and the number that matters is the one on the test.
 
 **The next person pricing a fork of this shape should price the threading, not
 the certificate work.** Eleven of the thirteen files changed to take a new
@@ -430,18 +494,25 @@ this project's rules would report findings nobody intends to fix.
 
 ## What is still not settled
 
-**1. 0-RTT, and the verifier identity. Open.** `TlsConfig.session_ticket`
-(`tls13.zig:736`) and `TlsConfig.ticket_key` (`tls13.zig:737`) must be stable
-across every client-config construction, or resumption silently stops matching.
-The certificate patch did **not** discharge this and nothing since has touched
-it. Treat early data as unimplemented. It closes when one constructor owns both
-values and a test resumes against a server whose ticket key is held constant
-across two connections.
+**1. 0-RTT, and the verifier identity. Closed, with a residue.** One value owns
+both halves now — `TlsConfig.resumption`, a `Resumption` that is a server's
+`TicketKey` or a client's `SessionTicket` and never both — and a test resumes
+against a server whose key is held constant across two connections, with the
+second observably not a full handshake. The tension the old entry named is also
+gone, in the direction the entry wanted: a pinned client resumes, and the pin
+holds on the resumed connection. See entry 6 above.
 
-There is a tension that keeps this open rather than merely untidy: `ClientAuth`'s
-doc comment says session tickets are neither issued nor accepted while a
-client-auth policy is in force. In this tree a pinned client identity and
-resumption are mutually exclusive, and an iroh peer wants both.
+**What item 1 did not know, and entry 6 corrects.** The entry said the ticket
+format is the block. It is not — the plaintext is `[64]u8` and the sealed form
+`[80]u8`, both sized in the file, and growing them is mechanical. The block is
+that TLS has one client-identity acquisition path and resumption skipped it.
+
+**Still open, and now named.** A client that offers a ticket the server
+declines cannot fall back: this stack has one handshake schedule rather than
+two, so the client verifies the server's Finished against the schedule it
+committed to and refuses the connection. That is a client-side fix in
+`clientProcessServerHello` and it is not this entry's business. Early data
+remains unimplemented.
 
 **2. Interop, and therefore requirement 3. Open.** The matrix this vendoring
 relied on is upstream's, and it is **not reproducible from this repository**:

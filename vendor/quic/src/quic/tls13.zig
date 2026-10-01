@@ -255,8 +255,21 @@ fn readTlv(b: []const u8, pos: usize, limit: usize) ?Tlv {
 /// `SubjectPublicKeyInfo` and compared against `expect_node_id`. A
 /// certificate that fails that always fails the handshake with
 /// bad_certificate; `mode` only decides what happens when the client sends
-/// none. Session tickets are neither issued nor accepted while a policy is in
-/// force, so every connection proves its certificate afresh.
+/// none.
+///
+/// A policy in force does not opt the connection out of resumption. TLS 1.3
+/// does not currently send a CertificateRequest on a PSK handshake (RFC 8446
+/// Appendix E.3), and the combination that appendix calls unsafe is an
+/// *external* PSK, which two endpoints may share and authenticate each other
+/// with. A PSK out of a NewSessionTicket is the case it singles out as sound:
+/// the binder makes the client's signature cover the server's certificate
+/// transitively. So a resumed connection here asks for the certificate and
+/// the client answers exactly as it does on a full handshake, and every
+/// connection proves its certificate afresh. What the PSK removes is the
+/// server's own Certificate and CertificateVerify. It does not remove the
+/// client identity, because a session ticket is bearer material: it is handed
+/// to the client and replayable, so a node id recovered from one would be a
+/// credential rather than a proof of possession (DECISIONS/0001 item 4).
 pub const ClientAuth = struct {
     /// The node id the client's certificate has to carry. Null accepts any
     /// key, and then the client has proved possession of the id it presented
@@ -576,6 +589,71 @@ pub const SessionTicket = struct {
     }
 };
 
+/// The largest sealed ticket this stack writes: a fixed plaintext plus
+/// AES-128-GCM's 16-byte tag. Named once because both ends of the ticket
+/// path need the same number — the writer sizes its buffer and the reader
+/// bounds what it will copy — and two spellings of it are two chances to
+/// read past one of them.
+const sealed_ticket_len = 80;
+
+/// A server's ticket sealing key: AES-128-GCM, so 16 bytes (RFC 8446
+/// §4.6.1 leaves the construction to the server). One value for a server's
+/// whole life, and the only way to make one is `generate` — there is no
+/// `rotate` and no setter, so a key cannot change under the tickets it
+/// sealed without that being written out.
+///
+/// `generate` takes the caller's entropy rather than reaching for a global:
+/// a handshake driven from a global CSPRNG could not be driven twice with
+/// two generators, which is the property the whole pure core is for
+/// (DECISIONS/0002).
+pub const TicketKey = struct {
+    bytes: [16]u8,
+
+    pub fn generate(random: std.Random) TicketKey {
+        var key: TicketKey = undefined;
+        random.bytes(&key.bytes);
+        return key;
+    }
+};
+
+/// Resumption, as one value.
+///
+/// A client resumes with a ticket it holds; a server issues and accepts
+/// tickets under a key it holds. One field on `TlsConfig`, not two,
+/// because the two are one fact — a ticket is only resumable by the key
+/// that sealed it — and a pair of fields lets a caller name a ticket from
+/// one key and a key from another without either of them noticing. That
+/// pairing is what DECISIONS/0001 item 1 asks for, and making it a value
+/// rather than a convention is the only version of it that survives
+/// contact with a caller who rebuilds the config for every connection.
+///
+/// The tag says which end is speaking, so a client config cannot be handed
+/// a sealing key and a server config cannot be handed a ticket.
+pub const Resumption = union(enum) {
+    server: TicketKey,
+    client: *const SessionTicket,
+
+    /// The key to seal and open tickets under, or null on a config that
+    /// issues none — which a client config always is. Static, and named for
+    /// the optional, because that is what a config field holds and Zig will
+    /// not find a union's members through one.
+    pub fn serverKey(self: ?Resumption) ?TicketKey {
+        return switch (self orelse return null) {
+            .server => |key| key,
+            .client => null,
+        };
+    }
+
+    /// The ticket to resume with, or null on a config that resumes with
+    /// none — which a server config always is.
+    pub fn clientTicket(self: ?Resumption) ?*const SessionTicket {
+        return switch (self orelse return null) {
+            .client => |ticket| ticket,
+            .server => null,
+        };
+    }
+};
+
 // ─── Server certificates / SNI ───────────────────────────────────────
 
 /// A certificate chain and the private key for its leaf.
@@ -733,8 +811,20 @@ pub const TlsConfig = struct {
     /// over the raw 44 bytes. When set, the fingerprint stands in for a
     /// chain; no chain is walked either way.
     cert_hashes: ?[]const [32]u8 = null,
-    session_ticket: ?*const SessionTicket = null, // Stored ticket from previous connection (client)
-    ticket_key: ?[16]u8 = null, // AES-128-GCM key for encrypting/decrypting tickets (server)
+    /// Client only: remembered transport parameters for 0-RTT, carried
+    /// forward from the connection that was issued the ticket.
+    ///
+    /// Not the handshake's resumption input — `resumption` is, and it is
+    /// the only one, so a ticket and the key that opens it cannot be set
+    /// apart on the same config. This field stays because
+    /// `connection.zig` reads it for exactly this: the parameters are an
+    /// optimisation, and dropping them costs 0-RTT its remembered limits
+    /// and nothing else.
+    session_ticket: ?*const SessionTicket = null,
+    /// Resumption, on either end: a client names the ticket it resumes
+    /// with, a server the key it seals and opens tickets under. Null is a
+    /// connection that never resumes, and it is one null for both roles.
+    resumption: ?Resumption = null,
     cipher_suite_only: ?quic_crypto.CipherSuite = null, // If set, offer ONLY this cipher suite
     quic_version: u32 = protocol.QUIC_V1, // QUIC version (affects HKDF labels)
 };
@@ -935,7 +1025,7 @@ pub const Tls13Handshake = struct {
         self.state = .client_start;
         self.is_server = false;
         self.transcript = TranscriptHash.init();
-        self.key_schedule = if (config.session_ticket) |ticket|
+        self.key_schedule = if (Resumption.clientTicket(config.resumption)) |ticket|
             KeySchedule.initWithPsk(ticket.psk)
         else
             KeySchedule.init();
@@ -1175,14 +1265,12 @@ pub const Tls13Handshake = struct {
             .client_start => return self.clientBuildHello(now_s, random),
             .client_wait_server_hello => return self.clientProcessServerHello(),
             .client_wait_encrypted_extensions => return self.clientProcessEncryptedExtensions(),
-            .client_wait_certificate => {
-                // If PSK was accepted, skip certificate and certificate_verify
-                if (self.using_psk) {
-                    self.state = .client_wait_finished;
-                    return ._continue;
-                }
-                return self.clientProcessCertificate();
-            },
+            // A PSK skips the server's Certificate and CertificateVerify and
+            // nothing else — see `ClientAuth` for why a policy in force does
+            // not stop the CertificateRequest. Skipping this state on
+            // `using_psk` left the server waiting for a Certificate the
+            // client had been told, by that skip, never to send.
+            .client_wait_certificate => return self.clientProcessCertificate(),
             .client_wait_certificate_verify => return self.clientProcessCertificateVerify(),
             .client_wait_finished => return self.clientProcessFinished(),
             .client_send_finished => return self.clientSendFinished(random),
@@ -1256,7 +1344,7 @@ pub const Tls13Handshake = struct {
             self.config.alpn,
             self.config.server_name,
             self.tp_encoded[0..self.tp_encoded_len],
-            self.config.session_ticket,
+            Resumption.clientTicket(self.config.resumption),
             &self.key_schedule,
             self.config.cipher_suite_only,
             now_s,
@@ -1265,7 +1353,7 @@ pub const Tls13Handshake = struct {
         self.transcript.update(msg);
 
         // If we have a session ticket, derive early data secret for 0-RTT
-        if (self.config.session_ticket != null) {
+        if (Resumption.clientTicket(self.config.resumption) != null) {
             const transcript_hash = self.transcript.current();
             self.key_schedule.deriveEarlyDataSecret(transcript_hash);
             self.pending_install_early = true;
@@ -1404,6 +1492,19 @@ pub const Tls13Handshake = struct {
     }
 
     fn clientProcessCertificate(self: *Tls13Handshake) !Action {
+        // A resumed handshake has no server certificate to process, so what
+        // follows EncryptedExtensions on one is a CertificateRequest or the
+        // server's Finished. The Finished is answered by
+        // `clientProcessFinished`, which reads it itself, so it is looked at
+        // rather than taken here.
+        if (self.using_psk) {
+            const next = self.peekHandshakeMsg() orelse return .wait_for_data;
+            if (next[0] == @intFromEnum(tls.HandshakeType.finished)) {
+                self.state = .client_wait_finished;
+                return ._continue;
+            }
+        }
+
         const msg = self.readHandshakeMsg() orelse return .wait_for_data;
 
         // RFC 8446 4.3.2: a server that wants a client certificate asks here,
@@ -1791,8 +1892,11 @@ pub const Tls13Handshake = struct {
         }
 
         // Try to process PSK extension if present and we have a ticket key.
-        // A ticket carries no client identity: with client auth, always a full handshake.
-        if (psk_ext_offset != null and self.config.ticket_key != null and self.client_auth == null) {
+        // A policy in force does not refuse the PSK: resumption and a client
+        // certificate are not alternatives, and skipping the CertificateRequest
+        // is what left a resumed connection reaching the end with a pin in
+        // force and nothing to compare against it (DECISIONS/0001 item 4).
+        if (psk_ext_offset != null and self.serverTicketKey() != null) {
             std.log.info("PSK extension found, attempting PSK processing", .{});
             self.tryProcessPsk(msg, body, pos, ext_data, psk_ext_offset.?, psk_ext_len);
             if (self.using_psk) {
@@ -1930,14 +2034,15 @@ pub const Tls13Handshake = struct {
         @memcpy(self.out_buf[0..msg.len], msg);
         self.out_len = msg.len;
 
-        // If PSK was accepted, skip certificate and certificate_verify
-        if (self.using_psk) {
-            self.state = .server_send_finished;
-        } else if (self.client_auth != null) {
-            self.state = .server_send_certificate_request;
-        } else {
-            self.state = .server_send_certificate;
-        }
+        // What the next message is, decided once. A CertificateRequest is
+        // asked for whenever a policy is in force, PSK or not; only this
+        // server's own Certificate is what a PSK removes.
+        self.state = if (self.client_auth != null)
+            .server_send_certificate_request
+        else if (self.using_psk)
+            .server_send_finished
+        else
+            .server_send_certificate;
         return Action{ .send_data = .{
             .level = .handshake,
             .data = self.out_buf[0..self.out_len],
@@ -1948,7 +2053,10 @@ pub const Tls13Handshake = struct {
         const msg = buildCertificateRequest(&self.out_buf) catch return error.InternalError;
         self.out_len = msg.len;
         self.transcript.update(msg);
-        self.state = .server_send_certificate;
+        // The PSK removed this server's Certificate, not the request that
+        // asks the client for one. The two used to disagree here and at the
+        // state above, and either disagreement was the bypass.
+        self.state = if (self.using_psk) .server_send_finished else .server_send_certificate;
         return Action{ .send_data = .{
             .level = .handshake,
             .data = self.out_buf[0..self.out_len],
@@ -2053,12 +2161,45 @@ pub const Tls13Handshake = struct {
 
         self.transcript.update(msg);
 
-        // If we have a ticket key, send a NewSessionTicket before completing
-        if (self.config.ticket_key != null and self.client_auth == null) {
+        // A ticket is owed whenever this side seals them at all. A policy in
+        // force does not stop it: the ticket carries no identity, so it is
+        // never what authenticates the client.
+        if (self.serverTicketKey() != null) {
             self.state = .server_send_ticket;
             return ._continue;
         }
 
+        return self.serverFinish();
+    }
+
+    /// The key this side seals and opens tickets under, or null when it
+    /// seals none. Named once because the writer and the PSK reader have
+    /// to agree on it, and a disagreement between them is a server that
+    /// seals under one key and opens under another.
+    fn serverTicketKey(self: *const Tls13Handshake) ?TicketKey {
+        return Resumption.serverKey(self.config.resumption);
+    }
+
+    /// Whether this handshake may declare the connection complete.
+    ///
+    /// A policy in force means the connection completes only on an identity
+    /// this server verified. `serverProcessClientCertificate` is the sole
+    /// writer of `peer_node_id` and the sole comparison of
+    /// `auth.expect_node_id`, and a PSK does not reach it — which is
+    /// exactly why this is asked separately: the state machine routes a
+    /// resumed connection through the CertificateRequest just as it routes
+    /// a full one, and this refuses the handshake rather than the
+    /// connection if some future path ever skips it. Both writers of
+    /// `connected` ask it, so there is one answer and no flag to remember.
+    fn serverIdentityEstablished(self: *const Tls13Handshake) bool {
+        const auth = self.client_auth orelse return true;
+        return auth.mode == .optional or self.peer_node_id != null;
+    }
+
+    /// The one place a server handshake reaches `connected` without owing
+    /// a ticket.
+    fn serverFinish(self: *Tls13Handshake) error{CertificateRequired}!Action {
+        if (!self.serverIdentityEstablished()) return error.CertificateRequired;
         self.state = .connected;
         return .complete;
     }
@@ -2129,7 +2270,7 @@ pub const Tls13Handshake = struct {
     // ─── Server: Send NewSessionTicket ──────────────────────────────
 
     fn serverSendTicket(self: *Tls13Handshake, now_s: i64, random: std.Random) !Action {
-        const ticket_key = self.config.ticket_key orelse return error.InternalError;
+        const ticket_key = self.serverTicketKey() orelse return error.InternalError;
 
         // Derive resumption master secret
         const transcript_hash = self.transcript.current();
@@ -2161,7 +2302,7 @@ pub const Tls13Handshake = struct {
         // Encrypt ticket with AES-128-GCM using ticket_key
         var nonce_for_ticket: [12]u8 = .{0} ** 12;
         @memcpy(nonce_for_ticket[8..12], &nonce_buf);
-        var encrypted_ticket: [80]u8 = undefined; // plaintext + 16 tag
+        var encrypted_ticket: [sealed_ticket_len]u8 = undefined; // plaintext + 16 tag
         var tag: [16]u8 = undefined;
         Aes128Gcm.encrypt(
             encrypted_ticket[0..plaintext_len],
@@ -2169,7 +2310,7 @@ pub const Tls13Handshake = struct {
             ticket_plain[0..plaintext_len],
             "",
             nonce_for_ticket,
-            ticket_key,
+            ticket_key.bytes,
         );
         @memcpy(encrypted_ticket[plaintext_len..][0..16], &tag);
         const encrypted_len = plaintext_len + 16;
@@ -2223,6 +2364,7 @@ pub const Tls13Handshake = struct {
         @memcpy(self.out_buf[0..nst_pos], nst[0..nst_pos]);
         self.out_len = nst_pos;
 
+        if (!self.serverIdentityEstablished()) return error.CertificateRequired;
         self.state = .connected;
         return Action{ .send_data = .{
             .level = .application,
@@ -2241,7 +2383,7 @@ pub const Tls13Handshake = struct {
         psk_ext_offset: usize,
         psk_ext_len: usize,
     ) void {
-        const ticket_key = self.config.ticket_key orelse return;
+        const ticket_key = self.serverTicketKey() orelse return;
 
         if (psk_ext_len < 6) return;
         const psk_data = ext_data[psk_ext_offset..][0..psk_ext_len];
@@ -2274,6 +2416,12 @@ pub const Tls13Handshake = struct {
 
         // Decrypt ticket identity to get PSK
         if (identity_len < 16 + 1) return; // at least tag + 1 byte
+        // A ticket this server sealed is one plaintext plus a 16-byte tag
+        // and no longer. A longer identity is a peer offering something that
+        // would be copied past the end of two fixed buffers below, and a
+        // server holding a key reaches this from the wire on every
+        // ClientHello — client-auth policy or not.
+        if (identity_len > sealed_ticket_len) return;
         const ciphertext_len = identity_len - 16;
 
         // Reconstruct nonce from ticket (we use the last 4 bytes of identity as hint)
@@ -2297,7 +2445,7 @@ pub const Tls13Handshake = struct {
                 tag,
                 "",
                 ticket_nonce,
-                ticket_key,
+                ticket_key.bytes,
             ) catch continue;
 
             // Decrypted successfully
@@ -2435,6 +2583,24 @@ pub const Tls13Handshake = struct {
     // Try to read a complete handshake message from the input buffer.
     // Returns the full message (type + 3-byte length + body) or null.
     fn readHandshakeMsg(self: *Tls13Handshake) ?[]const u8 {
+        const msg = self.peekHandshakeMsg() orelse return null;
+        self.in_offset += msg.len;
+
+        // Compact the buffer if we've consumed everything
+        if (self.in_offset == self.in_len) {
+            self.in_offset = 0;
+            self.in_len = 0;
+        }
+
+        return msg;
+    }
+
+    /// The next complete handshake message, without taking it.
+    ///
+    /// A resumed client has to know that what is next is the server's
+    /// Finished before it changes state, and `readHandshakeMsg` has stepped
+    /// past it by the time it knows. So the resumed path asks first.
+    fn peekHandshakeMsg(self: *const Tls13Handshake) ?[]const u8 {
         const available = self.in_len - self.in_offset;
         if (available < 4) return null;
 
@@ -2445,16 +2611,7 @@ pub const Tls13Handshake = struct {
         const total_len = 4 + msg_len;
         if (available < total_len) return null;
 
-        const msg = self.in_buf[self.in_offset..][0..total_len];
-        self.in_offset += total_len;
-
-        // Compact the buffer if we've consumed everything
-        if (self.in_offset == self.in_len) {
-            self.in_offset = 0;
-            self.in_len = 0;
-        }
-
-        return msg;
+        return self.in_buf[self.in_offset..][0..total_len];
     }
 
     fn parseEncryptedExtensions(self: *Tls13Handshake, body: []const u8) !void {
@@ -3535,15 +3692,14 @@ test "loopback PSK resumption: two handshakes with session ticket" {
     var server = Identity.init(server_seed);
     server.link();
     var entropy: Counted = .{};
-    var ticket_key: [16]u8 = undefined;
-    entropy.random().bytes(&ticket_key);
+    const ticket_key = TicketKey.generate(entropy.random());
 
     const server_config = TlsConfig{
         .cert_chain_der = &server.chain,
         .private_key_bytes = &server.seed,
         .private_key_algorithm = .ed25519,
         .alpn = &[_][]const u8{"h3"},
-        .ticket_key = ticket_key,
+        .resumption = .{ .server = ticket_key },
     };
 
     const client_config = TlsConfig{
@@ -3622,7 +3778,7 @@ test "loopback PSK resumption: two handshakes with session ticket" {
 
     // ─── Second handshake: PSK resumption ─────────────
     var psk_client_config = client_config;
-    psk_client_config.session_ticket = &ticket;
+    psk_client_config.resumption = .{ .client = &ticket };
 
     var server2 = Tls13Handshake.initServer(server_config, tp, entropy.random());
     var client2 = Tls13Handshake.initClient(psk_client_config, tp, entropy.random());
@@ -3988,6 +4144,228 @@ fn serverConfig(entries: []CertEntry, auth: *const ClientAuth) TlsConfig {
         .alpn = &[_][]const u8{"h3"},
         .client_auth = auth,
     };
+}
+
+/// One connection's two ends, built from configs and kept so a test can
+/// read what they made of it afterwards. 52 KB apiece, so they are heap.
+const Ends = struct {
+    server: *Tls13Handshake,
+    client: *Tls13Handshake,
+
+    fn init(gpa: std.mem.Allocator, cc: TlsConfig, sc: TlsConfig, random: std.Random) !Ends {
+        const tp = transport_params.TransportParams{
+            .initial_max_data = 1 << 20,
+            .initial_max_streams_bidi = 10,
+        };
+        const server = try gpa.create(Tls13Handshake);
+        errdefer gpa.destroy(server);
+        const client = try gpa.create(Tls13Handshake);
+        Tls13Handshake.initServerInto(server, sc, tp, random);
+        server.allocator = gpa;
+        Tls13Handshake.initClientInto(client, cc, tp, random);
+        return .{ .server = server, .client = client };
+    }
+
+    fn deinit(self: *Ends, gpa: std.mem.Allocator) void {
+        self.server.deinit();
+        gpa.destroy(self.server);
+        gpa.destroy(self.client);
+    }
+};
+
+/// Drives one connection to completion and then pumps the NewSessionTicket
+/// that follows it, which is where the client's ticket comes from — so the
+/// caller does not have to know that the ticket is a post-handshake message
+/// rather than part of the handshake. Returns the first refusal, as
+/// `handshake` does.
+fn connect(ends: *Ends, random: std.Random) DriveError!?HandshakeError {
+    var client_done = false;
+    var server_done = false;
+    var i: usize = 0;
+    while ((!client_done or !server_done) and i < 100) : (i += 1) {
+        if (!client_done) {
+            const action = ends.client.step(test_now_s, random) catch |err| return refused(err);
+            switch (action) {
+                .send_data => |sd| ends.server.provideData(sd.data),
+                .complete => client_done = true,
+                else => {},
+            }
+        }
+        if (!server_done) {
+            const action = ends.server.step(test_now_s, random) catch |err| return refused(err);
+            switch (action) {
+                .send_data => ends.client.provideData(ends.server.out_buf[0..ends.server.out_len]),
+                .complete => server_done = true,
+                else => {},
+            }
+        }
+    }
+    if (!client_done or !server_done) return error.HandshakeStalled;
+
+    var post: usize = 0;
+    while (post < 8) : (post += 1) {
+        const action = ends.client.step(test_now_s, random) catch |err| return refused(err);
+        switch (action) {
+            ._continue => continue,
+            else => break,
+        }
+    }
+    return null;
+}
+
+test "a pinned client resumes, and the pin holds on the resumed connection" {
+    const gpa = std.testing.allocator;
+    var server = Identity.init(server_seed);
+    server.link();
+    var client = Identity.init(client_seed);
+    client.link();
+    var entropy: Counted = .{};
+    const random = entropy.random();
+
+    // One key for the server's whole life, drawn once. This is the value
+    // DECISIONS/0001 item 1 is about: a key drawn per connection seals
+    // tickets nothing can reopen, and the connection that follows does not
+    // say so.
+    const ticket_key = TicketKey.generate(random);
+    var auth: ClientAuth = .{ .expect_node_id = client.node_id, .mode = .required };
+    var entries = [_]CertEntry{.{ .server_names = &.{}, .cert = server.certificate() }};
+    var server_config = serverConfig(&entries, &auth);
+    server_config.resumption = .{ .server = ticket_key };
+
+    // First connection: a full handshake, and the ticket it leaves behind.
+    var first = try Ends.init(gpa, clientConfig(server.node_id, &client), server_config, random);
+    defer first.deinit(gpa);
+    try std.testing.expect((try connect(&first, random)) == null);
+    try std.testing.expect(!first.server.using_psk);
+    try std.testing.expectEqual(client.node_id, first.server.peerNodeId().?);
+    const ticket = first.client.received_ticket orelse return error.HandshakeStalled;
+
+    // Second connection under the same key. The server's certificate is not
+    // on the wire this time, and that is what makes the second connection
+    // observably not a full handshake: the client's own pin on the server
+    // survives it, which it could not if there were a certificate left to
+    // compare against.
+    var resuming = clientConfig(server.node_id, &client);
+    resuming.resumption = .{ .client = &ticket };
+    var second = try Ends.init(gpa, resuming, server_config, random);
+    defer second.deinit(gpa);
+    try std.testing.expect((try connect(&second, random)) == null);
+    try std.testing.expect(second.server.using_psk);
+    try std.testing.expect(second.client.using_psk);
+    try std.testing.expect(second.client.peerNodeId() == null);
+
+    // And the client is not authenticated by the ticket. A resumed
+    // connection asks for the certificate exactly as a full one does, and
+    // the answer is what the pin is compared against.
+    try std.testing.expect(second.client.certificate_requested);
+    try std.testing.expectEqual(client.node_id, second.server.peerNodeId().?);
+    try std.testing.expectEqual(ed25519_spki_len, second.server.peerCertificate().?.len);
+}
+
+test "a ticket the server's current key cannot open is refused, not resumed" {
+    const gpa = std.testing.allocator;
+    var server = Identity.init(server_seed);
+    server.link();
+    var client = Identity.init(client_seed);
+    client.link();
+    var entropy: Counted = .{};
+    const random = entropy.random();
+    var auth: ClientAuth = .{ .expect_node_id = client.node_id, .mode = .required };
+    var entries = [_]CertEntry{.{ .server_names = &.{}, .cert = server.certificate() }};
+
+    var issued = serverConfig(&entries, &auth);
+    issued.resumption = .{ .server = TicketKey.generate(random) };
+    var first = try Ends.init(gpa, clientConfig(server.node_id, &client), issued, random);
+    defer first.deinit(gpa);
+    try std.testing.expect((try connect(&first, random)) == null);
+    const ticket = first.client.received_ticket orelse return error.HandshakeStalled;
+
+    // The key rotates, as a server's does when it restarts or an operator
+    // replaces it, and the ticket cannot be opened under the new one.
+    var rotated = serverConfig(&entries, &auth);
+    rotated.resumption = .{ .server = TicketKey.generate(random) };
+    var resuming = clientConfig(server.node_id, &client);
+    resuming.resumption = .{ .client = &ticket };
+    var second = try Ends.init(gpa, resuming, rotated, random);
+    defer second.deinit(gpa);
+    // Refusing the ticket is the server's answer, and this is what it looks
+    // like: the connection does not resume and it does not complete. The
+    // client offered a PSK and the server declined it, and this stack has
+    // one handshake schedule rather than two, so the client verifies the
+    // server's Finished against the schedule it committed to and refuses
+    // it. What item 1 exists to prevent is the opposite outcome — both ends
+    // believing they had resumed when they had not — and `using_psk` is
+    // where that would show.
+    try std.testing.expectEqual(refused(error.BadFinished), try connect(&second, random));
+    try std.testing.expect(!second.server.using_psk);
+    try std.testing.expect(!second.server.isComplete());
+    try std.testing.expect(!second.client.isComplete());
+}
+
+test "a resumed connection with a pin in force cannot complete without a certificate" {
+    const gpa = std.testing.allocator;
+    var server = Identity.init(server_seed);
+    server.link();
+    var client = Identity.init(client_seed);
+    client.link();
+    var entropy: Counted = .{};
+    const random = entropy.random();
+    var auth: ClientAuth = .{ .expect_node_id = client.node_id, .mode = .required };
+    var entries = [_]CertEntry{.{ .server_names = &.{}, .cert = server.certificate() }};
+    var server_config = serverConfig(&entries, &auth);
+    server_config.resumption = .{ .server = TicketKey.generate(random) };
+
+    var first = try Ends.init(gpa, clientConfig(server.node_id, &client), server_config, random);
+    defer first.deinit(gpa);
+    try std.testing.expect((try connect(&first, random)) == null);
+    const ticket = first.client.received_ticket orelse return error.HandshakeStalled;
+
+    // The client resumes and has no certificate to answer the
+    // CertificateRequest with. The PSK is accepted — `using_psk` says so,
+    // and it is the acceptance that used to be the bypass — and the
+    // handshake then stops at the request rather than reaching the end with
+    // a pin in force and nothing to compare it against. This is item 4.
+    var anonymous = clientConfig(server.node_id, &client);
+    anonymous.client_certificate = null;
+    anonymous.resumption = .{ .client = &ticket };
+    var ends = try Ends.init(gpa, anonymous, server_config, random);
+    defer ends.deinit(gpa);
+    try std.testing.expectEqual(refused(error.CertificateRequired), try connect(&ends, random));
+    try std.testing.expect(ends.server.using_psk);
+    try std.testing.expect(ends.client.certificate_requested);
+    try std.testing.expect(ends.server.peerNodeId() == null);
+    try std.testing.expect(!ends.server.isComplete());
+}
+
+test "a ticket and the key that opens it are one value" {
+    const gpa = std.testing.allocator;
+    var server = Identity.init(server_seed);
+    server.link();
+    var client = Identity.init(client_seed);
+    client.link();
+    var entropy: Counted = .{};
+    const random = entropy.random();
+    var auth: ClientAuth = .{ .expect_node_id = client.node_id };
+    var entries = [_]CertEntry{.{ .server_names = &.{}, .cert = server.certificate() }};
+
+    // A ticket on the server side is not a key, and the handshake says so
+    // rather than leaving a caller to find out: the server issues nothing,
+    // so the client is left holding no ticket and the next connection
+    // cannot resume. Before `Resumption` these were two fields and the
+    // pairing was expressible — a ticket in one, a key in the other,
+    // neither of them noticing.
+    var held: SessionTicket = .{ .psk = .{0x55} ** 32 };
+    var config = serverConfig(&entries, &auth);
+    config.resumption = .{ .client = &held };
+    try std.testing.expect(Resumption.serverKey(config.resumption) == null);
+
+    var ends = try Ends.init(gpa, clientConfig(server.node_id, &client), config, random);
+    defer ends.deinit(gpa);
+    try std.testing.expect((try connect(&ends, random)) == null);
+    try std.testing.expect(ends.client.received_ticket == null);
+    // The connection is still authenticated; refusing the ticket costs a
+    // resumption, not a handshake.
+    try std.testing.expectEqual(client.node_id, ends.server.peerNodeId().?);
 }
 
 test "a 44-byte Ed25519 SPKI is a peer certificate in both directions" {

@@ -18,12 +18,15 @@ pub const postcard = @import("wire/postcard.zig");
 pub const net_report = @import("net/report.zig");
 pub const holepunch = @import("net/holepunch.zig");
 pub const net_probe = @import("net/probe.zig");
+pub const net_probe_run = @import("net/probe_run.zig");
+pub const net_holepunch_run = @import("net/holepunch_run.zig");
 
 pub const discovery_item = @import("discovery/item.zig");
 pub const discovery_resolve = @import("discovery/resolve.zig");
 pub const discovery_dns = @import("discovery/dns.zig");
 pub const discovery_dial_source = @import("discovery/dial_source.zig");
 pub const pkarr = @import("discovery/pkarr.zig");
+pub const discovery_lookup_io = @import("discovery/lookup_io.zig");
 
 pub const relay_frame = @import("relay/frame.zig");
 pub const relay_client = @import("relay/client.zig");
@@ -47,6 +50,7 @@ pub const blob_ticket = @import("ticket/blob_ticket.zig");
 
 pub const gossip_hyparview = @import("gossip/hyparview.zig");
 pub const gossip_plumtree = @import("gossip/plumtree.zig");
+pub const node = @import("node/node.zig");
 
 pub const NodeId = key.NodeId;
 pub const SecretKey = key.SecretKey;
@@ -75,10 +79,13 @@ test {
     std.testing.refAllDecls(net_report);
     std.testing.refAllDecls(holepunch);
     std.testing.refAllDecls(net_probe);
+    std.testing.refAllDecls(net_probe_run);
+    std.testing.refAllDecls(net_holepunch_run);
     std.testing.refAllDecls(discovery_item);
     std.testing.refAllDecls(discovery_resolve);
     std.testing.refAllDecls(discovery_dial_source);
     std.testing.refAllDecls(discovery_dns);
+    std.testing.refAllDecls(discovery_lookup_io);
     std.testing.refAllDecls(postcard);
     std.testing.refAllDecls(pkarr);
     std.testing.refAllDecls(relay_frame);
@@ -98,4 +105,5 @@ test {
     std.testing.refAllDecls(blob_ticket);
     std.testing.refAllDecls(gossip_hyparview);
     std.testing.refAllDecls(gossip_plumtree);
+    std.testing.refAllDecls(node);
 }

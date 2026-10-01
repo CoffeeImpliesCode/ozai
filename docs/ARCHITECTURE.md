@@ -37,10 +37,14 @@ The rule that makes the whole thing testable: **nothing below `ozai.base` may
 read a clock, read the environment, or take an allocator it was not handed.**
 Everything above it may, as long as `io: std.Io` is threaded rather than stored.
 
-The runtime is [`DECISIONS/0002`](DECISIONS/0002-async-substrate.md): zio, used
-at the transport and endpoint layers and invisible above them. A state machine
-that needs a runtime stood up in order to be tested has found a boundary in the
-wrong place.
+The runtime is `std.Io` — `Io.Threaded` — at the transport and endpoint layers
+and invisible above them; see [`DECISIONS/0002`](DECISIONS/0002-async-substrate.md),
+which chose zio on 2026-09-29 and reversed it the next day, and was
+reconsidered again on 2026-10-01 with the reversal standing. It is not zio. The
+reason it is not is not fashion: `Io.Uring` cannot send a UDP datagram in 0.16.0,
+and `Io.Evented` is Uring on Linux, so a runtime that owns readiness cannot own
+this stack's send path. A state machine that needs a runtime stood up in order to
+be tested has found a boundary in the wrong place.
 
 ## Module tree
 

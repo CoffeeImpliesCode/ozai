@@ -67,7 +67,9 @@ pub const Ecn = frame.Ecn;
 pub const Error = error{
     /// A zero segment size or a zero receive stride. Zero names no datagram.
     ZeroSegmentSize,
-    /// A segment size the `UDP_SEGMENT` control message cannot carry.
+    /// A segment size the `UDP_SEGMENT` control message cannot carry, or one
+    /// wider than a single datagram may be (`max_send_payload`). Either way no
+    /// run can be built out of it.
     SegmentSizeTooLarge,
     /// A receive stride larger than the buffer it describes. A datagram
     /// cannot be bigger than the bytes that hold it.
@@ -76,7 +78,8 @@ pub const Error = error{
 
 /// The most datagrams one `sendmsg` may carry as ancillary data: the traffic
 /// class and the segmentation size. Not a limit on how many datagrams a run
-/// holds — that is `Capability.max_send_segments`.
+/// holds — that is `Capability.maxRunDatagrams`, which reads two constraints
+/// rather than one.
 pub const max_cmsg = 2;
 
 /// The Linux control-message options this seam names.
@@ -131,12 +134,44 @@ pub const tos_width: u32 = switch (builtin.os.tag) {
 /// `UDP_MAX_SEGMENTS` in `include/uapi/linux/udp.h`, `1 << 6`. noq returns
 /// exactly this from `max_gso_segments` when `UDP_SEGMENT` is accepted
 /// (`noq-udp/src/linux.rs:26-37`).
+///
+/// A count, and not the whole answer: the other half binds first. At 1200
+/// bytes a segment this allows 64 datagrams where `max_send_payload` allows
+/// 54, so a run built from this number alone is a run the kernel answers with
+/// `EMSGSIZE`. Measured on this node, 64 segments of 1200 — 76800 bytes — is
+/// refused and 54 of them is not.
+///
+/// Nor is it enforced on this kernel's send path, where 136 segments of 60
+/// bytes went out. It is kept because it is noq's answer, not because a probe
+/// on this node would have returned it.
 pub const max_segments_linux: u16 = 64;
+
+/// The most payload bytes one `sendmsg` may carry, and the second of the two
+/// constraints on a run.
+///
+/// Not `0xffff`. The headers the kernel adds are part of the message by the
+/// time it becomes an IP packet, and it is that packet's own 16-bit total
+/// length field which has to fit, so the ceiling is `0xffff` less an IP header
+/// and the 8-byte UDP one. Measured on this node over loopback with a
+/// `UDP_SEGMENT` control message: a run of 64 segments at 1026 bytes is
+/// accepted at 65507 total and refused with `EMSGSIZE` at 65508, and the same
+/// run over IPv6 is accepted at 65527 and refused at 65528. Those are 65535
+/// less 20 and 8, and less 40 and 8.
+///
+/// IPv4's is the one written down because a `Runs` walk is handed no address
+/// and so no family, and of two ceilings the smaller is the one legal on both.
+pub const max_send_payload: usize = 65507;
 
 /// `UDP_GRO_CNT_MAX` in `net/ipv4/udp_offload.c`, 64, the value noq installs
 /// when `UDP_GRO` is accepted (`noq-udp/src/unix.rs:129-138`). It is not an
 /// arbitrary cap: the receive buffer has to be big enough for the largest
 /// list the kernel might produce, or a coalesced read is truncated.
+///
+/// The send side's second constraint is arithmetic and lives in
+/// `Capability.maxRunDatagrams`. This one has no second constraint because no
+/// walk cuts a read: `Recv` is a buffer that arrived whole, and `Recv.init` is
+/// where a stride the buffer cannot hold is refused. A caller that coalesces
+/// sizes its own buffer for `max_recv_segments * stride`.
 pub const max_gro_segments_linux: u16 = 64;
 
 /// Which IP version a datagram goes out as, or came back on.
@@ -181,6 +216,11 @@ pub const Capability = struct {
     /// otherwise. A 1 is not a cap of one segment per send, it is the absence
     /// of the feature: noq's `max_gso_segments` means exactly that, and a
     /// batch on such a socket is sent one datagram at a time.
+    ///
+    /// The socket's half of the answer, and not all of it. One `sendmsg` is
+    /// also refused above `max_send_payload` bytes, which is the binding half
+    /// at every segment size over 1023, so what fits in a run is
+    /// `maxRunDatagrams` and never this number alone.
     max_send_segments: u16,
     /// `UDP_GRO_CNT_MAX` when the socket accepted `UDP_GRO`, and 1
     /// otherwise, for noq's `gro_segments`.
@@ -203,6 +243,29 @@ pub const Capability = struct {
     /// in its own `sendmsg`, which is a working socket and a slower one.
     pub fn supportsSegmentation(self: Capability) bool {
         return self.max_send_segments > 1;
+    }
+
+    /// The most datagrams one `sendmsg` may carry at `segment_size`, and what
+    /// `Runs` cuts its runs at.
+    ///
+    /// Both constraints meet here and neither of them is a field on this
+    /// struct: the count is `max_send_segments`, and the other is
+    /// `max_send_payload / segment_size`, a ratio no probe produces and one
+    /// that depends on a segment size the probe never saw. Writing down the
+    /// count alone is the bug this exists for — `Socket.send` cannot fall
+    /// back from the `EMSGSIZE` an over-long run earns, only from a refused
+    /// segmentation — so a cap is never read off one of the two alone.
+    ///
+    /// A zero segment size is refused rather than divided by, and a segment
+    /// size above `max_send_payload` is refused rather than divided into zero
+    /// datagrams: `UDP_SEGMENT` carries a `u16`, so every size that reaches
+    /// here is one a datagram could carry and every answer is at least one.
+    pub fn maxRunDatagrams(self: Capability, segment_size: usize) Error!u16 {
+        if (segment_size == 0) return error.ZeroSegmentSize;
+        if (segment_size > max_send_payload) return error.SegmentSizeTooLarge;
+        const by_payload: usize = max_send_payload / segment_size;
+        const by_count: usize = @max(1, @as(usize, self.max_send_segments));
+        return @intCast(@min(by_count, by_payload));
     }
 
     /// Whether a read may arrive as a list of datagrams. False means every
@@ -339,9 +402,9 @@ pub const Runs = struct {
     segment_size: ?u16,
     /// The codepoint every datagram carries.
     ecn: ?Ecn,
-    /// The most datagrams one run may hold, clamped to at least one so that a
-    /// hand-built capability of zero cannot divide anything.
-    cap: u16,
+    /// The most datagrams one run may hold: `Capability.maxRunDatagrams` at
+    /// this batch's segment size, and never below one.
+    max_datagrams: u16,
     /// Datagrams already handed out.
     index: usize,
     /// Datagrams in the batch.
@@ -349,19 +412,34 @@ pub const Runs = struct {
 
     /// The runs for `send` on a socket that answers `caps`.
     ///
-    /// The refusal is the same zero-segment-size refusal `relay/frame.zig`
-    /// makes, for the same reason: this is the value on its way to the socket
-    /// and a zero there names no datagram.
+    /// The bound is decided here rather than where the segment count is read,
+    /// because it is a ratio and not a number. A run of `n` datagrams is
+    /// `n * segment_size` bytes on the wire, and one `sendmsg` above
+    /// `max_send_payload` bytes is refused with `EMSGSIZE` — which
+    /// `Socket.send` treats as fatal rather than as the `.segmentation`
+    /// fallback, so a batch this seam calls legal has to be legal on the wire
+    /// and not only in the count.
+    ///
+    /// The zero-segment-size refusal is the same one `relay/frame.zig` makes,
+    /// for the same reason: this is the value on its way to the socket and a
+    /// zero there names no datagram. `maxRunDatagrams` makes it too, and the
+    /// check below is what catches a hand-built value naming no segment.
     pub fn init(send: Send, caps: Capability) Error!Runs {
         if (send.segment_size) |size| {
             if (size == 0) return error.ZeroSegmentSize;
         }
         const total = send.datagramCount();
+        // No segment size is one datagram, and `next` hands the payload back
+        // whole without consulting the bound.
+        const max_datagrams = if (send.segment_size) |size|
+            try caps.maxRunDatagrams(size)
+        else
+            1;
         return .{
             .contents = send.contents,
             .segment_size = send.segment_size,
             .ecn = send.ecn,
-            .cap = @max(@as(u16, 1), caps.max_send_segments),
+            .max_datagrams = max_datagrams,
             .index = 0,
             .total = total,
         };
@@ -388,7 +466,7 @@ pub const Runs = struct {
                 .segment_size = null,
             };
         }
-        const take = @min(self.cap, self.total - self.index);
+        const take = @min(self.max_datagrams, self.total - self.index);
         const start = self.index * size;
         const end = @min(@min(self.index + take, self.total) * size, self.contents.len);
         self.index += take;
@@ -406,7 +484,7 @@ pub const Runs = struct {
     /// twice to get it.
     pub fn count(self: Runs) usize {
         if (self.total == 0) return 0;
-        return divCeil(self.total, self.cap);
+        return divCeil(self.total, self.max_datagrams);
     }
 };
 
@@ -607,8 +685,17 @@ pub const Refused = enum {
     /// `EINVAL` is about the newest one — noq guards only the IPv4 tos
     /// (`unix.rs:613-618`) and leaves the other two in place.
     unknown_control_message,
-    /// The driver cannot segment. The run goes out one datagram per
-    /// `sendmsg` and the socket's capability stops offering segmentation.
+    /// The socket will not segment what it was asked to segment. The run goes
+    /// out one datagram per `sendmsg` and the socket's capability stops
+    /// offering segmentation.
+    ///
+    /// Which is not only a driver that cannot segment. A socket can accept
+    /// `UDP_SEGMENT` at the probe and refuse the send: measured on this node, a
+    /// segment size that is a multiple of 256 is refused with `EINVAL` at
+    /// every count from one to 128, through `sendmsg` and through the raw
+    /// syscall alike, and 1024 is one of them. No probe reaches that, so this
+    /// answer and `Capability.withoutSegmentation` are the whole of the
+    /// reaction to it.
     segmentation,
 };
 
@@ -658,7 +745,7 @@ pub fn report(send: Send, family: Family, refused: Refused) Report {
 ///
 /// Written out rather than `std.math.divCeil` so that the precondition is at
 /// the call site instead of inside a `catch`. Every `b` here is a receive
-/// stride from `Recv.init` or a run cap from `Runs.init`, both of which have
+/// stride from `Recv.init` or a run bound from `Runs.init`, both of which have
 /// already refused zero.
 fn divCeil(a: usize, b: usize) usize {
     return a / b + @intFromBool(a % b != 0);
@@ -849,6 +936,131 @@ test "every run agrees with the codec on what a batch is" {
             }
             try std_testing.expectEqual(runs.count(), seen);
             try std_testing.expectEqual(count, datagrams);
+        }
+    }
+}
+
+test "a run is bounded by both send constraints, at every segment size" {
+    // 1200 is the size that made this visible: 64 segments of it are 76800
+    // bytes and this node refuses that with `EMSGSIZE`, while 54 of them —
+    // 64800 bytes — go out. Each row is one `maxRunDatagrams` answer.
+    const rows = [_]struct { size: usize, runs: u16 }{
+        .{ .size = 64, .runs = 64 },
+        .{ .size = 1023, .runs = 64 },
+        .{ .size = 1024, .runs = 63 },
+        .{ .size = 1200, .runs = 54 },
+        .{ .size = 1452, .runs = 45 },
+        .{ .size = 9000, .runs = 7 },
+    };
+    for (rows) |row| {
+        try std_testing.expectEqual(
+            row.runs,
+            try Capability.linux_full.maxRunDatagrams(row.size),
+        );
+    }
+    // A socket that cannot segment is one datagram whatever the arithmetic
+    // says, and the payload ceiling is not a floor it can lift.
+    try std_testing.expectEqual(
+        @as(u16, 1),
+        try Capability.none.maxRunDatagrams(1200),
+    );
+}
+
+test "the two send constraints swap which one binds at 1024 bytes" {
+    // 64 segments of 1023 is 65472 bytes and the wire takes it; 64 segments of
+    // 1024 is 65536 and it does not. The crossing is a segment size, and it is
+    // why the answer cannot be a `u16` on `Capability`: one value below it and
+    // another above it.
+    const full = Capability.linux_full;
+    try std_testing.expectEqual(@as(u16, 64), try full.maxRunDatagrams(1022));
+    try std_testing.expectEqual(@as(u16, 64), try full.maxRunDatagrams(1023));
+    try std_testing.expectEqual(@as(u16, 63), try full.maxRunDatagrams(1024));
+    try std_testing.expectEqual(@as(u16, 63), try full.maxRunDatagrams(1025));
+    // Below the crossing the count is the binding half and the ratio is the
+    // larger answer, which is what makes the field the answer there.
+    try std_testing.expectEqual(
+        full.max_send_segments,
+        try full.maxRunDatagrams(1023),
+    );
+    // Above it the count is not consulted: 1200 admits 54 and 9000 admits 7,
+    // where `max_segments_linux` admits 64 for both.
+    try std_testing.expect(try full.maxRunDatagrams(1200) < full.max_send_segments);
+    try std_testing.expect(try full.maxRunDatagrams(9000) < full.max_send_segments);
+}
+
+test "a segment size no datagram may carry is refused, not divided by" {
+    // The division is the hazard: `max_send_payload / 0` traps and
+    // `max_send_payload / (max_send_payload + 1)` is zero datagrams. Both are
+    // declared answers rather than either of those.
+    const full = Capability.linux_full;
+    try std_testing.expectError(error.ZeroSegmentSize, full.maxRunDatagrams(0));
+    try std_testing.expectError(
+        error.SegmentSizeTooLarge,
+        full.maxRunDatagrams(max_send_payload + 1),
+    );
+    try std_testing.expectError(
+        error.SegmentSizeTooLarge,
+        full.maxRunDatagrams(std.math.maxInt(u16)),
+    );
+    // The widest segment size a datagram may carry admits exactly one, which
+    // is where the refusal above is drawn.
+    try std_testing.expectEqual(@as(u16, 1), try full.maxRunDatagrams(max_send_payload));
+    // A hand-built capability of zero is one datagram, not a division by it.
+    const zero: Capability = .{ .max_send_segments = 0, .max_recv_segments = 1 };
+    try std_testing.expectEqual(@as(u16, 1), try zero.maxRunDatagrams(1200));
+
+    // And the refusals reach the walk, which is where a caller meets them. A
+    // size the `UDP_SEGMENT` control message carries is still a size no run
+    // can be built from.
+    const bytes = [_]u8{0} ** 200;
+    try std_testing.expectError(
+        error.SegmentSizeTooLarge,
+        Runs.init(try Send.batch(&bytes, max_send_payload + 1, null), full),
+    );
+}
+
+test "no run asks a sendmsg for more than one message's worth of bytes" {
+    // The invariant the crossing is about, at the sizes a connection cannot be
+    // made to produce: whatever the segment count says, a run's bytes fit one
+    // message, and the runs put the batch back together byte for byte.
+    const gpa = std_testing.allocator;
+    const sizes = [_]usize{ 1, 64, 576, 1023, 1024, 1200, 1452, 9000 };
+    const counts = [_]usize{ 1, 2, 7, 54, 55, 63, 64, 65, 200 };
+    for (sizes) |size| {
+        for (counts) |count| {
+            const bytes = try gpa.alloc(u8, size * count);
+            defer gpa.free(bytes);
+            @memset(bytes, 0x5a);
+            // A batch of one datagram carries no segment size, and the seam's
+            // own rule is that it does not acquire one here.
+            const send = if (count == 1)
+                Send.single(bytes, null)
+            else
+                try Send.batch(bytes, size, null);
+            var runs = try Runs.init(send, Capability.linux_full);
+            const promised = runs.count();
+            var taken: usize = 0;
+            var rejoined: usize = 0;
+            while (runs.next()) |run| {
+                taken += 1;
+                rejoined += run.contents.len;
+                // The property the fix is for, stated over the bytes and not
+                // over the count.
+                try std_testing.expect(run.contents.len <= max_send_payload);
+                // No run is cut inside a datagram.
+                try std_testing.expectEqual(@as(usize, 0), run.contents.len % size);
+                if (run.segment_size) |value| {
+                    // Segmented at this batch's own size, and at more than one
+                    // datagram — the send-side half of rule 7.
+                    try std_testing.expectEqual(@as(usize, @intCast(value)), size);
+                    try std_testing.expect(run.contents.len > size);
+                } else {
+                    try std_testing.expectEqual(@as(usize, 1), run.datagramCount());
+                }
+            }
+            try std_testing.expectEqual(promised, taken);
+            try std_testing.expectEqual(bytes.len, rejoined);
+            try std_testing.expectEqual(send.datagramCount(), rejoined / size);
         }
     }
 }

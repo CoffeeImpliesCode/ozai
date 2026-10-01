@@ -3,7 +3,9 @@
 - **Status**: accepted, recorded 2026-09-29. **Reversed 2026-09-30**; see
   [Reconsideration of 2026-09-30](#reconsideration-of-2026-09-30). The
   layering is unchanged and is now the whole decision. What reversed is the
-  dependency.
+  dependency. **Reconsidered 2026-10-01**, answer unchanged; see
+  [Reconsideration of 2026-10-01](#reconsideration-of-2026-10-01). What
+  expired is the reason the reversal was given, not the reversal.
 - **zio is not a dependency of this project, and never was.** `build.zig.zon:6`
   is `.dependencies = .{}`, `build.zig` contains no `b.dependency` call, and no
   file under `src/`, `test/`, `vendor/` or `build.zig` names zio except
@@ -307,3 +309,198 @@ The questions to answer then, in this order:
    (`lib/std/Io.zig:1132`) against zio's `withTimeout`. If std cannot express a
    deadline registry that cancels its own timers, that is the one gap worth a
    dependency, and it should be measured before it is paid for.
+
+---
+
+## Reconsideration of 2026-10-01
+
+**The reversal stands.** No runtime dependency, `std.Io` is the substrate, and
+`Io.Threaded` is what a process will be built on. Nothing below the line moves
+and no module changes.
+
+The reason it stood on 2026-09-30 was "there is nothing to schedule". That
+premise has expired. What replaces it is not a preference; it is two facts
+about the tree and the toolchain, and neither of them is about zio.
+
+### What expired, and what did not
+
+The 2026-09-30 trigger was "a connection becomes a task rather than a value" —
+`docs/PLAN.md` M11+ (`:313-321`). **Its precondition has fired and the trigger
+has not.** `Task` is still a value the caller drives
+(`src/endpoint/endpoint.zig:69-76`), and `Io.Group`, `Io.async`, `Io.Uring`,
+`Io.Evented` and `Io.Timeout` name nothing under `src/`, `test/` or `build.zig`.
+
+What is new is everything *around* the hole. Four endpoints finish a handshake
+over real sockets and converge on one membership in a single synchronously
+driven round loop: `Mesh.round` (`test/protocol_loopback_test.zig:967-977`)
+advances a counter and then runs, per node, `Wire.take` (`:626`) and
+`Wire.flush` (`:665`), then the protocol and the timers. Six sockets, six
+connections, one loop, no scheduler. The relay registry is complete and driven
+by nobody.
+
+So the project is one function short of this question. The useful work now is
+naming that function before it is written, and saying what shape it is allowed
+to have. That is what the rest of this section does.
+
+### The narrow question
+
+Not "which runtime". **What has to happen between `Action.spawn` and
+`Reaped`, and what has to hold the `Io` while it happens.** Two facts answer
+it.
+
+1. **The socket asks the runtime for one thing, and it is not I/O.** `Socket`
+   holds `handle`, `family`, `caps` and `address` and no `Io`
+   (`src/transport/socket.zig:542-553`). Every operation that can be cancelled
+   takes `io: std.Io` and calls `io.checkCancel()` and nothing else — `:618`,
+   `:736`, `:773`, `:805`. The wait before a read is a `poll` on the descriptor
+   this module opened (`:768-784`), and `:761-767` is why: no backend has ever
+   been told the descriptor exists.
+
+   So `Io.Uring` is a worse fit rather than a better one. It cannot send a UDP
+   datagram at all — `netSendUnavailable` (`lib/std/Io/Uring.zig:5042`) answers
+   `error.NetworkDown` at `:5053` — and `Io.Evented` resolves to `Io.Uring` on
+   Linux (`lib/std/Io.zig:31-37`). **This is a fact about the toolchain and it
+   survives either outcome of this record.** It was true on 2026-09-30, it is
+   true now, and it would be true if the project wanted a scheduler badly.
+2. **`Io.Threaded` answers that one call for the price of an atomic load.**
+   `checkCancel` (`lib/std/Io/Threaded.zig:2411-2414`) is `Thread.checkCancel`,
+   which loads `thread.status` monotonically (`:914`) and stores only on the
+   `.canceling` arm (`:922-928`). A datagram send is a syscall; the cancel
+   check is not what would ever be measured.
+
+### `Io.Group` cannot express `Action.spawn`; `Io.async` can
+
+This is the 2026-09-30 section's first reopen question, answered by reading the
+tree rather than by choosing.
+
+- **`Io.Group` is a group, not a join handle.** `Group.async` returns `void`
+  (`lib/std/Io.zig:1240`), its function must be coercible to `Cancelable!void`,
+  and the error is discarded at `:1245`. `Group.await` returns `Cancelable!void`
+  (`:1282`). `Group.cancel` cancels *every* member of the group (`:1298-1300`).
+  Nothing in it names which task ended, how it ended, or which one to stop.
+- **`Action.spawn` needs all three.** It carries a `Task`
+  (`src/endpoint/endpoint.zig:136-138`), the caller drives it to the end, and
+  the loop is owed a `Reaped` naming the id and one of three endings —
+  `finished`, `cancelled`, `panicked` (`:78-98`) — of which `panicked` is the
+  only beginning that is not somebody's request (`:180-182`).
+- **`Io.async` is the same size and has all three.** It returns `Future(Result)`
+  where `Result` is the function's own return type
+  (`lib/std/Io.zig:2326-2330`), and `Future.cancel` (`:1191`) and
+  `Future.await` (`:1199`) are per-future.
+
+So the shape this decision serves is: **one `Io.Group` for the endpoint's
+shutdown, one `Io.async` per accepted connection.** The split is not a
+compromise, it is the router's own order. `Group.cancel` *is* the
+`cancel_accepts` arm (`src/router/router.zig:718-719`, emitted at `:810-811`),
+which by construction falls after every handler has reported and before the
+close (`:714-724`), and a `Future` is what lets one peer be stopped without
+cancelling every other accept with it.
+
+The cost on `Io.Threaded` is a growable worker pool rather than a thread per
+connection: `groupAsync` prepends to `t.run_queue`
+(`lib/std/Io/Threaded.zig:2226`) and spawns a worker only when the pool has no
+idle thread (`:2205-2216`), under an `async_limit` (`:2197`). Bounded, visible,
+and worth stating here rather than discovering later.
+
+### The caller, named
+
+`Action.spawn` and `Action.shutdown` are values for a caller to perform with
+the `io: std.Io` it already holds (`src/endpoint/endpoint.zig:27-37`).
+**That caller does not exist.** `build.zig`'s only `addExecutable` is the
+examples step (`:89-115`, one file, `src/examples/node_id.zig`), and
+`b.installArtifact` at `:31` installs a library.
+
+Its shape is not free. The tree already fixes it:
+
+- It holds no `Io`. It threads one into `Socket.send` and `Socket.tryReceive`
+  (`src/transport/socket.zig:612`, `:636`) and into `Bridge.create`
+  (`src/transport/quic_bridge.zig:455`) — which is what
+  `test/protocol_loopback_test.zig:630`, `:655` and `:671` already do, on
+  `t.io`.
+- It owns one `Io.Group` and one `Future` per live task, and reports back
+  through the only interface the loop has: `Event.arrived`, `Event.reaped`,
+  `Event.close_requested` into `Loop.step`
+  (`src/endpoint/endpoint.zig:270-310`).
+- It reads no clock. Time is the same argument the test passes today
+  (`test/protocol_loopback_test.zig:967-968`).
+
+Written that way it is a `main` over `Io.Threaded`. Nothing in it needs a third
+runtime, and nothing in it may reach above `ozai.endpoint`.
+
+### What would make the other shape right
+
+The project is not choosing between a thread pool and a poll loop over its own
+descriptors. **It already has the poll loop**: `socket.zig:768` polls the
+descriptor it opened, `tryReceive` answers `error.WouldBlock` as a value
+(`:631-635`), and `Wire.take` treats exactly that as the loop's exit
+(`test/protocol_loopback_test.zig:628-635`). The runtime is one atomic load
+around those syscalls and nothing else.
+
+A runtime that owned readiness *and* the sends would become right when:
+
+1. **`Io.Uring` can send a UDP datagram.** `netSendUnavailable`
+   (`lib/std/Io/Uring.zig:5042-5054`) becomes a real send path. Until then
+   `Io.Evented` on Linux cannot send what this project produces. This is the
+   constraint that survives either outcome, and it is the only one of the three
+   that is about the toolchain rather than about this project.
+2. **ozai stops owning the descriptor**, so that a backend has been told about
+   it. `socket.zig:20-24` is the reason it does: `SO_REUSEPORT` must be set
+   before the bind and `std.Io.net` has no spelling of it. Handing the
+   descriptor to a backend means giving up `UDP_SEGMENT`, and the 2026-09-30
+   section's second question forbids re-litigating that because a runtime
+   arrived.
+3. **The poll loop is measured to be the bottleneck.** A number — round count
+   and socket count at which it was measured — not a forecast about swarms. The
+   six-socket mesh is not it.
+
+### The layering, unchanged
+
+Restated in substance, because a reconsideration that moved it would be a
+different decision and this one does not:
+
+- **`ozai.base` and the wire codecs stay pure.** No `Io`, no clock, no
+  environment, no allocator it was not handed.
+- **The runtime stays at the edges.** `ozai.transport` owns the socket,
+  `ozai.endpoint` owns tasks and shutdown, and neither exposes which runtime it
+  is built on.
+- **An `Io` is threaded and never stored.** It holds at the one place it is
+  hardest: `Socket` has four fields and one of them is a descriptor
+  (`src/transport/socket.zig:542-553`).
+- **Tests construct their own time.** The round loop advances a counter and
+  reads no clock (`test/protocol_loopback_test.zig:967-968`).
+
+**One count in the Decision section is stale, and it is worth correcting rather
+than leaving.** It says `io: std.Io` is a parameter "in three places across
+two files". That was true on 2026-09-30. There are **13** now:
+`src/base/key.zig` 1, `src/transport/quic_bridge.zig` 3,
+`src/transport/socket.zig` 8, and one inside a doc comment at
+`src/endpoint/endpoint.zig:32`. The rule did not move; the surface it is
+threaded through grew by a socket seam, which is the rule working.
+
+### The trigger to reopen it again
+
+In the direction chosen — towards a runtime that owns readiness — reopen on any
+one of these, each measured against the tree this project pins and never
+against this record's summary of it:
+
+1. **`Io.Uring` can send a UDP datagram.** Re-read `lib/std/Io/Uring.zig:5042`
+   and find a send path. This one alone changes the shape: `Io.Evented` becomes
+   an option, `Io.async` could be `Io.concurrent` (`lib/std/Io.zig:2365`), and
+   the worker pool could be fibers (`lib/std/Io/fiber.zig`).
+2. **`std.Io.net` gains the socket setters** — `SO_REUSEPORT` before the bind,
+   `UDP_SEGMENT`, `UDP_GRO` — which would end `socket.zig`'s reason for owning
+   the descriptor. This is the first revisit trigger and it is still half fired
+   (`lib/std/Io/net.zig:229-230`, `:246`). It carries more weight than it did on
+   2026-09-30: it is the only trigger that would make a backend's own send path
+   competitive with the seam this project wrote.
+3. **A node's connection count makes the poll loop the bottleneck.** A number,
+   not a forecast.
+4. **The caller exists and its join set wants more than one `Io.Group` plus one
+   `Future` per peer give.** Concretely: some ending
+   `src/endpoint/endpoint.zig:78-98` names cannot be produced as a `Reaped`, or
+   the handlers-then-cancel-then-close order (`src/router/router.zig:714-724`)
+   cannot be expressed that way.
+
+And in the other direction — towards *less* runtime — reopen if the caller is
+written and turns out to need no `Future` and no `Group` at all: only the poll
+loop `src/transport/socket.zig:768` already is.

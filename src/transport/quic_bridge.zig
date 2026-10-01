@@ -114,6 +114,7 @@ const SocketAddr = base_addr.SocketAddr;
 
 const Manager = quic.connection_manager.ConnectionManager;
 const Entry = quic.connection_manager.ConnEntry;
+const quic_stream = quic.stream;
 const Tls13 = quic.tls13;
 const TlsConfig = Tls13.TlsConfig;
 const ClientAuth = Tls13.ClientAuth;
@@ -321,6 +322,111 @@ pub const Conn = struct {
             used = try closeRun(out, used, buffer, run_start, filled, run_size, ecn, self);
         }
         return out[0..used];
+    }
+
+    /// The bidirectional stream this connection's *peer* opened, or null when
+    /// it has not opened one.
+    ///
+    /// **A stream is read by whichever end opened it.** `Stream.take` reads
+    /// the stream it is called on and nothing else, so a protocol where both
+    /// ends speak on one stream has only two shapes: this end opens one and
+    /// finds the peer's, or the peer opens one and this end takes it. The
+    /// relay protocol takes the second — the client opens one stream and the
+    /// relay speaks on that same one — because the client is the end that
+    /// dials, and the end that dials is the end that has to speak first.
+    ///
+    /// Null rather than a refusal: the peer simply has not got there yet, and
+    /// a caller that read that as an error would fail a connection that is one
+    /// round trip from working. How many peer streams a caller expects is the
+    /// caller's own question and is not answered here.
+    pub fn peerStream(self: Conn) ?Stream {
+        var it = self.entry.conn.streams.streams.iterator();
+        while (it.next()) |entry| {
+            if (quic_stream.isLocal(entry.key_ptr.*, self.entry.conn.is_server)) continue;
+            return .{ .entry = entry.value_ptr.* };
+        }
+        return null;
+    }
+};
+
+/// One application stream on a connection, as a byte pipe in this project's
+/// vocabulary.
+///
+/// **The seam for everything that runs above a datagram.** `Conn` reads state
+/// and `Conn.drain` writes packets, and nothing in between was exposed: a
+/// protocol carried *over* a connection — the relay protocol is the one this
+/// project has — has to run on a stream, and a caller reaching into
+/// `Conn.entry.conn.streams` for one would be a second opinion on the core,
+/// which is the thing this file exists to prevent. So the stream is named
+/// here, once, and `vendor/quic` is untouched: it opens a stream, carries
+/// bytes and says when it is done, which is the whole of what a framed
+/// protocol over QUIC asks of a transport.
+///
+/// It is not relay-specific and nothing in this file knows what rides on it.
+/// A borrowed handle, so every guarantee `Conn` states about its own entry
+/// holds for this: good until the connection is swept.
+pub const Stream = struct {
+    /// The core's own stream.
+    entry: *quic_stream.Stream,
+
+    /// Open a new bidirectional stream on `conn`.
+    ///
+    /// The core's error set here is `anyerror` — `Connection.openStream`
+    /// (`connection.zig:3935`) carries no named set — so it is mapped onto
+    /// `Error.CoreRefused` for the reason that error gives, with the core's
+    /// own answer logged before the refusal is named.
+    pub fn open(conn: Conn) Error!Stream {
+        const opened = conn.entry.conn.openStream() catch |err| {
+            std.log.warn("quic bridge: the core refused to open a stream: {t}", .{err});
+            return error.CoreRefused;
+        };
+        return .{ .entry = opened };
+    }
+
+    /// The core's own id for this stream.
+    pub fn id(self: Stream) u64 {
+        return self.entry.stream_id;
+    }
+
+    /// Write bytes, after everything written before them.
+    pub fn write(self: *Stream, bytes: []const u8) Error!void {
+        self.entry.send.writeData(bytes) catch |err| {
+            std.log.warn("quic bridge: the core refused stream bytes: {t}", .{err});
+            return error.CoreRefused;
+        };
+    }
+
+    /// Say nothing more on this stream. A peer reads the end as a FIN.
+    pub fn close(self: *Stream) void {
+        self.entry.send.close();
+    }
+
+    /// The next readable bytes, or null when none are ready.
+    ///
+    /// **A copy, into the caller's buffer.** The core hands its chunk to the
+    /// application to free (`ReceiveStream.read`, `stream.zig:523`), so
+    /// `gpa` is the allocator that made it — which is the bridge's own, and a
+    /// caller passes the one it created the bridge with. The bytes are copied
+    /// because a framed protocol parses a message in place and borrows into
+    /// it, and a borrow of the core's chunk is a borrow of memory the next
+    /// read has already reused. Copying is one pass over what arrived and no
+    /// allocation at all, which a per-read `dupe` would not be.
+    ///
+    /// `error.NoRoom` rather than a short read: the core hands over whatever
+    /// chunk it holds, and a caller whose buffer is sized to the largest frame
+    /// the protocol permits is told so rather than handed a fragment that
+    /// would decode as a different frame.
+    pub fn take(self: *Stream, gpa: std.mem.Allocator, into: []u8) Error!?[]const u8 {
+        const chunk = self.entry.recv.read() orelse return null;
+        defer gpa.free(chunk);
+        if (chunk.len > into.len) return error.NoRoom;
+        @memcpy(into[0..chunk.len], chunk);
+        return into[0..chunk.len];
+    }
+
+    /// Whether the peer has said everything it will say on this stream.
+    pub fn finished(self: Stream) bool {
+        return self.entry.recv.allReceived();
     }
 };
 
