@@ -10,7 +10,7 @@
 //! stamped with is visible here rather than somewhere nobody can read it.
 
 const std = @import("std");
-const posix = std.posix;
+const address = @import("../address.zig");
 const testing = std.testing;
 const connection = @import("connection.zig");
 const connection_manager = @import("connection_manager.zig");
@@ -40,6 +40,7 @@ const Datagram = struct {
 /// One direction of the link: fixed delay, and a drop decision per datagram.
 const Link = struct {
     queue: std.ArrayList(Datagram) = .empty,
+    head: usize = 0,
     delay_ns: i64,
     sent: u64 = 0,
     dropped: u64 = 0,
@@ -79,21 +80,48 @@ const Link = struct {
             self.dropped += 1;
             return;
         }
+        std.debug.assert(self.head <= self.queue.items.len);
+        // Compact only after consuming at least as much as the live tail.
+        if (self.head > 0 and self.head >= self.queue.items.len - self.head) {
+            const live = self.queue.items.len - self.head;
+            std.mem.copyForwards(
+                Datagram,
+                self.queue.items[0..live],
+                self.queue.items[self.head..],
+            );
+            self.queue.items.len = live;
+            self.head = 0;
+        }
         var d: Datagram = .{ .arrive = now + self.delay_ns, .len = bytes.len, .bytes = undefined };
         @memcpy(d.bytes[0..bytes.len], bytes);
         try self.queue.append(testing.allocator, d);
     }
 
+    /// The borrowed datagram remains valid until the next push on this link.
+    fn popDue(self: *Link, now: i64) ?*Datagram {
+        std.debug.assert(self.head <= self.queue.items.len);
+        if (self.head == self.queue.items.len) return null;
+        const datagram = &self.queue.items[self.head];
+        if (datagram.arrive > now) return null;
+        // Reclaim on push, not here: clearing the list poisons this borrow.
+        self.head += 1;
+        return datagram;
+    }
+
     fn nextArrival(self: *const Link) ?i64 {
-        return if (self.queue.items.len > 0) self.queue.items[0].arrive else null;
+        std.debug.assert(self.head <= self.queue.items.len);
+        return if (self.head < self.queue.items.len)
+            self.queue.items[self.head].arrive
+        else
+            null;
     }
 };
 
-fn addr(port: u16) posix.sockaddr.storage {
-    var st = std.mem.zeroes(posix.sockaddr.storage);
-    const in: *posix.sockaddr.in = @ptrCast(@alignCast(&st));
-    in.* = .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
-    return st;
+/// Loopback on `port`. Both ends of the link are reached on it, so the port is
+/// the only thing that tells the two apart — which is what makes the port part
+/// of a path rather than decoration the harness happens to vary.
+fn addr(port: u16) address.Address {
+    return address.Address.initIpv4(.{ 127, 0, 0, 1 }, port);
 }
 
 /// The server's Ed25519 seed. Fixed, so the node id it owns — and so every
@@ -218,7 +246,10 @@ fn runBulk(total: usize, c2s_loss: Link.Loss, s2c_loss: Link.Loss, one_way_ns: i
             const sconn = mgr.entries.items[0].conn;
             if (stream_id) |id| if (sconn.streams.getStream(id)) |s| {
                 while (s.recv.read()) |d| {
-                    for (d, delivered..) |v, k| try testing.expectEqual(@as(u8, @intCast(k % 251)), v);
+                    for (d, 0..) |v, k| {
+                        const expected: u8 = @intCast((delivered + @as(u64, k)) % 251);
+                        try testing.expectEqual(expected, v);
+                    }
                     delivered += d.len;
                     alloc.free(d);
                 }
@@ -245,16 +276,14 @@ fn runBulk(total: usize, c2s_loss: Link.Loss, s2c_loss: Link.Loss, one_way_ns: i
 
         // Deliver what has arrived.
         var delivered_any = false;
-        while (c2s.queue.items.len > 0 and c2s.queue.items[0].arrive <= now) {
-            var d = c2s.queue.orderedRemove(0);
+        while (c2s.popDue(now)) |d| {
             delivered_any = true;
             switch (mgr.recvDatagram(d.bytes[0..d.len], c_addr, s_addr, 0, &resp, now, random)) {
                 .send_response => |r| try s2c.push(now, r),
                 else => {},
             }
         }
-        while (s2c.queue.items.len > 0 and s2c.queue.items[0].arrive <= now) {
-            var d = s2c.queue.orderedRemove(0);
+        while (s2c.popDue(now)) |d| {
             client.handleDatagram(d.bytes[0..d.len], .{ .to = c_addr, .from = s_addr, .datagram_size = d.len }, now, random);
             delivered_any = true;
         }
@@ -339,8 +368,8 @@ const stateless_reset = @import("stateless_reset.zig");
 const Pair = struct {
     mgr: connection_manager.ConnectionManager,
     client: *connection.Connection,
-    c_addr: posix.sockaddr.storage,
-    s_addr: posix.sockaddr.storage,
+    c_addr: address.Address,
+    s_addr: address.Address,
     now: i64,
     entropy: TestRandom,
     random: std.Random,

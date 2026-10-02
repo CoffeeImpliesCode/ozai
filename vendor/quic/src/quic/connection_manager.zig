@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const posix = std.posix;
+const address = @import("../address.zig");
 const io = @import("../io_compat.zig");
 
 const connection = @import("connection.zig");
@@ -348,8 +348,8 @@ pub const ConnectionManager = struct {
     pub fn acceptConnection(
         self: *ConnectionManager,
         header: packet.Header,
-        local: posix.sockaddr.storage,
-        remote: posix.sockaddr.storage,
+        local: address.Address,
+        remote: address.Address,
         odcid: ?[]const u8,
         retry_scid: ?[]const u8,
         now: i64,
@@ -496,8 +496,8 @@ pub const ConnectionManager = struct {
     pub fn recvDatagram(
         self: *ConnectionManager,
         bytes: []u8,
-        from: posix.sockaddr.storage,
-        local: posix.sockaddr.storage,
+        from: address.Address,
+        local: address.Address,
         ecn_val: u2,
         out_buf: []u8,
         now: i64,
@@ -512,8 +512,8 @@ pub const ConnectionManager = struct {
     pub fn recvHandedOver(
         self: *ConnectionManager,
         bytes: []u8,
-        from: posix.sockaddr.storage,
-        local: posix.sockaddr.storage,
+        from: address.Address,
+        local: address.Address,
         ecn_val: u2,
         out_buf: []u8,
         now: i64,
@@ -525,8 +525,8 @@ pub const ConnectionManager = struct {
     fn route(
         self: *ConnectionManager,
         bytes: []u8,
-        from: posix.sockaddr.storage,
-        local: posix.sockaddr.storage,
+        from: address.Address,
+        local: address.Address,
         ecn_val: u2,
         out_buf: []u8,
         now: i64,
@@ -613,12 +613,24 @@ pub const ConnectionManager = struct {
                     retry_token = packet.validateRetryToken(token, from, self.retry_token_key, now) catch null;
                     if (retry_token) |*vt| {
                         entry = self.acceptConnection(
-                            header, local, from, vt.getOdcid(), vt.getRetryScid(), now, random,
+                            header,
+                            local,
+                            from,
+                            vt.getOdcid(),
+                            vt.getRetryScid(),
+                            now,
+                            random,
                         ) catch return .{ .dropped = {} };
                     } else if (packet.validateNewToken(token, from, self.retry_token_key, now)) {
                         // Valid NEW_TOKEN — the address is proven already
                         entry = self.acceptConnection(
-                            header, local, from, header.dcid, null, now, random,
+                            header,
+                            local,
+                            from,
+                            header.dcid,
+                            null,
+                            now,
+                            random,
                         ) catch return .{ .dropped = {} };
                     } else if (need_retry) {
                         return .{ .dropped = {} };
@@ -645,7 +657,13 @@ pub const ConnectionManager = struct {
                 }
                 if (entry == null) {
                     entry = self.acceptConnection(
-                        header, local, from, null, null, now, random,
+                        header,
+                        local,
+                        from,
+                        null,
+                        null,
+                        now,
+                        random,
                     ) catch return .{ .dropped = {} };
                 }
             }
@@ -817,7 +835,7 @@ test "max_connections is configurable past 256, and every removed entry is freed
     defer mgr.deinit();
     mgr.max_connections = 300;
 
-    const local = std.mem.zeroes(posix.sockaddr.storage);
+    const local: address.Address = .unset;
     var dcids: [301][8]u8 = undefined;
     const scid = [_]u8{0xaa} ** 8;
     for (&dcids, 0..) |*d, i| {
@@ -852,7 +870,7 @@ test "connections coming and going leave the CID map free slots to stop a lookup
     var mgr = testManager(alloc, random);
     defer mgr.deinit();
 
-    const local = std.mem.zeroes(posix.sockaddr.storage);
+    const local: address.Address = .unset;
     const scid = [_]u8{0xaa} ** 8;
     var dcid: [8]u8 = undefined;
     for (0..3000) |i| {
@@ -919,7 +937,7 @@ test "an Initial in a datagram under 1200 bytes opens no connection" {
     const random = entropy.random();
     var mgr = testManager(alloc, random);
     defer mgr.deinit();
-    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    const addr: address.Address = .unset;
 
     var buf = [_]u8{0} ** 1500;
     var out: [1500]u8 = undefined;
@@ -936,7 +954,7 @@ test "an Initial with a DCID under 8 bytes opens no connection" {
     const random = entropy.random();
     var mgr = testManager(alloc, random);
     defer mgr.deinit();
-    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    const addr: address.Address = .unset;
 
     var buf = [_]u8{0} ** 1200;
     var out: [1500]u8 = undefined;
@@ -954,7 +972,7 @@ test "Version Negotiation only answers full-size datagrams, and is rate limited"
     var mgr = testManager(alloc, random);
     defer mgr.deinit();
     mgr.reply_limits = .init(1);
-    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    const addr: address.Address = .unset;
     const unknown: u32 = 0x1a2a3a4a;
 
     var buf = [_]u8{0} ** 1200;
@@ -976,7 +994,7 @@ test "stateless reset answers only packets long enough not to be one" {
     const random = entropy.random();
     var mgr = testManager(alloc, random);
     defer mgr.deinit();
-    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    const addr: address.Address = .unset;
 
     var buf = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
     var out: [1500]u8 = undefined;
@@ -1016,7 +1034,7 @@ test "spoofed reset triggers do not spend the CONNECTION_REFUSED budget" {
     defer mgr.deinit();
     mgr.reply_limits = .init(1);
     mgr.max_connections = 0;
-    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    const addr: address.Address = .unset;
     var out: [1500]u8 = undefined;
 
     var junk = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
@@ -1043,7 +1061,7 @@ test "a server at capacity refuses a new client with CONNECTION_REFUSED" {
     var mgr = testManager(alloc, random);
     defer mgr.deinit();
     mgr.max_connections = 0;
-    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    const addr: address.Address = .unset;
 
     var buf: [1500]u8 = undefined;
     const client = try clientInitial(alloc, &buf, now, random);
@@ -1084,7 +1102,7 @@ test "refuse_new turns away new connections while existing ones keep routing" {
     var mgr = testManager(alloc, random);
     defer mgr.deinit();
     mgr.refuse_new = true;
-    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    const addr: address.Address = .unset;
 
     var buf: [1500]u8 = undefined;
     const client = try clientInitial(alloc, &buf, now, random);
@@ -1131,7 +1149,7 @@ test "a 1-RTT packet for another QUIC-LB server id is reported, not reset" {
     const random = entropy.random();
     var mgr = steeringManager(alloc, 1, random);
     defer mgr.deinit();
-    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    const addr: address.Address = .unset;
     var out: [1500]u8 = undefined;
     var buf: [64]u8 = undefined;
 
@@ -1164,7 +1182,7 @@ test "an Initial is accepted locally even when its DCID decodes to another serve
     const random = entropy.random();
     var mgr = steeringManager(alloc, 1, random);
     defer mgr.deinit();
-    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    const addr: address.Address = .unset;
     var out: [1500]u8 = undefined;
 
     var cid: [8]u8 = undefined;
@@ -1189,7 +1207,7 @@ test "past retry_threshold a new client gets Retry, and is served once it echoes
     var mgr = testManager(alloc, random);
     defer mgr.deinit();
     mgr.retry_threshold = 1;
-    const addr = std.mem.zeroes(posix.sockaddr.storage);
+    const addr: address.Address = .unset;
     var out: [1500]u8 = undefined;
 
     // Under the threshold: served straight away.

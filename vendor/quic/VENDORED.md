@@ -9,19 +9,20 @@ The QUIC substrate for M8. Third-party code, vendored, patched, and pinned.
 | Version | `0.5.0` (`build.zig.zon:3`) — the repository publishes no tags, so a commit SHA is the only pin available |
 | Licence | MIT — `LICENSE`, byte-identical to upstream's |
 | `minimum_zig_version` | `0.16.0` (upstream `build.zig.zon:13`) |
-| Vendored | 32 of upstream's 74 `.zig` files under `src/`: 29,776 lines upstream, 30,278 here |
-| Written here | `src/test_all.zig` — upstream's test root, rebuilt (43 lines) |
+| Initial vendoring | 32 of upstream's 74 `.zig` files under `src/`: 29,776 lines upstream, 30,278 at the initial cut |
+| Written at the initial cut | `src/test_all.zig` — upstream's test root, rebuilt (43 lines) |
 | Not vendored | 42 files, 35,388 lines — see below |
-| Patched | 14 files, +2,749 / −2,247; 1 file deleted outright |
+| Initial patch | 14 files, +2,749 / −2,247; 1 file deleted outright |
 
 Fetched 2026-09-30 with `gh api` against the pinned SHA. No clone is kept in this
 repository; `docs/PLAN.md` and `README.md` point at read-only checkouts under
 `~/projects` that do not exist on this node, so every byte here was captured
 from GitHub primary source and pinned.
 
-Every count below is measured against this tree and against the pinned commit.
-A `file:line` names the file it is in. A bare `:NNN` names the **upstream**
-file the section is about; where a section mixes the two, the file is spelled.
+The initial-cut counts and cost measurements below are historical measurements
+against the pinned commit, not current-tree statistics after later portability
+patches. A `file:line` names the recorded site in this fork; a bare `:NNN` names
+the **upstream** file the section is about. Later patches can move fork line numbers.
 
 ## What is here, and why only this
 
@@ -397,12 +398,84 @@ the ticket rather than resuming; a resumed connection with a pin in force
 failing `certificate_required` rather than completing with no identity; and a
 server handed a ticket issuing none.
 
-461 tests now, from 457.
+At that patch, the test count grew from 457 to 461.
 
 **One defect found on the way and not fixed here.** A client that offers a
 ticket the server declines cannot fall back, so the rotated-key test records a
 refusal rather than a full handshake. Pre-existing, client-side, and written
 up under "What is still not settled" below rather than here.
+
+### 7. Cross-platform addresses and fixture indices
+
+The complete ABI survey exposed two fixture loops that used a `u64` wire offset
+as a native `for` index. The reordered receive-window test and the lossy-link
+upload now enumerate native indices from zero and add them to the wide offset
+when computing expected bytes. The 5,000-frame workload, 16 MiB upload,
+6 MiB stream window, byte comparisons and virtual-time bounds are unchanged.
+
+WASI also exposed a false dependency: this sans-IO core stored path addresses
+as `std.posix.sockaddr.storage`, which is `void` on that target. The old
+`sockaddr.zig` module is replaced by `address.zig`; no POSIX-shaped fallback or
+compatibility export remains. `Address` is a pure tagged value with `unset`,
+IPv4 and IPv6 states, host-order ports, and an IPv6 scope ID. `unset` remains
+distinct from a wildcard address. Path equality includes port and scope;
+same-IP comparison retains its existing port/scope-independent behavior.
+Mapped IPv6 addresses remain distinct paths but count as IPv4 when choosing
+a preferred-address family.
+
+The core, preferred-address constructors, test roots, invariant inventory,
+bridge, dialer and discovery error consumer all use that value. Kernel address
+conversion stays in the actual socket seam. An unnamed bridge path reports
+`NoPathAddress`, not an obsolete numeric-family error.
+
+Retry and NEW_TOKEN previously bound only 14 raw kernel-layout bytes. On Linux
+IPv6 that omitted the address tail: two addresses differing only in byte 15
+validated the same token. Both rejection regressions failed before the change
+and passed afterwards, with positive controls for the original IPv6 address.
+Both formats now bind one canonical 23-byte stack value: family, big-endian
+port, all address bytes and big-endian scope. These issuer-private tokens have
+no legacy-format fallback. This is address-validation proof, not an iroh
+interoperability claim.
+
+The emulated upload also exposed quadratic work in the test link:
+`orderedRemove(0)` moved every queued datagram on each receive: 1,520 bytes
+per record on the measured 64-bit targets, since the record carries a native
+`usize` length and its size is pointer-width dependent.
+The FIFO now advances a head cursor, borrows the current record, and compacts
+consumed records only on a later push. Clearing the queue inside the pop
+poisoned the borrow that same pop had just returned, and all five upload tests
+crashed under Debug. That is the whole defect: reclaim is now deferred until
+the next push, which is where that borrow is documented to expire.
+
+A fixed-input benchmark drained 5,000 records three times with byte and order
+checks. Ordered removal moved 56,988,600,000 bytes; cursor removal moved none.
+Observed durations: native 3.18 → 0.06 seconds; SPARC64 QEMU 94.97 → 0.85.
+The complete, unchanged 16 MiB upload passed before and after the change:
+native 4.54 → 2.00 seconds, SPARC64 524.25 → 174.77, and big-endian MIPS64
+828.96 → 292.54. Other verification jobs were active; these are observed
+durations, not isolated throughput ratios. No payload, stream window,
+retirement count, byte comparison or virtual-time deadline was reduced.
+
+**Two measurements, not one conclusion.** All five crashes were Debug failures
+on this test link's consumer path, and the deferred-push fix is what the
+corrected Debug path shows. That is not a release-build result. The separate
+measured Safe limitation belongs to another target: under Hexagon/QEMU a
+standard-library-only ReleaseSafe Ed25519 probe derives `e13b9579…` instead
+of the captured `197f6b23…` public key for seed `[42; 32]`, and native
+ReleaseSafe derives the captured key (`README.md`, cross-platform rows).
+That mismatch is in emulated standard-library crypto, not in this queue,
+and it is why no Safe fallback is offered for the rows that fail here.
+Neither result stands in for the other: a Debug pass is not a Safe
+result, and the Hexagon key result says nothing about the FIFO.
+
+The corrected rerun of the vendored 108-row ABI survey over this section's
+address and fixture fixes is not recorded yet.
+
+<!-- NUMERIC-PENDING (parent, corrected 467 survey): insert the observed
+executed / build-only / failed row counts, the passing test count and the exit
+status of the completed corrected survey. Nothing until that run finishes. The
+earlier 18 executed / 20 build-only / 70 failed / exit 1 result describes the
+pre-address, pre-fixture survey and is not this one's outcome. -->
 
 ## Measured cost
 

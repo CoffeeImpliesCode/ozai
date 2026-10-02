@@ -14,6 +14,7 @@
 // test that nobody references is not a test.
 
 test {
+    _ = @import("address.zig");
     _ = @import("quic/ack_handler.zig");
     _ = @import("quic/aes_gcm.zig");
     _ = @import("quic/congestion.zig");

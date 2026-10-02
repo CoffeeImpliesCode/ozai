@@ -2,7 +2,7 @@ const std = @import("std");
 const io = @import("../io_compat.zig");
 const testing = std.testing;
 
-const posix = std.posix;
+const address = @import("../address.zig");
 
 const packet = @import("packet.zig");
 const protocol = @import("protocol.zig");
@@ -54,22 +54,19 @@ pub const PreferredAddress = struct {
         return self.cid_buf[0..self.cid_len];
     }
 
-    pub fn toSockaddrV4(self: *const PreferredAddress) posix.sockaddr.storage {
-        var storage: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-        const addr_in: *posix.sockaddr.in = @ptrCast(@alignCast(&storage));
-        addr_in.* = .{
-            .port = std.mem.nativeToBig(u16, self.ipv4_port),
-            .addr = @bitCast(self.ipv4_addr),
-        };
-        return storage;
+    /// The IPv4 address this parameter offers, as the core holds an address.
+    pub fn ipv4Address(self: *const PreferredAddress) address.Address {
+        return address.Address.initIpv4(self.ipv4_addr, self.ipv4_port);
     }
 
-    pub fn toSockaddrV6(self: *const PreferredAddress) posix.sockaddr.storage {
-        var storage: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-        const addr_in6: *posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
-        addr_in6.port = std.mem.nativeToBig(u16, self.ipv6_port);
-        addr_in6.addr = self.ipv6_addr;
-        return storage;
+    /// The IPv6 address this parameter offers, as the core holds an address.
+    ///
+    /// The scope is zero and the wire format is why: RFC 9000 §9.6 carries no
+    /// scope, so a peer that offers a link-local address here has named one
+    /// that no interface can be inferred for, and guessing an interface for it
+    /// would be the core inventing a path the peer never said existed.
+    pub fn ipv6Address(self: *const PreferredAddress) address.Address {
+        return address.Address.initIpv6(self.ipv6_addr, self.ipv6_port, 0);
     }
 };
 
@@ -477,21 +474,6 @@ test "TransportParams: preferred_address roundtrip" {
     try testing.expectEqual(pref.cid_len, dp.cid_len);
     try testing.expectEqualSlices(u8, pref.cid_buf[0..8], dp.cid_buf[0..8]);
     try testing.expectEqualSlices(u8, &pref.stateless_reset_token, &dp.stateless_reset_token);
-}
-
-// PreferredAddress sockaddr helpers
-test "PreferredAddress: toSockaddrV4" {
-    var pref = PreferredAddress{};
-    pref.ipv4_addr = .{ 127, 0, 0, 1 };
-    pref.ipv4_port = 4433;
-
-    try testing.expect(pref.hasIpv4());
-    try testing.expect(!pref.hasIpv6());
-
-    const sa = pref.toSockaddrV4();
-    const sa_in: *const posix.sockaddr.in = @ptrCast(@alignCast(&sa));
-    try testing.expectEqual(posix.AF.INET, sa_in.family);
-    try testing.expectEqual(std.mem.nativeToBig(u16, 4433), sa_in.port);
 }
 
 test "TransportParams: disable_active_migration roundtrip" {

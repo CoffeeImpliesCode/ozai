@@ -1,8 +1,7 @@
 const std = @import("std");
 const io = @import("../io_compat.zig");
 const limits = @import("limits.zig");
-const net = std.net;
-const posix = std.posix;
+const address = @import("../address.zig");
 const crypto = std.crypto;
 const tls = std.crypto.tls;
 
@@ -94,9 +93,12 @@ pub const PathValidator = struct {
 };
 
 pub const NetworkPath = struct {
-    local_addr: posix.sockaddr.storage,
-    peer_addr: posix.sockaddr.storage,
-    is_initial: bool,
+    /// `unset` until a caller names the path, which is what a second
+    /// `NetworkPath` is: a connection carries one active path and one
+    /// candidate, and a candidate that has not been proposed has no address.
+    local_addr: address.Address = .unset,
+    peer_addr: address.Address = .unset,
+    is_initial: bool = false,
 
     /// Bytes received on this path (for amplification limit).
     bytes_received: u64 = 0,
@@ -111,8 +113,8 @@ pub const NetworkPath = struct {
     validator: PathValidator = .{},
 
     pub fn init(
-        local_addr: posix.sockaddr.storage,
-        peer_addr: posix.sockaddr.storage,
+        local_addr: address.Address,
+        peer_addr: address.Address,
         is_initial: bool,
     ) NetworkPath {
         return .{
@@ -520,8 +522,8 @@ pub const ECN_ECT0: u2 = 0b10;
 pub const ECN_CE: u2 = 0b11;
 
 pub const RecvInfo = struct {
-    to: posix.sockaddr.storage,
-    from: posix.sockaddr.storage,
+    to: address.Address,
+    from: address.Address,
     // ECN codepoint from IP header (0=Not-ECT, 1=ECT(1), 2=ECT(0), 3=CE)
     ecn: u2 = ECN_NOT_ECT,
     // Size of the UDP datagram (for amplification limit accounting).
@@ -623,7 +625,7 @@ pub const Connection = struct {
     tls13_hs: ?*tls13.Tls13Handshake = null,
 
     // Network paths (active + candidate for migration)
-    paths: [2]NetworkPath = .{ std.mem.zeroes(NetworkPath), std.mem.zeroes(NetworkPath) },
+    paths: [2]NetworkPath = .{ .{}, .{} },
     active_path_idx: u8 = 0,
     path_initialized: bool = false,
 
@@ -808,8 +810,8 @@ pub const Connection = struct {
         conn: *Connection,
         allocator: std.mem.Allocator,
         header: packet.Header,
-        local: posix.sockaddr.storage,
-        remote: posix.sockaddr.storage,
+        local: address.Address,
+        remote: address.Address,
         comptime is_server: bool,
         config: ConnectionConfig,
         tls_config: ?tls13.TlsConfig,
@@ -1001,8 +1003,8 @@ pub const Connection = struct {
     pub fn accept(
         allocator: std.mem.Allocator,
         header: packet.Header,
-        local: posix.sockaddr.storage,
-        remote: posix.sockaddr.storage,
+        local: address.Address,
+        remote: address.Address,
         comptime is_server: bool,
         config: ConnectionConfig,
         tls_config: ?tls13.TlsConfig,
@@ -1539,14 +1541,14 @@ pub const Connection = struct {
         // Only for 1-RTT packets after handshake is confirmed, with non-probing frames
         if (epoch == .application and self.handshake_confirmed and has_non_probing) {
             const active_path = &self.paths[self.active_path_idx];
-            if (!sockaddrEql(&info.from, &active_path.peer_addr)) {
+            if (!info.from.eql(active_path.peer_addr)) {
                 std.log.info("connection migration detected from new peer address", .{});
                 self.handleMigration(info.from, info.to, now, random);
                 // Credit this packet's bytes to the new path (already counted on old path above)
                 if (info.datagram_size > 0) {
                     self.paths[self.active_path_idx].bytes_received += info.datagram_size;
                 }
-            } else if (!sockaddrEql(&info.to, &active_path.local_addr)) {
+            } else if (!info.to.eql(active_path.local_addr)) {
                 // Local address changed (e.g., client migrated to our preferred_address port).
                 // Treat as a path change: update local_addr and send PATH_CHALLENGE.
                 std.log.info("preferred_address migration: local address changed", .{});
@@ -2711,11 +2713,12 @@ pub const Connection = struct {
 
                                     // Pick preferred address of the OTHER family to ensure a real path change.
                                     // Detects IPv4-mapped IPv6 (::ffff:x.x.x.x) as effectively IPv4.
-                                    const current_is_v4 = isEffectivelyV4(&self.paths[self.active_path_idx].peer_addr);
+                                    const current_is_v4 =
+                                        self.paths[self.active_path_idx].peer_addr.isEffectivelyIpv4();
                                     const pref_addr = if (current_is_v4)
-                                        (if (pref.hasIpv6()) pref.toSockaddrV6() else pref.toSockaddrV4())
+                                        (if (pref.hasIpv6()) pref.ipv6Address() else pref.ipv4Address())
                                     else
-                                        (if (pref.hasIpv4()) pref.toSockaddrV4() else pref.toSockaddrV6());
+                                        (if (pref.hasIpv4()) pref.ipv4Address() else pref.ipv6Address());
 
                                     // Set up candidate path
                                     const candidate_idx: u8 = 1 - self.active_path_idx;
@@ -3425,8 +3428,8 @@ pub const Connection = struct {
     /// Called when a 1-RTT packet with non-probing frames arrives from a different address.
     fn handleMigration(
         self: *Connection,
-        new_peer_addr: posix.sockaddr.storage,
-        local_addr: posix.sockaddr.storage,
+        new_peer_addr: address.Address,
+        local_addr: address.Address,
         now: i64,
         random: std.Random,
     ) void {
@@ -3457,7 +3460,7 @@ pub const Connection = struct {
 
         // Reset CC/RTT/MTU/ECN if IP address changed (not just port — NAT rebinding preserves CC)
         const old_path = &self.paths[1 - candidate_idx];
-        const same_ip = sockaddrSameIp(&new_peer_addr, &old_path.peer_addr);
+        const same_ip = new_peer_addr.sameIp(old_path.peer_addr);
         if (!same_ip) {
             self.cc = congestion.Cubic.init();
             self.pacer = congestion.Pacer.init();
@@ -4324,12 +4327,12 @@ pub const Connection = struct {
 
     /// Return the peer address on the active path.
     /// This may change after connection migration or preferred address selection.
-    pub fn peerAddress(self: *const Connection) *const posix.sockaddr.storage {
+    pub fn peerAddress(self: *const Connection) *const address.Address {
         return &self.paths[self.active_path_idx].peer_addr;
     }
 
     /// Return the local address on the active path.
-    pub fn localAddress(self: *const Connection) *const posix.sockaddr.storage {
+    pub fn localAddress(self: *const Connection) *const address.Address {
         return &self.paths[self.active_path_idx].local_addr;
     }
 
@@ -4424,85 +4427,6 @@ pub const Connection = struct {
         }
     }
 };
-
-/// Compare two sockaddrs for equality (IPv4: port + address).
-/// Uses byte-level reads to avoid alignment issues with posix.sockaddr (align=1).
-/// Check if an AF_INET6 address is IPv4-mapped (::ffff:a.b.c.d).
-pub fn isV4Mapped(addr: *const posix.sockaddr.storage) bool {
-    if (addr.family != posix.AF.INET6) return false;
-    const in6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
-    // ::ffff:0:0/96 — first 10 bytes zero, bytes 10-11 are 0xff
-    for (0..10) |i| {
-        if (in6.addr[i] != 0) return false;
-    }
-    return in6.addr[10] == 0xff and in6.addr[11] == 0xff;
-}
-
-/// Check if an address is effectively IPv4 (AF_INET or IPv4-mapped AF_INET6).
-pub fn isEffectivelyV4(addr: *const posix.sockaddr.storage) bool {
-    return addr.family == posix.AF.INET or isV4Mapped(addr);
-}
-
-pub fn sockaddrEql(a: *const posix.sockaddr.storage, b: *const posix.sockaddr.storage) bool {
-    if (a.family != b.family) return false;
-    if (a.family == posix.AF.INET6) {
-        const a_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(a);
-        const b_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(b);
-        const a6 = std.mem.bytesToValue(posix.sockaddr.in6, a_bytes);
-        const b6 = std.mem.bytesToValue(posix.sockaddr.in6, b_bytes);
-        return a6.port == b6.port and std.mem.eql(u8, &a6.addr, &b6.addr) and a6.scope_id == b6.scope_id;
-    }
-    const a_bytes: *const [@sizeOf(posix.sockaddr.in)]u8 = @ptrCast(a);
-    const b_bytes: *const [@sizeOf(posix.sockaddr.in)]u8 = @ptrCast(b);
-    const a_in = std.mem.bytesToValue(posix.sockaddr.in, a_bytes);
-    const b_in = std.mem.bytesToValue(posix.sockaddr.in, b_bytes);
-    return a_in.port == b_in.port and a_in.addr == b_in.addr;
-}
-
-/// Compare two sockaddrs for same IP address (ignoring port).
-/// Uses byte-level reads to avoid alignment issues with posix.sockaddr (align=1).
-pub fn sockaddrSameIp(a: *const posix.sockaddr.storage, b: *const posix.sockaddr.storage) bool {
-    if (a.family != b.family) return false;
-    if (a.family == posix.AF.INET6) {
-        const a_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(a);
-        const b_bytes: *const [@sizeOf(posix.sockaddr.in6)]u8 = @ptrCast(b);
-        const a6 = std.mem.bytesToValue(posix.sockaddr.in6, a_bytes);
-        const b6 = std.mem.bytesToValue(posix.sockaddr.in6, b_bytes);
-        return std.mem.eql(u8, &a6.addr, &b6.addr);
-    }
-    const a_bytes: *const [@sizeOf(posix.sockaddr.in)]u8 = @ptrCast(a);
-    const b_bytes: *const [@sizeOf(posix.sockaddr.in)]u8 = @ptrCast(b);
-    const a_in = std.mem.bytesToValue(posix.sockaddr.in, a_bytes);
-    const b_in = std.mem.bytesToValue(posix.sockaddr.in, b_bytes);
-    return a_in.addr == b_in.addr;
-}
-
-/// Get the correct address length for sendto() based on the address family.
-pub fn sockaddrLen(addr: *const posix.sockaddr.storage) posix.socklen_t {
-    return if (addr.family == posix.AF.INET6) @sizeOf(posix.sockaddr.in6) else @sizeOf(posix.sockaddr.in);
-}
-
-/// Extract port from a sockaddr in host byte order.
-pub fn sockaddrPort(addr: *const posix.sockaddr.storage) u16 {
-    if (addr.family == posix.AF.INET6) {
-        const in6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
-        return std.mem.bigToNative(u16, in6.port);
-    } else if (addr.family == posix.AF.INET) {
-        const in4: *const posix.sockaddr.in = @ptrCast(@alignCast(addr));
-        return std.mem.bigToNative(u16, in4.port);
-    }
-    return 0;
-}
-
-/// Convert a posix.sockaddr (from std.net.Address.any) to posix.sockaddr.storage.
-pub fn sockaddrToStorage(addr: *const posix.sockaddr) posix.sockaddr.storage {
-    var storage: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-    const src_bytes: [*]const u8 = @ptrCast(addr);
-    const dst_bytes: [*]u8 = @ptrCast(&storage);
-    const len: usize = if (addr.family == posix.AF.INET6) @sizeOf(posix.sockaddr.in6) else @sizeOf(posix.sockaddr.in);
-    @memcpy(dst_bytes[0..len], src_bytes[0..len]);
-    return storage;
-}
 
 /// Generates a new random connection ID of the given size into the provided buffer.
 pub fn generateConnectionId(buf: []u8, random: std.Random) void {
@@ -5046,115 +4970,6 @@ test "DatagramQueue: peekDataSkipExpired with no max age" {
     try std.testing.expectEqualSlices(u8, "data", peeked.?);
 }
 
-// --- Address utility function tests ---
-
-fn makeIpv4Addr(a: u8, b: u8, c: u8, d: u8, port: u16) posix.sockaddr.storage {
-    var in4: posix.sockaddr.in = std.mem.zeroes(posix.sockaddr.in);
-    in4.family = posix.AF.INET;
-    in4.port = std.mem.nativeToBig(u16, port);
-    in4.addr = (@as(u32, d) << 24) | (@as(u32, c) << 16) | (@as(u32, b) << 8) | @as(u32, a);
-    return sockaddrToStorage(@ptrCast(&in4));
-}
-
-fn makeIpv6Addr(addr_bytes_in: [16]u8, port: u16) posix.sockaddr.storage {
-    var in6: posix.sockaddr.in6 = std.mem.zeroes(posix.sockaddr.in6);
-    in6.family = posix.AF.INET6;
-    in6.port = std.mem.nativeToBig(u16, port);
-    in6.addr = addr_bytes_in;
-    return sockaddrToStorage(@ptrCast(&in6));
-}
-
-test "sockaddrEql: same IPv4 addresses" {
-    const a = makeIpv4Addr(127, 0, 0, 1, 4433);
-    const b = makeIpv4Addr(127, 0, 0, 1, 4433);
-    try std.testing.expect(sockaddrEql(&a, &b));
-}
-
-test "sockaddrEql: different IPv4 ports" {
-    const a = makeIpv4Addr(127, 0, 0, 1, 4433);
-    const b = makeIpv4Addr(127, 0, 0, 1, 4434);
-    try std.testing.expect(!sockaddrEql(&a, &b));
-}
-
-test "sockaddrEql: different IPv4 addresses" {
-    const a = makeIpv4Addr(127, 0, 0, 1, 4433);
-    const b = makeIpv4Addr(192, 168, 1, 1, 4433);
-    try std.testing.expect(!sockaddrEql(&a, &b));
-}
-
-test "sockaddrSameIp: same IP different ports" {
-    const a = makeIpv4Addr(10, 0, 0, 1, 1234);
-    const b = makeIpv4Addr(10, 0, 0, 1, 5678);
-    try std.testing.expect(sockaddrSameIp(&a, &b));
-}
-
-test "sockaddrSameIp: different IPs" {
-    const a = makeIpv4Addr(10, 0, 0, 1, 1234);
-    const b = makeIpv4Addr(10, 0, 0, 2, 1234);
-    try std.testing.expect(!sockaddrSameIp(&a, &b));
-}
-
-test "isV4Mapped: IPv4-mapped IPv6" {
-    // ::ffff:127.0.0.1
-    var addr_bytes = [_]u8{0} ** 16;
-    addr_bytes[10] = 0xff;
-    addr_bytes[11] = 0xff;
-    addr_bytes[12] = 127;
-    addr_bytes[13] = 0;
-    addr_bytes[14] = 0;
-    addr_bytes[15] = 1;
-    const addr = makeIpv6Addr(addr_bytes, 4433);
-    try std.testing.expect(isV4Mapped(&addr));
-}
-
-test "isV4Mapped: regular IPv6 is not mapped" {
-    // ::1 (loopback)
-    var addr_bytes = [_]u8{0} ** 16;
-    addr_bytes[15] = 1;
-    const addr = makeIpv6Addr(addr_bytes, 4433);
-    try std.testing.expect(!isV4Mapped(&addr));
-}
-
-test "isV4Mapped: IPv4 is not mapped" {
-    const addr = makeIpv4Addr(127, 0, 0, 1, 4433);
-    try std.testing.expect(!isV4Mapped(&addr));
-}
-
-test "isEffectivelyV4: IPv4" {
-    const addr = makeIpv4Addr(10, 0, 0, 1, 80);
-    try std.testing.expect(isEffectivelyV4(&addr));
-}
-
-test "isEffectivelyV4: IPv4-mapped IPv6" {
-    var addr_bytes = [_]u8{0} ** 16;
-    addr_bytes[10] = 0xff;
-    addr_bytes[11] = 0xff;
-    addr_bytes[12] = 10;
-    addr_bytes[13] = 0;
-    addr_bytes[14] = 0;
-    addr_bytes[15] = 1;
-    const addr = makeIpv6Addr(addr_bytes, 80);
-    try std.testing.expect(isEffectivelyV4(&addr));
-}
-
-test "isEffectivelyV4: native IPv6 is not v4" {
-    var addr_bytes = [_]u8{0} ** 16;
-    addr_bytes[0] = 0x20;
-    addr_bytes[1] = 0x01;
-    const addr = makeIpv6Addr(addr_bytes, 80);
-    try std.testing.expect(!isEffectivelyV4(&addr));
-}
-
-test "sockaddrLen: IPv4 vs IPv6" {
-    const v4 = makeIpv4Addr(127, 0, 0, 1, 80);
-    try std.testing.expectEqual(@as(posix.socklen_t, @sizeOf(posix.sockaddr.in)), sockaddrLen(&v4));
-
-    var v6_bytes = [_]u8{0} ** 16;
-    v6_bytes[15] = 1;
-    const v6 = makeIpv6Addr(v6_bytes, 80);
-    try std.testing.expectEqual(@as(posix.socklen_t, @sizeOf(posix.sockaddr.in6)), sockaddrLen(&v6));
-}
-
 // --- Connection state and method tests ---
 
 fn testConnection(allocator: std.mem.Allocator) Connection {
@@ -5495,8 +5310,8 @@ test "Connection: openStream" {
 
 test "accept: create server connection" {
     var rng = TestRandom{};
-    const local = makeIpv4Addr(0, 0, 0, 0, 443);
-    const remote = makeIpv4Addr(192, 168, 1, 100, 12345);
+    const local = address.Address.initIpv4(.{ 0, 0, 0, 0 }, 443);
+    const remote = address.Address.initIpv4(.{ 192, 168, 1, 100 }, 12345);
 
     const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
     const scid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
@@ -5540,8 +5355,8 @@ test "accept: create server connection" {
 test "accept: a client may choose a zero-length SCID" {
     var rng = TestRandom{};
     // RFC 9000 §5.1 allows it and Safari does it; we answer to an empty DCID.
-    const local = makeIpv4Addr(0, 0, 0, 0, 443);
-    const remote = makeIpv4Addr(192, 168, 1, 100, 12345);
+    const local = address.Address.initIpv4(.{ 0, 0, 0, 0 }, 443);
+    const remote = address.Address.initIpv4(.{ 192, 168, 1, 100 }, 12345);
     const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
 
     var header = packet.Header{
@@ -5586,8 +5401,8 @@ test "PathValidator: checkTimeout after max retries" {
 
 test "NetworkPath: amplification limit" {
     var path = NetworkPath.init(
-        makeIpv4Addr(0, 0, 0, 0, 443),
-        makeIpv4Addr(192, 168, 1, 1, 12345),
+        address.Address.initIpv4(.{ 0, 0, 0, 0 }, 443),
+        address.Address.initIpv4(.{ 192, 168, 1, 1 }, 12345),
         true,
     );
 
@@ -6621,7 +6436,7 @@ test "a paused stream's window arriving reordered is not mistaken for reassembly
     var payload: [1200]u8 = undefined;
     for (order) |o| {
         const offset = o.idx * payload.len;
-        for (&payload, offset..) |*b, k| b.* = @intCast(k % 251);
+        for (&payload, 0..) |*b, k| b.* = @intCast((offset + @as(u64, k)) % 251);
         try conn.processFrame(&.{ .stream = .{ .stream_id = 0, .offset = offset, .length = payload.len, .fin = false, .data = &payload } }, .application, 0, rng.random());
     }
     try std.testing.expect(conn.local_err == null);
@@ -6630,7 +6445,10 @@ test "a paused stream's window arriving reordered is not mistaken for reassembly
     var got: u64 = 0;
     while (s.recv.read()) |chunk| {
         defer std.testing.allocator.free(chunk);
-        for (chunk, got..) |v, k| try std.testing.expectEqual(@as(u8, @intCast(k % 251)), v);
+        for (chunk, 0..) |v, k| {
+            const expected: u8 = @intCast((got + @as(u64, k)) % 251);
+            try std.testing.expectEqual(expected, v);
+        }
         got += chunk.len;
     }
     try std.testing.expectEqual(@as(u64, n * payload.len), got);

@@ -14,7 +14,7 @@
 // reach the operating system, and nothing in it can be made to do so without
 // writing a new file.
 
-pub const sockaddr = @import("sockaddr.zig");
+pub const address = @import("address.zig");
 pub const io_compat = @import("io_compat.zig");
 
 pub const connection = @import("quic/connection.zig");
