@@ -164,11 +164,11 @@ const frames_per_round = 8;
 /// was reordered, duplicated or truncated is visible rather than merely absent.
 const payload_length = 16;
 
-fn payload(index: usize) [payload_length]u8 {
+fn payload(index: u64) [payload_length]u8 {
     var out: [payload_length]u8 = @splat(0xa5);
     var at: usize = 0;
     while (at < payload_length) : (at += 8) {
-        std.mem.writeInt(u64, out[at..][0..8], @intCast(index), .big);
+        std.mem.writeInt(u64, out[at..][0..8], index, .big);
     }
     return out;
 }

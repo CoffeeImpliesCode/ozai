@@ -139,17 +139,13 @@ fn windowMs(passes: i64) i64 {
     return passes * pass_ms * pass_slack;
 }
 
-/// Sixty nominal passes exceed the measured handshake and departure windows.
-/// The test signals a healthy child after observing its state, before this limit.
-const watchdog_passes = 60;
+/// Each observation and reap remains bounded to sixty seconds.
+const wait_passes = 120;
+const budget_ms: i64 = windowMs(wait_passes);
 
-/// `--for` for every node in this file. A watchdog, and nothing else: see
-/// `watchdog_passes`.
-const watchdog_ms: i64 = windowMs(watchdog_passes);
-
-/// Allow a final report and reaping after the child's own watchdog expires.
-/// A timeout prints the awaited state and every child's captured output.
-const budget_ms: i64 = 2 * watchdog_ms;
+/// A child must remain alive while its parent observes and signals it.
+/// Auto-expiry is a last-resort guard, not the event a lifecycle test awaits.
+const watchdog_ms: i64 = 4 * budget_ms;
 
 /// A short `--for`, for a child whose command line must never need one.
 ///
@@ -255,17 +251,9 @@ const Process = struct {
                 .stdout = .pipe,
                 .stderr = .pipe,
             }) catch |err| {
-                // The whole command line, because the first thing to be wrong
-                // is very often a flag this file has just learned to pass and
-                // the name of the process on its own says nothing about it.
-                // `zig build` puts this binary there, which is also why nothing
-                // about installing it is this file's business: the path in
-                // `argv[0]` is whatever the build that compiled this test
-                // emitted, and the next line is the only place worth looking
-                // when it is not runnable.
+                // Keep the emitted node visible even when argv[0] is the foreign executor.
                 std.debug.print(
-                    "two_process: could not start {s} ({t}). `zig build` built it, " ++
-                        "and it was asked to run:\n  {s}\n",
+                    "two_process: could not start {s} ({t}). Command:\n  {s}\n",
                     .{ name, err, argv[0] },
                 );
                 for (argv[1..]) |arg| std.debug.print("  {s}\n", .{arg});
@@ -490,7 +478,11 @@ const Roster = struct {
         var open: usize = 0;
         for (self.items.items) |process| {
             if (process.reaped) continue;
-            for ([_]?std.Io.File{ process.child.stdout, process.child.stderr }) |pipe| {
+            for (
+                [_]?std.Io.File{ process.child.stdout, process.child.stderr },
+                [_]bool{ process.out_done, process.err_done },
+            ) |pipe, done| {
+                if (done) continue;
                 const end = pipe orelse continue;
                 fds[open] = .{
                     .fd = end.handle,
@@ -519,6 +511,7 @@ const Roster = struct {
         while (true) {
             try self.pump(io);
             if (ready(process)) return true;
+            if (process.finished()) return false;
             const left = deadline - nowMs(io);
             if (left <= 0) return false;
             try self.wait(@intCast(@min(left, poll_slice_ms)));
@@ -571,6 +564,12 @@ const Roster = struct {
         while (!holds(process, want)) {
             try self.pump(io);
             if (holds(process, want)) return;
+            if (process.finished()) return self.gaveUp(
+                "exited before reporting {s}",
+                process,
+                want,
+                .{what},
+            );
             const left = deadline - nowMs(io);
             if (left <= 0) return self.gaveUp(
                 "never reported {s} in {d} ms",
@@ -979,6 +978,7 @@ fn flags(arena: Allocator, plan: Plan) ![]const []const u8 {
     var seed_bytes: [SecretKey.seed_length]u8 = @splat(plan.tag);
     const key_seed = base32.encode(base32.z32, SecretKey.seed_length, &seed_bytes);
     var argv: std.ArrayList([]const u8) = .empty;
+    if (node_test_options.node_executor) |executor| try argv.append(arena, executor);
     try argv.append(arena, node_exe);
     try argv.append(arena, "--listen");
     try argv.append(arena, loopback);

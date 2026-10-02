@@ -78,6 +78,7 @@ const vendored_root = "vendor/quic/src";
 /// honest: a list that quietly omits a file is worse than no gate at all,
 /// because it looks like coverage.
 pub const vendored_files = [_][]const u8{
+    vendored_root ++ "/address.zig",
     vendored_root ++ "/io_compat.zig",
     vendored_root ++ "/lib.zig",
     vendored_root ++ "/quic/ack_handler.zig",
@@ -109,7 +110,6 @@ pub const vendored_files = [_][]const u8{
     vendored_root ++ "/quic/tls13.zig",
     vendored_root ++ "/quic/transport_params.zig",
     vendored_root ++ "/quic/util.zig",
-    vendored_root ++ "/sockaddr.zig",
     vendored_root ++ "/test_all.zig",
 };
 
@@ -127,9 +127,10 @@ const deleted_seam = "sys.zig";
 /// Qualifiers that mean "reached through a system namespace". A method call on
 /// a type is not a syscall — `Connection.accept(` is this project's handshake
 /// entry point — so a socket is only a socket when a namespace stands in front
-/// of it. `posix.sockaddr`, `posix.AF` and `posix.socklen_t` are in none of the
-/// name sets below on purpose: carrying an address is not holding a descriptor,
-/// and those three appear on library lines all over the tree.
+/// of it. `posix` is here for the syscalls it names, not for the address types
+/// it used to carry: the core's address is its own value
+/// (`vendor/quic/src/address.zig`) and the tree now names no `posix` at all, so
+/// a `posix.` appearing in it from here on is reaching for the system.
 const namespaces = [_][]const u8{ "c", "fs", "linux", "os", "posix", "process", "std", "sys" };
 
 /// Syscalls that own a descriptor. Reached as a bare call or through a

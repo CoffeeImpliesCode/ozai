@@ -504,7 +504,7 @@ const Plan = struct {
     /// How many bytes the plan covers in total.
     fn total(plan: Plan) usize {
         var sum: usize = 0;
-        for (plan.ranges[0..plan.len]) |range| sum += range.end - range.start;
+        for (plan.ranges[0..plan.len]) |range| sum += @intCast(range.end - range.start);
         return sum;
     }
 
@@ -548,7 +548,7 @@ fn planSpec(plan: *Plan, spec: range_spec.RangeSpec, store: Store) error{TooMany
 /// The direction `planSpec` did not take, and the one a getter has to take to
 /// know what an answer will cover. The clip is the same rule: the last chunk
 /// of a blob is short and the boundary list does not know that.
-fn planFromBoundaries(boundaries: []const u64, size: usize) Plan {
+fn planFromBoundaries(boundaries: []const u64, size: u64) Plan {
     var plan: Plan = .{};
     var slot: usize = 0;
     while (slot + 1 < boundaries.len) : (slot += 2) {
@@ -1037,8 +1037,9 @@ const Link = struct {
             var budget = job.truncate_to orelse std.math.maxInt(usize);
             for (job.plan.ranges[0..job.plan.len]) |range| {
                 if (budget == 0) break;
-                const take = @min(budget, range.end - range.start);
-                try stream.send.writeData(link.store.bytes[range.start .. range.start + take]);
+                const start: usize = @intCast(range.start);
+                const take: usize = @intCast(@min(budget, range.end - range.start));
+                try stream.send.writeData(link.store.bytes[start .. start + take]);
                 budget -= take;
             }
         }
@@ -1198,7 +1199,7 @@ fn answerOf(link: *Link, job: *Job) blobs.BaoResponse {
 fn covers(store: Store, plan: Plan, answer: blobs.BaoResponse) bool {
     var at: usize = 0;
     for (plan.ranges[0..plan.len]) |range| {
-        const want = store.bytes[range.start..range.end];
+        const want = store.bytes[@intCast(range.start)..@intCast(range.end)];
         if (answer.bytes.len < at + want.len) return false;
         if (!std.mem.eql(u8, want, answer.bytes[at .. at + want.len])) return false;
         at += want.len;
@@ -1408,7 +1409,7 @@ test "disjoint ranges and a whole blob return exactly the bytes asked for" {
         // Spelled out, span by span, so a failure says which range is wrong.
         var at: usize = 0;
         for (job.expected.ranges[0..job.expected.len]) |range| {
-            const want = link.store.bytes[range.start..range.end];
+            const want = link.store.bytes[@intCast(range.start)..@intCast(range.end)];
             try t.expectEqualSlices(u8, want, answer.bytes[at .. at + want.len]);
             at += want.len;
         }
