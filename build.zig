@@ -172,6 +172,16 @@ pub fn build(b: *std.Build) void {
     const lib_unit_tests = b.addTest(.{ .root_module = lib_test_mod });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
+    const portable_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/portable_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    portable_test_mod.addImport("quic", quic_mod);
+    const run_portable_tests = b.addRunArtifact(b.addTest(.{ .root_module = portable_test_mod }));
+    const portable_step = b.step("test-portable", "Run socket-free protocol and state-machine tests");
+    portable_step.dependOn(&run_portable_tests.step);
+
     // Integration tests live outside `src/` and get their own module: Zig only
     // runs the test blocks a root file reaches, so a test in a library file is
     // vacuous unless the library root imports it.
@@ -284,6 +294,19 @@ pub fn build(b: *std.Build) void {
     // path and its options dependency select and build that exact child.
     const node_test_options = b.addOptions();
     node_test_options.addOptionPath("node_executable", node_exe.getEmittedBin());
+    // A QEMU-run test must use that executor for its children too: the host
+    // kernel need not have binfmt_misc or native 32-bit execution enabled.
+    const cross_executor = if (std.mem.eql(
+        u8,
+        b.graph.environ_map.get("CROSS_TEST_RUNNER_KIND") orelse "",
+        "exec",
+    )) b.graph.environ_map.get("CROSS_TEST_RUNNER") else null;
+    const node_executor = b.option(
+        []const u8,
+        "test-node-executor",
+        "Executor for foreign node-test children",
+    ) orelse cross_executor;
+    node_test_options.addOption(?[]const u8, "node_executor", node_executor);
     two_process_mod.addOptions("node_test_options", node_test_options);
     const two_process_tests = b.addTest(.{
         .root_module = two_process_mod,
