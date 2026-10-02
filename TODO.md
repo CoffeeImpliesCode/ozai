@@ -48,14 +48,12 @@ what "next" means.
 - **State-driven process tests.** `ozai-node --progress` exposes live counters,
   and `test/two_process_test.zig` observes handshakes, delivery and departure
   before it stops a child. Run durations are watchdogs, not readiness
-  conditions, and the ceilings are the ones that file actually uses: every
-  child in it gets `--for 30000`, and every parent wait gets 60000 ms, with
-  one exception. The serving relay that carries a datagram for a peer besides
-  gets a single pass, because a refused command line never becomes a node to
-  bound, and a long watchdog there would only put the failure further behind.
-  Sixty nominal passes at the node's 250 ms poll interval with a 2× slack
-  allowance is the first number, and the second is twice that again, covering
-  the final report and the reap. No test on the passing path waits for either.
+  conditions. Parent observations retain their 60000 ms ceilings; children
+  now get a 240000 ms fallback watchdog so those observations can finish
+  before child expiry. Every passing test explicitly stops its children.
+  The refusal guard remains short: a rejected command line never becomes a
+  node to observe. Closed output pipes are not polled again, and premature
+  EOF fails the observation rather than spinning until its deadline.
 - **A relay reached by URL across real sockets.** `test/relay_wire_test.zig`
   and `test/two_process_test.zig` cover delivery and independent shutdown.
 - **The relay's outbound frame bound.** `relay/frame.zig` owns the text bound
@@ -130,8 +128,27 @@ bottom of this file.
   `test/vendored_invariants.zig` is what pays that exclusion back: it fails if
   a socket, a clock, a global entropy source or a libc call returns to the
   vendored tree.
-- The recorded run executes coverage and both `cross-test.profile.sh` rows:
-  instrumented tests, native GNU tests and native musl tests each pass 543/543.
-  Coverage source-line zeros are not automatically unexecuted branches;
-  accepted cold-region decisions and the missing `devenv` sandbox are in
-  [`README.md`](README.md). Interop and 0-RTT remain open.
+- Cross-validation separates the full Linux socket/process suite in
+  `cross-test.profile.sh` from 463 tests in 32 pure project modules across all
+  108 pinned compiler libc ABI targets in `cross-test.portable.profile.sh`.
+  The 32 are the previous 29 plus the QUIC bridge, the dial path and the
+  discovery driver, pure for the same reason as the rest; the three
+  socket-owning live roots stay out. 463/463 is what the expanded root measures
+  in isolation under Debug, not a cross-target result. The last 108-target
+  portable survey — 53 run, 37 build-only, 18 SDK failures — predates those
+  three modules and describes the older 29-module root, so it has to be rerun
+  before its counts describe this one. The vendored sans-IO core, 467 tests,
+  uses the same matrix with `--step quic-test`; its canonical row is likewise
+  still being measured, and the earlier one predates the pure-address and
+  fixture corrections. Core path addresses stay pure values; kernel conversion
+  stays in the socket seam. Emulation budgets do not replace payload, order or
+  virtual-time checks. Exact executed/build-only/failed counts, toolchain
+  limits, native coverage and accepted cold regions are in
+  [`README.md`](README.md); a build-only row is never a test pass. The portable
+  entry point is explicit: update its imports and `refAllDecls` list when
+  adding a pure module — the QUIC bridge, the dial path and the discovery
+  driver are wired in for that reason — importing the live root or guessing
+  purity would invalidate its non-Linux scope. Foreign GNU runs use private
+  compatible loaders, the loader prefix passed per invocation as
+  `QEMU_LD_PREFIX`; shared tools and global temporary storage remain
+  untouched. Interop and 0-RTT remain open.
