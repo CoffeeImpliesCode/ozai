@@ -60,9 +60,9 @@
 //! 4193 addresses and `transport/addr_map.zig` memoises them, and both are used
 //! here — `resolveRoute` is the one place a target becomes an address, and the
 //! core is told the *socket address* while the caller is handed the *key* it
-//! stands for. That split is the point: the core gets an address it can put in
-//! a `sockaddr.storage` and compare, and the caller gets back the peer and relay
-//! or the custom bytes it has to open a socket for. `Conn.drain` gives the
+//! stands for. That split is the point: the core gets an address it can hold
+//! and compare, and the caller gets back the peer and relay or the custom
+//! bytes it has to open a socket for. `Conn.drain` gives the
 //! caller an `Egress` carrying only the address, so the address is all the
 //! socket layer ever sees and `ownerOf` is how it turns one back into a key.
 //!
@@ -185,8 +185,6 @@ const base_ula = @import("../base/ula.zig");
 const addr_map = @import("addr_map.zig");
 const batch = @import("batch.zig");
 const quic_bridge = @import("quic_bridge.zig");
-
-const posix = std.posix;
 
 const NodeId = base_key.NodeId;
 const SecretKey = base_key.SecretKey;
@@ -602,11 +600,10 @@ pub const Dialer = struct {
         // What the first flight is sent to, and nothing more: the core builds
         // its path from the first datagram it receives (`connection.zig:1533`),
         // so these are read once by `Conn.drain` and then rewritten. They are
-        // written at all because an all-zero `sockaddr.storage` is an address
-        // family this project does not model, and `drain` would refuse the
-        // first datagram it was ever asked for.
-        conn.paths[0].peer_addr = toSockaddr(peer_addr);
-        conn.paths[0].local_addr = toSockaddr(local);
+        // written at all because a `NetworkPath` starts `unset`, and `drain`
+        // would refuse the first datagram it was ever asked for.
+        conn.paths[0].peer_addr = toCoreAddress(peer_addr);
+        conn.paths[0].local_addr = toCoreAddress(local);
 
         const entry = try self.gpa.create(Entry);
         errdefer self.gpa.destroy(entry);
@@ -652,34 +649,19 @@ fn noteCid(entry: *Entry, key: CidKey) Error!void {
     entry.registered_cid_count += 1;
 }
 
-/// This project's address as the core's `sockaddr.storage`.
+/// This project's address as the core's own.
 ///
-/// The core's own address vocabulary is `vendor/quic/src/sockaddr.zig`, which
-/// stands in for the `std.net.Address` Zig 0.16 removed, and it carries both
-/// conversions; this is its way in, for the same reason the bridge has a
-/// `fromSockaddr` as well as a `toSockaddr`. `quic_bridge.zig` has the same
-/// conversion for its two directions and does not export it, so this is a
-/// second copy of one `switch` — the smallest duplication in the file, and
-/// unavoidable without changing a file this ticket was told not to change.
-fn toSockaddr(socket: SocketAddr) posix.sockaddr.storage {
-    var addr: quic.sockaddr.Address = switch (socket.ip) {
-        .v4 => |octets| quic.sockaddr.Address.initIp4(octets, socket.port),
-        .v6 => |octets| .{
-            .in6 = .{
-                .sa = .{
-                    .port = std.mem.nativeToBig(u16, socket.port),
-                    .flowinfo = 0,
-                    .addr = octets,
-                    // Zero because `SocketAddr` carries no scope. A link-local
-                    // address would need one and this project has no name for it; the
-                    // synthetic ULAs are not link-local, which is why the core's
-                    // `scope_id` comparison can never disagree with `ula` for them.
-                    .scope_id = 0,
-                },
-            },
-        },
+/// `quic_bridge.zig` has the same conversion for both directions and does not
+/// export it, so this is a second copy of one `switch` — the smallest
+/// duplication in the file, and it is here because a dial writes a path
+/// directly and the bridge's copy is not part of its own surface.
+fn toCoreAddress(socket: SocketAddr) quic.address.Address {
+    return switch (socket.ip) {
+        .v4 => |octets| quic.address.Address.initIpv4(octets, socket.port),
+        // The scope is zero because `SocketAddr` carries none; see
+        // `quic_bridge.toCoreAddress` for why that is the only honest value.
+        .v6 => |octets| quic.address.Address.initIpv6(octets, socket.port, 0),
     };
-    return quic.connection.sockaddrToStorage(&addr.any);
 }
 
 const t = std.testing;
@@ -758,7 +740,7 @@ fn forward(
     egress: []Egress,
     out: []u8,
 ) Error!bool {
-    const from = conn.local() orelse return error.UnknownAddressFamily;
+    const from = conn.local() orelse return error.NoPathAddress;
     const sends = try conn.drain(egress, out, at, random);
     for (sends) |send| {
         // Through `batch.Runs` on the way, at a capability that cannot
@@ -1296,9 +1278,10 @@ test "a dial runs initiated to connected as a function of datagrams and nothing 
     try t.expectEqual(dial.conn.id(), found.id());
 
     // What the core was told, and what it learned. The synthetic address
-    // survived the `sockaddr.storage` round trip and `classify` still names the
-    // relay subnet: the core does not validate a peer's address, and a client
-    // is not even subject to the anti-amplification limit.
+    // survived the trip into the core's own representation and `classify`
+    // still names the relay subnet: the core does not validate a peer's
+    // address, and a client is not even subject to the anti-amplification
+    // limit.
     try t.expectEqual(dial.route.socket, dial.conn.peer().?);
     try t.expectEqual(
         base_ula.Classification{ .relay = dial.route.socket.ip.v6 },

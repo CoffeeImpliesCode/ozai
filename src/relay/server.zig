@@ -751,7 +751,7 @@ pub fn Registry(comptime inactive_depth: usize) type {
 
         /// Where this node id's probe starts.
         fn start(self: *const Self, node_id: NodeId) usize {
-            return std.hash.Wyhash.hash(0, &node_id.toBytes()) % self.slots.len;
+            return @intCast(std.hash.Wyhash.hash(0, &node_id.toBytes()) % self.slots.len);
         }
 
         fn find(self: *const Self, node_id: NodeId) ?usize {

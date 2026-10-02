@@ -2721,7 +2721,7 @@ fn writeVarint(out: []u8, value: u64) Error!usize {
 
 fn readVarint(bytes: []const u8) ?Varint {
     if (bytes.len == 0) return null;
-    const len = @as(usize, 1) << @as(u6, @truncate(bytes[0] >> 6));
+    const len = @as(usize, 1) << @as(u2, @truncate(bytes[0] >> 6));
     if (bytes.len < len) return null;
     const wide: u64 = switch (len) {
         1 => bytes[0],

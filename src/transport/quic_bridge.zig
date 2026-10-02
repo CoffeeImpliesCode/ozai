@@ -47,8 +47,8 @@
 //!    a peer's address is routable, private, or even well formed. The only
 //!    address-sensitive policy in the tree is `NetworkPath.canSend`
 //!    (`connection.zig:127`), the server-side 3× anti-amplification limit,
-//!    and the two byte comparisons `sockaddrEql` and `sockaddrSameIp`
-//!    (`connection.zig:4446` and `:4464`). An RFC 4193 ULA is therefore
+//!    and the two comparisons `Address.eql` and `Address.sameIp`
+//!    (`vendor/quic/src/address.zig`). An RFC 4193 ULA is therefore
 //!    accepted as a peer address without complaint, which is the answer to
 //!    the question `docs/PLAN.md`'s mapping raises, and the test
 //!    "the core takes a synthetic address for a peer's address" is that
@@ -68,8 +68,8 @@
 //!    file.
 //!
 //! 3. **The core's path identity includes the port; `ula`'s does not.**
-//!    `sockaddrEql` compares family, port, address and `scope_id`
-//!    (`connection.zig:4453`); `ula.classify` compares eight octets and
+//!    `Address.eql` compares family, address, port and scope
+//!    (`vendor/quic/src/address.zig`); `ula.classify` compares eight octets and
 //!    ignores the port entirely. Every synthetic address carries
 //!    `ula.mapped_port`, so the two agree today by construction — but a
 //!    caller that reached the same /64 on a second port would be invisible
@@ -105,8 +105,6 @@ const base_addr = @import("../base/addr.zig");
 const base_ula = @import("../base/ula.zig");
 const addr_map = @import("addr_map.zig");
 const batch = @import("batch.zig");
-
-const posix = std.posix;
 
 const NodeId = base_key.NodeId;
 const SecretKey = base_key.SecretKey;
@@ -166,11 +164,12 @@ pub const Error = batch.Error || error{
     /// allocator that will not make the send ledger above all — and that is
     /// what a caller must still fail on.
     NoStreamRoom,
-    /// The core holds a peer address in a family this project does not
-    /// model. Every address the core is given goes through `toSockaddr` and
-    /// comes back through `fromSockaddr`, so this is reachable only from a
-    /// peer-supplied `preferred_address` transport parameter.
-    UnknownAddressFamily,
+    /// The active path has no address. Every address the core holds went
+    /// through `toCoreAddress` or came out of a peer's `preferred_address`,
+    /// and the one value neither produced is the `unset` a `NetworkPath`
+    /// starts as — so this is a connection whose path has not been named yet,
+    /// which a client is until its dialer writes one onto it.
+    NoPathAddress,
     /// The core refused to build a packet. Its own error set is `anyerror` —
     /// `Connection.sendAt` (`connection.zig:3139`) carries no named set —
     /// so a bridge that propagated it would put `anyerror` in its public API,
@@ -252,15 +251,15 @@ pub const Conn = struct {
 
     /// The peer's address on the active path, in this project's address.
     ///
-    /// Null for a family `addr.SocketAddr` does not model; see
-    /// `Error.UnknownAddressFamily` for the one route there.
+    /// Null when the path has no peer address yet; see
+    /// `Error.NoPathAddress` for the one route there.
     pub fn peer(self: Conn) ?SocketAddr {
-        return fromSockaddr(self.entry.conn.peerAddress());
+        return fromCoreAddress(self.entry.conn.peerAddress());
     }
 
     /// This node's address on the active path.
     pub fn local(self: Conn) ?SocketAddr {
-        return fromSockaddr(self.entry.conn.localAddress());
+        return fromCoreAddress(self.entry.conn.localAddress());
     }
 
     /// Whether the handshake is done and the connection carries stream data.
@@ -713,8 +712,8 @@ pub const Bridge = struct {
         @memcpy(scratch[0..datagram.bytes.len], datagram.bytes);
         const action = self.manager.recvDatagram(
             scratch[0..datagram.bytes.len],
-            toSockaddr(datagram.from),
-            toSockaddr(datagram.local),
+            toCoreAddress(datagram.from),
+            toCoreAddress(datagram.local),
             ecnBits(datagram.ecn),
             scratch[datagram.bytes.len..],
             at,
@@ -848,68 +847,41 @@ fn closeRun(
 ) Error!usize {
     if (used == out.len) return error.NoRoom;
     out[used] = .{
-        .to = conn.peer() orelse return error.UnknownAddressFamily,
+        .to = conn.peer() orelse return error.NoPathAddress,
         .send = try group(buffer[begin..end], size, ecn),
     };
     return used + 1;
 }
 
-/// This project's address as the core's `sockaddr.storage`.
+/// This project's address as the core's own.
 ///
-/// The core's address vocabulary is a C struct because a C struct is what
-/// `sendmsg` takes; ours is a tagged union because a tagged union says which
-/// family it is without a `switch` at the call site. This and `fromSockaddr`
-/// are the only two places the two vocabularies meet.
-fn toSockaddr(socket: SocketAddr) posix.sockaddr.storage {
-    var storage: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
-    switch (socket.ip) {
-        .v4 => |octets| {
-            const in4: *posix.sockaddr.in = @ptrCast(@alignCast(&storage));
-            in4.* = .{
-                .port = std.mem.nativeToBig(u16, socket.port),
-                .addr = std.mem.nativeToBig(u32, std.mem.readInt(u32, &octets, .big)),
-            };
-        },
-        .v6 => |octets| {
-            const in6: *posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
-            in6.* = .{
-                .port = std.mem.nativeToBig(u16, socket.port),
-                .flowinfo = 0,
-                .addr = octets,
-                // Zero because `SocketAddr` carries no scope. A link-local
-                // address would need one and this project has no name for it;
-                // the synthetic ULAs are not link-local, which is why the
-                // core's `scope_id` comparison can never disagree with `ula`
-                // for them.
-                .scope_id = 0,
-            };
-        },
-    }
-    return storage;
+/// The core's address is a tagged union over the two families with no kernel
+/// struct behind it (`vendor/quic/src/address.zig`), and this project's is a
+/// tagged union with no scope, so the conversion is the bytes and the port
+/// and nothing else has to be decided. This and `fromCoreAddress` are the only
+/// two places the two vocabularies meet; the socket seam's own conversions
+/// live in `transport/socket.zig` and never see the core's type.
+fn toCoreAddress(socket: SocketAddr) quic.address.Address {
+    return switch (socket.ip) {
+        .v4 => |octets| quic.address.Address.initIpv4(octets, socket.port),
+        // The scope is zero because `SocketAddr` carries none. A link-local
+        // address would need one and this project has no name for it; the
+        // synthetic ULAs are not link-local, which is why the core's scope
+        // comparison can never disagree with `ula` for them.
+        .v6 => |octets| quic.address.Address.initIpv6(octets, socket.port, 0),
+    };
 }
 
-/// The core's `sockaddr.storage` as this project's address.
+/// The core's address as this project's.
 ///
-/// Null for a family `SocketAddr` does not model, rather than a panic: the
-/// only address the core holds that this function did not put there is a
-/// peer's `preferred_address` transport parameter, and a peer is not
-/// trusted to send one this project can represent.
-fn fromSockaddr(storage: *const posix.sockaddr.storage) ?SocketAddr {
-    return switch (storage.family) {
-        posix.AF.INET => blk: {
-            const in4: *const posix.sockaddr.in = @ptrCast(@alignCast(storage));
-            var octets: [4]u8 = undefined;
-            std.mem.writeInt(u32, &octets, std.mem.bigToNative(u32, in4.addr), .big);
-            break :blk .{ .ip = .{ .v4 = octets }, .port = std.mem.bigToNative(u16, in4.port) };
-        },
-        posix.AF.INET6 => blk: {
-            const in6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(storage));
-            break :blk .{
-                .ip = .{ .v6 = in6.addr },
-                .port = std.mem.bigToNative(u16, in6.port),
-            };
-        },
-        else => null,
+/// Null for the one value `SocketAddr` cannot spell — `unset`, a path the
+/// core has not been given an address for — and null rather than a wildcard
+/// for it, because a datagram sent to a path with no address reaches nobody.
+fn fromCoreAddress(core: *const quic.address.Address) ?SocketAddr {
+    return switch (core.*) {
+        .unset => null,
+        .ipv4 => |v4| .{ .ip = .{ .v4 = v4.bytes }, .port = v4.port },
+        .ipv6 => |v6| .{ .ip = .{ .v6 = v6.bytes }, .port = v6.port },
     };
 }
 const t = std.testing;
@@ -1058,8 +1030,8 @@ const Client = struct {
             at,
             self.random(),
         );
-        self.conn.paths[0].peer_addr = toSockaddr(server_addr);
-        self.conn.paths[0].local_addr = toSockaddr(client_addr);
+        self.conn.paths[0].peer_addr = toCoreAddress(server_addr);
+        self.conn.paths[0].local_addr = toCoreAddress(client_addr);
     }
 
     fn deinit(self: *Client) void {
@@ -1090,8 +1062,8 @@ const Client = struct {
         std.debug.assert(bytes.len <= self.inbound.len);
         @memcpy(self.inbound[0..bytes.len], bytes);
         self.conn.handleDatagram(self.inbound[0..bytes.len], .{
-            .to = toSockaddr(client_addr),
-            .from = toSockaddr(server_addr),
+            .to = toCoreAddress(client_addr),
+            .from = toCoreAddress(server_addr),
             .datagram_size = bytes.len,
         }, at, self.random());
     }
@@ -1211,8 +1183,8 @@ test "a node's identity reaches the core as a bare SPKI and the handshake finish
 
     // The answer to the question `docs/PLAN.md`'s mapping raises: the core
     // does not validate a peer's address, so an RFC 4193 ULA is a peer
-    // address like any other. It round-trips through the core's
-    // `sockaddr.storage` unchanged, and `classify` still recognises it.
+    // address like any other. It round-trips through the core's own address
+    // type unchanged, and `classify` still recognises it.
     try t.expectEqual(client_addr, conn.peer().?);
     try t.expectEqual(server_addr, conn.local().?);
     try t.expectEqual(

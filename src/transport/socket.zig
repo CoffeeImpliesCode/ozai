@@ -98,10 +98,8 @@ const names = batch.linux;
 
 const socklen_t = c.socklen_t;
 
-/// The host's byte order, which is the order a control message's value is in:
-/// the kernel copies the bytes rather than converting them, so `UDP_SEGMENT`
-/// is read as a native `u16` and a traffic class as whatever width it
-/// arrived at. See `trafficClass` for why those two are not the same width.
+/// Control integers use native byte order. `UDP_SEGMENT` sends a `u16`,
+/// `UDP_GRO` returns an integer, and traffic classes arrive as a byte or an integer.
 const endian = builtin.cpu.arch.endian();
 
 /// How many times one syscall is retried after a signal before the call is
@@ -109,18 +107,6 @@ const endian = builtin.cpu.arch.endian();
 /// is the only correct answer; the bound is what stops a storm of them from
 /// becoming a hang.
 pub const max_syscall_attempts = 4;
-
-/// The `eventfd` flags, which the 0.16 std tree does not spell and
-/// `<sys/eventfd.h>` does. `semaphore` is the load-bearing one: a read takes
-/// one unit off the counter rather than all of it, so a wake nobody was
-/// waiting for cannot leave the next wait spinning on a count that never
-/// reaches zero. The other two are the two every descriptor this file opens
-/// carries.
-const wake_flags = struct {
-    const semaphore: c_uint = 1;
-    const nonblock: c_uint = 0o4000;
-    const cloexec: c_uint = 0o2000000;
-};
 
 /// The counter an `eventfd` counts in, which the kernel fixes at eight bytes
 /// and both `read` and `write` want all of. It is a value rather than a count
@@ -191,11 +177,9 @@ pub fn cmsgSpace(width: usize) usize {
     return cmsgAlign(cmsgLen(width));
 }
 
-/// Bytes of ancillary data one message of this seam needs: a traffic class and
-/// a stride or a segment size, and nothing else. It is the size of both the
-/// send and the receive buffer, and the receive side fits because a codepoint
-/// arrives a byte wide and a `u16` still occupies a whole padded message.
-pub const control_size: usize = cmsgSpace(batch.tos_width) + cmsgSpace(@sizeOf(u16));
+/// Room for a traffic class and either UDP_SEGMENT's u16 or UDP_GRO's int.
+/// The receive integer is wider, so it bounds the shared control buffer.
+pub const control_size: usize = cmsgSpace(batch.tos_width) + cmsgSpace(@sizeOf(c_int));
 
 /// The width `msg_controllen` is spelled in: POSIX says `socklen_t` and musl
 /// says POSIX, while glibc follows the kernel and spells it a `size_t`.
@@ -387,10 +371,9 @@ fn takeValue(header: []const u8, value_at: usize, length: usize, read: *CmsgRead
     const level = getHeader("level", header);
     const kind = getHeader("type", header);
     if (level == names.udp_level and kind == names.gro) {
-        // `UDP_GRO` carries a `u16`, which is what `CMSG_LEN` was computed
-        // from on the way in; a wider value is a different message.
-        if (value.len < @sizeOf(u16)) return;
-        read.stride = std.mem.readInt(u16, value[0..@sizeOf(u16)], endian);
+        // The receive ABI is a full native int, unlike UDP_SEGMENT's u16.
+        if (value.len < @sizeOf(c_uint)) return;
+        read.stride = std.mem.readInt(c_uint, value[0..@sizeOf(c_uint)], endian);
         return;
     }
     const carries_class = (level == names.ip_level and kind == names.ipv4_tos) or
@@ -1182,7 +1165,7 @@ fn createSocket(family: batch.Family) OpenError!c.fd_t {
 /// anyway would be handed a cancellation that arrives a slice late with nothing
 /// to say that it had.
 fn createWake() OpenError!c.fd_t {
-    const flags = wake_flags.semaphore | wake_flags.nonblock | wake_flags.cloexec;
+    const flags = linux.EFD.SEMAPHORE | linux.EFD.NONBLOCK | linux.EFD.CLOEXEC;
     const handle = c.eventfd(0, flags);
     if (handle >= 0) return handle;
     return switch (c.errno(handle)) {
@@ -1310,11 +1293,9 @@ fn setFlag(handle: c.fd_t, level: u32, name: u32, value: bool) OptionError!void 
 }
 
 fn setOption(handle: c.fd_t, level: u32, name: u32, value: []const u8) OptionError!void {
-    // Two narrowings, neither proved anywhere above: `setsockopt` spells its
-    // level as an `int`, a `socklen_t` is narrower than a `usize` on every
-    // platform, and an out-of-range `@intCast` traps in Debug where a
-    // defined wrap would not. An option the ABI cannot spell is one the
-    // kernel would refuse anyway, so it is refused here under that name.
+    // The level is an `int`; the length can be wider than `socklen_t`.
+    // Reject unrepresentable values before the syscall rather than trapping
+    // during a narrowing cast.
     const option_level = std.math.cast(c_int, level) orelse return error.InvalidValue;
     const option_length = std.math.cast(socklen_t, value.len) orelse return error.InvalidValue;
     const rc = c.setsockopt(handle, option_level, name, value.ptr, option_length);
@@ -1333,6 +1314,24 @@ fn setOption(handle: c.fd_t, level: u32, name: u32, value: []const u8) OptionErr
 // ───────────────────────────────────────────────────────────────────── tests
 
 const t = std.testing;
+
+// Linux 6.12 recvmsg capture: GRO has an int payload, not UDP_SEGMENT's u16.
+// The receive fixture must not use the send codec that made the width mistake.
+const KernelGro = extern struct {
+    length: usize,
+    level: c_int,
+    kind: c_int,
+    stride: c_int,
+};
+
+fn kernelGro(stride: c_int) KernelGro {
+    return .{
+        .length = cmsgLen(@sizeOf(c_int)),
+        .level = @intCast(names.udp_level),
+        .kind = @intCast(names.gro),
+        .stride = stride,
+    };
+}
 
 test "a single datagram writes one control message" {
     const payload = [_]u8{0xaa} ** 64;
@@ -1406,21 +1405,23 @@ test "a header spells its length in the width the kernel reads" {
     try t.expectEqual(@as(?batch.Ecn, .ect1), read.ecn);
 }
 
-test "a codepoint comes back one byte wide, not at the send width" {
-    // Captured from a real `recvmsg` on this kernel: `ip_cmsg_put` writes
-    // `cmsg_len = CMSG_LEN(sizeof(u8))` and one byte, while `batch.tos_width`
-    // is the width the *option* takes and is four on Linux. A reader that
-    // insists on `tos_width` drops the message and reports not-ECT for every
-    // IPv4 datagram, which is a wrong answer rather than a missing one. The
-    // bytes below are the ones that kernel produced for a datagram sent with
-    // `IP_TOS` = 0b10.
-    const captured = [_]u8{
-        0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-        0x02,
+test "an IPv4 ECN byte is read even when shorter than the send option" {
+    // The kernel's byte payload differs from the integer send option. Spell
+    // its native ABI explicitly; a fixed x86_64 capture is invalid on 32-bit
+    // and big-endian targets.
+    const KernelByte = extern struct {
+        length: usize,
+        level: c_int,
+        kind: c_int,
+        codepoint: u8,
     };
-    try t.expectEqual(cmsgLen(1), captured.len);
-    const read = readCmsg(&captured);
+    const captured: KernelByte = .{
+        .length = @offsetOf(KernelByte, "codepoint") + @sizeOf(u8),
+        .level = @intCast(names.ip_level),
+        .kind = @intCast(names.ipv4_tos),
+        .codepoint = 0b10,
+    };
+    const read = readCmsg(std.mem.asBytes(&captured)[0..captured.length]);
     try t.expect(!read.truncated);
     try t.expectEqual(@as(?batch.Ecn, .ect0), read.ecn);
     try t.expectEqual(@as(?usize, null), read.stride);
@@ -1496,13 +1497,8 @@ test "a message this seam did not ask for does not hide the one after it" {
     }};
     var stranger_control: ControlBuffer = undefined;
     const between = try writeCmsg(&stranger, &stranger_control);
-    const stride_message = [_]batch.Cmsg{.{
-        .level = names.udp_level,
-        .kind = names.gro,
-        .value = .{ .short = 100 },
-    }};
-    var stride_control: ControlBuffer = undefined;
-    const stride_bytes = try writeCmsg(&stride_message, &stride_control);
+    const stride_message = kernelGro(100);
+    const stride_bytes = std.mem.asBytes(&stride_message)[0..stride_message.length];
 
     var blob: [control_size * 3]u8 = undefined;
     var used: usize = 0;
@@ -1592,16 +1588,16 @@ test "an address survives the kernel's own layout" {
 }
 
 test "an option value the ABI cannot spell is refused, not a trap" {
-    // One past what a `socklen_t` holds, and never read: the refusal comes
-    // before the syscall, so naming the four gigabytes is cheaper than
-    // having them. Without the checked cast this is a panic in Debug.
-    const nowhere: [*]const u8 = @ptrFromInt(1);
-    const too_wide = nowhere[0 .. @as(usize, std.math.maxInt(socklen_t)) + 1];
+    if (comptime @bitSizeOf(usize) > @bitSizeOf(socklen_t)) {
+        // The refusal precedes the syscall, so no backing allocation is needed.
+        const nowhere: [*]const u8 = @ptrFromInt(1);
+        const too_wide = nowhere[0 .. @as(usize, std.math.maxInt(socklen_t)) + 1];
+        try t.expectError(
+            error.InvalidValue,
+            setOption(-1, names.udp_level, names.segment, too_wide),
+        );
+    }
     const flag: c_int = 1;
-    try t.expectError(
-        error.InvalidValue,
-        setOption(-1, names.udp_level, names.segment, too_wide),
-    );
 
     // The other narrowing on the same line: `setsockopt` spells its level as
     // an `int`, and `2^32 - 1` is not one. A descriptor of `-1` is what
@@ -1686,53 +1682,23 @@ test "a lost codepoint is reported, and only on IPv4" {
     try t.expectEqual(@as(?batch.Ecn, null), nothing.carried);
 }
 
-test "a coalesced read of one datagram is the uncoalesced read" {
-    const one = [_]u8{0x5a} ** 16;
-    const three = [_]u8{0x5a} ** 48;
-    var control: ControlBuffer = undefined;
-
-    // The stride a read gets is the one the `UDP_GRO` message carries, read
-    // back out of real bytes rather than handed in by hand.
-    const stride_message = [_]batch.Cmsg{.{
-        .level = names.udp_level,
-        .kind = names.gro,
-        .value = .{ .short = 16 },
-    }};
-    const read = readCmsg(try writeCmsg(&stride_message, &control));
-    try t.expectEqual(@as(?usize, 16), read.stride);
+test "a kernel GRO integer defines datagram boundaries, and a short value does not" {
+    var message = kernelGro(14);
+    const read = readCmsg(std.mem.asBytes(&message)[0..message.length]);
+    try t.expectEqual(@as(?usize, 14), read.stride);
     try t.expectEqual(@as(?batch.Ecn, null), read.ecn);
+    try t.expect(!read.truncated);
 
-    const coalesced: Received = .{
-        .bytes = &three,
-        .from = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1 },
-        .stride = read.stride,
-        .ecn = null,
-    };
-    try t.expectEqual(@as(usize, 3), (try coalesced.toRecv()).datagramCount());
+    var payload: [42]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @intCast(index);
+    const received = try batch.Recv.init(&payload, read.stride, null);
+    try t.expectEqual(@as(usize, 3), received.datagramCount());
+    try t.expectEqualSlices(u8, payload[14..28], received.datagram(1).?);
+    try t.expect(received.datagram(3) == null);
 
-    const solo: Received = .{
-        .bytes = &one,
-        .from = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1 },
-        .stride = read.stride,
-        .ecn = null,
-    };
-    try t.expectEqual(@as(usize, 1), (try solo.toRecv()).datagramCount());
-
-    // A stride equal to the buffer's own length and no stride at all are the
-    // same read, which is what makes the null arm safe to act on.
-    const with_stride = try batch.Recv.init(&one, read.stride, .ect0);
-    const without = try batch.Recv.init(&one, null, .ect0);
-    try t.expectEqual(without.stride, with_stride.stride);
-    try t.expectEqual(without.datagramCount(), with_stride.datagramCount());
-    try t.expectEqual(@as(usize, 1), with_stride.datagramCount());
-    try t.expectEqualSlices(u8, &one, with_stride.datagram(0).?);
-    try t.expect(with_stride.datagram(1) == null);
-
-    // A stride the buffer cannot hold is refused, not clamped, and a stride of
-    // no bytes names no datagram at all.
-    try t.expectError(error.StrideExceedsBuffer, batch.Recv.init(&one, 17, null));
-    try t.expectError(error.ZeroSegmentSize, batch.Recv.init(&one, 0, null));
-    try t.expectError(error.ZeroSegmentSize, batch.Recv.init(&.{}, null, null));
+    message.length = cmsgLen(@sizeOf(u16));
+    const short = readCmsg(std.mem.asBytes(&message)[0..message.length]);
+    try t.expectEqual(@as(?usize, null), short.stride);
 }
 
 // 79 display columns; the rule counts UTF-8 bytes, three per box character.

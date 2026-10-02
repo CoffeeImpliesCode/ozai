@@ -649,7 +649,7 @@ fn forward(
     var scratch: [2 * max_datagram]u8 = undefined;
     var egress: [max_egress]quic_bridge.Egress = undefined;
     var out: [max_egress * max_datagram]u8 = undefined;
-    const from = conn.local() orelse return error.UnknownAddressFamily;
+    const from = conn.local() orelse return error.NoPathAddress;
     const sends = try conn.drain(&egress, &out, at_instant, engine.random());
     for (sends) |send| {
         var runs = try batch.Runs.init(send.send, batch.Capability.none);
