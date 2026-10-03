@@ -458,14 +458,14 @@ A runtime that owned readiness *and* the sends would become right when:
 Restated in substance, because a reconsideration that moved it would be a
 different decision and this one does not:
 
-- **`ozai.base` and the wire codecs stay pure.** No `Io`, no clock, no
-  environment, no allocator it was not handed.
+- **Wire codecs and network state machines stay pure.** They read no clock or
+  environment and use only explicit allocators. `SecretKey.generate` is an
+  entropy edge with an explicit `Io` parameter, not pure key derivation.
 - **The runtime stays at the edges.** `ozai.transport` owns the socket,
   `ozai.endpoint` owns tasks and shutdown, and neither exposes which runtime it
   is built on.
-- **An `Io` is threaded and never stored.** It holds at the one place it is
-  hardest: `Socket` has four fields and one of them is a descriptor
-  (`src/transport/socket.zig:542-553`).
+- **Drivers borrow `Io` per operation.** The backend and its userdata outlive
+  all tasks that use them. `Socket` keeps the descriptor, not a backend.
 - **Tests construct their own time.** The round loop advances a counter and
   reads no clock (`test/protocol_loopback_test.zig:967-968`).
 

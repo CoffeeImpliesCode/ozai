@@ -35,7 +35,8 @@ const std = @import("std");
 const addr = @import("../base/addr.zig");
 const item = @import("item.zig");
 
-/// What a service is asked to publish.
+/// What a service is asked to publish, and what it takes on the duty of
+/// releasing.
 ///
 /// Upstream's `publish(&self, data: &EndpointData)`
 /// (`iroh/src/address_lookup.rs:343`) takes the *data* and not the endpoint, so
@@ -45,12 +46,44 @@ const item = @import("item.zig");
 /// not publishing. `discovery/item.zig`'s `Item` is the same join on the
 /// reading side.
 ///
-/// The address is *moved*, not borrowed. Upstream copies, because a Rust
-/// `EndpointData` behind a `Cow` is one the caller wants to keep reading; a Zig
-/// move is free, and making `publish` copy would be an allocation the caller
-/// could have avoided. The caller must not read `endpoint` again afterwards,
-/// which is the ordinary convention for a parameter that is consumed.
+/// # The address is transferred, and the allocator travels with it
+///
+/// `publish` *consumes* this value: from the moment it returns the caller owns
+/// nothing here and the callee owns all of it, releasing included. Nothing is
+/// copied, because a Zig move is free and making `publish` copy would be an
+/// allocation every publication paid for.
+///
+/// A `NodeAddr` carries no allocator of its own, so the one that built
+/// `endpoint` arrives beside it, and that is what the field is for. Both of the
+/// services that take this value need it:
+///
+/// * `AddressLookup.ignore_publish` releases the address list and returns.
+///   Handed a `NodeAddr` alone it could only have leaked, and a leak a service
+///   causes by being a resolver is not a fact the caller can act on — the
+///   caller gave the value away.
+/// * `PkarrPublisher` releases the slot a later publication replaces, and the
+///   slot it still holds, each with the allocator that slot arrived with. One
+///   allocator of the publisher's own cannot do that: the previous publication
+///   was built by whoever called `publish` last, and freeing it with any other
+///   is a double free or a leak depending on which that was.
+///
+/// So `alloc` must still be valid when the callee releases the value, which for
+/// a publisher that stores it means until its `deinit`.
+///
+/// # What the transfer does not carry
+///
+/// Only the outer list. A `.custom` address borrows its `data`, and
+/// `base/addr.zig` owns that rule, so the bytes behind one stay the caller's
+/// to keep alive for as long as the callee holds the endpoint — until the
+/// publisher's `deinit`, in the case that stores it. `parseTxt` is where the
+/// reading side pays for that.
 pub const Published = struct {
+    /// The allocator `endpoint`'s address list came from, and the only one it
+    /// may be released with. A value rather than a pointer: whatever it
+    /// addresses must be alive at the release above.
+    alloc: std.mem.Allocator,
+    /// The address to publish, consumed by the call that takes this value. Its
+    /// list is sorted, unique and owned; the caller must not read it again.
     endpoint: addr.NodeAddr,
     /// When this address was learned, or null when the caller cannot say. Null
     /// is infinitely old to `Item.order`, so a publisher that declines to vouch
@@ -77,18 +110,39 @@ pub const ResolveError = error{OutOfMemory};
 /// is no third entry here for a destructor. Adding one would be Zig's `Drop`
 /// wearing a trait method's name, and the method set is the part worth keeping
 /// recognisable.
+///
+/// Copying a handle is free and every copy names the same service; nothing in
+/// it is owned, and the service has to outlive every handle taken of it.
 pub const AddressLookup = struct {
+    /// The service's own vtable, borrowed: a field of the service value, and
+    /// dead with it.
     vtable: *const VTable,
+    /// The service value behind this handle, borrowed and reinterpreted. It
+    /// must stay alive and unmoved for every call made through the handle.
     ctx: *anyopaque,
 
+    /// The two methods every service implements, and the two defaults it may
+    /// take instead.
+    ///
+    /// Each entry runs synchronously on the thread that called through
+    /// `AddressLookup` and returns before that call does, so a service whose
+    /// own work is off-thread takes its own handle rather than being called
+    /// from one. `ctx` is the service value and is live for the call.
     pub const VTable = struct {
-        /// Publish, taking ownership of the address. Fire and forget, as
-        /// upstream's is: "This is fire and forget, since the `Endpoint` can
-        /// not wait for successful publishing"
-        /// (`iroh/src/address_lookup.rs:337`).
+        /// Takes over `data`: the callee owns the address list from this call
+        /// onwards and releases it with `data.alloc`, on this call or on a
+        /// later one. Fire and forget, as upstream's is: "This is fire and
+        /// forget, since the `Endpoint` can not wait for successful publishing"
+        /// (`iroh/src/address_lookup.rs:337`). `AddressLookup.ignore_publish`
+        /// is the slot for a service that publishes nothing, and it releases
+        /// there and then; `PkarrPublisher` keeps the value and releases the
+        /// one a later publication replaces.
         publish: *const fn (ctx: *anyopaque, data: Published) void,
         /// Begin a resolve, or answer null for a service that does not resolve
-        /// at all. The caller owns what comes back and must `deinit` it.
+        /// at all. The caller owns what comes back and must `deinit` it, and
+        /// `error.OutOfMemory` means nothing was started and there is nothing
+        /// to release. Every allocation the stream makes comes from `alloc`,
+        /// so that allocator has to outlive the stream.
         resolve: *const fn (
             ctx: *anyopaque,
             alloc: std.mem.Allocator,
@@ -96,13 +150,21 @@ pub const AddressLookup = struct {
         ) ResolveError!?Stream,
     };
 
+    /// Hands `data` to the service and gives up ownership of it: the address
+    /// list is released with `data.alloc` here or by the service later, and
+    /// either way the caller must not read `data.endpoint` again.
     pub fn publish(self: AddressLookup, data: Published) void {
         self.vtable.publish(self.ctx, data);
     }
 
+    /// Starts a resolve for `node_id`, allocating the stream out of `alloc`, or
+    /// answers null for a service that will not answer for that node at all.
+    ///
     /// Null means "cannot resolve at all", which is not "resolved to nothing".
     /// The second is a stream that ran and came back with no items; see
-    /// `Stream` and `item.Resolution`.
+    /// `Stream` and `item.Resolution`. A returned stream reads the service on
+    /// every pull, so the service outlives it even though the stream borrows
+    /// nothing from it.
     pub fn resolve(
         self: AddressLookup,
         alloc: std.mem.Allocator,
@@ -116,6 +178,10 @@ pub const AddressLookup = struct {
     /// function so that a service which publishes nothing says so by taking the
     /// default instead of restating it, and so a reader can tell at the vtable
     /// which services are publishers and which only resolve.
+    ///
+    /// "Nothing" is about the publication and not about the value: `data` was
+    /// transferred, so the address list is released here with `data.alloc` and
+    /// the caller is left with nothing of its own to release.
     pub const ignore_publish: *const fn (*anyopaque, Published) void = ignorePublish;
 
     /// Upstream's default `resolve`: `None`
@@ -128,7 +194,23 @@ pub const AddressLookup = struct {
     ) ResolveError!?Stream = refuseResolve;
 };
 
-fn ignorePublish(_: *anyopaque, _: Published) void {}
+fn ignorePublish(_: *anyopaque, data: Published) void {
+    releaseTransfer(data);
+}
+
+/// Release one transferred publication: its address list, with the allocator
+/// that list came from.
+///
+/// The length is the test because an endpoint that never grew a list holds
+/// `NodeAddr.init`'s empty literal rather than an allocation, and `free` of a
+/// zero-length slice is not a call `std` accepts. `base/addr.zig` owns
+/// `NodeAddr.deinit`; this is the one place in discovery that reaches past it,
+/// and the empty list is a supported state rather than a mistake — a node that
+/// published nothing is one of the answers `item.Resolution` names.
+fn releaseTransfer(data: Published) void {
+    if (data.endpoint.addrs.len == 0) return;
+    data.endpoint.deinit(data.alloc);
+}
 
 fn refuseResolve(
     _: *anyopaque,
@@ -144,8 +226,10 @@ fn refuseResolve(
 
 /// One pull's worth of answer.
 pub const Event = union(enum) {
-    /// A result. Its `NodeAddr` belongs to the stream and dies with
-    /// `Stream.deinit`; a caller that keeps one must copy it.
+    /// A result. Its address list, and the payload bytes behind any custom
+    /// address in it, belong to the stream and die with `Stream.deinit`; a
+    /// caller that keeps one past that copies what it needs, since copying an
+    /// `Item` shares that storage rather than duplicating it.
     item: item.Item,
     /// One answer could not be turned into an item.
     ///
@@ -163,6 +247,8 @@ pub const Failure = struct {
     /// Which service produced it, so a caller reading a merged stream knows
     /// which resolver to blame without keeping a handle per service.
     provenance: item.Provenance,
+    /// What went wrong with that one answer. Nothing partial survives it: this
+    /// answer is gone and the stream carries on.
     reason: Reason,
 };
 
@@ -221,11 +307,25 @@ pub const Reason = DecodeError || ParseError || error{
 /// only itself would satisfy every assertion written about it while the fetch
 /// behind it kept running, which is exactly the failure the invariant names.
 pub const Cancellation = struct {
+    /// The producer's own value, borrowed and reached by `stop`. It has to stay
+    /// alive until `fire` runs, which is `Stream.deinit` and not the end of the
+    /// resolve.
     ctx: *anyopaque,
+    /// Runs synchronously on the calling thread and returns before `fire` does,
+    /// with everything it needs reachable from `ctx`: a producer whose work is
+    /// off-thread is told to stop here, not joined here. Nothing reenters the
+    /// stream from it — the state is still live, but a pull from inside a
+    /// cancel is not a call this contract allows.
     stop: *const fn (ctx: *anyopaque) void,
 
-    /// Tell the producer to stop. Called at most once per resolve, on every
-    /// path out of the stream.
+    /// Tells the producer to stop. Called exactly once per stream, from
+    /// `Stream.deinit`, on every path out of a resolve — drained, abandoned, or
+    /// never pulled at all — so a producer may treat it as one request and a
+    /// second one as a no-op.
+    ///
+    /// It does not join the producer's work: a resolve that already finished is
+    /// told to stop anyway, because a `cancel` that does nothing then is cheaper
+    /// than a status check that could be got wrong.
     pub fn fire(self: Cancellation) void {
         self.stop(self.ctx);
     }
@@ -254,14 +354,35 @@ pub const Cancellation = struct {
 /// The `Resolution` from `finish` borrows that same heap, so it is read before
 /// `deinit` and not after. `item.Resolution` says so; this is where the borrow
 /// comes from.
+///
+/// # What the stream owns, and what a copy of one is
+///
+/// The state is allocated from the allocator the resolve was started with and
+/// released by `deinit` with that same allocator, so the allocator has to
+/// outlive the stream. Every item a pull hands out lives in that state — a
+/// pkarr stream's are in an arena inside it — so an `Event` stays valid until
+/// `deinit` and not one instant past it, and a later pull does not invalidate
+/// an earlier one. `item.Item` is where copying one of those is described.
+///
+/// A `Stream` is a handle and not a move: copying one copies the state pointer
+/// and each copy keeps its own `status`, so `deinit` reached through two copies
+/// tells the producer to stop twice and frees the state twice. One `deinit` per
+/// returned stream, on one handle.
 pub const Stream = struct {
-    /// The service's own state, laid out by whoever started the work.
+    /// The service's state, owned by this stream and released by `deinit`. It
+    /// is not moved while the stream is live, because every pull reads it.
     state: *anyopaque,
+    /// How to pull, finish, cancel and release that state, borrowed. Both
+    /// services here point this at a file-scope constant, so it outlives every
+    /// stream; an implementation whose vtable is a field would have to keep the
+    /// service alive instead.
     vtable: *const VTable,
-    /// The allocator the work was started with, held rather than passed to
-    /// `deinit` because an owning handle that takes the allocator again is a
-    /// handle that can be freed with the wrong one.
+    /// The allocator the state came from. Held rather than taken again by
+    /// `deinit`, because an owning handle that takes the allocator once more is
+    /// a handle that can be freed with the wrong one.
     alloc: std.mem.Allocator,
+    /// Which of the three states this handle is in. `.live` is the only one a
+    /// caller may pull in, and only `deinit` moves a handle out of it.
     status: Status,
 
     /// Why `finish` may and may not be read.
@@ -280,21 +401,35 @@ pub const Stream = struct {
         closed,
     };
 
+    /// The four calls a service implements behind a stream, in the order
+    /// `deinit` makes them.
+    ///
+    /// Each runs synchronously on the thread that called through `Stream` and
+    /// returns before that call does; none of them runs after its own call has
+    /// returned, so a service does not keep a pointer into them.
     pub const VTable = struct {
-        /// One pull. Null when the service has nothing more, and `finish` is
-        /// the answer from then on.
+        /// One pull: the next answer, or null when the service has nothing
+        /// more. Null moves the handle to `.finished`, which is what makes
+        /// `finish` readable and what stops a second pull reaching the service.
         next: *const fn (state: *anyopaque) ?Event,
-        /// How the service came to be finished. Readable only after `next`
-        /// answered null, and the items it hands back are the stream's own.
+        /// How the service came to be finished, read once `next` has answered
+        /// null. The items it hands back belong to the state and die with
+        /// `deinit`.
         finish: *const fn (state: *anyopaque) item.Resolution,
-        /// Tell the producer to stop. Called exactly once per resolve, by
-        /// `deinit`, whether the stream was drained or abandoned.
+        /// Tell the producer to stop. Called exactly once, by `deinit`, whether
+        /// the stream was drained or abandoned.
         cancel: *const fn (state: *anyopaque) void,
-        /// Release the state. Called exactly once, after `cancel`.
+        /// Release the state, with the `alloc` it was started with. Called
+        /// exactly once, after `cancel`.
         destroy: *const fn (state: *anyopaque, alloc: std.mem.Allocator) void,
     };
 
-    /// The next answer, or null when the service is finished.
+    /// The next answer, or null when the service is finished, in which case this
+    /// handle is `.finished` and `finish` may be read.
+    ///
+    /// A returned `Event.item` is the stream's own and is valid until `deinit`;
+    /// a later pull does not disturb it. After `.finished` or `.closed` this
+    /// answers null without reaching the service at all.
     pub fn next(self: *Stream) ?Event {
         if (self.status != .live) return null;
         const event = self.vtable.next(self.state);
@@ -302,9 +437,12 @@ pub const Stream = struct {
         return event;
     }
 
-    /// What the service came to. Meaningful only once `next` has answered null,
-    /// and the only way a caller learns whether the service resolved to nothing
-    /// or had nothing to say for a different reason.
+    /// What the service came to, which is the only way a caller learns whether
+    /// it resolved to nothing or had nothing to say for another reason.
+    ///
+    /// Readable only once `next` has answered null. The `Resolution.resolved`
+    /// slice borrows the state, so it is read before `deinit` and is dead after
+    /// it; a caller that needs it to outlive the stream has to copy it out.
     pub fn finish(self: *const Stream) item.Resolution {
         std.debug.assert(self.status == .finished);
         return self.vtable.finish(self.state);
@@ -323,6 +461,9 @@ pub const Stream = struct {
     /// that already finished is told anyway: a service that has finished has
     /// nothing left to stop, and a `cancel` that is a no-op then is cheaper than
     /// a status check that could be got wrong.
+    ///
+    /// The state and every item in it are released here, so a `Resolution` read
+    /// from `finish` and an `Event.item` from a pull are both dead afterwards.
     pub fn deinit(self: *Stream) void {
         if (self.status == .closed) return;
         self.status = .closed;
@@ -366,6 +507,10 @@ pub const Attribute = enum {
     /// cannot be added without a spelling.
     pub const all = [_]Attribute{ .relay, .addr, .user_data };
 
+    /// The attribute whose record key is `key_text`, or null when the key is not
+    /// one of the three. The match is exact — `strum`'s generated `FromStr` is
+    /// too — so a case-folded or hyphen-less key is an unknown key rather than
+    /// a spelling of one of these.
     pub fn parse(key_text: []const u8) ?Attribute {
         inline for (all) |attribute| {
             if (std.mem.eql(u8, key_text, attribute.text())) return attribute;
@@ -373,6 +518,8 @@ pub const Attribute = enum {
         return null;
     }
 
+    /// The key this attribute is written under in a `key=value` record. A slice
+    /// of a string literal, so it is valid for the life of the program.
     pub fn text(self: Attribute) []const u8 {
         return switch (self) {
             .relay => "relay",
@@ -397,9 +544,16 @@ pub const Attribute = enum {
 /// reads it and never shared: two resolves against one service each get their
 /// own, and neither can tread on the other's place in the buffer.
 pub const RecordSet = struct {
+    /// The NUL-separated records, borrowed from whoever holds the answer. A
+    /// `RecordSet` owns none of them and has no `deinit`: the buffer has to
+    /// outlive every read made through any copy of this set.
     bytes: []const u8,
+    /// How far this copy has read, zero for a set nothing has read from. It is
+    /// per-copy state rather than a property of the buffer, which is what lets
+    /// two sets read one buffer from its start at the same time.
     at: usize = 0,
 
+    /// A set over `bytes`, positioned at its first record.
     pub fn init(bytes: []const u8) RecordSet {
         return .{ .bytes = bytes };
     }
@@ -434,17 +588,28 @@ pub const RecordSet = struct {
 /// publisher knew and the reader did not, and inventing one on the reading side
 /// would put a value into the order that no two services could ever agree on.
 ///
+/// # What the result owns, and what a caller has to release
+///
 /// Everything the result owns comes from `alloc`: the address list, and the
 /// bytes behind every `addr=<custom>` value. The second one is not optional.
 /// `addr.CustomAddr.data` borrows — `CustomAddr.parse` needs storage for the
 /// inline data and `NodeAddr.insert` copies the slice header, not the bytes it
-/// points at — so the bytes are copied out here, and the copy has to outlive
-/// the item. `NodeAddr.deinit(alloc)` does not free them, because a `NodeAddr`
-/// has no field for them. A caller that wants the item to outlive the allocator
-/// it passed wants an arena, and both resolvers below hold one for exactly that
-/// reason. This is invariant 6 read from the other end: the value never carries
-/// a slice into storage it does not own, and where it cannot own it, the owner
-/// is named.
+/// points at — so the bytes are copied out here, and that copy has to outlive
+/// the item.
+///
+/// So `alloc` has to outlive the item, and `NodeAddr.deinit` releases the
+/// address list and nothing else, because a `NodeAddr` has no field for the
+/// payloads. On the success path the item owns both: a caller that holds it in
+/// an arena gets both back from one `arena.deinit`, which is what both
+/// resolvers below do, and a caller that does not has to walk `addrs` and free
+/// each custom address's `data` itself. This is invariant 6 read from the
+/// other end: the value never carries a slice into storage it does not own, and
+/// where it cannot own it, the owner is named.
+///
+/// On either error nothing survives: the address list and every payload copied
+/// before the failing record are released before the error leaves, and no
+/// record after it is read. There is no partial item to clean up, and `alloc` is
+/// back to what it was on entry.
 ///
 /// Upstream's three rules, all three load-bearing:
 ///
@@ -468,7 +633,11 @@ pub fn parseTxt(
 ) ParseError!item.Item {
     var set = records;
     var endpoint = addr.NodeAddr.init(node_id);
-    errdefer endpoint.deinit(alloc);
+    // The address list, when there is one to release: `NodeAddr.init` hands back
+    // an empty literal rather than an allocation, and `free` of a zero-length
+    // slice is not a call `std` accepts. `releaseTransfer` says the same about
+    // the publishing side, for the same reason.
+    errdefer if (endpoint.addrs.len != 0) endpoint.deinit(alloc);
     // Every custom address data buffer copied out so far, so the error path can
     // hand them all back. `NodeAddr.deinit` frees the address list and nothing
     // else, so a buffer that only an earlier record allocated has no owner left
@@ -514,21 +683,28 @@ pub fn parseTxt(
                     // outlive the item — which is the rule `parseTxt` states
                     // about its allocator.
                     const data = try alloc.dupe(u8, custom.data);
-                    const grown = endpoint.insert(alloc, .{
-                        .custom = .{ .id = custom.id, .data = data },
-                    }) catch {
+                    // Recorded before the address is inserted, and not after,
+                    // because recording it can fail and the insert is what makes
+                    // the item refer to the copy. Appending first means every
+                    // later path out of here frees the copy through `owned`,
+                    // where the error path walks it; the other order handed back
+                    // an item holding a buffer that nothing owned as soon as
+                    // this append failed. The one path the tracker cannot cover
+                    // is this one, and it frees the copy itself.
+                    owned.append(alloc, data) catch {
                         alloc.free(data);
                         return error.OutOfMemory;
                     };
+                    const grown = endpoint.insert(alloc, .{
+                        .custom = .{ .id = custom.id, .data = data },
+                    }) catch return error.OutOfMemory;
                     if (grown) |next| {
                         endpoint = next;
-                        // Only now does anything refer to the copy, so it
-                        // leaves this record's hands and joins the list the
-                        // error path frees.
-                        try owned.append(alloc, data);
                     } else {
-                        // Already present, so nothing refers to the copy.
-                        alloc.free(data);
+                        // Already present, so nothing refers to the copy, and it
+                        // is the last thing `owned` recorded: popping it is the
+                        // whole of taking it back.
+                        alloc.free(owned.pop().?);
                     }
                 }
             },
@@ -590,6 +766,11 @@ pub fn maxTxtStringsLength(addrs: usize) usize {
 }
 
 /// One signed pkarr packet, as a resolver needs it.
+///
+/// A value: `node_id` is fixed-size and `txt` is a position in somebody else's
+/// buffer. Nothing here is released, and a `Packet` is valid for as long as the
+/// bytes `PacketSource.decode` read it out of — which is why that callback may
+/// not decode into scratch it reuses before the pull that asked for it ends.
 pub const Packet = struct {
     /// Who signed it, which *is* the node being published: upstream reads the
     /// id out of the packet's own public key (`iroh-dns/src/endpoint_info.rs`,
@@ -604,6 +785,9 @@ pub const Packet = struct {
     /// character strings, they are concatenated first"). The concatenation is a
     /// DNS-layer fact and the same one `discovery/dns.zig` relies on, so neither
     /// service does it.
+    ///
+    /// Borrowed from the packet bytes, positioned at its first record; a copy is
+    /// how two readers share one buffer without stepping on each other.
     txt: RecordSet,
 };
 
@@ -612,21 +796,44 @@ pub const Packet = struct {
 /// Nothing here fetches. A resolver is handed an answer set that something else
 /// already retrieved, together with a handle to that retrieval, which is how a
 /// caller cancels without the resolver ever learning what a socket is.
+///
+/// Nothing here is owned: the answers are borrowed and the two callables are
+/// the caller's own, so all of it has to outlive every stream started against
+/// it. One source may serve several streams, and `decode` is then called from
+/// whichever thread is pulling — the seam carries no synchronisation of its own,
+/// and a source shared across threads has to be safe to call that way.
 pub const PacketSource = struct {
+    /// The source's own value, borrowed and reached by `decode`. It has to stay
+    /// alive until every stream reading this source is closed.
     ctx: *anyopaque,
     /// Signed-packet bytes to what they say. This function is
     /// `discovery/pkarr.zig`'s and nothing in this file is; a resolver calls it
     /// and turns its answer into either a `Packet` or a `DecodeError`, and that
     /// mapping is the whole of the coupling between the two files.
+    ///
+    /// Called once per answer, synchronously, inside the `Stream.next` that
+    /// walks to it and on that call's thread. `packet` borrows `answers` and is
+    /// live for the call only; the returned `Packet.txt` may borrow it, so a
+    /// source that decodes out of a scratch buffer cannot hand one back that
+    /// outlives the pull. Nothing here reenters the stream being pulled, and
+    /// `error.MalformedPacket` and `error.BadSignature` lose that one answer
+    /// rather than the stream.
     decode: *const fn (ctx: *anyopaque, packet: []const u8) DecodeError!Packet,
     /// The answers, already retrieved, concatenated and NUL-separated. The
     /// first NUL ends one packet and the second starts the next, which is why
     /// each answer is a whole signed packet and a packet may hold several
     /// `_iroh` records of its own.
+    ///
+    /// Borrowed, and read from the position this value holds: a resolver copies
+    /// it per resolve so two streams cannot tread on each other's place in the
+    /// buffer, but both copies point at the same bytes, which therefore have to
+    /// stay valid and unchanged until the last of those streams is closed.
     answers: RecordSet,
     /// How to stop the retrieval. Null when there was none — an answer set read
-    /// out of a file has nothing to cancel, and saying so is different from
-    /// having a cancellation that nobody fired.
+    /// out of a file has nothing to cancel — and a stream with a null one still
+    /// runs and still frees; it simply tells nobody to stop. Non-null is fired
+    /// exactly once per stream, from `Stream.deinit`, so the handle it points at
+    /// has to outlive every stream started here.
     cancellation: ?Cancellation,
 };
 
@@ -637,21 +844,27 @@ pub const PacketSource = struct {
 /// `AddressLookup.refuse_resolve` and a resolve asked of it comes back `None`.
 /// That is the production case for the distinction invariant 13 is about, and
 /// not only a trait default nobody uses.
+///
+/// One slot, so the last publication is readable, and `deinit` for the one that
+/// is still in it. The slot holds the whole `Published`, allocator included, so
+/// a value this publisher did not build is released with the allocator that did
+/// build it — see `Published`.
 pub const PkarrPublisher = struct {
-    alloc: std.mem.Allocator,
-    /// The last data handed to `publish`, owned so the caller is free the moment
-    /// `publish` returns. Upstream's is `self.watchable.set(Some(info))`
+    /// The last data handed to `publish`, owned whole so the caller is free the
+    /// moment `publish` returns. Upstream's is `self.watchable.set(Some(info))`
     /// (`iroh/src/address_lookup/pkarr.rs`, `update_endpoint_data`): the same
     /// take-ownership swap, into the same one slot, read by a background task
     /// that republishes on a timer.
-    stored: ?item.Item,
+    ///
+    /// Null is the empty state: nothing published, and `published` says so
+    /// rather than answering with an item that has no address.
+    stored: ?Published,
+    /// Borrowed by every `AddressLookup` handed out of `lookup`.
     vtable: AddressLookup.VTable = publisher_vtable,
 
-    /// The allocator is taken here and held rather than taken per call, because
-    /// the one slot has to be given back on the next `publish` and on `deinit`
-    /// and those are the only two moments it exists.
-    pub fn init(alloc: std.mem.Allocator) PkarrPublisher {
-        return .{ .alloc = alloc, .stored = null };
+    /// A publisher with nothing in its slot.
+    pub fn init() PkarrPublisher {
+        return .{ .stored = null };
     }
 
     // The slot is given back and then nulled, and null is the terminal state:
@@ -660,22 +873,31 @@ pub const PkarrPublisher = struct {
     // field names and `stored` is not on it, so the `= null` it cannot see is
     // here to be read.
     // ziglint-ignore: Z030
-    /// The one slot has to be given back. Not a vtable entry, because the
-    /// vtable is a borrowed view: see `AddressLookup`.
+    /// Releases the slot, with the allocator that slot arrived with, and leaves
+    /// the publisher empty. Not a vtable entry, because the vtable is a
+    /// borrowed view: see `AddressLookup`. A second call frees nothing, and a
+    /// `Published` published afterwards is released by the next `publish` or by
+    /// this call.
     pub fn deinit(self: *PkarrPublisher) void {
-        if (self.stored) |value| value.endpoint.deinit(self.alloc);
+        if (self.stored) |data| releaseTransfer(data);
         self.stored = null;
     }
 
+    /// A handle onto this publisher. Borrowed, so the publisher has to outlive
+    /// every handle taken of it and every publish made through one.
     pub fn lookup(self: *PkarrPublisher) AddressLookup {
         return .{ .vtable = &self.vtable, .ctx = @ptrCast(@alignCast(self)) };
     }
 
     /// What was published last, or null when `publish` has not been called.
-    /// Borrows the publisher's own storage, so the slice is dead after the next
-    /// `publish` — invariant 6's reason.
+    ///
+    /// Borrows the publisher's own storage, so the address list is dead after
+    /// the next `publish` and after `deinit` — invariant 6's reason. The
+    /// provenance is `.pkarr` and the stamp is the one the caller published,
+    /// because a publisher is only ever a pkarr one.
     pub fn published(self: *const PkarrPublisher) ?item.Item {
-        return self.stored;
+        const data = self.stored orelse return null;
+        return item.Item.init(data.endpoint, .pkarr, data.last_updated);
     }
 
     /// The records a signed packet for the published data would carry, as a
@@ -746,8 +968,11 @@ fn publisherPublish(ctx: *anyopaque, data: Published) void {
     // `watchable.set`: a publisher's job is to say what this node is reachable
     // at *now*, and an address the endpoint has since stopped using is not a
     // second opinion, it is stale.
-    if (self.stored) |previous| previous.endpoint.deinit(self.alloc);
-    self.stored = item.Item.init(data.endpoint, .pkarr, data.last_updated);
+    // Released with the allocator that slot arrived with, not with one of this
+    // publisher's: whoever published last built that list, and a publisher has
+    // no allocator of its own to release it with.
+    if (self.stored) |previous| releaseTransfer(previous);
+    self.stored = data;
 }
 
 /// `PkarrResolver`: the service that only resolves.
@@ -757,14 +982,24 @@ fn publisherPublish(ctx: *anyopaque, data: Published) void {
 /// `AddressLookup.ignore_publish`. Publishing is somebody else's job, and a
 /// resolver that also published would make "what this node is reachable at" and
 /// "what the network says about that node" the same value.
+///
+/// Copying the service copies the borrowed source and the vtable, so a copy is
+/// a second handle onto one answer set and not a second retrieval.
 pub const PkarrResolver = struct {
+    /// The answers and the handle to the retrieval behind them, both borrowed.
+    /// Every stream started against this resolver reads them, so they have to
+    /// outlive all of those streams.
     source: PacketSource,
+    /// Borrowed by every `AddressLookup` handed out of `lookup`.
     vtable: AddressLookup.VTable = resolver_vtable,
 
+    /// A resolver over one already-retrieved answer set.
     pub fn init(source: PacketSource) PkarrResolver {
         return .{ .source = source };
     }
 
+    /// A handle onto this resolver. Borrowed, so the resolver has to outlive
+    /// every stream started through the handle.
     pub fn lookup(self: *PkarrResolver) AddressLookup {
         return .{ .vtable = &self.vtable, .ctx = @ptrCast(@alignCast(self)) };
     }
@@ -969,7 +1204,7 @@ const FakeRelay = struct {
 };
 
 test "a publisher cannot resolve, which is not a failure" {
-    var publisher = PkarrPublisher.init(t.allocator);
+    var publisher = PkarrPublisher.init();
     defer publisher.deinit();
     // Upstream's publisher implements `publish` and no `resolve`
     // (`iroh/src/address_lookup/pkarr.rs:357`), so a resolve is the trait
@@ -980,7 +1215,7 @@ test "a publisher cannot resolve, which is not a failure" {
 }
 
 test "a publisher that has published nothing writes nothing" {
-    var publisher = PkarrPublisher.init(t.allocator);
+    var publisher = PkarrPublisher.init();
     defer publisher.deinit();
     // `published` is null and `writeTxtStrings` says so rather than handing
     // back an empty record set, which a reader would take for a node that has
@@ -991,13 +1226,101 @@ test "a publisher that has published nothing writes nothing" {
     try t.expectError(error.NothingPublished, publisher.writeTxtStrings(&buffer));
 }
 
+test "a publish nobody wanted still released what it was handed" {
+    // The other end of the transfer. Every resolver in the tree takes
+    // `ignore_publish`, so this is the shape a caller publishes into when the
+    // service it chose does not publish: nothing was published, and nothing is
+    // left over for the caller to release either, because the address list
+    // arrived with the allocator that built it. `t.allocator` names the leak at
+    // the end of the test, so a `publish` that dropped the value on the floor
+    // fails here without needing an assertion of its own.
+    const id = try corpusId(3);
+    var relay: FakeRelay = .{ .answers = "", .packets = &.{} };
+    var resolver = PkarrResolver.init(relay.source(null));
+
+    resolver.lookup().publish(.{
+        .alloc = t.allocator,
+        .endpoint = try addr.NodeAddr.withRelay(
+            t.allocator,
+            id,
+            try addr.RelayUrl.parse("https://relay.example./"),
+        ),
+        .last_updated = null,
+    });
+    // The publication changed nothing about the service: it resolves as it did,
+    // which is the whole of what publishing into a resolver means.
+    var stream = (try resolver.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
+    try t.expect(stream.next() == null);
+    try t.expect(stream.finish().isEmptyResult());
+    stream.deinit();
+}
+
+test "a publisher releases the slot it replaces with the allocator that made it" {
+    // Two publications, two allocators, and the second replaces the first. A
+    // publisher holds no allocator of its own, so this is only correct because
+    // each `Published` carries the one its list came from: releasing the first
+    // slot with the second's would hand an arena's bytes to a testing allocator
+    // that never allocated them, and the run would stop inside `free` rather
+    // than at an assertion here.
+    const id = try corpusId(4);
+    // Declared before the publisher, so `deinit` empties the slot while the
+    // arena is still there. That order is the obligation `Published` states for
+    // a caller, and a test that got it wrong would free into a dead arena.
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var publisher = PkarrPublisher.init();
+    defer publisher.deinit();
+
+    publisher.lookup().publish(.{
+        .alloc = arena.allocator(),
+        .endpoint = try addr.NodeAddr.withRelay(
+            arena.allocator(),
+            id,
+            try addr.RelayUrl.parse("https://one.example./"),
+        ),
+        .last_updated = 1,
+    });
+    publisher.lookup().publish(.{
+        .alloc = t.allocator,
+        .endpoint = try addr.NodeAddr.withRelay(
+            t.allocator,
+            id,
+            try addr.RelayUrl.parse("https://two.example./"),
+        ),
+        .last_updated = 2,
+    });
+
+    // The slot is the second publication and the first is gone: an address the
+    // endpoint has since stopped using is stale, not a second opinion.
+    const stored = publisher.published() orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(?u64, 2), stored.last_updated);
+    try t.expectEqual(@as(usize, 1), stored.endpoint.addrs.len);
+    try t.expectEqual(
+        try addr.RelayUrl.parse("https://two.example./"),
+        stored.endpoint.addrs[0].relay,
+    );
+
+    // A third publication replaces that one, and `deinit` releases this one on
+    // the way out — the release a replaced slot never gets to make.
+    publisher.lookup().publish(.{
+        .alloc = t.allocator,
+        .endpoint = try addr.NodeAddr.withRelay(
+            t.allocator,
+            id,
+            try addr.RelayUrl.parse("https://three.example./"),
+        ),
+        .last_updated = 3,
+    });
+}
+
 test "cannot resolve and resolved to nothing are different answers" {
     const id = try corpusId(1);
 
     // A service that will not answer at all. There is no `Resolution` in hand
     // afterwards, and the absence is the whole point: there is no value a caller
     // could mistake for an empty one.
-    var publisher = PkarrPublisher.init(t.allocator);
+    var publisher = PkarrPublisher.init();
     defer publisher.deinit();
     try t.expect((try publisher.lookup().resolve(t.allocator, id)) == null);
 
@@ -1208,6 +1531,37 @@ test "a value that will not parse is dropped and the rest is kept" {
     );
 }
 
+test "a custom payload is released however the record fails" {
+    // Three allocations stand between this record and the item: the payload
+    // copy, the tracker that records it, and the growth of the address list.
+    // The middle one is the one that used to be missed — the copy went into the
+    // address list first and was recorded afterwards, so a failure in the
+    // recording handed back an item holding a buffer no path owned. Each probe
+    // fails one of the two later allocations by index, and `t.allocator` names
+    // the leak at the end of the test, so both are green only when the copy is
+    // released on each of those paths.
+    const id = try corpusId(6);
+    const records: RecordSet = .init("addr=1_a1b2c3\x00");
+
+    var recording = t.FailingAllocator.init(t.allocator, .{ .fail_index = 1 });
+    try t.expectError(error.OutOfMemory, parseTxt(recording.allocator(), id, records, .pkarr));
+
+    var growing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 2 });
+    try t.expectError(error.OutOfMemory, parseTxt(growing.allocator(), id, records, .pkarr));
+
+    // The success path still owns what the contract says it does: the payload is
+    // the caller's to release, because `NodeAddr.deinit` frees the address list
+    // and nothing else. Reading it here is the other half of that sentence — an
+    // item that copied the bytes out and then lost track of them would fail on
+    // the leak check above and never reach this.
+    const value = try parseTxt(t.allocator, id, records, .pkarr);
+    try t.expectEqual(@as(usize, 1), value.endpoint.addrs.len);
+    for (value.endpoint.addrs) |one| {
+        if (one == .custom) t.allocator.free(one.custom.data);
+    }
+    value.endpoint.deinit(t.allocator);
+}
+
 test "a packet signed for another node is reported, not returned" {
     // Upstream takes the id from the packet and hands it on
     // (`from_pkarr_signed_packet`), so a relay answering a query for one node
@@ -1261,7 +1615,7 @@ test "a packet that will not decode fails one answer and not the stream" {
 
 test "published records read back as the address that was published" {
     const id = try corpusId(7);
-    var publisher = PkarrPublisher.init(t.allocator);
+    var publisher = PkarrPublisher.init();
     defer publisher.deinit();
 
     // Three families, so the loop that writes one record per address is walked
@@ -1279,7 +1633,11 @@ test "published records read back as the address that was published" {
     }) |value| {
         if (try endpoint.insert(t.allocator, value)) |grown| endpoint = grown;
     }
-    publisher.lookup().publish(.{ .endpoint = endpoint, .last_updated = 7 });
+    publisher.lookup().publish(.{
+        .alloc = t.allocator,
+        .endpoint = endpoint,
+        .last_updated = 7,
+    });
 
     var buffer: [maxTxtStringsLength(4)]u8 = undefined;
     const records = try publisher.writeTxtStrings(&buffer);

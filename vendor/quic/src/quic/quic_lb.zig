@@ -427,3 +427,44 @@ test "quic_lb encrypted no length encoding" {
     try std.testing.expect(extractServerId(&config, &cid, &extracted_sid));
     try std.testing.expectEqualSlices(u8, &.{ 0x11, 0x22, 0x33 }, extracted_sid[0..3]);
 }
+
+test "quic_lb: the longest payload the two lengths can combine into round-trips" {
+    // The lengths are combined into one payload, and that is what the decode
+    // buffer and the cipher's rounds both have to fit: the 4-pass form XORs
+    // half the payload out of a 16-byte AES block, so the payload is at most
+    // 32 bytes, and the server id alone is at most 15.
+    const key = [16]u8{ 0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0 };
+    var config = Config{
+        .config_id = 6,
+        .server_id_len = 15,
+        .nonce_len = 17,
+        .key = key,
+    };
+    @memset(&config.server_id, 0xa5);
+    try std.testing.expectEqual(@as(u8, 33), cidLength(&config));
+
+    var prng = std.Random.DefaultPrng.init(0x6c6f6e67);
+    var cid: [40]u8 = undefined;
+    generateCid(&config, &cid, prng.random());
+
+    var extracted: [15]u8 = undefined;
+    try std.testing.expect(extractServerId(&config, &cid, &extracted));
+    try std.testing.expectEqualSlices(u8, &config.server_id, &extracted);
+}
+
+test "quic_lb: the longest payload also round-trips without a key" {
+    var config = Config{
+        .config_id = 0,
+        .server_id_len = 15,
+        .nonce_len = 17,
+    };
+    @memset(&config.server_id, 0x5a);
+
+    var prng = std.Random.DefaultPrng.init(0x706c6169);
+    var cid: [40]u8 = undefined;
+    generateCid(&config, &cid, prng.random());
+
+    var extracted: [15]u8 = undefined;
+    try std.testing.expect(extractServerId(&config, &cid, &extracted));
+    try std.testing.expectEqualSlices(u8, &config.server_id, &extracted);
+}

@@ -48,10 +48,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // Declared on the library so an importer of `ozai` can reach the transport
-    // stack as `ozai.quic` without this repository depending on it at build
-    // time. Zig modules are lazy, so naming it here costs nothing until
-    // something imports it.
+    // Both modules are registered consumer routes. The bridge imports the
+    // same core module, while consumers add "quic" explicitly when naming
+    // the core's types in their own module.
     lib_mod.addImport("quic", quic_mod);
 
     // The test root is `test_all.zig`, not `lib.zig`. A root that only
@@ -507,7 +506,7 @@ fn checkVendoredFileList(b: *std.Build) void {
 
     var found: std.ArrayList([]const u8) = .empty;
     defer found.deinit(gpa);
-    var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| {
+    var dir = b.build_root.handle.openDir(io, root, .{ .iterate = true }) catch |err| {
         std.debug.panic("cannot read {s}: {s}", .{ root, @errorName(err) });
     };
     defer dir.close(io);

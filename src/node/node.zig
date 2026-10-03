@@ -3952,3 +3952,68 @@ test "a message length round-trips at every varint width" {
     try t.expect(readVarint(&.{}) == null);
     try t.expect(readVarint(&.{0x40}) == null);
 }
+
+fn unusableClock(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+    return .{ .nanoseconds = std.math.maxInt(i96) };
+}
+
+fn alwaysCanceled(_: ?*anyopaque) std.Io.Cancelable!void {
+    return error.Canceled;
+}
+
+test "a clock this node cannot use still closes the node" {
+    const node = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x7c),
+        .listen = loopback,
+        .topic = briskTopic(),
+    }, 0x3737);
+    defer node.deinit();
+    var vtable = t.io.vtable.*;
+    vtable.now = unusableClock;
+    const broken: std.Io = .{ .userdata = t.io.userdata, .vtable = &vtable };
+    var stop = Stop.init();
+    try t.expectError(error.InstantOutOfRange, node.run(broken, &stop));
+    try t.expectEqual(@as(u64, 0), node.stats.steps);
+    try t.expectEqual(router.Shutdown.Phase.closed, node.accept.shutdown.phase);
+    try t.expectEqual(@as(usize, 0), node.accept.live);
+    try t.expect(!node.socket_open);
+}
+
+test "a close that cannot write is finished by the close after it" {
+    const listener = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x62),
+        .listen = loopback,
+        .topic = briskTopic(),
+    }, 0x6262);
+    defer listener.deinit();
+    const peers = [_]Peer{.{
+        .id = listener.nodeId(),
+        .addr = .{ .ip = listener.address() },
+    }};
+    const dialer = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xa2),
+        .listen = loopback,
+        .peers = &peers,
+        .topic = briskTopic(),
+    }, 0xa2a2);
+    defer dialer.deinit();
+    var at: Instant = start_ns;
+    try dialer.start(at, dialer.generator());
+    var pass: usize = 0;
+    while (pass < max_passes) : (pass += 1) {
+        at += time_quantum;
+        _ = try dialer.step(t.io, at, dialer.generator());
+        _ = try listener.step(t.io, at, listener.generator());
+    }
+    try t.expectEqual(@as(usize, 1), dialer.establishedCount());
+    var vtable = t.io.vtable.*;
+    vtable.checkCancel = alwaysCanceled;
+    const cancelled: std.Io = .{ .userdata = t.io.userdata, .vtable = &vtable };
+    try t.expectError(error.Canceled, dialer.close(cancelled, at, dialer.generator()));
+    try t.expectEqual(router.Shutdown.Phase.closing_endpoint, dialer.accept.shutdown.phase);
+    try t.expect(dialer.socket_open);
+    try dialer.close(t.io, at, dialer.generator());
+    try t.expectEqual(router.Shutdown.Phase.closed, dialer.accept.shutdown.phase);
+    try t.expect(!dialer.socket_open);
+    try listener.close(t.io, at, listener.generator());
+}

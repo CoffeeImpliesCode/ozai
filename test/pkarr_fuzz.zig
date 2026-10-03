@@ -87,7 +87,7 @@ fn check(bytes: []const u8) !void {
     // a decode cannot quietly drop a byte, reorder the header or re-spell the
     // timestamp's endianness.
     var out: [pkarr.max_packet_length]u8 = undefined;
-    const reencoded = packet.encode(&out);
+    const reencoded = try packet.encode(&out);
     try t.expectEqualSlices(u8, bytes, reencoded);
 
     try checkSignable(packet);
@@ -100,7 +100,7 @@ fn check(bytes: []const u8) !void {
 /// agrees with the bug it is meant to catch.
 fn checkSignable(packet: pkarr.Packet) !void {
     var scratch: [pkarr.max_signable_length]u8 = undefined;
-    const signable = packet.signable(&scratch);
+    const signable = try packet.signable(&scratch);
 
     var expected: [pkarr.max_signable_length]u8 = undefined;
     const prefix = try std.fmt.bufPrint(&expected, "3:seqi{d}e1:v{d}:", .{

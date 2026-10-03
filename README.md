@@ -161,6 +161,38 @@ and pays that back through `zig build quic-test`; the cache roots are there
 because a lint section reports whatever the file list hands it, and build
 output is not a defect.
 
+### Consume as a package
+
+The package registers two modules: `ozai` and `quic`. `ozai` imports the same
+QUIC core internally. It does not export an `ozai.quic` alias.
+
+Add an `ozai` dependency to `build.zig.zon`. Use its registered modules in
+your build:
+
+```zig
+const dep = b.dependency("ozai", .{
+    .target = target,
+    .optimize = optimize,
+});
+const app = b.addExecutable(.{
+    .name = "app",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }),
+});
+app.root_module.addImport("ozai", dep.module("ozai"));
+app.root_module.addImport("quic", dep.module("quic"));
+```
+
+The Linux socket and node drivers require libc. Pure codecs and state machines
+do not. Import `quic` when your source names the core's types.
+Fetched packages include the module sources, vendored license, README and
+architecture and decision documents. Build checks resolve paths from the package
+root, not the consuming application's working directory.
+
 ### Cross-platform tests
 
 `cross-test.profile.sh` runs the full 543-test Linux socket/process suite,
@@ -290,7 +322,7 @@ closed output pipes are removed from polling, and premature EOF fails the wait.
 
 ```
 src/root.zig            public surface
-src/base/               identity and addressing — pure, no I/O
+src/base/               identity, addressing and an explicit entropy edge
 src/examples/           runnable proofs
 test/                   integration tests, outside src/ so they are reachable
 docs/                   plan, architecture, decision records

@@ -71,15 +71,10 @@
 //!
 //! # What cannot be measured here, and why it is named
 //!
-//! "The control frame was written *ahead* of the datagrams" is the other half
-//! of invariant 9, and this file does **not** assert it, because the relay's
-//! queues are its own storage: nothing outside `src/relay/server.zig` can read
-//! their depth or their order. What is observable from here is a client's
-//! `delivered()` count, and that count grows with every frame the relay drains
-//! — which, while a flood is in, is exactly what is filling the queue. So the
-//! two ends of the claim are not independently measurable and the ordering
-//! half is named rather than asserted at a bound that would only hold because
-//! of how this file schedules its passes.
+//! This file does not assert that a control frame reaches the wire ahead of
+//! every queued datagram. `Queue` exposes its ring fields, but this test
+//! observes delivery rather than sampling the relay's queue at each drain.
+//! It verifies control admission under data load, not wire ordering.
 //!
 //! What is asserted instead is the half that *is* checkable from outside, and
 //! it is the failure the invariant names: a control frame queued against a

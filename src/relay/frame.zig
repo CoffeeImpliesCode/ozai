@@ -2229,3 +2229,21 @@ fn hexdump(bytes: []const u8) [2 * max_dumped_bytes]u8 {
     @memset(out[shown * 2 ..], ' ');
     return out;
 }
+
+test "codec: text that is not UTF-8 is refused, because decode refuses it too" {
+    const not_text = [_]u8{ 0xff, 'n', 'o', ' ' };
+    var out: [scratch_len]u8 = undefined;
+    @memset(&out, 0xff);
+    try std_testing.expectError(
+        error.InvalidUtf8,
+        encode(.{ .server_denies_auth = .{ .reason = &not_text } }, .v2, &out),
+    );
+    for (out) |byte| try std_testing.expectEqual(@as(u8, 0xff), byte);
+    var v1_out: [scratch_len]u8 = undefined;
+    @memset(&v1_out, 0xff);
+    try std_testing.expectError(
+        error.InvalidUtf8,
+        encode(.{ .health = &not_text }, .v1, &v1_out),
+    );
+    for (v1_out) |byte| try std_testing.expectEqual(@as(u8, 0xff), byte);
+}

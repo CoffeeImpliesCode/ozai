@@ -33,24 +33,31 @@ would break if it moved.
 └───────────────────────────────────────────────────────┘
 ```
 
-The rule that makes the whole thing testable: **nothing below `ozai.base` may
-read a clock, read the environment, or take an allocator it was not handed.**
-Everything above it may, as long as `io: std.Io` is threaded rather than stored.
+Wire codecs and network state machines consume caller-supplied bytes, state,
+time and entropy. They do not fetch a clock, environment or hidden allocator.
+`SecretKey.generate` is an explicit entropy edge. It borrows `std.Io` rather
+than hiding a process random source.
 
-The runtime is `std.Io` — `Io.Threaded` — at the transport and endpoint layers
-and invisible above them; see [`DECISIONS/0002`](DECISIONS/0002-async-substrate.md),
-which chose zio on 2026-09-29 and reversed it the next day, and was
-reconsidered again on 2026-10-01 with the reversal standing. It is not zio. The
-reason it is not is not fashion: `Io.Uring` cannot send a UDP datagram in 0.16.0,
-and `Io.Evented` is Uring on Linux, so a runtime that owns readiness cannot own
-this stack's send path. A state machine that needs a runtime stood up in order to
-be tested has found a boundary in the wrong place.
+The socket and node drivers borrow `std.Io` per operation. Its backend and
+userdata must outlive the operation and any task that uses them.
+Runtime owners keep their allocator, but pure actions keep no socket handle.
+See [`DECISIONS/0002`](DECISIONS/0002-async-substrate.md) for the runtime choice.
+
+The current Linux driver uses `Io.Threaded`. `Io.Uring` cannot send a UDP
+datagram in Zig 0.16.0, and `Io.Evented` uses Uring on Linux.
+Neither runtime owns this stack's send path.
 
 ## Module tree
 
 Names are chosen for what they are *for* in Zig, not for their Rust originals.
 Where a rename happened, the reason is recorded here so it is not undone by a
 well-meaning port.
+
+The diagram names responsibilities, not import routes. The package registers
+`ozai` and `quic` separately. `src/root.zig` lists the supported `ozai`
+namespaces. Owning declarations state each result's lifetime and release duty.
+Reachable fields are not private, and copying an owner does not duplicate its
+resources. Allocating owners require exactly one teardown.
 
 | Zig | Rust upstream | Why |
 |---|---|---|
