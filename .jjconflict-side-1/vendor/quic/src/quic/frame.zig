@@ -1,0 +1,1606 @@
+const std = @import("std");
+const io = @import("../io_compat.zig");
+
+const packet = @import("packet.zig");
+
+/// Length of the run of PADDING (zero) bytes at the start of `bytes`.
+/// Padded Initials and PMTU probes carry ~1000 of them, so it scans a vector
+/// at a time.
+pub fn paddingLen(bytes: []const u8) usize {
+    const V = std.simd.suggestVectorLength(u8) orelse 16;
+    var i: usize = 0;
+    while (i + V <= bytes.len) : (i += V) {
+        const v: @Vector(V, u8) = bytes[i..][0..V].*;
+        if (@reduce(.Or, v) != 0) break;
+    }
+    while (i < bytes.len and bytes[i] == 0) i += 1;
+    return i;
+}
+
+pub const FrameError = error{
+    FrameEncodingError,
+};
+
+pub const FrameType = enum(u64) {
+    padding = 0x00,
+    ping = 0x01,
+    ack = 0x02,
+    ack_ecn = 0x03,
+    reset_stream = 0x04,
+    stop_sending = 0x05,
+    crypto = 0x06,
+    new_token = 0x07,
+    stream = 0x08,
+    max_data = 0x10,
+    max_stream_data = 0x11,
+    max_streams_bidi = 0x12,
+    max_streams_uni = 0x13,
+    data_blocked = 0x14,
+    stream_data_blocked = 0x15,
+    streams_blocked_bidi = 0x16,
+    streams_blocked_uni = 0x17,
+    new_connection_id = 0x18,
+    retire_connection_id = 0x19,
+    path_challenge = 0x1a,
+    path_response = 0x1b,
+    connection_close = 0x1c,
+    application_close = 0x1d,
+    handshake_done = 0x1e,
+    immediate_ack = 0x1f,
+    datagram = 0x30,
+    datagram_with_length = 0x31,
+    ack_frequency = 0xaf,
+    _,
+};
+
+/// QUIC transport error codes (RFC 9000 Section 20).
+pub const TransportError = enum(u64) {
+    no_error = 0x00,
+    internal_error = 0x01,
+    connection_refused = 0x02,
+    flow_control_error = 0x03,
+    stream_limit_error = 0x04,
+    stream_state_error = 0x05,
+    final_size_error = 0x06,
+    frame_encoding_error = 0x07,
+    transport_parameter_error = 0x08,
+    connection_id_limit_error = 0x09,
+    protocol_violation = 0x0a,
+    invalid_token = 0x0b,
+    application_error = 0x0c,
+    crypto_buffer_exceeded = 0x0d,
+    key_update_error = 0x0e,
+    aead_limit_reached = 0x0f,
+    no_viable_path = 0x10,
+    version_negotiation_error = 0x11,
+    _,
+
+    /// Create a CRYPTO_ERROR code (0x100 + TLS alert code)
+    pub fn cryptoError(alert: u64) u64 {
+        return 0x100 + alert;
+    }
+};
+
+/// ACK range: represents a contiguous range of acknowledged packet numbers.
+pub const AckRange = struct {
+    /// Smallest packet number in this range.
+    start: u64,
+    /// Largest packet number in this range.
+    end: u64,
+};
+
+/// Maximum number of additional ACK ranges stored inline (avoids allocation).
+pub const MAX_ACK_RANGES: usize = 32;
+
+pub const Frame = union(FrameType) {
+    padding: usize,
+
+    ping: void,
+
+    ack: struct {
+        largest_ack: u64,
+        ack_delay: u64,
+        first_ack_range: u64,
+        ack_range_count: u8 = 0,
+        ack_ranges: [MAX_ACK_RANGES]AckRange = undefined,
+    },
+
+    ack_ecn: struct {
+        largest_ack: u64,
+        ack_delay: u64,
+        first_ack_range: u64,
+        ack_range_count: u8 = 0,
+        ack_ranges: [MAX_ACK_RANGES]AckRange = undefined,
+        ecn_ect0: u64,
+        ecn_ect1: u64,
+        ecn_ce: u64,
+    },
+
+    reset_stream: struct {
+        stream_id: u64,
+        error_code: u64,
+        final_size: u64,
+    },
+
+    stop_sending: struct {
+        stream_id: u64,
+        error_code: u64,
+    },
+
+    crypto: struct {
+        offset: u64,
+        data: []u8,
+    },
+    new_token: []u8,
+
+    stream: struct {
+        stream_id: u64,
+        offset: u64,
+        length: u64,
+        fin: bool,
+        data: []u8,
+    },
+
+    max_data: u64,
+
+    max_stream_data: struct {
+        stream_id: u64,
+        max: u64,
+    },
+
+    max_streams_bidi: u64,
+    max_streams_uni: u64,
+    data_blocked: u64,
+
+    stream_data_blocked: struct {
+        stream_id: u64,
+        limit: u64,
+    },
+
+    streams_blocked_bidi: u64,
+    streams_blocked_uni: u64,
+
+    new_connection_id: struct {
+        seq_num: u64,
+        retire_prior_to: u64,
+        conn_id: []u8,
+        stateless_reset_token: [16]u8,
+    },
+
+    retire_connection_id: struct {
+        seq_num: u64,
+    },
+
+    path_challenge: [8]u8,
+    path_response: [8]u8,
+
+    connection_close: struct {
+        error_code: u64,
+        frame_type: u64,
+        reason: []u8,
+    },
+
+    application_close: struct {
+        error_code: u64,
+        reason: []u8,
+    },
+
+    handshake_done: void,
+
+    // draft-ietf-quic-ack-frequency
+    immediate_ack: void,
+
+    datagram: struct {
+        data: []u8,
+    },
+
+    datagram_with_length: struct {
+        data: []const u8,
+    },
+
+    // draft-ietf-quic-ack-frequency
+    ack_frequency: struct {
+        sequence_number: u64,
+        ack_eliciting_threshold: u64,
+        request_max_ack_delay: u64, // microseconds
+        reordering_threshold: u64,
+    },
+
+    /// A frame body cannot extend past the datagram it was decoded from.
+    /// Wire lengths are u64 varints, so this is also where they narrow to
+    /// usize (RFC 9000 12.4: a violation is FRAME_ENCODING_ERROR).
+    fn body(bytes: []u8, seek: *usize, len: u64) ![]u8 {
+        if (len > bytes.len - seek.*) return error.FrameEncodingError;
+        defer seek.* += @intCast(len);
+        return bytes[seek.*..][0..@intCast(len)];
+    }
+
+    /// Parse a single frame from a byte buffer.
+    pub fn parse(bytes: []u8) !Frame {
+        var size: usize = undefined;
+        return parseSized(bytes, &size);
+    }
+
+    /// Parse a single frame, and set `size` to the bytes it took up, so the
+    /// next frame starts at `bytes[size..]`.
+    pub fn parseSized(bytes: []u8, size: *usize) !Frame {
+        var stream = io.fixedBufferStream(bytes);
+        var reader = &stream;
+        defer size.* = stream.seek;
+
+        const frame_type = try packet.readVarInt(reader);
+
+        return switch (frame_type) {
+            // padding
+            0x00 => .{
+                .padding = blk: {
+                    const len = paddingLen(bytes);
+                    stream.seek = len;
+                    break :blk len;
+                },
+            },
+
+            // ping
+            0x01 => .{
+                .ping = {},
+            },
+
+            // ack (0x02) and ack_ecn (0x03)
+            0x02, 0x03 => blk: {
+                const is_ecn = (frame_type == 0x03);
+                const largest_ack = try packet.readVarInt(reader);
+                const ack_delay = try packet.readVarInt(reader);
+                const ack_range_count = try packet.readVarInt(reader);
+                const first_ack_range = try packet.readVarInt(reader);
+
+                // RFC 9000 19.3.1: a range reaching below packet number 0 is
+                // FRAME_ENCODING_ERROR, not something to clamp into range.
+                if (first_ack_range > largest_ack) return error.FrameEncodingError;
+
+                // Parse additional ACK ranges, computing absolute PN ranges
+                var additional_ranges: [MAX_ACK_RANGES]AckRange = undefined;
+                var range_count: u8 = 0;
+                var smallest = largest_ack - first_ack_range;
+
+                var i: u64 = 0;
+                while (i < ack_range_count) : (i += 1) {
+                    const gap = try packet.readVarInt(reader);
+                    const ack_range_len = try packet.readVarInt(reader);
+                    // Validate every range, including the ones past our cap.
+                    if (smallest < gap +| 2) return error.FrameEncodingError;
+                    const range_largest = smallest - gap - 2;
+                    if (ack_range_len > range_largest) return error.FrameEncodingError;
+                    const range_smallest = range_largest - ack_range_len;
+                    if (range_count < MAX_ACK_RANGES) {
+                        additional_ranges[range_count] = .{ .start = range_smallest, .end = range_largest };
+                        range_count += 1;
+                    }
+                    smallest = range_smallest;
+                }
+
+                var ecn_ect0: u64 = 0;
+                var ecn_ect1: u64 = 0;
+                var ecn_ce: u64 = 0;
+                if (is_ecn) {
+                    ecn_ect0 = try packet.readVarInt(reader);
+                    ecn_ect1 = try packet.readVarInt(reader);
+                    ecn_ce = try packet.readVarInt(reader);
+                }
+
+                if (is_ecn) {
+                    break :blk .{
+                        .ack_ecn = .{
+                            .largest_ack = largest_ack,
+                            .ack_delay = ack_delay,
+                            .first_ack_range = first_ack_range,
+                            .ack_range_count = range_count,
+                            .ack_ranges = additional_ranges,
+                            .ecn_ect0 = ecn_ect0,
+                            .ecn_ect1 = ecn_ect1,
+                            .ecn_ce = ecn_ce,
+                        },
+                    };
+                } else {
+                    break :blk .{
+                        .ack = .{
+                            .largest_ack = largest_ack,
+                            .ack_delay = ack_delay,
+                            .first_ack_range = first_ack_range,
+                            .ack_range_count = range_count,
+                            .ack_ranges = additional_ranges,
+                        },
+                    };
+                }
+            },
+
+            // reset_stream
+            0x04 => .{
+                .reset_stream = .{
+                    .stream_id = try packet.readVarInt(reader),
+                    .error_code = try packet.readVarInt(reader),
+                    .final_size = try packet.readVarInt(reader),
+                },
+            },
+
+            // stop_sending
+            0x05 => .{
+                .stop_sending = .{
+                    .stream_id = try packet.readVarInt(reader),
+                    .error_code = try packet.readVarInt(reader),
+                },
+            },
+
+            // crypto
+            0x06 => {
+                const offset = try packet.readVarInt(reader);
+                const length = try packet.readVarInt(reader);
+
+                return .{
+                    .crypto = .{
+                        .offset = offset,
+                        .data = try body(bytes, &stream.seek, length),
+                    },
+                };
+            },
+
+            // new token
+            0x07 => {
+                const len = try packet.readVarInt(reader);
+                return .{
+                    .new_token = try body(bytes, &stream.seek, len),
+                };
+            },
+
+            // stream frame (0x08 - 0x0f)
+            0x08...0x0f => blk: {
+                const type_byte: u8 = @intCast(frame_type);
+                const has_offset = (type_byte & 0x04) != 0;
+                const has_length = (type_byte & 0x02) != 0;
+                const has_fin = (type_byte & 0x01) != 0;
+
+                const stream_id = try packet.readVarInt(reader);
+                const offset: u64 = if (has_offset) try packet.readVarInt(reader) else 0;
+                const data_length: u64 = if (has_length)
+                    try packet.readVarInt(reader)
+                else
+                    bytes.len - stream.seek;
+
+                break :blk .{ .stream = .{
+                    .stream_id = stream_id,
+                    .offset = offset,
+                    .length = data_length,
+                    .fin = has_fin,
+                    .data = try body(bytes, &stream.seek, data_length),
+                } };
+            },
+
+            // max data
+            0x10 => .{
+                .max_data = try packet.readVarInt(reader),
+            },
+
+            // max stream data
+            0x11 => .{
+                .max_stream_data = .{
+                    .stream_id = try packet.readVarInt(reader),
+                    .max = try packet.readVarInt(reader),
+                },
+            },
+
+            // max streams bidi
+            0x12 => .{
+                .max_streams_bidi = try packet.readVarInt(reader),
+            },
+
+            // max streams uni
+            0x13 => .{
+                .max_streams_uni = try packet.readVarInt(reader),
+            },
+
+            // data blocked
+            0x14 => .{
+                .data_blocked = try packet.readVarInt(reader),
+            },
+
+            // stream data blocked
+            0x15 => .{
+                .stream_data_blocked = .{
+                    .stream_id = try packet.readVarInt(reader),
+                    .limit = try packet.readVarInt(reader),
+                },
+            },
+
+            // streams blocked bidi
+            0x16 => .{
+                .streams_blocked_bidi = try packet.readVarInt(reader),
+            },
+
+            // streams blocked uni
+            0x17 => .{
+                .streams_blocked_uni = try packet.readVarInt(reader),
+            },
+
+            // new connection id
+            0x18 => {
+                var conn_id_len: u8 = undefined;
+
+                return .{
+                    .new_connection_id = .{
+                        .seq_num = try packet.readVarInt(reader),
+                        .retire_prior_to = try packet.readVarInt(reader),
+                        .conn_id = blk: {
+                            conn_id_len = try reader.takeByte();
+
+                            if (conn_id_len < 1 or conn_id_len > 20) {
+                                return error.FrameEncodingError;
+                            }
+
+                            break :blk try body(bytes, &stream.seek, conn_id_len);
+                        },
+                        .stateless_reset_token = (try reader.takeArray(16)).*,
+                    },
+                };
+            },
+
+            // retire connection id
+            0x19 => .{
+                .retire_connection_id = .{
+                    .seq_num = try packet.readVarInt(reader),
+                },
+            },
+
+            // path challenge
+            0x1a => .{
+                .path_challenge = (try reader.takeArray(8)).*,
+            },
+
+            // path response
+            0x1b => .{
+                .path_response = (try reader.takeArray(8)).*,
+            },
+
+            // connection close
+            0x1c => .{
+                .connection_close = .{
+                    .error_code = try packet.readVarInt(reader),
+                    .frame_type = try packet.readVarInt(reader),
+                    .reason = blk: {
+                        const len = try packet.readVarInt(reader);
+                        break :blk try body(bytes, &stream.seek, len);
+                    },
+                },
+            },
+
+            // application close
+            0x1d => .{
+                .application_close = .{
+                    .error_code = try packet.readVarInt(reader),
+                    .reason = blk: {
+                        const len = try packet.readVarInt(reader);
+                        break :blk try body(bytes, &stream.seek, len);
+                    },
+                },
+            },
+
+            // handshake done
+            0x1e => .{ .handshake_done = {} },
+
+            // immediate ack (draft-ietf-quic-ack-frequency)
+            0x1f => .{ .immediate_ack = {} },
+
+            // datagram without length (0x30) — data is rest of packet
+            0x30 => .{ .datagram = .{
+                .data = try body(bytes, &stream.seek, bytes.len - stream.seek),
+            } },
+
+            // datagram with length (0x31) — varint length prefix
+            0x31 => blk: {
+                const length = try packet.readVarInt(reader);
+                break :blk .{ .datagram_with_length = .{
+                    .data = try body(bytes, &stream.seek, length),
+                } };
+            },
+
+            // ack frequency (draft-ietf-quic-ack-frequency)
+            0xaf => .{ .ack_frequency = .{
+                .sequence_number = try packet.readVarInt(reader),
+                .ack_eliciting_threshold = try packet.readVarInt(reader),
+                .request_max_ack_delay = try packet.readVarInt(reader),
+                .reordering_threshold = try packet.readVarInt(reader),
+            } },
+
+            else => return error.FrameEncodingError,
+        };
+    }
+
+    /// Write a frame to the given writer.
+    pub fn write(self: Frame, writer: anytype) !void {
+        switch (self) {
+            .padding => |size| {
+                var i: usize = 0;
+                while (i < size) : (i += 1) {
+                    try writer.writeByte(0x00);
+                }
+            },
+
+            .ping => {
+                try packet.writeVarInt(writer, 0x01);
+            },
+
+            .ack => |ack| {
+                try packet.writeVarInt(writer, 0x02);
+                try packet.writeVarInt(writer, ack.largest_ack);
+                try packet.writeVarInt(writer, ack.ack_delay);
+                try packet.writeVarInt(writer, @as(u64, ack.ack_range_count));
+                try packet.writeVarInt(writer, ack.first_ack_range);
+
+                // Convert absolute ranges back to gap/ack_range wire format
+                var prev_smallest = ack.largest_ack -| ack.first_ack_range;
+                for (ack.ack_ranges[0..ack.ack_range_count]) |r| {
+                    const gap = prev_smallest -| r.end -| 2;
+                    const ack_range_len = r.end - r.start;
+                    try packet.writeVarInt(writer, gap);
+                    try packet.writeVarInt(writer, ack_range_len);
+                    prev_smallest = r.start;
+                }
+            },
+
+            .ack_ecn => |ack| {
+                try packet.writeVarInt(writer, 0x03);
+                try packet.writeVarInt(writer, ack.largest_ack);
+                try packet.writeVarInt(writer, ack.ack_delay);
+                try packet.writeVarInt(writer, @as(u64, ack.ack_range_count));
+                try packet.writeVarInt(writer, ack.first_ack_range);
+
+                var prev_smallest = ack.largest_ack -| ack.first_ack_range;
+                for (ack.ack_ranges[0..ack.ack_range_count]) |r| {
+                    const gap = prev_smallest -| r.end -| 2;
+                    const ack_range_len = r.end - r.start;
+                    try packet.writeVarInt(writer, gap);
+                    try packet.writeVarInt(writer, ack_range_len);
+                    prev_smallest = r.start;
+                }
+
+                try packet.writeVarInt(writer, ack.ecn_ect0);
+                try packet.writeVarInt(writer, ack.ecn_ect1);
+                try packet.writeVarInt(writer, ack.ecn_ce);
+            },
+
+            .reset_stream => |rs| {
+                try packet.writeVarInt(writer, 0x04);
+                try packet.writeVarInt(writer, rs.stream_id);
+                try packet.writeVarInt(writer, rs.error_code);
+                try packet.writeVarInt(writer, rs.final_size);
+            },
+
+            .stop_sending => |ss| {
+                try packet.writeVarInt(writer, 0x05);
+                try packet.writeVarInt(writer, ss.stream_id);
+                try packet.writeVarInt(writer, ss.error_code);
+            },
+
+            .crypto => |c| {
+                try packet.writeVarInt(writer, 0x06);
+                try packet.writeVarInt(writer, c.offset);
+                try packet.writeVarInt(writer, c.data.len);
+                try writer.writeAll(c.data);
+            },
+
+            .new_token => |token| {
+                try packet.writeVarInt(writer, 0x07);
+                try packet.writeVarInt(writer, token.len);
+                try writer.writeAll(token);
+            },
+
+            .stream => |s| {
+                // Always set the LEN flag to prevent subsequent frames from being
+                // misinterpreted as stream data (RFC 9000 §19.8)
+                var type_byte: u8 = 0x08 | 0x02; // LEN always set
+                if (s.offset > 0) type_byte |= 0x04;
+                if (s.fin) type_byte |= 0x01;
+
+                try packet.writeVarInt(writer, type_byte);
+                try packet.writeVarInt(writer, s.stream_id);
+                if (s.offset > 0) try packet.writeVarInt(writer, s.offset);
+                try packet.writeVarInt(writer, s.length); // always write length
+                try writer.writeAll(s.data);
+            },
+
+            .max_data => |max| {
+                try packet.writeVarInt(writer, 0x10);
+                try packet.writeVarInt(writer, max);
+            },
+
+            .max_stream_data => |msd| {
+                try packet.writeVarInt(writer, 0x11);
+                try packet.writeVarInt(writer, msd.stream_id);
+                try packet.writeVarInt(writer, msd.max);
+            },
+
+            .max_streams_bidi => |max| {
+                try packet.writeVarInt(writer, 0x12);
+                try packet.writeVarInt(writer, max);
+            },
+
+            .max_streams_uni => |max| {
+                try packet.writeVarInt(writer, 0x13);
+                try packet.writeVarInt(writer, max);
+            },
+
+            .data_blocked => |limit| {
+                try packet.writeVarInt(writer, 0x14);
+                try packet.writeVarInt(writer, limit);
+            },
+
+            .stream_data_blocked => |sdb| {
+                try packet.writeVarInt(writer, 0x15);
+                try packet.writeVarInt(writer, sdb.stream_id);
+                try packet.writeVarInt(writer, sdb.limit);
+            },
+
+            .streams_blocked_bidi => |max| {
+                try packet.writeVarInt(writer, 0x16);
+                try packet.writeVarInt(writer, max);
+            },
+
+            .streams_blocked_uni => |max| {
+                try packet.writeVarInt(writer, 0x17);
+                try packet.writeVarInt(writer, max);
+            },
+
+            .new_connection_id => |ncid| {
+                try packet.writeVarInt(writer, 0x18);
+                try packet.writeVarInt(writer, ncid.seq_num);
+                try packet.writeVarInt(writer, ncid.retire_prior_to);
+                try writer.writeByte(@intCast(ncid.conn_id.len));
+                try writer.writeAll(ncid.conn_id);
+                try writer.writeAll(&ncid.stateless_reset_token);
+            },
+
+            .retire_connection_id => |rcid| {
+                try packet.writeVarInt(writer, 0x19);
+                try packet.writeVarInt(writer, rcid.seq_num);
+            },
+
+            .path_challenge => |data| {
+                try packet.writeVarInt(writer, 0x1a);
+                try writer.writeAll(&data);
+            },
+
+            .path_response => |data| {
+                try packet.writeVarInt(writer, 0x1b);
+                try writer.writeAll(&data);
+            },
+
+            .connection_close => |cc| {
+                try packet.writeVarInt(writer, 0x1c);
+                try packet.writeVarInt(writer, cc.error_code);
+                try packet.writeVarInt(writer, cc.frame_type);
+                try packet.writeVarInt(writer, cc.reason.len);
+                try writer.writeAll(cc.reason);
+            },
+
+            .application_close => |ac| {
+                try packet.writeVarInt(writer, 0x1d);
+                try packet.writeVarInt(writer, ac.error_code);
+                try packet.writeVarInt(writer, ac.reason.len);
+                try writer.writeAll(ac.reason);
+            },
+
+            .handshake_done => {
+                try packet.writeVarInt(writer, 0x1e);
+            },
+
+            .immediate_ack => {
+                try packet.writeVarInt(writer, 0x1f);
+            },
+
+            .datagram => |d| {
+                try packet.writeVarInt(writer, 0x30);
+                try writer.writeAll(d.data);
+            },
+
+            .datagram_with_length => |d| {
+                try packet.writeVarInt(writer, 0x31);
+                try packet.writeVarInt(writer, d.data.len);
+                try writer.writeAll(d.data);
+            },
+
+            .ack_frequency => |af| {
+                try packet.writeVarInt(writer, 0xaf);
+                try packet.writeVarInt(writer, af.sequence_number);
+                try packet.writeVarInt(writer, af.ack_eliciting_threshold);
+                try packet.writeVarInt(writer, af.request_max_ack_delay);
+                try packet.writeVarInt(writer, af.reordering_threshold);
+            },
+        }
+    }
+
+    pub fn isAckEliciting(self: Frame) bool {
+        return switch (self) {
+            .padding, .ack, .ack_ecn, .connection_close, .application_close => false,
+            .datagram, .datagram_with_length => true,
+            else => true,
+        };
+    }
+
+    pub fn isProbing(self: Frame) bool {
+        return switch (self) {
+            .padding, .new_connection_id, .path_challenge, .path_response => true,
+            else => false,
+        };
+    }
+
+    /// Check if this frame type is allowed in the given packet type (RFC 9000 §12.5, Table 3).
+    pub fn isAllowedIn(self: Frame, pkt_type: packet.PacketType) bool {
+        return switch (self) {
+            // PADDING, PING: all packet types
+            .padding, .ping => true,
+            // ACK, ACK_ECN: Initial, Handshake, 1-RTT (NOT 0-RTT)
+            .ack, .ack_ecn => pkt_type != .zero_rtt,
+            // CRYPTO: Initial, Handshake, 1-RTT (NOT 0-RTT)
+            .crypto => pkt_type != .zero_rtt,
+            // CONNECTION_CLOSE: Initial, Handshake, 1-RTT (NOT 0-RTT)
+            .connection_close => pkt_type != .zero_rtt,
+            // NEW_TOKEN, NEW_CONNECTION_ID, RETIRE_CONNECTION_ID, HANDSHAKE_DONE: 1-RTT only
+            // ACK_FREQUENCY, IMMEDIATE_ACK: 1-RTT only (draft-ietf-quic-ack-frequency)
+            .new_token,
+            .new_connection_id,
+            .retire_connection_id,
+            .handshake_done,
+            .ack_frequency,
+            .immediate_ack,
+            => pkt_type == .one_rtt,
+            // All others: 0-RTT and 1-RTT only
+            .reset_stream,
+            .stop_sending,
+            .stream,
+            .max_data,
+            .max_stream_data,
+            .max_streams_bidi,
+            .max_streams_uni,
+            .data_blocked,
+            .stream_data_blocked,
+            .streams_blocked_bidi,
+            .streams_blocked_uni,
+            .path_challenge,
+            .path_response,
+            .application_close,
+            .datagram,
+            .datagram_with_length,
+            => pkt_type == .one_rtt or pkt_type == .zero_rtt,
+        };
+    }
+};
+
+/// A pending control frame to be sent in the next outgoing packet.
+/// Uses value types only (no slices) to avoid dangling references.
+pub const PendingControlFrame = union(enum) {
+    ping: void,
+    path_challenge: [8]u8,
+    path_response: [8]u8,
+    retire_connection_id: u64,
+    connection_close: struct {
+        error_code: u64,
+        frame_type: u64,
+        is_app: bool,
+    },
+    max_data: u64,
+    max_stream_data: struct {
+        stream_id: u64,
+        max: u64,
+    },
+    max_streams_bidi: u64,
+    max_streams_uni: u64,
+    streams_blocked_bidi: u64,
+    streams_blocked_uni: u64,
+    data_blocked: u64,
+    stream_data_blocked: struct {
+        stream_id: u64,
+        limit: u64,
+    },
+    new_token: struct {
+        token_buf: [92]u8 = .{0} ** 92,
+        token_len: u8 = 0,
+    },
+    reset_stream: struct {
+        stream_id: u64,
+        error_code: u64,
+        final_size: u64,
+    },
+    stop_sending: struct {
+        stream_id: u64,
+        error_code: u64,
+    },
+    new_connection_id: struct {
+        seq_num: u64,
+        retire_prior_to: u64,
+        cid_buf: [20]u8,
+        cid_len: u8,
+        stateless_reset_token: [16]u8,
+    },
+    ack_frequency: struct {
+        sequence_number: u64,
+        ack_eliciting_threshold: u64,
+        request_max_ack_delay: u64,
+        reordering_threshold: u64,
+    },
+    immediate_ack: void,
+
+    /// Write this pending control frame directly on the wire.
+    /// For new_connection_id we serialize directly (avoids dangling slice from toFrame()).
+    pub fn write(self: PendingControlFrame, writer: anytype) !void {
+        switch (self) {
+            .new_token => |nt| {
+                try packet.writeVarInt(writer, 0x07);
+                try packet.writeVarInt(writer, nt.token_len);
+                try writer.writeAll(nt.token_buf[0..nt.token_len]);
+            },
+            .new_connection_id => |ncid| {
+                try packet.writeVarInt(writer, 0x18);
+                try packet.writeVarInt(writer, ncid.seq_num);
+                try packet.writeVarInt(writer, ncid.retire_prior_to);
+                try writer.writeByte(ncid.cid_len);
+                try writer.writeAll(ncid.cid_buf[0..ncid.cid_len]);
+                try writer.writeAll(&ncid.stateless_reset_token);
+            },
+            else => {
+                const f = self.toFrame();
+                try f.write(writer);
+            },
+        }
+    }
+
+    /// Convert to a Frame for writing on the wire.
+    pub fn toFrame(self: PendingControlFrame) Frame {
+        return switch (self) {
+            .ping => .{ .ping = {} },
+            .path_challenge => |data| .{ .path_challenge = data },
+            .path_response => |data| .{ .path_response = data },
+            .retire_connection_id => |seq| .{ .retire_connection_id = .{ .seq_num = seq } },
+            .connection_close => |cc| if (cc.is_app)
+                .{ .application_close = .{ .error_code = cc.error_code, .reason = &.{} } }
+            else
+                .{ .connection_close = .{ .error_code = cc.error_code, .frame_type = cc.frame_type, .reason = &.{} } },
+            .max_data => |max| .{ .max_data = max },
+            .max_stream_data => |msd| .{ .max_stream_data = .{ .stream_id = msd.stream_id, .max = msd.max } },
+            .max_streams_bidi => |max| .{ .max_streams_bidi = max },
+            .max_streams_uni => |max| .{ .max_streams_uni = max },
+            .streams_blocked_bidi => |max| .{ .streams_blocked_bidi = max },
+            .streams_blocked_uni => |max| .{ .streams_blocked_uni = max },
+            .data_blocked => |limit| .{ .data_blocked = limit },
+            .stream_data_blocked => |sdb| .{ .stream_data_blocked = .{ .stream_id = sdb.stream_id, .limit = sdb.limit } },
+            .reset_stream => |rs| .{ .reset_stream = .{ .stream_id = rs.stream_id, .error_code = rs.error_code, .final_size = rs.final_size } },
+            .stop_sending => |ss| .{ .stop_sending = .{ .stream_id = ss.stream_id, .error_code = ss.error_code } },
+            .ack_frequency => |af| .{ .ack_frequency = .{
+                .sequence_number = af.sequence_number,
+                .ack_eliciting_threshold = af.ack_eliciting_threshold,
+                .request_max_ack_delay = af.request_max_ack_delay,
+                .reordering_threshold = af.reordering_threshold,
+            } },
+            .immediate_ack => .{ .immediate_ack = {} },
+            .new_token => unreachable, // handled directly in write()
+            .new_connection_id => unreachable, // handled directly in write()
+        };
+    }
+};
+
+/// Fixed-capacity queue for pending control frames.
+///
+/// Full means the connection is producing control frames faster than it can
+/// send them. What happens then depends on the frame, so callers choose:
+/// `push` is for frames that are safe to lose (PING, PATH_*, BLOCKED — each
+/// regenerated or superseded); frames the peer must eventually see go through
+/// `tryPush`, and their producer retries on a later pass when it fails.
+/// CONNECTION_CLOSE always gets in: one slot is held back for it.
+pub const PendingFrameQueue = struct {
+    const capacity = @import("limits.zig").pending_frames;
+
+    items: [capacity]PendingControlFrame = undefined,
+    len: u8 = 0,
+
+    /// Queue `frame`, dropping it if the queue is full; see `tryPush`.
+    pub fn push(self: *PendingFrameQueue, frame: PendingControlFrame) void {
+        _ = self.tryPush(frame);
+    }
+
+    /// Whether `n` new, unmerged frames would fit.
+    pub fn hasRoomFor(self: *const PendingFrameQueue, n: usize) bool {
+        return self.len + n < capacity;
+    }
+
+    /// Put back a frame just popped. Never fails: `pop` freed its slot.
+    pub fn requeue(self: *PendingFrameQueue, frame: PendingControlFrame) void {
+        if (self.tryPush(frame)) return;
+        if (self.len < capacity) {
+            self.items[self.len] = frame;
+            self.len += 1;
+        }
+    }
+
+    /// Queue `frame`, merging it into a queued frame of the same kind where
+    /// one exists. False if it did not fit.
+    pub fn tryPush(self: *PendingFrameQueue, frame: PendingControlFrame) bool {
+        var i: u8 = 0;
+        while (i < self.len) : (i += 1) {
+            switch (frame) {
+                .ping => switch (self.items[i]) {
+                    .ping => return true,
+                    else => {},
+                },
+                .immediate_ack => switch (self.items[i]) {
+                    .immediate_ack => return true,
+                    else => {},
+                },
+                .max_data => |new_max| switch (self.items[i]) {
+                    .max_data => |old_max| {
+                        self.items[i] = .{ .max_data = @max(old_max, new_max) };
+                        return true;
+                    },
+                    else => {},
+                },
+                .max_stream_data => |new_msd| switch (self.items[i]) {
+                    .max_stream_data => |old_msd| if (old_msd.stream_id == new_msd.stream_id) {
+                        self.items[i] = .{ .max_stream_data = .{
+                            .stream_id = new_msd.stream_id,
+                            .max = @max(old_msd.max, new_msd.max),
+                        } };
+                        return true;
+                    },
+                    else => {},
+                },
+                .max_streams_bidi => |new_max| switch (self.items[i]) {
+                    .max_streams_bidi => |old_max| {
+                        self.items[i] = .{ .max_streams_bidi = @max(old_max, new_max) };
+                        return true;
+                    },
+                    else => {},
+                },
+                .max_streams_uni => |new_max| switch (self.items[i]) {
+                    .max_streams_uni => |old_max| {
+                        self.items[i] = .{ .max_streams_uni = @max(old_max, new_max) };
+                        return true;
+                    },
+                    else => {},
+                },
+                .data_blocked => |new_limit| switch (self.items[i]) {
+                    .data_blocked => |old_limit| {
+                        self.items[i] = .{ .data_blocked = @max(old_limit, new_limit) };
+                        return true;
+                    },
+                    else => {},
+                },
+                .stream_data_blocked => |new_sdb| switch (self.items[i]) {
+                    .stream_data_blocked => |old_sdb| if (old_sdb.stream_id == new_sdb.stream_id) {
+                        self.items[i] = .{ .stream_data_blocked = .{
+                            .stream_id = new_sdb.stream_id,
+                            .limit = @max(old_sdb.limit, new_sdb.limit),
+                        } };
+                        return true;
+                    },
+                    else => {},
+                },
+                .streams_blocked_bidi => |new_limit| switch (self.items[i]) {
+                    .streams_blocked_bidi => |old_limit| {
+                        self.items[i] = .{ .streams_blocked_bidi = @max(old_limit, new_limit) };
+                        return true;
+                    },
+                    else => {},
+                },
+                .streams_blocked_uni => |new_limit| switch (self.items[i]) {
+                    .streams_blocked_uni => |old_limit| {
+                        self.items[i] = .{ .streams_blocked_uni = @max(old_limit, new_limit) };
+                        return true;
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+        }
+        const is_close = frame == .connection_close;
+        if (self.len < capacity - 1 or (is_close and self.len < capacity)) {
+            self.items[self.len] = frame;
+            self.len += 1;
+            return true;
+        }
+        if (is_close) {
+            // Nothing queued matters once we are closing.
+            self.items[self.len - 1] = frame;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn pop(self: *PendingFrameQueue) ?PendingControlFrame {
+        if (self.len == 0) return null;
+        const item = self.items[0];
+        self.len -= 1;
+        // Shift remaining items
+        var i: u8 = 0;
+        while (i < self.len) : (i += 1) {
+            self.items[i] = self.items[i + 1];
+        }
+        return item;
+    }
+};
+
+// Tests
+
+test "parseSized ends each frame where the next one starts" {
+    // picoquic packs HANDSHAKE_DONE and stream data behind ACK_FREQUENCY.
+    const frames = [_]Frame{
+        .{ .ack_frequency = .{ .sequence_number = 0, .ack_eliciting_threshold = 2, .request_max_ack_delay = 1000, .reordering_threshold = 0 } },
+        .immediate_ack,
+        .{ .crypto = .{ .offset = 7, .data = @constCast("hello") } },
+        .{ .stream = .{ .stream_id = 4, .offset = 9, .length = 3, .fin = true, .data = @constCast("abc") } },
+        .{ .new_connection_id = .{ .seq_num = 1, .retire_prior_to = 0, .conn_id = @constCast(&[_]u8{0xcd} ** 8), .stateless_reset_token = .{0} ** 16 } },
+        .{ .connection_close = .{ .error_code = 1, .frame_type = 0, .reason = @constCast("bye") } },
+        .{ .datagram_with_length = .{ .data = @constCast("dg") } },
+    };
+    for (frames) |f| {
+        var buf: [96]u8 = undefined;
+        var fbs = io.fixedBufferStream(&buf);
+        try f.write(&fbs);
+        const len = fbs.seek;
+        buf[len] = 0x1e; // HANDSHAKE_DONE follows
+        var size: usize = undefined;
+        _ = try Frame.parseSized(buf[0 .. len + 1], &size);
+        try std.testing.expectEqual(len, size);
+    }
+}
+
+test "parse padding frame" {
+    {
+        var bytes = [_]u8{0x00};
+        switch (try Frame.parse(&bytes)) {
+            FrameType.padding => |padding| try std.testing.expect(1 == padding),
+            else => unreachable,
+        }
+    }
+    {
+        var bytes = [_]u8{ 0x00, 0x00, 0x01 };
+        var size: usize = undefined;
+        switch (try Frame.parseSized(&bytes, &size)) {
+            FrameType.padding => |padding| try std.testing.expect(2 == padding),
+            else => unreachable,
+        }
+        // The PING that follows is the next frame, not part of the padding.
+        try std.testing.expectEqual(2, size);
+    }
+    {
+        var bytes = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+        switch (try Frame.parse(&bytes)) {
+            FrameType.padding => |padding| try std.testing.expect(10 == padding),
+            else => unreachable,
+        }
+    }
+}
+
+test "paddingLen: runs across and inside vector-sized blocks" {
+    var buf: [200]u8 = @splat(0);
+    try std.testing.expectEqual(200, paddingLen(&buf));
+    try std.testing.expectEqual(0, paddingLen(&.{}));
+    for ([_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 150, 199 }) |at| {
+        buf[at] = 0x01;
+        try std.testing.expectEqual(at, paddingLen(&buf));
+        buf[at] = 0x00;
+    }
+}
+
+test "parse ping frame" {
+    var bytes = [_]u8{ 0x01, 0x00 };
+    switch (try Frame.parse(&bytes)) {
+        FrameType.ping => try std.testing.expect(true),
+        else => unreachable,
+    }
+}
+
+test "parse ack frame" {
+    {
+        // ACK frame: largest=10, delay=5, range_count=0, first_range=3
+        var bytes = [_]u8{ 0x02, 0x0a, 0x05, 0x00, 0x03 };
+        switch (try Frame.parse(&bytes)) {
+            FrameType.ack => |ack| {
+                try std.testing.expectEqual(@as(u64, 10), ack.largest_ack);
+                try std.testing.expectEqual(@as(u64, 5), ack.ack_delay);
+                try std.testing.expectEqual(@as(u64, 3), ack.first_ack_range);
+            },
+            else => unreachable,
+        }
+    }
+    {
+        // ACK-ECN frame
+        var bytes = [_]u8{ 0x03, 0x0a, 0x05, 0x00, 0x03, 0x01, 0x02, 0x03 };
+        switch (try Frame.parse(&bytes)) {
+            FrameType.ack_ecn => |ack| {
+                try std.testing.expectEqual(@as(u64, 10), ack.largest_ack);
+                try std.testing.expectEqual(@as(u64, 1), ack.ecn_ect0);
+                try std.testing.expectEqual(@as(u64, 2), ack.ecn_ect1);
+                try std.testing.expectEqual(@as(u64, 3), ack.ecn_ce);
+            },
+            else => unreachable,
+        }
+    }
+}
+
+test "ACK ranges reaching below packet number 0 are FRAME_ENCODING_ERROR" {
+    // first_ack_range 11 below largest 10.
+    var first = [_]u8{ 0x02, 0x0a, 0x00, 0x00, 0x0b };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&first));
+
+    // [7,10], then a gap of 6 would put the next range's top at -1.
+    var gap = [_]u8{ 0x02, 0x0a, 0x00, 0x01, 0x03, 0x06, 0x00 };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&gap));
+
+    // [7,10], gap 1 → next range tops at 4; a length of 5 reaches -1.
+    var len = [_]u8{ 0x02, 0x0a, 0x00, 0x01, 0x03, 0x01, 0x05 };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&len));
+
+    // The same range ending exactly at 0 is fine.
+    var ok = [_]u8{ 0x02, 0x0a, 0x00, 0x01, 0x03, 0x01, 0x04 };
+    const f = try Frame.parse(&ok);
+    try std.testing.expectEqual(@as(u64, 0), f.ack.ack_ranges[0].start);
+    try std.testing.expectEqual(@as(u64, 4), f.ack.ack_ranges[0].end);
+}
+
+test "parse reset_stream frame" {
+    var bytes = [_]u8{
+        0x04,
+        0x00, 0x00, 0x00, 0x00, // Stream ID
+        0x00, 0x00, 0x00, 0x00, // Application Protocol Error Code
+        0x00, 0x00, 0x00, 0x00, // Final Size
+    };
+    switch (try Frame.parse(&bytes)) {
+        FrameType.reset_stream => try std.testing.expect(true),
+        else => unreachable,
+    }
+}
+
+test "parse stop_sending frame" {
+    var bytes = [_]u8{
+        0x05,
+        0x00, 0x00, 0x00, 0x00, // Stream ID
+        0x00, 0x00, 0x00, 0x00, // Error Code
+    };
+    switch (try Frame.parse(&bytes)) {
+        FrameType.stop_sending => try std.testing.expect(true),
+        else => unreachable,
+    }
+}
+
+test "parse crypto frame" {
+    var bytes = [_]u8{
+        0x06,
+        0x00, // Offset: 0
+        0x04, // Data Length: 4
+        0xde, 0xad, 0xbe, 0xef, // Data
+    };
+    switch (try Frame.parse(&bytes)) {
+        FrameType.crypto => |crypto| {
+            try std.testing.expectEqual(@as(u64, 0), crypto.offset);
+            try std.testing.expectEqualSlices(u8, &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, crypto.data);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse new_token frame" {
+    var bytes = [_]u8{
+        0x07,
+        16, // size
+        97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, // "abcdefghijklmnop"
+    };
+    switch (try Frame.parse(&bytes)) {
+        FrameType.new_token => |frame| {
+            try std.testing.expectEqualStrings("abcdefghijklmnop", frame);
+            try std.testing.expect(true);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse stream frame with all flags" {
+    // Stream frame type 0x0f = FIN + LEN + OFF
+    var bytes = [_]u8{
+        0x0f,
+        0x04, // stream id: 4
+        0x0a, // offset: 10
+        0x03, // length: 3
+        0x41, 0x42, 0x43, // data: "ABC"
+    };
+    switch (try Frame.parse(&bytes)) {
+        FrameType.stream => |s| {
+            try std.testing.expectEqual(@as(u64, 4), s.stream_id);
+            try std.testing.expectEqual(@as(u64, 10), s.offset);
+            try std.testing.expectEqual(@as(u64, 3), s.length);
+            try std.testing.expect(s.fin);
+            try std.testing.expectEqualSlices(u8, &[_]u8{ 0x41, 0x42, 0x43 }, s.data);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse stream frame minimal (no offset, no length, no fin)" {
+    // Stream frame type 0x08 = no flags
+    var bytes = [_]u8{
+        0x08,
+        0x00, // stream id: 0
+        0xAA, 0xBB, // remaining data (no length field, so all remaining)
+    };
+    switch (try Frame.parse(&bytes)) {
+        FrameType.stream => |s| {
+            try std.testing.expectEqual(@as(u64, 0), s.stream_id);
+            try std.testing.expectEqual(@as(u64, 0), s.offset);
+            try std.testing.expect(!s.fin);
+            try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB }, s.data);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse max_data frame" {
+    var bytes = [_]u8{ 0x10, 0x9d, 0x7f, 0x3e, 0x7d }; // 494878333
+    switch (try Frame.parse(&bytes)) {
+        FrameType.max_data => |max_data| {
+            try std.testing.expect(max_data == 494878333);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse max_stream_data frame" {
+    var bytes = [_]u8{
+        0x11,
+        0x00, // stream id: 0
+        0x7b, 0xbd, // max: 15293
+    };
+    switch (try Frame.parse(&bytes)) {
+        FrameType.max_stream_data => |max_stream_data| {
+            try std.testing.expect(max_stream_data.stream_id == 0);
+            try std.testing.expect(max_stream_data.max == 15293);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse max_streams_bidi frame" {
+    var bytes = [_]u8{ 0x12, 0x9d, 0x7f, 0x3e, 0x7d }; // 494878333
+    switch (try Frame.parse(&bytes)) {
+        FrameType.max_streams_bidi => |value| {
+            try std.testing.expect(value == 494878333);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse max_streams_uni frame" {
+    var bytes = [_]u8{ 0x13, 0x9d, 0x7f, 0x3e, 0x7d }; // 494878333
+    switch (try Frame.parse(&bytes)) {
+        FrameType.max_streams_uni => |value| {
+            try std.testing.expect(value == 494878333);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse data_blocked frame" {
+    var bytes = [_]u8{ 0x14, 0x9d, 0x7f, 0x3e, 0x7d }; // 494878333
+    switch (try Frame.parse(&bytes)) {
+        FrameType.data_blocked => |value| {
+            try std.testing.expect(value == 494878333);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse stream_data_blocked frame" {
+    var bytes = [_]u8{
+        0x15,
+        0x00, // stream id: 0
+        0x7b, 0xbd, // limit: 15293
+    };
+    switch (try Frame.parse(&bytes)) {
+        FrameType.stream_data_blocked => |stream_data_blocked| {
+            try std.testing.expect(stream_data_blocked.stream_id == 0);
+            try std.testing.expect(stream_data_blocked.limit == 15293);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse streams_blocked_bidi frame" {
+    var bytes = [_]u8{ 0x16, 0x9d, 0x7f, 0x3e, 0x7d }; // 494878333
+    switch (try Frame.parse(&bytes)) {
+        FrameType.streams_blocked_bidi => |value| {
+            try std.testing.expect(value == 494878333);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse streams_blocked_uni frame" {
+    var bytes = [_]u8{ 0x17, 0x9d, 0x7f, 0x3e, 0x7d }; // 494878333
+    switch (try Frame.parse(&bytes)) {
+        FrameType.streams_blocked_uni => |value| {
+            try std.testing.expect(value == 494878333);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse new_connection_id frame" {
+    var bytes = [_]u8{
+        0x18, // Type
+        0x00, // Sequence Number: 0
+        0x01, // Retire Prior To: 0
+        0x02, // Length (8)
+        0x00, 0x01, // Connection ID (8..160)
+        97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, // Stateless Reset Token
+    };
+
+    switch (try Frame.parse(&bytes)) {
+        FrameType.new_connection_id => |new_connection_id| {
+            try std.testing.expect(new_connection_id.seq_num == 0);
+            try std.testing.expect(new_connection_id.retire_prior_to == 1);
+            try std.testing.expectFmt("{ 0, 1 }", "{any}", .{new_connection_id.conn_id});
+            try std.testing.expectEqualStrings("abcdefghijklmnop", &new_connection_id.stateless_reset_token);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse retire_connection_id frame" {
+    var bytes = [_]u8{
+        0x19, // Type
+        0x02, // Sequence Number: 0
+    };
+    switch (try Frame.parse(&bytes)) {
+        FrameType.retire_connection_id => |retire_connection_id| {
+            try std.testing.expect(retire_connection_id.seq_num == 2);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse path_challenge frame" {
+    var bytes = [_]u8{ 0x1a, 1, 2, 3, 4, 5, 6, 7, 8 };
+    switch (try Frame.parse(&bytes)) {
+        FrameType.path_challenge => |data| {
+            try std.testing.expectFmt("{ 1, 2, 3, 4, 5, 6, 7, 8 }", "{any}", .{data});
+        },
+        else => unreachable,
+    }
+}
+
+test "parse path_response frame" {
+    var bytes = [_]u8{ 0x1b, 1, 2, 3, 4, 5, 6, 7, 8 };
+    switch (try Frame.parse(&bytes)) {
+        FrameType.path_response => |data| {
+            try std.testing.expectFmt("{ 1, 2, 3, 4, 5, 6, 7, 8 }", "{any}", .{data});
+        },
+        else => unreachable,
+    }
+}
+
+test "parse connection_close frame" {
+    var bytes = [_]u8{ 0x1c, 0x10, @intFromEnum(FrameType.max_data), 16, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112 };
+
+    switch (try Frame.parse(&bytes)) {
+        FrameType.connection_close => |connection_close| {
+            try std.testing.expect(connection_close.error_code == 0x10);
+            try std.testing.expect(connection_close.frame_type == @intFromEnum(FrameType.max_data));
+            try std.testing.expectEqualStrings("abcdefghijklmnop", connection_close.reason);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse application_close frame" {
+    var bytes = [_]u8{ 0x1d, 0x10, 16, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112 };
+
+    switch (try Frame.parse(&bytes)) {
+        FrameType.application_close => |connection_close| {
+            try std.testing.expect(connection_close.error_code == 0x10);
+            try std.testing.expectEqualStrings("abcdefghijklmnop", connection_close.reason);
+        },
+        else => unreachable,
+    }
+}
+
+test "parse handshake_done frame" {
+    var bytes = [_]u8{0x1e};
+    switch (try Frame.parse(&bytes)) {
+        FrameType.handshake_done => try std.testing.expect(true),
+        else => unreachable,
+    }
+}
+
+test "write and parse ping frame roundtrip" {
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const frame = Frame{ .ping = {} };
+    try frame.write(&fbs);
+    const written = fbs.buffered();
+    var written_mut: [64]u8 = undefined;
+    @memcpy(written_mut[0..written.len], written);
+    const parsed = try Frame.parse(written_mut[0..written.len]);
+    try std.testing.expectEqual(FrameType.ping, parsed);
+}
+
+test "write and parse max_data frame roundtrip" {
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const frame = Frame{ .max_data = 999999 };
+    try frame.write(&fbs);
+    const written = fbs.buffered();
+    var written_mut: [64]u8 = undefined;
+    @memcpy(written_mut[0..written.len], written);
+    const parsed = try Frame.parse(written_mut[0..written.len]);
+    switch (parsed) {
+        .max_data => |val| try std.testing.expectEqual(@as(u64, 999999), val),
+        else => unreachable,
+    }
+}
+
+test "PendingControlFrame: max_streams_bidi write and parse roundtrip" {
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const pcf = PendingControlFrame{ .max_streams_bidi = 42 };
+    try pcf.write(&fbs);
+    const written = fbs.buffered();
+    var written_mut: [64]u8 = undefined;
+    @memcpy(written_mut[0..written.len], written);
+    const parsed = try Frame.parse(written_mut[0..written.len]);
+    switch (parsed) {
+        .max_streams_bidi => |val| try std.testing.expectEqual(@as(u64, 42), val),
+        else => unreachable,
+    }
+}
+
+test "PendingControlFrame: max_streams_uni write and parse roundtrip" {
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const pcf = PendingControlFrame{ .max_streams_uni = 100 };
+    try pcf.write(&fbs);
+    const written = fbs.buffered();
+    var written_mut: [64]u8 = undefined;
+    @memcpy(written_mut[0..written.len], written);
+    const parsed = try Frame.parse(written_mut[0..written.len]);
+    switch (parsed) {
+        .max_streams_uni => |val| try std.testing.expectEqual(@as(u64, 100), val),
+        else => unreachable,
+    }
+}
+
+test "PendingControlFrame: streams_blocked_bidi write and parse roundtrip" {
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const pcf = PendingControlFrame{ .streams_blocked_bidi = 7 };
+    try pcf.write(&fbs);
+    const written = fbs.buffered();
+    var written_mut: [64]u8 = undefined;
+    @memcpy(written_mut[0..written.len], written);
+    const parsed = try Frame.parse(written_mut[0..written.len]);
+    switch (parsed) {
+        .streams_blocked_bidi => |val| try std.testing.expectEqual(@as(u64, 7), val),
+        else => unreachable,
+    }
+}
+
+test "PendingControlFrame: streams_blocked_uni write and parse roundtrip" {
+    var buf: [64]u8 = undefined;
+    var fbs = io.fixedBufferStream(&buf);
+    const pcf = PendingControlFrame{ .streams_blocked_uni = 3 };
+    try pcf.write(&fbs);
+    const written = fbs.buffered();
+    var written_mut: [64]u8 = undefined;
+    @memcpy(written_mut[0..written.len], written);
+    const parsed = try Frame.parse(written_mut[0..written.len]);
+    switch (parsed) {
+        .streams_blocked_uni => |val| try std.testing.expectEqual(@as(u64, 3), val),
+        else => unreachable,
+    }
+}
+
+test "PendingControlFrame: toFrame mapping for new variants" {
+    // max_streams_bidi
+    const pcf1 = PendingControlFrame{ .max_streams_bidi = 50 };
+    const f1 = pcf1.toFrame();
+    switch (f1) {
+        .max_streams_bidi => |val| try std.testing.expectEqual(@as(u64, 50), val),
+        else => unreachable,
+    }
+
+    // max_streams_uni
+    const pcf2 = PendingControlFrame{ .max_streams_uni = 25 };
+    const f2 = pcf2.toFrame();
+    switch (f2) {
+        .max_streams_uni => |val| try std.testing.expectEqual(@as(u64, 25), val),
+        else => unreachable,
+    }
+
+    // streams_blocked_bidi
+    const pcf3 = PendingControlFrame{ .streams_blocked_bidi = 10 };
+    const f3 = pcf3.toFrame();
+    switch (f3) {
+        .streams_blocked_bidi => |val| try std.testing.expectEqual(@as(u64, 10), val),
+        else => unreachable,
+    }
+
+    // streams_blocked_uni
+    const pcf4 = PendingControlFrame{ .streams_blocked_uni = 5 };
+    const f4 = pcf4.toFrame();
+    switch (f4) {
+        .streams_blocked_uni => |val| try std.testing.expectEqual(@as(u64, 5), val),
+        else => unreachable,
+    }
+}
+
+test "PendingFrameQueue: push and pop max_streams variants" {
+    var queue = PendingFrameQueue{};
+
+    queue.push(.{ .max_streams_bidi = 100 });
+    queue.push(.{ .max_streams_uni = 50 });
+    queue.push(.{ .streams_blocked_bidi = 10 });
+    queue.push(.{ .streams_blocked_uni = 5 });
+
+    try std.testing.expectEqual(@as(u8, 4), queue.len);
+
+    const f1 = queue.pop().?;
+    switch (f1) {
+        .max_streams_bidi => |val| try std.testing.expectEqual(@as(u64, 100), val),
+        else => unreachable,
+    }
+
+    const f2 = queue.pop().?;
+    switch (f2) {
+        .max_streams_uni => |val| try std.testing.expectEqual(@as(u64, 50), val),
+        else => unreachable,
+    }
+
+    const f3 = queue.pop().?;
+    switch (f3) {
+        .streams_blocked_bidi => |val| try std.testing.expectEqual(@as(u64, 10), val),
+        else => unreachable,
+    }
+
+    const f4 = queue.pop().?;
+    switch (f4) {
+        .streams_blocked_uni => |val| try std.testing.expectEqual(@as(u64, 5), val),
+        else => unreachable,
+    }
+
+    try std.testing.expect(queue.pop() == null);
+}
+
+test "frame body longer than the datagram is rejected, not sliced" {
+    // 0x06 CRYPTO, offset 0, length 16383 — but only 4 bytes follow.
+    var crypto_frame = [_]u8{ 0x06, 0x00, 0x7f, 0xff, 0xde, 0xad, 0xbe, 0xef };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&crypto_frame));
+
+    // Same shape via CONNECTION_CLOSE's reason phrase.
+    var close_frame = [_]u8{ 0x1c, 0x00, 0x00, 0x7f, 0xff, 0x41 };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&close_frame));
+
+    // 0x07 NEW_TOKEN with a length past the end.
+    var token_frame = [_]u8{ 0x07, 0x7f, 0xff, 0x01, 0x02 };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&token_frame));
+}
+
+test "PendingFrameQueue: full refuses new frames but always admits CONNECTION_CLOSE" {
+    var q = PendingFrameQueue{};
+    var i: u64 = 0;
+    while (q.tryPush(.{ .reset_stream = .{ .stream_id = i * 4, .error_code = 0, .final_size = 0 } })) i += 1;
+    try std.testing.expect(!q.hasRoomFor(1));
+    try std.testing.expect(!q.tryPush(.{ .stop_sending = .{ .stream_id = 1, .error_code = 0 } }));
+
+    // The reserved slot, then eviction: a close is never lost.
+    try std.testing.expect(q.tryPush(.{ .connection_close = .{ .error_code = 1, .frame_type = 0, .is_app = false } }));
+    try std.testing.expect(q.tryPush(.{ .connection_close = .{ .error_code = 2, .frame_type = 0, .is_app = false } }));
+    try std.testing.expect(q.items[q.len - 1] == .connection_close);
+
+    // A popped frame can always be put back.
+    const f = q.pop().?;
+    q.requeue(f);
+    try std.testing.expectEqual(@as(usize, @import("limits.zig").pending_frames), q.len);
+}
