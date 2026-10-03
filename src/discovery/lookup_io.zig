@@ -694,10 +694,26 @@ pub const SocketError = error{
 /// lookup's socket is the one thing above it that a lookup needs. `io: std.Io`
 /// is a parameter of both calls and is stored nowhere, for the reason
 /// `docs/DECISIONS/0002-async-substrate.md` gives.
+///
+/// Nothing here is owned: `ctx` is the socket's own value and the three
+/// functions are the caller's, so all of it has to outlive every `Retrieval`
+/// begun with it. Each call runs synchronously, on the thread that asked, and
+/// returns before `Retrieval.ask` does — this seam retains neither a datagram
+/// nor a reply — and none of them is reentered from another: a `send` or
+/// `receive` that called back into the retrieval asking it would be reading a
+/// `Request` that call is in the middle of writing.
 pub const Datagram = struct {
+    /// The socket's own value, borrowed and reached by all three calls. It has
+    /// to stay alive and unchanged until every `Retrieval` begun over this
+    /// `Datagram` is finished with it.
     ctx: *anyopaque,
     /// Put one datagram on the wire, whole or not at all: a query truncated in
     /// transit is a question nobody can answer.
+    ///
+    /// `bytes` is the framed query, borrowed for the call, and `to` is
+    /// `Retrieval.server` by value. Called synchronously, on the thread that
+    /// asked, with `io` borrowed for the call and stored nowhere. Nothing
+    /// survives it.
     send: *const fn (
         ctx: *anyopaque,
         io: std.Io,
@@ -707,7 +723,14 @@ pub const Datagram = struct {
     /// Take one datagram into `into`, waiting at most `deadline_ms`.
     ///
     /// `into` does not outlive this call, which is why the answer is copied out
-    /// of it rather than handed back pointing into it.
+    /// of it rather than handed back pointing into it; whatever was in `into`
+    /// before is gone afterwards. `deadline_ms` is `null` for "as long as the
+    /// caller means" and a count of milliseconds otherwise, and `error.Empty` is
+    /// what that wait running out looks like.
+    ///
+    /// Called synchronously, on the thread that asked, with `io` borrowed for
+    /// the call. The `Reply` borrows `into` and dies with this call, so a
+    /// datagram to keep is one to copy before the next receive.
     receive: *const fn (
         ctx: *anyopaque,
         io: std.Io,
@@ -727,6 +750,8 @@ pub const Datagram = struct {
         /// Borrowed from the buffer the receive was given, and dead as soon as
         /// that call is.
         bytes: []const u8,
+        /// Who sent it, by value, and the only thing standing between a lookup
+        /// and a forged answer: a TXT answer carries no signature.
         from: addr.SocketAddr,
     };
 };
@@ -738,7 +763,17 @@ pub const Datagram = struct {
 /// on it — the query and the answer through `ask`, the deadline through
 /// `Request`, the transaction id through `begin`, and the abort through
 /// `cancellation`.
+///
+/// Two of its fields are state rather than configuration. `stopped` is
+/// terminal: `cancellation().fire()` sets it, and every later `ask` answers
+/// `error.Canceled` — a retrieval that was stopped is one that will not ask
+/// again, which is a state rather than a failure to retry. `owner` is scratch,
+/// reused by every ask, and nothing handed out points into it: the records that
+/// leave an ask are copies.
 pub const Retrieval = struct {
+    /// The socket to ask, borrowed. It, and everything its `ctx` reaches, has to
+    /// outlive this retrieval and every ask made through it, because an ask
+    /// reads all three of its functions.
     datagram: Datagram,
     /// Who the question goes to, kept so a datagram from anywhere else can be
     /// refused. A TXT answer carries no signature, so the source address is the
@@ -790,6 +825,23 @@ pub const Retrieval = struct {
     /// `request.name` is `_iroh.<z32>.<origin>` in presentation form, built by
     /// `discovery/dns.zig`'s `queryName` into storage the caller owns. What
     /// comes back is this call's to free with `Answer.deinit`.
+    ///
+    /// Blocks until one datagram arrives, the deadline passes or the abort
+    /// handle fires, and is cancellable the whole way: `error.Canceled` answers
+    /// a retrieval that was stopped, whether before this call or while the
+    /// receive was in flight.
+    ///
+    /// Both of `request`'s buffers are written — `wire` holds the query this
+    /// call sent, `reply` whatever came back — so neither keeps what it held
+    /// before. Nothing survives an error: a refused send, a refused receive and
+    /// a malformed message each release what they had built, and the datagram
+    /// is gone from the socket either way.
+    ///
+    /// This is not a retry. The transaction id was drawn once by `begin`, so a
+    /// second ask asks the same question and will read the first one's late
+    /// answer if one is still coming. Repeating a query is RFC 1035 §7.2's
+    /// policy and needs an instant this value does not carry, so a caller that
+    /// wants one begins another retrieval with another id.
     pub fn ask(
         self: *Retrieval,
         alloc: std.mem.Allocator,
@@ -840,14 +892,19 @@ fn stopRetrieval(ctx: *anyopaque) void {
 /// list that long is a list nothing distinguishes. The buffers are the
 /// caller's because a read buffer does not outlive the call and a query may be
 /// longer than anything this file could own.
+///
+/// `ask` writes `wire` and `reply` on every call, so what either buffer holds is
+/// meaningful after an ask that used it and only until the next one.
 pub const Request = struct {
     /// The name asked about, in presentation form with its trailing dot.
     name: []const u8,
     /// Where the framed query goes before it is sent: `queryLength(name)`
-    /// bytes.
+    /// bytes. Written by `ask`, and what it held before is gone after one.
     wire: []u8,
     /// Where the datagram is read before it is parsed. `reply_length` bytes is
-    /// what a peer that honours the advertised size can send.
+    /// what a peer that honours the advertised size can send. Written by `ask`,
+    /// and a shorter datagram leaves the rest of it as it was — which is no
+    /// problem, because a caller reads the parsed `Answer` and not this buffer.
     reply: []u8,
     /// How long one receive waits, in milliseconds, and null for as long as the
     /// caller means. Upstream gives each of its six staggered queries three
