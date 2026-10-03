@@ -1,0 +1,7 @@
+{
+  "rules": {
+    "unused-decls": "warn",
+    "suppressed-errors": "warn",
+    "avoid-as": "warn"
+  }
+}
