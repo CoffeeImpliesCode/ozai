@@ -105,6 +105,10 @@ const Allocator = std.mem.Allocator;
 /// The protocol never reads a clock; it is told what time it is.
 pub const Nanos = u64;
 
+/// Nanoseconds in a millisecond and in a second, the two units every `Config`
+/// duration in this module is written in. They are named rather than spelled
+/// out because a round number written `1_000_000_000` at four call sites is
+/// four chances to be `1_000_000`.
 pub const nanos_per_milli: Nanos = 1_000_000;
 pub const nanos_per_second: Nanos = 1_000_000_000;
 
@@ -164,6 +168,27 @@ pub const Error = error{
 /// one: the caller hands in a container and the state machine appends to it.
 /// The membership layer's actions container is this same type over its own
 /// events.
+///
+/// **It owns the list, and not the bytes the entries name.** An `Out` here is
+/// a value with slices in it, and those slices borrow: a payload the state
+/// forwarded, or one it is holding in its cache for a peer that may graft
+/// later, or a `PeerData` a message carried. `push` copies the `Out` value and
+/// nothing more, so the entry stays valid exactly as long as the borrow is, and
+/// not one moment longer. See `State.handle` for which borrow each event kind
+/// carries and what invalidates it.
+///
+/// **Allocator identity is the caller's throughout.** `init` stores the
+/// allocator and both `push` and `deinit` use that one, so the allocator a
+/// caller passes is the allocator that must free the list. Growing the list
+/// reallocates; `clear` keeps the allocation; `deinit` releases it, once.
+/// `push` is the only fallible member, and it fails only with
+/// `error.OutOfMemory` — the state machine never refuses to record an event for
+/// a protocol reason, because the protocol reasons are its own errors and they
+/// travel through `handle`.
+///
+/// Not thread-safe and not reentrant: two calls appending through one
+/// `Actions` interleave. `handle` never calls back into the container it was
+/// given, so a state machine holding one is not itself a reentrancy hazard.
 pub fn Actions(comptime Out: type) type {
     return struct {
         const Self = @This();
@@ -207,10 +232,19 @@ pub fn Actions(comptime Out: type) type {
 /// `Swarm(0)` is the message at its origin and the round *is* the distance to
 /// the origin.
 pub const Round = struct {
+    /// The round a broadcast starts at: the origin's own hop count is zero.
     pub const zero: Round = .{ .value = 0 };
 
+    /// The hop count this message has travelled, which *is* the distance to
+    /// the origin. `u16` and it wraps: a swarm outlives 65 535 hops, so `next`
+    /// wraps rather than clamping and `hopsSince` is saturating rather than
+    /// subtracting a wrapped counter.
     value: u16,
 
+    /// The next hop's round. Wrapping, deliberately: a clamp would pin a swarm
+    /// at 65535 forever and make every later round indistinguishable from it,
+    /// while the only comparison a hop count is put to — `hopsSince` — already
+    /// refuses to read a wrapped pair as a distance.
     pub fn next(self: Round) Round {
         return .{ .value = self.value +% 1 };
     }
@@ -234,18 +268,32 @@ pub const MessageId = struct {
         return id;
     }
 
+    /// The id these 32 bytes are, for a caller that decoded them rather than
+    /// hashing a payload. No validation happens here and none is possible: any
+    /// 32 bytes are a well-formed id, and whether they name a real message is
+    /// answered by `Gossip.validate` on the payload that arrives with it.
     pub fn fromBytes(bytes: [id_length]u8) MessageId {
         return .{ .bytes = bytes };
     }
 
+    /// A copy of the digest, for a caller storing it or writing it out. By
+    /// value: the digest is 32 bytes and a borrow of a temporary would outlive
+    /// the call.
     pub fn toBytes(self: MessageId) [id_length]u8 {
         return self.bytes;
     }
 
+    /// Whether two ids are the same message. Total over the whole digest, so
+    /// this is `==` on the struct spelled out; it is here because a caller
+    /// reaching for the id through a union arm cannot use `==` without naming
+    /// the payload beside it.
     pub fn eql(a: MessageId, b: MessageId) bool {
         return std.mem.eql(u8, &a.bytes, &b.bytes);
     }
 
+    /// Digest order, ascending, which is what every id-sorted structure in this
+    /// module orders by. Arbitrary but total and stable, so two nodes that
+    /// disagree about nothing still agree about it.
     pub fn order(a: MessageId, b: MessageId) std.math.Order {
         return std.mem.order(u8, &a.bytes, &b.bytes);
     }
@@ -349,6 +397,17 @@ pub const IHaves = struct {
     count: u16,
     items: [max_ihaves_per_message]IHave,
 
+    /// The entries past `count` are never written and never read, so a decoded
+    /// or constructed `IHaves` carries no obligation about them.
+    /// An owned list of up to `max_ihaves_per_message`, or
+    /// `error.IHaveListTooLong`.
+    ///
+    /// Fixed-size rather than a slice, because a `Message::IHave` is a value
+    /// that outlives the frame it was cut from and this module has no
+    /// allocator. The count is proved here, at the cast: `u16` holds anything
+    /// `max_ihaves_per_message` does, so the cast admits nothing the length
+    /// check did not. The entries are copied, so the list borrows nothing from
+    /// `items` afterwards.
     pub fn init(items: []const IHave) Error!IHaves {
         if (items.len > max_ihaves_per_message) return error.IHaveListTooLong;
         var list: IHaves = undefined;
@@ -357,6 +416,9 @@ pub const IHaves = struct {
         return list;
     }
 
+    /// The first `count` entries. Pointer receiver for the reason
+    /// `RelayUrl.hostSlice` takes one: a by-value receiver can hand back a
+    /// slice into a temporary that dies the moment it returns.
     pub fn slice(self: *const IHaves) []const IHave {
         return self.items[0..self.count];
     }
@@ -487,6 +549,12 @@ fn PeerSet(comptime capacity: usize) type {
             return self.items[0..self.len];
         }
 
+        /// Forget every peer. The slots past `len` keep whatever they held and
+        /// are never read again; `len` is what every reader consults.
+        pub fn clear(self: *Self) void {
+            self.len = 0;
+        }
+
         pub fn contains(self: *const Self, peer: NodeId) bool {
             for (self.slice()) |item| {
                 if (sameNode(item, peer)) return true;
@@ -546,6 +614,13 @@ fn IdCache(comptime capacity: usize) type {
 
         pub fn count(self: *const Self) usize {
             return self.len;
+        }
+
+        /// Forget every id, cached or not. Expiry is a sweep, not a
+        /// destructor: dropping the topic drops the table outright rather than
+        /// waiting for entries to age out.
+        pub fn clear(self: *Self) void {
+            self.len = 0;
         }
 
         pub fn contains(self: *const Self, id: MessageId) bool {
@@ -614,6 +689,13 @@ fn MessageCache(comptime capacity: usize) type {
 
         pub fn count(self: *const Self) usize {
             return self.len;
+        }
+
+        /// Forget every payload. The bytes past `len` in each slot stay as they
+        /// were and are never read, so this drops the messages without touching
+        /// a kilobyte per slot.
+        pub fn clear(self: *Self) void {
+            self.len = 0;
         }
 
         pub fn get(self: *const Self, id: MessageId) ?Gossip {
@@ -745,21 +827,127 @@ pub const State = struct {
     /// than `init` because the constructor is `init`.
     started: bool = false,
 
+    /// How many hops and payloads this tree has seen. Counters about what the
+    /// node did while it was on the topic, not protocol state: they survive
+    /// `leave`, so a caller can report what happened before it left.
+    ///
+    /// `payload_messages_received` counts every received `Gossip` *before* the
+    /// arm is chosen, so a spoofed frame is counted as received and then
+    /// discarded. That is a receive counter and not a delivery counter, and the
+    /// test that a spoofed message is not penalised asserts on everything
+    /// except it.
     stats: Stats = .{},
 
+    /// A tree with no edges, no queue and no cache, for `me` under `config`.
+    ///
+    /// Infallible and allocation-free: `Config` is three durations and two
+    /// thresholds rather than something to validate, and every bound in this
+    /// module is a compile-time constant, so there is nothing here that can be
+    /// refused. Nothing is scheduled until the first `handle`.
+    ///
+    /// Copyable: `State` holds no slice of its own storage, so a snapshot the
+    /// caller restores after a failed `handle` is a plain copy. See `handle`.
     pub fn init(me: NodeId, config: Config) State {
         return .{ .me = me, .config = config };
     }
 
+    /// The eager edges, in sorted order: the peers a new payload is pushed to.
+    ///
+    /// Pointer receiver and a borrowed slice, so the result lives as long as
+    /// this state and no longer; the next `handle` can remove an edge, and
+    /// `leave` empties the set. Read it, do not keep it.
     pub fn eagerPeers(self: *const State) []const NodeId {
         return self.eager_push_peers.slice();
     }
 
+    /// The lazy edges, in sorted order: the peers an id is announced to, after
+    /// the dispatch timer. Same borrow rule as `eagerPeers`, and the two sets
+    /// are disjoint by construction: a peer is in exactly one of them.
     pub fn lazyPeers(self: *const State) []const NodeId {
         return self.lazy_push_peers.slice();
     }
 
+    /// Forget the topic: drop every peer, queue, claim and cache entry, and
+    /// leave the state ready to answer nothing.
+    ///
+    /// `hyparview.TopicState` calls this when the application sends
+    /// `Command.quit`, and the promise it is keeping is the one on that
+    /// command — a node that has left does not keep a broadcast tree, a lazy
+    /// queue or a payload cache that a later event could still reach. Dropping
+    /// them here rather than clearing them lazily is what makes "left" a fact
+    /// about the state and not about the caller's bookkeeping.
+    ///
+    /// **Idempotent, and it produces no output.** The disconnects a leaving
+    /// node owes its neighbours are membership's to send, and this half has
+    /// none: by the time a `Quit` reaches this layer, membership has already
+    /// dropped the neighbours whose trees these were.
+    ///
+    /// `stats` survives, because a counter is a report about what the node did
+    /// while it was on the topic rather than state it was carrying. `me` and
+    /// `config` survive because they identify the state and not its contents.
+    /// `started` survives too, and deliberately: it is a latch on "has this
+    /// state ever run", not protocol state, and clearing it would make the next
+    /// `handle` queue a cache sweep for a topic that has nothing cached.
+    pub fn leave(self: *State) void {
+        self.eager_push_peers.clear();
+        self.lazy_push_peers.clear();
+        self.lazy_push_queue_len = 0;
+        self.dispatch_timer_scheduled = false;
+        self.missing_messages_len = 0;
+        self.received_messages.clear();
+        self.cache.clear();
+    }
+
     /// Handle one event. `now` is the caller's clock; nothing here reads one.
+    ///
+    /// **Not transactional, and the residue is named rather than hidden.** An
+    /// event advances `self` and appends to `out` as it goes, so an
+    /// `error.OutOfMemory` out of an append leaves the state advanced as far as
+    /// that event got and leaves the appends that succeeded in `out`. The state
+    /// is still a valid `State` — every mutation here is checked, so nothing is
+    /// left half-written — but it is not the state the caller handed in.
+    ///
+    /// Three ways out, and only the first is a promise:
+    ///
+    /// - **Snapshot.** `State` is a plain value holding no slice of its own
+    ///   storage, so a caller that needs all-or-nothing copies it before the
+    ///   call and restores that copy on error. The copy is a few kilobytes and
+    ///   no allocation. Two things bound what that recovers, and both are the
+    ///   caller's to arrange:
+    ///
+    ///   1. **It recovers `self` and nothing else.** Every protocol function in
+    ///      this module writes no memory outside `self` and `out` — the caches,
+    ///      the queues and the claim table are all inline in `State` — so the
+    ///      borrowed payload bytes a failed call handed to `out` *are* restored
+    ///      with the value. What is not restored is anything the caller did with
+    ///      them: a caller that acts on `out` as it drains it has already sent
+    ///      what it read, and a restored state does not unsend it.
+    ///   2. **It recovers `out` only if `out` was empty when the call started.**
+    ///      That is the precondition, and `out.clear()` is then exactly the undo
+    ///      because there is nothing else in the list. `Actions` has no
+    ///      truncate-to-a-saved-length, so a caller that accumulates output
+    ///      across events cannot use this recovery at all and must abandon.
+    ///
+    /// - **Abandon.** A caller that cannot snapshot — because it accumulates
+    ///   output, or because it has no copy to keep — treats a failed `handle` as
+    ///   the end of this topic's run: drop the state, tell the transport to
+    ///   close whatever it has open, and build a new `State` if the node comes
+    ///   back. `net/probe_run.drive` makes the same choice with the same
+    ///   `errdefer`.
+    /// - **Replay**, which is *not* promised. Re-sending the same event does not
+    ///   undo the neighbour already promoted, the payload already cached or the
+    ///   `IHave` already queued, and making it would put a second opinion about
+    ///   the protocol on the path of every event.
+    ///
+    /// Whatever is already in `out` is real work the state did, and whether to
+    /// act on it, clear it or snapshot over it is the caller's choice.
+    ///
+    /// **What the entries in `out` borrow.** `Actions` owns the list and not the
+    /// bytes its entries name: a `send_message` payload and an `emit_event`
+    /// payload borrow either the caller's own buffer or `self.cache`, and the
+    /// next `handle` on this state sweeps that cache and may evict the very
+    /// entry being forwarded. A caller that keeps an output list across a
+    /// `handle` copies the bytes.
     ///
     /// **The arms below run in this order, and the order is the contract.**
     /// Within `onGossip` the arms are: validate, then either the duplicate
@@ -969,11 +1157,17 @@ pub const State = struct {
             const claim: Claim = .{ .peer = sender, .round = ihave.round };
             const entry = try self.pushClaim(ihave.id, claim);
             if (entry.graft_timer_scheduled) continue;
-            entry.graft_timer_scheduled = true;
+            // Queued before the flag is set, and that order is the contract:
+            // a latch set first is a claim that a timer exists which the
+            // caller never received, so an allocator that refuses the append
+            // loses the graft for ever — the entry keeps saying one is
+            // outstanding and none will ever fire. The append can only fail, so
+            // doing it first loses nothing.
             try out.push(.{ .schedule_timer = .{
                 .after = self.config.graft_timeout_1,
                 .timer = .{ .send_graft = ihave.id },
             } });
+            entry.graft_timer_scheduled = true;
         }
     }
 
@@ -1108,11 +1302,12 @@ pub const State = struct {
             try self.queueIHave(peer, .{ .id = gossip.id, .round = round });
         }
         if (!self.dispatch_timer_scheduled) {
-            self.dispatch_timer_scheduled = true;
+            // Queued before the flag is set, for the reason `onIHave` gives.
             try out.push(.{ .schedule_timer = .{
                 .after = self.config.dispatch_timeout,
                 .timer = .dispatch_lazy_push,
             } });
+            self.dispatch_timer_scheduled = true;
         }
     }
 
@@ -1542,6 +1737,158 @@ test "an iHave that is not followed by a payload becomes a graft" {
     try t.expect(out.at(1) == .schedule_timer);
     try t.expectEqual(state.config.graft_timeout_2, out.at(1).schedule_timer.after);
     try t.expectEqual(@as(usize, 0), state.cache.count());
+}
+
+// Both timer latches below are claims that a timer exists. Set before the
+// append that publishes the timer, the claim survives an allocator refusing
+// that append, and the timer is then never produced: for the graft timer the
+// message is never asked for, and for the dispatch timer the queued ids wait
+// for a flush that nothing will trigger. Both are fixed the same way — the
+// append happens first — and both tests below fail without that order.
+test "a graft timer that could not be queued is asked for on the next claim" {
+    const me = try testNodeId(1);
+    const peer = try testNodeId(2);
+    const content = try blake3Input(8);
+    defer t.allocator.free(content);
+    const id = MessageId.fromContent(content);
+
+    var state: State = .init(me, .{});
+    // A first container over a real allocator, because the entry sweep is
+    // queued once on the first call whatever it is and must not be the
+    // allocation that fails here.
+    var warm: Actions(OutEvent) = .init(t.allocator);
+    defer warm.deinit();
+    try state.handle(.{ .neighbor_up = peer }, 0, &warm);
+
+    // A fresh container each time, because `clear` keeps its capacity and a
+    // container that already has room would not allocate at all.
+    var failing = std.testing.FailingAllocator.init(t.allocator, .{});
+    var out: Actions(OutEvent) = .init(failing.allocator());
+    defer out.deinit();
+    failing.fail_index = failing.alloc_index;
+    try t.expectError(error.OutOfMemory, state.handle(.{ .recv_message = .{
+        .from = peer,
+        .message = .{ .i_have = try IHaves.init(&.{.{ .id = id, .round = .{ .value = 2 } }}) },
+    } }, 0, &out));
+
+    // The claim was filed and the timer was not queued.
+    try t.expectEqual(@as(usize, 1), state.missing_messages_len);
+    try t.expect(!state.missing_messages[0].graft_timer_scheduled);
+    try t.expectEqual(@as(usize, 0), out.count());
+
+    // So the next claim queues it.
+    failing.fail_index = null;
+    try state.handle(.{ .recv_message = .{
+        .from = peer,
+        .message = .{ .i_have = try IHaves.init(&.{.{ .id = id, .round = .{ .value = 2 } }}) },
+    } }, 0, &out);
+    try t.expect(state.missing_messages[0].graft_timer_scheduled);
+    try t.expectEqual(@as(usize, 1), out.count());
+    try t.expect(out.at(0) == .schedule_timer);
+    try t.expectEqual(state.config.graft_timeout_1, out.at(0).schedule_timer.after);
+}
+
+test "a dispatch timer that could not be queued is flushed on the next burst" {
+    const me = try testNodeId(1);
+    const lazy_child = try testNodeId(4);
+    const content = try blake3Input(3);
+    defer t.allocator.free(content);
+
+    var state: State = .init(me, .{});
+    var warm: Actions(OutEvent) = .init(t.allocator);
+    defer warm.deinit();
+    try state.handle(.{ .neighbor_up = lazy_child }, 0, &warm);
+    // The tree puts this edge on the lazy side, which is what makes a burst
+    // queue ids instead of pushing payloads.
+    try state.addLazy(lazy_child);
+
+    var failing = std.testing.FailingAllocator.init(t.allocator, .{});
+    var out: Actions(OutEvent) = .init(failing.allocator());
+    defer out.deinit();
+    failing.fail_index = failing.alloc_index;
+    try t.expectError(
+        error.OutOfMemory,
+        state.handle(.{ .broadcast = .{ .content = content, .scope = .swarm } }, 0, &out),
+    );
+    try t.expect(!state.dispatch_timer_scheduled);
+    try t.expectEqual(@as(usize, 0), out.count());
+
+    // The queued ids are still there, so one more burst and the flush goes out.
+    failing.fail_index = null;
+    try state.handle(.{ .broadcast = .{ .content = content, .scope = .swarm } }, 0, &out);
+    try t.expect(state.dispatch_timer_scheduled);
+    try t.expectEqual(@as(usize, 1), out.count());
+    try t.expect(out.at(0) == .schedule_timer);
+    try t.expect(out.at(0).schedule_timer.timer == .dispatch_lazy_push);
+}
+
+// A topic's `quit` promises to drop its state. The caches are state, and the
+// observable proof that they are gone is silence: a graft for a payload this
+// node no longer holds gets no reply, which is the only honest one.
+test "leaving drops the tree, its queues and both caches" {
+    const me = try testNodeId(1);
+    const eager_child = try testNodeId(3);
+    const lazy_child = try testNodeId(4);
+    const claimer = try testNodeId(2);
+    const content = try blake3Input(3);
+    defer t.allocator.free(content);
+    const id = MessageId.fromContent(content);
+    // An id this node has never seen, so the claim table has an entry in it.
+    const stranger = MessageId.fromContent("not-mine");
+
+    var state: State = .init(me, .{});
+    var out: Actions(OutEvent) = .init(t.allocator);
+    defer out.deinit();
+
+    try state.handle(.{ .neighbor_up = eager_child }, 0, &out);
+    try state.addLazy(lazy_child);
+    try state.handle(.{ .broadcast = .{ .content = content, .scope = .swarm } }, 0, &out);
+    try state.handle(.{ .recv_message = .{
+        .from = claimer,
+        .message = .{ .i_have = try IHaves.init(&.{
+            .{ .id = stranger, .round = .{ .value = 2 } },
+        }) },
+    } }, 0, &out);
+
+    // Every table is loaded, or the rest of this test proves nothing.
+    try t.expectEqual(@as(usize, 1), state.eager_push_peers.count());
+    try t.expectEqual(@as(usize, 1), state.lazy_push_peers.count());
+    try t.expectEqual(@as(usize, 1), state.cache.count());
+    try t.expectEqual(@as(usize, 1), state.received_messages.count());
+    try t.expectEqual(@as(usize, 1), state.missing_messages_len);
+    try t.expect(state.lazy_push_queue_len > 0);
+    try t.expect(state.dispatch_timer_scheduled);
+
+    state.leave();
+
+    try t.expectEqual(@as(usize, 0), state.eager_push_peers.count());
+    try t.expectEqual(@as(usize, 0), state.lazy_push_peers.count());
+    try t.expectEqual(@as(usize, 0), state.cache.count());
+    try t.expectEqual(@as(usize, 0), state.received_messages.count());
+    try t.expectEqual(@as(usize, 0), state.missing_messages_len);
+    try t.expectEqual(@as(usize, 0), state.lazy_push_queue_len);
+    try t.expect(!state.dispatch_timer_scheduled);
+
+    // And silence, which is what the drop is observable as. The graft asks for
+    // the payload this node held a moment ago; there is nothing to answer it
+    // from, so nothing goes out.
+    out.clear();
+    try state.handle(.{ .recv_message = .{
+        .from = claimer,
+        .message = .{ .graft = .{ .id = id, .round = .{ .value = 3 } } },
+    } }, 0, &out);
+    try t.expectEqual(@as(usize, 0), out.count());
+
+    // A broadcast afterwards reaches no peer: the edges are gone, so there is
+    // no eager push and no lazy queue.
+    try state.handle(.{ .broadcast = .{ .content = content, .scope = .swarm } }, 0, &out);
+    try t.expectEqual(@as(usize, 0), out.count());
+    try t.expectEqual(@as(usize, 0), state.cache.count());
+
+    // `leave` twice is the same as once, and it owes the caller no output.
+    out.clear();
+    state.leave();
+    try t.expectEqual(@as(usize, 0), out.count());
 }
 
 // The second half: a peer that hears the same id from a third party grafts us
