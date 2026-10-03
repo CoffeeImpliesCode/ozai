@@ -6578,3 +6578,91 @@ test "connection flow control: a repeated RESET_STREAM counts its final size onc
     try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.highest_received);
     try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.bytes_read);
 }
+
+test "a server with no token key issues no NEW_TOKEN at all" {
+    var rng = TestRandom{};
+    const local = address.Address.initIpv4(.{ 0, 0, 0, 0 }, 443);
+    const remote = address.Address.initIpv4(.{ 192, 168, 1, 100 }, 12345);
+    const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const scid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
+    const header = packet.Header{
+        .packet_type = .initial,
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .dcid = &dcid,
+        .scid = &scid,
+        .token = &.{},
+        .packet_number = 0,
+        .packet_number_len = 1,
+        .remainder_len = 0,
+    };
+
+    var keyed = try Connection.accept(
+        std.testing.allocator,
+        header,
+        local,
+        remote,
+        true,
+        .{ .token_key = @splat(0x11) },
+        null,
+        null,
+        null,
+        test_now,
+        rng.random(),
+    );
+    defer keyed.deinit();
+    try std.testing.expect(keyed.newTokenFrame(test_now, rng.random()) != null);
+
+    // A connection with no token key has no secret to seal one with, and the
+    // zero key it would otherwise use is a key every reader of the wire has:
+    // a token sealed under it proves nothing and outlives the connection that
+    // issued it. No token, no frame.
+    var unkeyed = try Connection.accept(
+        std.testing.allocator,
+        header,
+        local,
+        remote,
+        true,
+        .{},
+        null,
+        null,
+        null,
+        test_now,
+        rng.random(),
+    );
+    defer unkeyed.deinit();
+    try std.testing.expectEqual(@as(?[16]u8, null), unkeyed.token_key);
+    try std.testing.expect(unkeyed.newTokenFrame(test_now, rng.random()) == null);
+}
+
+test "handleDatagram: a version negotiation packet ends the walk, not its length field" {
+    var rng = TestRandom{};
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // RFC 9000 §6.1: long header, version zero, both connection ids, then the
+    // versions. There is no Length field, so there is nothing in the packet
+    // that says how long it is — the whole datagram is the packet, and a
+    // server ignores it (a client is the only end that acts on one).
+    const local = address.Address.initIpv4(.{ 0, 0, 0, 0 }, 443);
+    const remote = address.Address.initIpv4(.{ 192, 168, 1, 100 }, 12345);
+    var datagram = [_]u8{0} ** 64;
+    datagram[0] = 0xc0;
+    std.mem.writeInt(u32, datagram[1..5], 0, .big);
+    datagram[5] = 8;
+    @memcpy(datagram[6..14], &conn.dcid);
+    datagram[14] = 8;
+    @memcpy(datagram[15..23], &conn.scid);
+    std.mem.writeInt(u32, datagram[23..27], 0x1a2a3a4a, .big);
+    std.mem.writeInt(u32, datagram[27..31], 0x5a5a5a5a, .big);
+
+    conn.handleDatagram(&datagram, .{
+        .to = local,
+        .from = remote,
+        .datagram_size = datagram.len,
+    }, test_now, rng.random());
+
+    // Ignored, so not closed, not acknowledged and not counted as received:
+    // the packet was read as a packet and nothing in it was acted on.
+    try std.testing.expect(!conn.isClosed());
+    try std.testing.expectEqual(@as(u64, 0), conn.getStats().packets_received);
+}

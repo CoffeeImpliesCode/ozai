@@ -123,10 +123,28 @@ fn ghashBlocks(hx: *const [pc_count]V, acc0: V, msg: []const u8, extra: ?V) V {
     }
 }
 
+/// Bytes of authentication tag AES-128-GCM produces, and so the bytes every
+/// QUIC packet carries after its ciphertext.
+///
 pub const tag_length = 16;
+/// Bytes of nonce AES-128-GCM is used with, and the width QUIC's per-packet
+/// nonce is padded to before the packet number is XORed into it.
+///
 pub const nonce_length = 12;
+/// Bytes of key a context is built from. One per key: a context holds one key
+/// schedule and cannot be re-keyed, so a key change is a new `Ctx`.
+///
 pub const key_length = 16;
 
+/// AES-128-GCM with the key schedule and the GHASH powers computed once, so a
+/// packet costs one AES pass and a table walk instead of setting both up per
+/// message.
+///
+/// A value that owns nothing: it is built from a key by value, copied freely,
+/// and every copy is independently usable — which is what a key update does
+/// with the previous generation while reordered packets are still arriving.
+/// Holding the precomputed state is the entire reason this type exists;
+/// `std`'s one-shot primitive has no equivalent.
 pub const Ctx = struct {
     aes: @TypeOf(Aes128.initEnc(@as([key_length]u8, undefined))),
     h: [16]u8,

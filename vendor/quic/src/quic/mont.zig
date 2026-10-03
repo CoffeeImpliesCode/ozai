@@ -22,11 +22,22 @@ const assert = std.debug.assert;
 
 /// Widest modulus, in bits. RSA-4096's CRT halves are 2048 bits.
 pub const max_bits = 2048;
+/// Limbs in the fixed-width number this module works on: one modulus wide.
+/// Every value it holds is padded to this, which is why the width is a
+/// compile-time constant rather than a property of a key.
+///
 pub const max_limbs = max_bits / 64;
 
 const window_bits = 4;
 const table_len = 1 << window_bits;
 
+/// Everything this module refuses.
+///
+/// One code because there is one shape of mistake: a modulus that is not
+/// odd, is empty, or is wider than `max_limbs`, or an operand that does not
+/// fit beside it. A caller that gets this has a key or an intermediate it
+/// cannot work with, and neither is fixed by trying again.
+///
 pub const Error = error{
     /// Not an odd modulus of 1 to `max_limbs` limbs, or an operand wider than it.
     InvalidModulus,

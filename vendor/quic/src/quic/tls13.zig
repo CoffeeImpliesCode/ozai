@@ -19,6 +19,10 @@ const quic_crypto = @import("crypto.zig");
 const protocol = @import("protocol.zig");
 const transport_params = @import("transport_params.zig");
 const limits = @import("limits.zig");
+/// RSA signing, re-exported for the key parser and the signer this handshake
+/// uses when it is asked to present an RSA certificate. It is the module
+/// itself and not a wrapper, so every contract it has is on `rsa.zig`.
+///
 pub const rsa = @import("rsa.zig");
 
 const Certificate = std.crypto.Certificate;
@@ -41,8 +45,17 @@ const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 
 const P256 = crypto.ecc.P256;
 
+/// The four QUIC encryption levels: `quic_crypto`'s own enum, aliased rather
+/// than re-declared. A value here is a `quic_crypto.EncryptionLevel` and its
+/// contract is that one's.
+///
 pub const EncryptionLevel = quic_crypto.EncryptionLevel;
 
+/// Which key an identity is signed with, and so which signature schemes a
+/// peer may use with it. It answers for the certificate, not for the
+/// connection: one connection presents one certificate, and this is what says
+/// how that certificate's key signs.
+///
 pub const PrivateKeyAlgorithm = enum {
     ecdsa_p256_sha256,
     ed25519,
@@ -384,6 +397,15 @@ pub fn parseCertificateList(body: []const u8, out: [][]const u8) error{ DecodeEr
 
 // ─── TranscriptHash ──────────────────────────────────────────────────
 
+/// The running hash of every handshake message, in the wire form they arrived
+/// in.
+///
+/// TLS derives every secret from it (RFC 8446 §7.1), so it is what a Finished
+/// is over and what a CertificateVerify signs. `update` takes a whole
+/// message including its type and three-byte length, because that header is
+/// hashed too, and `current` copies the state to read a digest without
+/// consuming it — a step may need the hash as often as it likes.
+///
 pub const TranscriptHash = struct {
     state: Sha256,
 
@@ -405,6 +427,15 @@ pub const TranscriptHash = struct {
 
 // ─── KeySchedule ─────────────────────────────────────────────────────
 
+/// The secrets TLS 1.3 has derived so far.
+///
+/// One struct per handshake, filled in as the handshake advances: the early,
+/// handshake, application and resumption secrets, each with a flag saying
+/// whether it exists yet, because a schedule is read only where the protocol
+/// says a secret has been derived. A value that owns nothing, so copying one
+/// is cheap and a copy is independent — which is what lets one schedule serve
+/// both directions and all four levels.
+///
 pub const KeySchedule = struct {
     early_secret: [32]u8,
     handshake_secret: [32]u8,
@@ -553,6 +584,16 @@ pub const KeySchedule = struct {
 
 // ─── Session Ticket (0-RTT resumption) ───────────────────────────────
 
+/// A session ticket and everything it authorises: 0-RTT resumption.
+///
+/// Self-contained and fixed-size, so one is copied into a session cache by
+/// value and outlives the connection that issued it. `lifetime` is in
+/// seconds and zero is the answer to a peer that asked for no resumption,
+/// `max_early_data_size` is what the server authorised — zero refuses 0-RTT,
+/// which is how a server that does not support it answers — and
+/// `creation_time` is on the caller's clock rather than the epoch; see the
+/// field.
+///
 pub const SessionTicket = struct {
     psk: [32]u8, // Pre-shared key derived from resumption_master_secret
     ticket: [512]u8 = .{0} ** 512, // Opaque ticket data (encrypted by server)
@@ -678,6 +719,12 @@ pub const CertEntry = struct {
     client_auth: ?*const ClientAuth = null,
 };
 
+/// The certificate chosen for a ClientHello, and whether the choice came from
+/// the name the client asked for. `matched` is false when the client sent no
+/// SNI or nothing matched it and the first entry was used as the default,
+/// which a caller has to know before it treats the certificate as the one the
+/// peer asked for.
+///
 pub const CertSelection = struct {
     entry: *const CertEntry,
     /// False when the client sent no SNI or nothing matched it, so the first
@@ -831,6 +878,16 @@ pub const TlsConfig = struct {
 
 // ─── Handshake state machine ─────────────────────────────────────────
 
+/// Everything a handshake can refuse: the TLS alerts of RFC 8446 §6.2 plus
+/// the QUIC transport-parameter error.
+///
+/// Each name is the alert the peer is sent for it, so forwarding one needs no
+/// table: `BadCertificate` closes with bad_certificate,
+/// `CertificateRequired` with certificate_required, `DecodeError` with
+/// decode_error. None is worth retrying unchanged — a caller has to change a
+/// certificate, offer a different key share, or change its configuration
+/// first.
+///
 pub const HandshakeError = error{
     UnexpectedMessage,
     DecodeError,
@@ -851,6 +908,14 @@ pub const HandshakeError = error{
     IllegalParameter,
 };
 
+/// One step's answer: what the caller must do next.
+///
+/// A handshake touches no network, so a step says what it wants done instead
+/// of doing it. `send_data` hands over the bytes to put in CRYPTO frames,
+/// `install_keys` the keys to use from that point on, `wait_for_data` that it
+/// needs more before it can continue, and `complete` that the handshake is
+/// done. `_continue` is internal and never leaves `step`.
+///
 pub const Action = union(enum) {
     send_data: SendData,
     install_keys: InstallKeys,
@@ -860,11 +925,20 @@ pub const Action = union(enum) {
     _continue,
 };
 
+/// Bytes to send at an encryption level. **Borrowed from the handshake's own
+/// staging buffer** and good only until the next `step` on that handshake, so
+/// a caller copies them into CRYPTO frames rather than keeping the slice.
+///
 pub const SendData = struct {
     level: EncryptionLevel,
     data: []const u8,
 };
 
+/// The keys to use from this point on at one encryption level: the pair that
+/// opens what arrives and the pair that seals what leaves.
+///
+/// A value, so installing one copies it and the caller keeps nothing alive.
+///
 pub const InstallKeys = struct {
     level: EncryptionLevel,
     open: quic_crypto.Open,
@@ -898,6 +972,23 @@ const HandshakeState = enum {
     connected,
 };
 
+/// One TLS 1.3 handshake, driving the QUIC transport parameters with it.
+///
+/// Built by `initClientInto` or `initServerInto` and advanced by `step`, with
+/// `now` and `random` as arguments rather than anything it reads for itself —
+/// the same rule as the rest of the core. It owns every buffer it needs and
+/// frees them in `deinit`.
+///
+/// **What it borrows is the caller's and must outlive it:** the certificate
+/// chain, the ALPN list, the client-auth block and the server certificate
+/// are all borrowed slices in `TlsConfig`, and a handshake that outlived them
+/// would be reading freed bytes. **What it produces stays good until
+/// `deinit`:** `peer_transport_params`, `negotiated_alpn` and
+/// `client_auth` are fields, and `peerCertificate` returns a slice the
+/// handshake owns and frees.
+///
+/// A connection holds one of these on the heap beside itself, so failing to
+/// allocate it fails the accept or the dial rather than a later step.
 pub const Tls13Handshake = struct {
     state: HandshakeState,
     is_server: bool,
@@ -3190,10 +3281,29 @@ fn writeU16(buf: []u8, val: u16) void {
 
 // ─── Minimal PEM parser ──────────────────────────────────────────────
 
+/// Decode the first CERTIFICATE section of a PEM document into `out` and
+/// return it.
+///
+/// **The result belongs to `out`, not to the caller's `pem_data`:** the base64
+/// is decoded into the caller's buffer and the returned slice points there,
+/// so it stays valid exactly as long as `out` does and is the caller's to
+/// overwrite. `pem_data` is borrowed and untouched. `error.DecodeError` is
+/// every failure — no markers, no body, or not enough room in `out` — and
+/// none of them distinguishes a malformed file from a truncated buffer.
+///
 pub fn parsePemCert(pem_data: []const u8, out: []u8) ![]const u8 {
     return parsePemSection(pem_data, "CERTIFICATE", out);
 }
 
+/// Decode a private key from a PEM document into `out` and return it.
+///
+/// Tries the three labels a private key arrives under, in order — EC
+/// (SEC1), then PKCS#1 RSA, then PKCS#8 — so a caller does not have to know
+/// which encoding its key file used, and gets the first that parses. The
+/// ownership is `parsePemCert`'s: the result is the caller's `out`, and
+/// `pem_data` is only borrowed. The bytes are still encoded, so
+/// `extractPrivateKey` is what turns them into a key and an algorithm.
+///
 pub fn parsePemPrivateKey(pem_data: []const u8, out: []u8) ![]const u8 {
     return parsePemSection(pem_data, "EC PRIVATE KEY", out) catch
         parsePemSection(pem_data, "RSA PRIVATE KEY", out) catch
@@ -3226,8 +3336,15 @@ fn parsePemSection(pem_data: []const u8, comptime label: []const u8, out: []u8) 
     return out[0..decoded_len];
 }
 
-// Extract the 32-byte raw private key from a DER-encoded EC private key.
-// RFC 5915: ECPrivateKey ::= SEQUENCE { version, privateKey, ... }
+/// The private scalar inside an RFC 5915 `ECPrivateKey`, borrowed out of
+/// `der`.
+///
+/// **A slice of `der`,** so it is valid while that DER is and must not be
+/// freed by the caller: the handshake copies what it keeps. Only the two
+/// leading fields of the SEQUENCE are walked — version and the key
+/// OCTET STRING — because nothing else in the structure is needed to sign.
+/// `error.DecodeError` is every way the walk fails.
+///
 pub fn extractEcPrivateKey(der: []const u8) ![]const u8 {
     // Simple DER walk: SEQUENCE -> version INTEGER -> OCTET STRING (the key)
     if (der.len < 2) return error.DecodeError;
@@ -3256,8 +3373,15 @@ pub fn extractEcPrivateKey(der: []const u8) ![]const u8 {
     return der[pos..][0..32];
 }
 
-// Extract the 32-byte raw private key from a PKCS#8 DER-encoded private key.
-// PKCS#8: SEQUENCE { version, AlgorithmIdentifier, OCTET STRING { ECPrivateKey } }
+/// The RFC 5915 `ECPrivateKey` nested inside a PKCS#8 `PrivateKeyInfo`
+/// (RFC 5915 §3), borrowed out of `der`.
+///
+/// **A slice of `der`**, with the same ownership and the same obligation as
+/// `extractEcPrivateKey`: the wrapper is walked and the inner structure is
+/// pointed at, not copied. The algorithm identifier is checked on the way
+/// through, so a PKCS#8 key that is not an EC key is a `DecodeError` here
+/// rather than a wrong answer later.
+///
 pub fn extractPkcs8EcPrivateKey(der: []const u8) ![]const u8 {
     // Walk the outer SEQUENCE
     if (der.len < 2 or der[0] != 0x30) return error.DecodeError;
@@ -3329,8 +3453,14 @@ fn readDerValue(der: []const u8, pos: *usize, expected_tag: u8) ![]const u8 {
     return value;
 }
 
-// Extract the 32-byte Ed25519 seed from a PKCS#8 DER-encoded private key.
-// RFC 8410: AlgorithmIdentifier OID 1.3.101.112, PrivateKey OCTET STRING.
+/// The 32-byte ed25519 seed inside a PKCS#8 `PrivateKeyInfo` (RFC 8410
+/// §7), borrowed out of `der`.
+///
+/// **A slice of `der`.** RFC 8410 nests the key in an OCTET STRING inside the
+/// private-key OCTET STRING, and both wrappers are walked to reach it; the
+/// algorithm identifier has to be 1.3.101.112 or this is a `DecodeError`
+/// rather than 32 bytes that are not a key.
+///
 pub fn extractEd25519PrivateKey(der: []const u8) ![]const u8 {
     var outer_pos: usize = 0;
     const outer = try readDerValue(der, &outer_pos, 0x30);
@@ -3367,6 +3497,13 @@ pub fn extractRsaPrivateKey(der: []const u8) rsa.Error![]const u8 {
     return pkcs1;
 }
 
+/// A private key: the raw key bytes and which algorithm they belong to.
+///
+/// **Both fields borrow.** `bytes` points into the DER the key was extracted
+/// from, so a `PrivateKey` is valid exactly as long as that DER is, and a
+/// caller that needs it longer copies it. The two together are what a
+/// certificate is signed and verified with, and `algorithm` is what says
+/// which signature schemes may be used.
 pub const PrivateKey = struct {
     /// A slice of the DER it was extracted from.
     bytes: []const u8,

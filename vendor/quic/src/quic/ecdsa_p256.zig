@@ -28,6 +28,10 @@ const Ecdsa = crypto.sign.ecdsa.EcdsaP256Sha256;
 const Sha256 = crypto.hash.sha2.Sha256;
 const Prf = crypto.auth.hmac.Hmac(Sha256);
 
+/// Bytes of deterministic per-signature noise the deterministic ECDSA path
+/// derives, mixed into each signature so two signatures over the same message
+/// differ. It is not a random draw: the value comes from the key and the
+/// message, which is what makes the scheme deterministic and reproducible.
 pub const noise_length = Ecdsa.noise_length;
 
 /// `j·16^i·G` at `[i][j - 1]`.

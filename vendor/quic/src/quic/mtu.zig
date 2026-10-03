@@ -22,6 +22,15 @@ const MIN_PROBE_INTERVAL: i64 = 200_000_000;
 /// Timer for re-probing after search completes (600 seconds = 10 minutes).
 const RAISE_TIMER_NS: i64 = 600_000_000_000;
 
+/// Where a path's MTU discovery has got to.
+///
+/// One value per path, and it only moves forward: `disabled` until the
+/// handshake completes, then `searching` while probes narrow the range, then
+/// `search_complete` when the search has converged and the PLPMTU is the
+/// largest size the path answered for. Nothing returns to `searching` except
+/// a new path or a lost probe, which is why a caller reads this to decide
+/// whether a probe is worth scheduling at all.
+///
 pub const MtuState = enum {
     /// Search not started yet (waiting for handshake).
     disabled,

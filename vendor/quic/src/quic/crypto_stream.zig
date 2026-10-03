@@ -60,7 +60,24 @@ pub const CryptoStream = struct {
     }
 
     /// Read contiguous TLS handshake data from the receive buffer.
-    /// Returns null if no complete data is available.
+    ///
+    /// Returns null when no complete data is available — a hole is still
+    /// open, or nothing has arrived — and the connection keeps the buffered
+    /// runs until the peer's retransmission fills what is missing. It is not
+    /// an error and not the end of the handshake.
+    ///
+    /// **A non-null result is owned by the caller**, who must free it with
+    /// `self.allocator` — the same allocator the stream was built with, not
+    /// whatever the TLS stack happens to hold. The chunk has left the sorter
+    /// and nothing else refers to the allocation, so `deinit` cannot free it
+    /// and a caller that drops the slice leaks it. It stays valid past
+    /// `deinit`, for the same reason: nothing in the stream holds it.
+    ///
+    /// The read position and the crypto-buffer window move before the caller
+    /// sees the slice, so a caller that cannot keep what it is handed has lost
+    /// it; `recv_sorter.peekLen` is how it asks first. See
+    /// `FrameSorter.pop` for the same contract one layer down.
+    ///
     pub fn read(self: *CryptoStream) ?[]const u8 {
         return self.recv_sorter.pop();
     }

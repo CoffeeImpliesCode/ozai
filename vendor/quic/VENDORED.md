@@ -477,6 +477,71 @@ status of the completed corrected survey. Nothing until that run finishes. The
 earlier 18 executed / 20 build-only / 70 failed / exit 1 result describes the
 pre-address, pre-fixture survey and is not this one's outcome. -->
 
+### 8. Repairs to contracts the audit found, named by what each one stops
+
+Seven of the eight are not protocol changes. They are places where the core
+took a decision it could not take back — consumed a frame, spent a packet
+number, filled a buffer with a key it did not have — and where the API around
+it did not say so before the caller had already paid.
+
+**A refused read keeps the bytes (`src/quic/stream.zig`).** `FrameSorter.pop`
+removed a chunk and then discovered it could not copy it, freeing the
+allocation and returning null: a run the peer had already been credited for,
+and which it will never retransmit because from its side it was delivered. The
+chunk goes back at the head of the list with its hole count undone, and the
+list has the slot it just vacated, so the restore cannot fail. `peekLen` is the
+new way to ask how much a read holds without taking it, which is what lets a
+caller make room *before* the read rather than after it.
+
+**`ReceiveStream.read` says what a caller owns (`src/quic/stream.zig`).** The
+slice it returns is an allocation the caller frees with the stream's allocator,
+and the read position, `bytes_read` and the connection credit have all moved by
+the time it is handed over. `CryptoStream.read` (`src/quic/crypto_stream.zig`)
+had the same ownership and none of the words.
+
+**Version Negotiation packets have a length (`src/quic/packet.zig`).** A VN
+header carries no Length field, so `parse` left `remainder_len` undefined —
+and a reader walking a coalesced datagram stepped by it before `recv` had
+decided to ignore the packet. The whole remainder of the datagram is the
+packet, which is what Retry and 1-RTT already recorded.
+
+**QUIC-LB states the combined length its fixed buffer assumes
+(`src/quic/quic_lb.zig`).** `extractServerId` decodes into a 20-byte stack
+buffer because the longest payload a connection id may carry is 19 bytes —
+`server_id_len + nonce_len`, plus the first octet, and QUIC's own 20-byte
+limit. The rule is now on `Config`, where the two lengths are written down,
+with the per-field ranges marked as necessary and not sufficient. Nothing
+validates it at runtime: a config is written once and checked on every packet,
+so a check would buy a per-packet cost to catch a constant.
+
+**`decryptPayload` cannot be out of memory (`src/quic/crypto.zig`).** It
+declared `error.OutOfMemory` and could only ever produce
+`error.AuthenticationFailed`; no allocation happens on that path. The set is
+now what the code can return, so a caller that saw an allocator error from it
+was reading a signature the function did not have — and the one caller that
+does propagate it, `packet.decrypt`, propagates a smaller set as a
+consequence.
+
+**The module root states the four things every consumer needs
+(`src/lib.zig`).** Time, randomness, the allocator and ownership are parameters
+and per-declaration contracts, and none of them were written down at the one
+place a consumer starts reading. Each re-export now says what that module is
+and what it borrows.
+
+**The wrapper states what its room costs (`src/transport/quic_bridge.zig`).**
+`Connection.sendAt` consumes what it packs, so `Conn.drain` asks the core for a
+datagram only where it can finish the job: an empty `out`, a buffer under one
+padded Initial, or a path with no address is refused with nothing built, and
+room running out between datagrams is a short answer rather than a refusal, so
+every datagram built is inside a run that is handed back. `Stream.drain` takes
+the room in its caller's sink before the read that would hand over the bytes.
+`Bridge.create` keeps `error.Canceled` apart from `error.EntropyUnavailable`,
+because one is the caller's own cancellation and the other is an `std.Io` that
+cannot key the bridge. And a peer pin now forces a certificate: the pin is read
+out of the same block `require_peer_certificate` decides whether to ask for,
+so a caller that named a peer and cleared that flag had its pin dropped.
+
+## Measured cost
 ## Measured cost
 
 | | Predicted | Measured |

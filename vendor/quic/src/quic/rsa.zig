@@ -15,7 +15,15 @@ const ff = std.crypto.ff;
 const mont = @import("mont.zig");
 const mem = std.mem;
 
+/// Smallest key this module accepts, in bits. A shorter key is refused by the
+/// parser rather than signed with: one that size is not a key anyone should be
+/// using, and accepting it would make that choice the caller's to discover by
+/// hand.
+///
 pub const min_bits = 2048;
+/// Largest key this module accepts, in bits, and so the width of every
+/// fixed-size number this module holds.
+///
 pub const max_bits = 4096;
 /// Longest signature: one modulus length.
 pub const max_signature_len = max_bits / 8;
@@ -32,6 +40,13 @@ comptime {
 // 1.2.840.113549.1.1.1
 const rsa_encryption_oid = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
 
+/// Everything this module refuses.
+///
+/// The three are ordered by how far the input got: `DecodeError` is bytes
+/// that are not a key at all, `UnsupportedKey` is a well-formed key this
+/// module will not use (the wrong size, or not two primes), and `InvalidKey`
+/// is one whose numbers contradict each other. None is worth retrying.
+///
 pub const Error = error{
     /// Not a well-formed key encoding.
     DecodeError,

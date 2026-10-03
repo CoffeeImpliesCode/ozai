@@ -45,7 +45,21 @@ const SAMPLE_LEN: usize = crypto_mod.SAMPLE_LEN;
 /// - Collecting frames (ACK, CRYPTO, STREAM, control)
 /// - Applying payload encryption and header protection
 /// - Padding Initial packets to minimum 1200 bytes
+///
+/// **It owns copies of both connection ids.** `scid_buf` and `dcid_buf` are
+/// its own, so a caller may hand it ids living anywhere — including inside the
+/// connection it belongs to — and may then move that connection: what this
+/// packs from is what `init` was given, changed only by `updateDcid`. The
+/// fields it borrows rather than owns are named as such (`initial_token`,
+/// `conn_flow_ctrl`), and those are the caller's to keep alive.
+///
+/// **Nothing here allocates.** Every packet is assembled in a stack buffer and
+/// sealed into the caller's `out_buf`, so there is no `deinit` and no
+/// allocation failure on the send path — the only ways a send can fail are the
+/// caller's buffer being too small and the packet number having to skip.
 pub const PacketPacker = struct {
+    /// The connection's allocator, kept beside it so the two are built
+    /// together. Nothing in this type allocates with it today.
     allocator: Allocator,
     is_server: bool,
 

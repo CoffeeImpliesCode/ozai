@@ -1,8 +1,26 @@
+/// QUIC version 1 (RFC 9000). The version every connection starts on: a
+/// client offers v2 only through Compatible Version Negotiation, never by
+/// writing it into its first packet.
+///
 pub const QUIC_V1: u32 = 0x00000001;
+/// QUIC version 2 (RFC 9369). The same wire protocol with a different initial
+/// salt, different HKDF labels and a different packet-type mapping, which is
+/// why every derivation asks `isV2` rather than comparing against this value.
+///
 pub const QUIC_V2: u32 = 0x6b3343cf; // RFC 9369
 
+/// Every version this core speaks, most preferred first. The order is what a
+/// Version Negotiation packet offers a peer, and the first entry is what a
+/// client sends.
+///
 pub const SUPPORTED_VERSIONS = [_]u32{ QUIC_V1, QUIC_V2 };
 
+/// Whether `version` is one this core speaks.
+///
+/// Version 0 is not a version: it is the marker that makes a packet a Version
+/// Negotiation packet (RFC 9000 §6.1), so a header parsed with version 0 has
+/// to be recognised before this is asked about it.
+///
 pub fn isSupportedVersion(version: u32) bool {
     for (SUPPORTED_VERSIONS) |v| {
         if (version == v) return true;

@@ -1439,3 +1439,26 @@ test "decodePacketNumber: RFC 9000 Appendix A examples" {
     // Let's use the simplest case: largest=0, truncated=0, nbits=8 -> 0
     try std.testing.expectEqual(@as(u64, 0), decodePacketNumber(0, 0, 8));
 }
+
+test "a version negotiation packet carries no length field, so it is the whole datagram" {
+    // RFC 9000 §6.1: first byte with the long-header bit, a version of zero,
+    // both connection ids, then the versions a peer may choose from. There is
+    // no Length field anywhere in it.
+    var bytes = [_]u8{0} ** 40;
+    bytes[0] = 0xc0;
+    std.mem.writeInt(u32, bytes[1..5], 0, .big);
+    bytes[5] = 4;
+    @memcpy(bytes[6..10], &[_]u8{ 1, 2, 3, 4 });
+    bytes[10] = 4;
+    @memcpy(bytes[11..15], &[_]u8{ 5, 6, 7, 8 });
+    std.mem.writeInt(u32, bytes[15..19], protocol.QUIC_V1, .big);
+    std.mem.writeInt(u32, bytes[19..23], protocol.QUIC_V2, .big);
+
+    var fbs = io.fixedBufferStream(&bytes);
+    const header = try Header.parse(&fbs, 0);
+    try std.testing.expectEqual(PacketType.version_negotiation, header.packet_type);
+    // What is left of the datagram is the packet, and a reader that walks a
+    // coalesced datagram by this number steps over the whole thing instead of
+    // a value it never had.
+    try std.testing.expectEqual(bytes.len - fbs.seek, header.remainder_len);
+}

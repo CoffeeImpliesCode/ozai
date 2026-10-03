@@ -2,34 +2,52 @@ const std = @import("std");
 const crypto = std.crypto;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 
+/// Bytes of a stateless reset token, and the tail every reset packet ends
+/// with (RFC 9000 §10.3).
+///
 pub const TOKEN_LEN: usize = 16;
+/// The shortest packet that can be a reset: one byte of header, four of
+/// noise, and the token. Shorter than this and the tail is more likely to be
+/// a real packet than a reset, so `isStatelessReset` refuses it.
+///
 pub const MIN_PACKET_LEN: usize = 21; // RFC 9000 §10.3: at least 1 byte header + 4 random + 16 token
 
-// Compute a deterministic stateless reset token from a static key and connection ID.
-// HMAC-SHA256(static_key, conn_id), truncated to 16 bytes.
+/// The reset token for `conn_id` under `static_key`:
+/// `HMAC-SHA256(static_key, conn_id)` truncated to `TOKEN_LEN`.
+///
+/// Deterministic, and that is the point: a server forgets a connection and
+/// still recognises its reset, because the token comes from the key and the
+/// connection id rather than from state. `static_key` is the same key every
+/// reset this peer might send is signed under — see `ConnectionManager` —
+/// and it is a secret: anyone holding it can compute the token for any
+/// connection id.
+///
 pub fn computeToken(static_key: [16]u8, conn_id: []const u8) [TOKEN_LEN]u8 {
     var mac: [HmacSha256.mac_length]u8 = undefined;
     HmacSha256.create(&mac, conn_id, &static_key);
     return mac[0..TOKEN_LEN].*;
 }
 
-// Generate a stateless reset packet (RFC 9000 §10.3).
-// Format: random header bytes (looks like short header) + stateless_reset_token as last 16 bytes.
-// Returns the number of bytes written, or 0 if max_size is too small.
-//
-// `random` fills the bytes in front of the token and is read nowhere else. The
-// token is the unforgeable part, and it is not drawn here at all: it is
-// HMAC(static_key, conn_id), so a third party cannot compute one for a
-// connection whose static key it does not have. These bytes are the other half
-// of that promise (RFC 9000 §10.3.3) — the noise that lets a reset pass as
-// traffic and keeps a blind attacker from synthesising one. So they must be
-// unpredictable in production; a fixed pattern would hand back the off-path DoS
-// the reset exists to stop. The draw is a parameter, not a global, so a weak
-// source cannot be substituted silently: `std.Random` has no null that means
-// "skip it", there is no fallback that quietly reaches for the process CSPRNG,
-// and the caller that holds the CSPRNG has to name it. A test names a seeded
-// one, which is the only way the round trip below can assert on the bytes it
-// produced.
+/// Write a stateless reset packet into `out` and return its length, or 0 when
+/// `max_size` (or `out`) leaves no room for one.
+///
+/// The shape is a short-header-looking first byte, unpredictable noise, and
+/// the token in the last `TOKEN_LEN` bytes (RFC 9000 §10.3.3). The noise is
+/// half of what makes a reset safe to send: it is what lets the packet pass
+/// as traffic and stops a blind attacker from synthesising one, so the bytes
+/// in front of the token must be unpredictable in production and a fixed
+/// pattern would hand back the off-path denial of service the reset exists to
+/// prevent.
+///
+/// `random` fills exactly those bytes and is read nowhere else. The token
+/// itself is not drawn — it is `computeToken(static_key, conn_id)`, so a
+/// third party cannot compute one for a connection whose static key it does
+/// not have. The draw is a parameter rather than a global for the same reason
+/// every draw in this tree is: `std.Random` has no null that means "skip it",
+/// there is no fallback that quietly reaches for the process CSPRNG, and the
+/// caller holding the CSPRNG has to name it. A test passes a seeded one,
+/// which is the only way a round trip can assert on the bytes produced.
+///
 pub fn generatePacket(
     out: []u8,
     max_size: usize,
@@ -58,8 +76,13 @@ pub fn generatePacket(
     return size;
 }
 
-// Check if a received packet is a stateless reset by comparing its last 16 bytes
-// against known peer reset tokens.
+/// Whether `data` ends in one of `tokens`, and so is a stateless reset.
+///
+/// The comparison is constant-time: the token is a secret, and a timing
+/// oracle here would leak it one byte at a time (RFC 9000 §10.3). `tokens` is
+/// the caller's list of every reset token a peer may still send — usually one
+/// per connection id the peer issued — and every one is checked, because a
+/// packet is a reset if it matches any of them.
 pub fn isStatelessReset(data: []const u8, tokens: []const [TOKEN_LEN]u8) bool {
     if (data.len < MIN_PACKET_LEN) return false;
 

@@ -356,6 +356,21 @@ pub const FrameSorter = struct {
         c.buf = buf;
     }
 
+    /// Bytes the next `pop` would return, or null when `pop` would return
+    /// null. It reads nothing and consumes nothing, so a caller that has to
+    /// prepare before it takes the bytes — an append that can fail, say —
+    /// can ask first and keep the run when the preparation did not.
+    ///
+    /// Exact rather than an upper bound: `pop` returns that same run, so a
+    /// caller that made room for this much has room for what it gets.
+    pub fn peekLen(self: *const FrameSorter) ?usize {
+        if (self.chunks.items.len == 0) return null;
+        const first = self.chunks.items[0];
+        if (first.offset > self.read_pos or first.end() <= self.read_pos) return null;
+        const consumed: usize = @intCast(self.read_pos - first.offset);
+        return first.data.len - consumed;
+    }
+
     /// Pop the next contiguous chunk of data from the read position.
     /// Returns null if there's no data available at the current read position.
     ///
@@ -373,11 +388,6 @@ pub const FrameSorter = struct {
 
         if (self.chunks.items.len > 1 and first.end() != self.chunks.items[1].offset) self.breaks -= 1;
         _ = self.chunks.orderedRemove(0);
-        // A reordering burst can leave room for up to a thousand holes' worth
-        // of chunks; hand it back once drained.
-        if (self.chunks.items.len == 0 and self.chunks.capacity > RETAINED_CHUNKS) {
-            self.chunks.clearAndFree(self.allocator);
-        }
         const skip: usize = @intCast(self.read_pos - first.offset);
         const readable = first.data[skip..];
         // The caller frees what we return, so it must be a whole allocation;
@@ -388,12 +398,24 @@ pub const FrameSorter = struct {
             first.data
         else blk: {
             const copy = self.allocator.dupe(u8, readable) catch {
-                self.allocator.free(first.allocation());
+                // The chunk has left the list but nothing was read and nothing
+                // was delivered, so freeing it here would drop a run the peer
+                // cannot retransmit — it has been received, and from its side
+                // that is done. Put it back at the head and undo the hole its
+                // removal closed; the list still has the slot it vacated, so
+                // this cannot fail and the retry sees the same run.
+                self.chunks.insertAssumeCapacity(0, first);
+                if (self.chunks.items.len > 1 and first.end() != self.chunks.items[1].offset) self.breaks += 1;
                 return null;
             };
             self.allocator.free(first.allocation());
             break :blk copy;
         };
+        // A reordering burst can leave room for up to a thousand holes' worth
+        // of chunks; hand it back once the chunk is out of the way.
+        if (self.chunks.items.len == 0 and self.chunks.capacity > RETAINED_CHUNKS) {
+            self.chunks.clearAndFree(self.allocator);
+        }
         self.read_pos += readable.len;
         return owned;
     }
@@ -513,13 +535,36 @@ pub const ReceiveStream = struct {
         self.sorter.fin_offset = final_size;
     }
 
-    /// Read contiguous data from the stream.
-    /// Returns the data slice or null if no data is available.
+    /// Bytes the next `read` would return, or null when it would return null.
+    ///
+    /// Nothing is consumed and no counter moves: no credit is earned, nothing
+    /// is delivered, and the run stays on the stream. A consumer that has to
+    /// prepare for a run before it takes it asks here first, so a
+    /// preparation that cannot be made leaves the bytes where the peer's
+    /// next retransmission still stands behind them. The answer is exact:
+    /// `read` returns that same run, so room made for this much is room for
+    /// what arrives.
+    pub fn peekLen(self: *const ReceiveStream) ?usize {
+        if (self.reset_err != null) return null;
+        return self.sorter.peekLen();
+    }
+
+    /// Read contiguous data from the stream, advancing everything that counts.
+    ///
+    /// Returns the run the peer sent that begins at the read position, or null
+    /// when no such run is buffered. Null is two different answers — nothing
+    /// has arrived, or the stream is complete and `finished` is now set — and
+    /// neither is a failure.
     ///
     /// A non-null result is owned by the caller, who must free it with the
     /// allocator this stream was built with. It is not a view into the stream
     /// and it stays valid past `deinit`, because nothing in the stream holds
     /// it any more. See `FrameSorter.pop`.
+    ///
+    /// The read position, `bytes_read` and the credit this stream has earned
+    /// from the connection all move before the caller sees the slice, so a
+    /// caller that cannot keep what it is handed has lost it. `peekLen` is how
+    /// it asks whether it can keep it first.
     pub fn read(self: *ReceiveStream) ?[]const u8 {
         if (self.reset_err != null) return null;
 
@@ -3806,4 +3851,65 @@ test "FrameSorter: chunk slots from a reordering burst are released once drained
 
     try testing.expectEqual(@as(u64, 2 * n), sorter.read_pos);
     try testing.expectEqual(@as(usize, 0), sorter.chunks.capacity);
+}
+
+test "FrameSorter: peekLen reports the next run without consuming it" {
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
+
+    // A gap first, so the head of the list is not the read position.
+    try sorter.push(64, "the second run", false);
+    try testing.expectEqual(@as(?usize, null), sorter.peekLen());
+
+    try sorter.push(0, "the first run", false);
+    try testing.expectEqual(@as(?usize, "the first run".len), sorter.peekLen());
+    // Reading what was peeked does not move it out from under the next peek.
+    try testing.expectEqual(@as(?usize, "the first run".len), sorter.peekLen());
+    const first = sorter.pop().?;
+    try testing.expectEqualStrings("the first run", first);
+    testing.allocator.free(first);
+    try testing.expectEqual(@as(?usize, "the second run".len), sorter.peekLen());
+}
+
+test "FrameSorter: a copy that cannot be made leaves the run on the stream" {
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
+
+    // Two runs pushed out of order coalesce into one chunk with room in
+    // front of it, which is the case where `pop` has to copy rather than
+    // hand over the allocation it already has.
+    try sorter.push(64, "the second run", false);
+    try sorter.push(0, "the first run", false);
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    sorter.allocator = failing.allocator();
+    try testing.expectEqual(@as(?[]const u8, null), sorter.pop());
+    sorter.allocator = testing.allocator;
+
+    // The refused pop is not a delivery: nothing was read, and the bytes are
+    // still the stream's to hand over. A peer cannot retransmit them, because
+    // from its side they were received.
+    try testing.expectEqual(@as(u64, 0), sorter.read_pos);
+    try testing.expectEqual(@as(?usize, "the first runthe second run".len), sorter.peekLen());
+    const both = sorter.pop().?;
+    try testing.expectEqualStrings("the first runthe second run", both);
+    testing.allocator.free(both);
+}
+
+test "ReceiveStream: a refused read costs the consumer nothing and no credit" {
+    var stream = ReceiveStream.init(testing.allocator, 0);
+    defer stream.deinit();
+    try stream.handleStreamFrame(0, "payload", false);
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    stream.sorter.allocator = failing.allocator();
+    try testing.expectEqual(@as(?[]const u8, null), stream.read());
+    stream.sorter.allocator = testing.allocator;
+
+    try testing.expectEqual(@as(u64, 0), stream.bytes_read);
+    try testing.expectEqual(@as(u64, 0), stream.takeConnCredit());
+    const payload = stream.read().?;
+    try testing.expectEqualStrings("payload", payload);
+    testing.allocator.free(payload);
+    try testing.expectEqual(@as(u64, "payload".len), stream.bytes_read);
 }

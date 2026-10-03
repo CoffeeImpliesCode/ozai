@@ -17,10 +17,24 @@ pub fn paddingLen(bytes: []const u8) usize {
     return i;
 }
 
+/// Everything decoding can refuse.
+///
+/// One code, because QUIC has one answer to it: a frame this core cannot
+/// parse is a `FRAME_ENCODING_ERROR` for the peer (RFC 9000 §19.6), so there
+/// is nothing for a caller to tell apart. `Frame.parse` returns it and
+/// `Connection.processFrame` turns it into that transport error.
 pub const FrameError = error{
     FrameEncodingError,
 };
 
+/// A frame's type code, by its value on the wire.
+///
+/// The `_` arm is the extension point: a code this core does not know is not
+/// an error here, it is a `FrameType` the union can hold and `Frame.parse`
+/// reports as one, so an unknown frame type is skipped per RFC 9000 §12.4
+/// instead of closing the connection. `Padding` is a type of its own rather
+/// than being stripped first, because its length is what carries the run.
+///
 pub const FrameType = enum(u64) {
     padding = 0x00,
     ping = 0x01,
@@ -92,6 +106,17 @@ pub const AckRange = struct {
 /// Maximum number of additional ACK ranges stored inline (avoids allocation).
 pub const MAX_ACK_RANGES: usize = 32;
 
+/// One decoded frame: the type from `FrameType` and the fields that type has.
+///
+/// **A parsed frame borrows.** `crypto` and `stream` hold `[]const u8` out of
+/// the buffer they were decoded from and are good until that buffer is
+/// written again; `connection_close` and `application_close` hold the reason
+/// phrase the same way. Nothing here copies a payload, so a frame that has to
+/// outlive its datagram must be re-encoded or copied by the caller.
+///
+/// The inverse of that is what `PendingControlFrame` is for: a frame on its
+/// way out is copied into a fixed buffer instead, because it is held in a
+/// queue while more packets are built.
 pub const Frame = union(FrameType) {
     padding: usize,
 

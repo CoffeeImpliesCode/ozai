@@ -10,8 +10,11 @@
 /// `DatagramQueue.resize` allocates beyond this when an app asks for more.
 pub const datagram_static_items: usize = 32;
 
-/// Packets buffered while their keys are missing (RFC 9001 4.1.4 permits
-/// dropping when full).
+/// Packets buffered while their keys are missing (RFC 9001 §4.1.4 permits
+/// dropping when full): `undecryptable_buf_len` is the bytes they may take,
+/// `undecryptable_max_pkts` the entries. Both bounds exist because the peer
+/// is unauthenticated until the handshake completes, so the queue it can fill
+/// has to be capped; past either, a packet is dropped rather than buffered.
 pub const undecryptable_buf_len: usize = 32 * 1024;
 pub const undecryptable_max_pkts: usize = 32;
 
@@ -38,11 +41,14 @@ pub const max_crypto_stream_offset: u64 = tls_handshake_in;
 /// cost. A peer advertising more is clamped, not trusted.
 pub const qpack_table_capacity: usize = 4096;
 
-/// TLS 1.3 handshake staging, heap-allocated per connection alongside
-/// `Connection` (`tls13_hs`) and the largest single allocation unit left.
-/// The out buffer holds one outgoing flight, dominated by the Certificate
-/// message, so it scales with the local cert chain — 32 KB covers the
-/// 9-cert amplificationlimit interop case. The in buffer reassembles one
-/// peer flight.
+/// TLS 1.3 handshake staging, heap-allocated per connection beside
+/// `Connection` and the largest single allocation unit left in the core.
+///
+/// `tls_handshake_out` holds one outgoing flight, dominated by the
+/// Certificate message, so it scales with the local certificate chain — 32 KB
+/// covers the nine-certificate amplification-limit interop case.
+/// `tls_handshake_in` reassembles one peer flight, which is all of a handshake
+/// that can arrive before TLS has anything to say, and it is what
+/// `max_crypto_stream_offset` is measured against.
 pub const tls_handshake_out: usize = 32 * 1024;
 pub const tls_handshake_in: usize = 16 * 1024;

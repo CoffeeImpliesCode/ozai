@@ -1248,3 +1248,42 @@ test "past retry_threshold a new client gets Retry, and is served once it echoes
     try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
     try std.testing.expect(mgr.entries.items[0].conn.paths[0].is_validated);
 }
+
+test "an accept that runs out of memory leaves no connection and no entry behind" {
+    const local: address.Address = .unset;
+    const scid = [_]u8{0xaa} ** 8;
+    const dcid = [_]u8{0xbb} ** 8;
+    const header: packet.Header = .{
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .packet_type = .initial,
+        .dcid = &dcid,
+        .scid = &scid,
+    };
+    var entropy = TestRandom.init(7);
+
+    // Every allocation an accept makes, one at a time, so the refusal lands
+    // at each step in turn: the two reservations, the connection, and the
+    // handshake and queues built inside it.
+    var fail_at: usize = 0;
+    while (fail_at < 8) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_at });
+        var mgr = testManager(failing.allocator(), entropy.random());
+        defer mgr.deinit();
+
+        if (mgr.acceptConnection(header, local, local, null, null, test_now, entropy.random())) |entry| {
+            // This step fitted: drop the connection the way a server does
+            // and let the next refusal be measured on a clean table.
+            mgr.removeConnection(entry);
+            mgr.freeDeadEntries();
+            continue;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            // A refused accept is not a connection: nothing in the table to
+            // remove, nothing in the routing map to route to, and nothing the
+            // testing allocator still holds an account of.
+            try std.testing.expectEqual(@as(usize, 0), mgr.entries.items.len);
+            try std.testing.expectEqual(@as(usize, 0), mgr.cid_map.count());
+            try std.testing.expectEqual(@as(usize, 0), mgr.dead_entries.items.len);
+        }
+    }
+}

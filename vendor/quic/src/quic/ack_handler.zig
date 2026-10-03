@@ -39,12 +39,15 @@ const MAX_PTO: i64 = 60_000_000_000;
 /// Caps backoff to ensure timely retransmission under extreme packet loss.
 const MAX_HANDSHAKE_PTO: i64 = 3_000_000_000;
 
-/// Maximum number of stream frame records per sent packet.
-/// Must be large enough to track all stream frames in a packet (e.g., many small 0-RTT streams).
-// Cap inline stream-frame records per sent packet. Each is 32 bytes and lives
-// inside SentPacket (one per in-flight packet). A 1200-byte MTU can't fit many
-// usefully-sized stream frames anyway — 12 is generous for real traffic and
-// keeps SentPacket at ~432 bytes instead of ~1.6KB.
+/// Maximum number of stream frame records kept per sent packet, so a lost
+/// packet can be retransmitted from what was recorded about it.
+///
+/// Each record is 32 bytes and lives inside the `SentPacket`, of which there
+/// is one per packet in flight, so this is a memory-per-packet decision as
+/// much as a protocol one: 12 keeps a `SentPacket` around 432 bytes instead of
+/// 1.6 KB, and a 1200-byte datagram cannot carry many usefully sized stream
+/// frames anyway. A packet that needs a thirteenth frame sends it in a later
+/// packet rather than dropping it.
 pub const MAX_STREAM_FRAMES_PER_PACKET: usize = 12;
 
 /// Retransmittable control frames recorded per sent packet. A packet that
