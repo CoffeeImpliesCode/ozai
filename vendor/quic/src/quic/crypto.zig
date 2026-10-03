@@ -1,6 +1,11 @@
+//! Packet protection: key derivation, AEAD sealing and opening, header
+//! protection, and the key rotation of RFC 9001 §6. Nothing here reads a
+//! clock, draws randomness or allocates — every key comes from values the
+//! caller passes, so the same secrets protect the same packets twice — and
+//! every struct here is a value whose copies are independent of each other.
+
 const std = @import("std");
 const protocol = @import("protocol.zig");
-const packet = @import("packet.zig");
 const assert = std.debug.assert;
 
 const crypto = std.crypto;
@@ -9,7 +14,6 @@ const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 const Aes128 = crypto.core.aes.Aes128;
-const Aes256 = crypto.core.aes.Aes256;
 const ChaCha20Poly1305 = crypto.aead.chacha_poly.ChaCha20Poly1305;
 const ChaCha20IETF = crypto.stream.chacha.ChaCha20IETF;
 const aes_gcm = @import("aes_gcm.zig");
@@ -19,10 +23,28 @@ const INITIAL_SALT_V1 = [_]u8{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0
 // RFC 9369 §3.1: QUIC v2 initial salt
 const INITIAL_SALT_V2 = [_]u8{ 0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9 };
 
-// Header protection sample length
+/// Bytes of a protected packet the header-protection mask is computed over
+/// (RFC 9001 §5.4.2). The sample starts four bytes after the packet number
+/// offset, which is why a packet shorter than that plus this cannot be
+/// protected at all.
+///
 pub const SAMPLE_LEN = 16;
+/// Bytes of header protection a mask carries: one for the first byte and
+/// four for a packet number that may be encoded as long as four bytes.
+/// RFC 9001 §5.4.3 fixes the mask at five whatever the packet number's own
+/// length turns out to be, so the four are computed even for a shorter one.
+///
 pub const MASK_LEN = 5;
 
+/// AES-128-GCM: the AEAD of the Initial keys (RFC 9001 §5.2) and of the
+/// `aes_128_gcm_sha256` suite, and what the Retry and NEW_TOKEN seals use,
+/// which are not negotiated per suite.
+///
+/// `chacha20_poly1305_sha256` seals with ChaCha20-Poly1305 and not with
+/// this, so the name is not a way to ask what a `Seal` will encrypt with —
+/// `Seal.cipher_suite` is. What both suites agree on, and what a caller
+/// sizes a payload buffer by, is the 16-byte tag.
+///
 pub const Aead = Aes128Gcm;
 const Hmac = HmacSha256;
 
@@ -30,16 +52,40 @@ const Hmac = HmacSha256;
 /// Seal/Open from the (immutable) hp_key, then reused on every packet.
 pub const Aes128HpCtx = @TypeOf(Aes128.initEnc(@as([16]u8, undefined)));
 
-// AES-128-GCM key length (used for initial keys which are always AES)
+/// AES-128-GCM key length, which is also the length of the Initial keys
+/// because those are always AES.
+///
 pub const key_len = 16;
+/// AEAD nonce length: the IV every key is derived with, and the width the
+/// packet number is XORed into (RFC 9001 §5.3).
+///
 pub const nonce_len = 12;
-// Max key length across all cipher suites (ChaCha20 = 32 bytes)
+/// The widest key any cipher suite here uses (ChaCha20-Poly1305), and so the
+/// width the fixed-size key arrays are. The bytes past the suite's own key
+/// length are zero and are never read.
+///
 pub const max_key_len = 32;
 
+/// A TLS 1.3 cipher suite, by its IANA code point.
+///
+/// The suite chooses three things at once — the AEAD, the key length and the
+/// header-protection function — and this core keeps all three together
+/// because the derivation is per suite. The enum's integer is the code
+/// point that goes on the wire; the variant name is this module's own
+/// spelling of it and is never sent.
 pub const CipherSuite = enum(u16) {
+    /// AES-128-GCM with SHA-256, IANA 0x1301 (RFC 8446 §9.1): the suite the
+    /// Initial keys are, and the only one `prepareCtx` fills contexts for.
     aes_128_gcm_sha256 = 0x1301,
+    /// ChaCha20-Poly1305 with SHA-256, IANA 0x1303 (RFC 8446 §9.1): 32-byte
+    /// keys, and header protection by the ChaCha20 block function
+    /// (RFC 9001 §5.4.4) rather than by AES.
     chacha20_poly1305_sha256 = 0x1303,
 
+    /// The AEAD key length in bytes: 16 for AES-128-GCM, 32 for
+    /// ChaCha20-Poly1305. `Open.key` and `Seal.key` are `max_key_len` wide,
+    /// so the bytes past this length are zero padding — which is what lets
+    /// one array hold either suite's key.
     pub fn keyLen(self: CipherSuite) usize {
         return switch (self) {
             .aes_128_gcm_sha256 => 16,
@@ -47,6 +93,9 @@ pub const CipherSuite = enum(u16) {
         };
     }
 
+    /// The header-protection key length in bytes for this suite: 16 for
+    /// AES-128-GCM, 32 for ChaCha20-Poly1305. It is the width to derive
+    /// `hp_key` with, and the only part of an `Open.hp_key` this core reads.
     pub fn hpKeyLen(self: CipherSuite) usize {
         return switch (self) {
             .aes_128_gcm_sha256 => 16,
@@ -64,20 +113,56 @@ pub const CipherSuite = enum(u16) {
     }
 };
 
-// Note: similar to packet.Epoch (4 values, maps to packet types) and
-// ack_handler.EncLevel (3 values, maps to PN spaces — no 0-RTT space).
-// Kept separate because the value mappings and cardinalities differ.
+/// The four levels QUIC protects separately, as a stable numbering.
+///
+/// Distinct from `packet.Epoch` (four values, keyed by packet type) and from
+/// `ack_handler.EncLevel` (three values, keyed by packet-number space — there
+/// is no 0-RTT space). Kept separate because the mappings and the
+/// cardinalities differ, and a caller that conflates them gets a key for the
+/// wrong level.
+///
 pub const EncryptionLevel = enum(u8) {
+    /// RFC 9001 §5.2: derived from the destination connection id, so both
+    /// sides hold them before anything is negotiated.
     initial = 0,
+    /// 0-RTT for a resumed session (RFC 9001 §5.6), carrying the client's
+    /// early traffic secret. A server installs the opening half of it; the
+    /// sealing half is a client's alone (RFC 9001 §5.6 forbids a server
+    /// from protecting a packet with early keys).
     early_data,
+    /// TLS handshake traffic (RFC 9001 §4.4.2), one secret per direction.
     handshake,
+    /// 1-RTT application data (RFC 9001 §5.3): the level a key update
+    /// rotates, and the only one `KeyUpdateManager` covers.
     application,
 };
 
+/// The keys one encryption level is opened with: an AEAD key, a
+/// header-protection key, and the static IV they are used with.
+///
+/// A value. It owns no allocation, it holds no reference to anything, and
+/// copying one is cheap and safe — which is what a key update does with the
+/// previous generation while reordered packets are still arriving.
+///
+/// `prepareCtx` fills the two cached contexts. It is an optimisation and not
+/// a requirement: without it every packet falls back to std's one-shot
+/// primitive, and with it the key schedule and GHASH powers are computed
+/// once per key. Nothing here is invalidated by a later key change, because
+/// a key change is a different `Open`.
+///
 pub const Open = struct {
+    /// The AEAD key, zero-padded to `max_key_len`: the bytes past
+    /// `cipher_suite.keyLen()` are zero and are never read.
     key: [max_key_len]u8 = .{0} ** max_key_len,
+    /// The header-protection key, zero-padded the same way. Only the first
+    /// `cipher_suite.hpKeyLen()` bytes are read.
     hp_key: [max_key_len]u8 = .{0} ** max_key_len,
+    /// The static IV every packet's nonce is `packet_number` XORed into
+    /// (RFC 9001 §5.3). It has no default, and a zero one makes every packet
+    /// under this key share a nonce.
     nonce: [nonce_len]u8,
+    /// The suite that decides the AEAD and the header-protection function
+    /// above. Defaults to AES-128-GCM, which is what the Initial keys are.
     cipher_suite: CipherSuite = .aes_128_gcm_sha256,
     /// Pre-expanded AES-128 round keys for header protection (AES suites only).
     /// Populated by prepareCtx() at construction; copied with the struct.
@@ -97,6 +182,11 @@ pub const Open = struct {
     }
 
     /// Generate a new QUIC Header Protection mask.
+    ///
+    /// `sample` is the `SAMPLE_LEN` protected bytes the mask is computed
+    /// over, borrowed for the call and not retained; it is not modified.
+    /// Every call makes a fresh mask, because the sample differs per packet.
+    /// Nothing is allocated.
     pub fn newMask(self: *const Open, sample: *const [SAMPLE_LEN]u8) [MASK_LEN]u8 {
         if (self.hp_aes_ctx) |ctx| {
             var encrypted_out: [SAMPLE_LEN]u8 = undefined;
@@ -106,12 +196,34 @@ pub const Open = struct {
         return computeHpMask(sample, self.hp_key, self.cipher_suite);
     }
 
+    /// Open a protected payload in place and return the plaintext it carried.
+    ///
+    /// The bytes come out where they went in: the result is
+    /// `payload[0 .. payload.len - 16]`, the tag is consumed, and nothing is
+    /// allocated — a caller keeps the buffer it had and owns no new memory.
+    /// `associated_data` is the unprotected header (RFC 9001 §5.2):
+    /// authenticated, never encrypted.
+    ///
+    /// `AuthenticationFailed` is every way the tag does not verify, and they
+    /// are deliberately not told apart: a payload shorter than its own tag, a
+    /// wrong key, a key from another encryption level, a packet number past
+    /// the nonce, a tampered header, or a peer that sent something it did not
+    /// sign. Nothing here can be out of memory — no allocation happens on
+    /// this path — so there is no allocator error in this set that a caller
+    /// could mistake for a forgery.
+    ///
+    /// The returned slice aliases `payload`, so the caller still owns that
+    /// buffer and frees nothing. On the error path that payload is not left
+    /// holding its old plaintext either: the AES path overwrites the whole
+    /// plaintext region with undefined bytes before returning, so a caller
+    /// that got `AuthenticationFailed` discards the packet and must not read
+    /// what is left in the buffer.
     pub fn decryptPayload(
         self: *const Open,
         packet_number: u64,
         associated_data: []const u8,
         payload: []u8,
-    ) error{ AuthenticationFailed, OutOfMemory }![]u8 {
+    ) error{AuthenticationFailed}![]u8 {
         const tag_len = 16; // Same for both AES-128-GCM and ChaCha20-Poly1305
         const payload_len = payload.len;
 
@@ -151,10 +263,27 @@ pub const Open = struct {
     }
 };
 
+/// The keys one encryption level is sealed with: the mirror of `Open`, for
+/// the packets this side sends.
+///
+/// A value, with the same ownership and copying rules as `Open`. The two are
+/// deliberately separate types rather than one with a direction flag: a
+/// connection holds both for a level and neither can be used as the other by
+/// accident, which is the mistake header protection makes expensive.
+///
 pub const Seal = struct {
+    /// The AEAD key, zero-padded to `max_key_len`: the bytes past
+    /// `cipher_suite.keyLen()` are zero and are never read.
     key: [max_key_len]u8 = .{0} ** max_key_len,
+    /// The header-protection key, zero-padded the same way. Only the first
+    /// `cipher_suite.hpKeyLen()` bytes are read.
     hp_key: [max_key_len]u8 = .{0} ** max_key_len,
+    /// The static IV every packet's nonce is `packet_number` XORed into
+    /// (RFC 9001 §5.3). It has no default, and a zero one makes every packet
+    /// under this key share a nonce.
     nonce: [nonce_len]u8,
+    /// The suite that decides the AEAD and the header-protection function
+    /// above. Defaults to AES-128-GCM, which is what the Initial keys are.
     cipher_suite: CipherSuite = .aes_128_gcm_sha256,
     /// Pre-expanded AES-128 round keys for header protection (AES suites only).
     /// Populated by prepareCtx() at construction; copied with the struct.
@@ -174,6 +303,11 @@ pub const Seal = struct {
     }
 
     /// Generate a new QUIC Header Protection mask.
+    ///
+    /// `sample` is the `SAMPLE_LEN` protected bytes the mask is computed
+    /// over, borrowed for the call and not retained; it is not modified.
+    /// Every call makes a fresh mask, because the sample differs per packet.
+    /// Nothing is allocated.
     pub fn newMask(self: *const Seal, sample: *const [SAMPLE_LEN]u8) [MASK_LEN]u8 {
         if (self.hp_aes_ctx) |ctx| {
             var encrypted_out: [SAMPLE_LEN]u8 = undefined;
@@ -183,9 +317,19 @@ pub const Seal = struct {
         return computeHpMask(sample, self.hp_key, self.cipher_suite);
     }
 
-    /// Apply header protection using the cached HP context if available.
-    /// Equivalent to the standalone applyHeaderProtection() but reuses the
-    /// pre-expanded AES round keys. RFC 9001 §5.4.
+    /// Apply header protection to an outgoing packet, in place. RFC 9001
+    /// §5.4. Equivalent to the standalone `applyHeaderProtection` but reuses
+    /// the pre-expanded AES round keys when `prepareCtx` filled them.
+    ///
+    /// `pkt_buf` is the packet as it will go on the wire with the packet
+    /// number already written at `pn_offset` in `pn_len` bytes (1 to 4). Only
+    /// `buf[0]` and `buf[pn_offset..pn_offset + pn_len]` are written, and the
+    /// long-header test reads the first byte before it is masked.
+    ///
+    /// A packet too short to carry the sample — fewer than
+    /// `pn_offset + 4 + SAMPLE_LEN` bytes — is left untouched and the call
+    /// returns nothing, so a caller that built such a packet has a header
+    /// that is not protected.
     pub fn applyHeaderProtection(
         self: *const Seal,
         pkt_buf: []u8,
@@ -209,9 +353,21 @@ pub const Seal = struct {
         }
     }
 
-    /// Encrypt a QUIC packet payload using AEAD.
-    /// Writes ciphertext + tag into `out` (which must be plaintext.len + tag_length).
-    /// Returns the total output length (plaintext.len + tag_length).
+    /// Encrypt a QUIC packet payload with the AEAD and write ciphertext + tag
+    /// into `out`.
+    ///
+    /// `associated_data` is the unprotected header (RFC 9001 §5.2):
+    /// authenticated, never encrypted. The nonce is this key's `nonce` with
+    /// `packet_number` XORed in, so two calls under one key must carry
+    /// different packet numbers.
+    ///
+    /// `out` must hold at least `plaintext.len + Aead.tag_length` bytes, and
+    /// that is asserted rather than returned, so it is unchecked in
+    /// ReleaseFast and ReleaseSmall. `out` may be the same buffer as
+    /// `plaintext`, which is how the packet buffer is protected in place.
+    /// Nothing past `plaintext.len + 16` is written and nothing is allocated.
+    ///
+    /// Returns the number of bytes written, `plaintext.len + 16`.
     pub fn encryptPayload(
         self: *const Seal,
         packet_number: u64,
@@ -257,6 +413,12 @@ fn makeNonce(iv: [nonce_len]u8, packet_number: u64) [nonce_len]u8 {
 /// Compute a QUIC Header Protection mask from a sample.
 /// AES: AES-ECB encrypt the sample, take first 5 bytes.
 /// ChaCha20: counter=sample[0..4] LE, nonce=sample[4..16], encrypt 5 zero bytes.
+///
+/// `hp_key` is a value, of which only `cipher_suite.hpKeyLen()` bytes are
+/// read, and `sample` is borrowed for the call and not modified. This is the
+/// uncached form: `Open.newMask` and `Seal.newMask` compute the same mask and
+/// reuse a prepared AES schedule when one is there. Pure, and it allocates
+/// nothing.
 pub fn computeHpMask(sample: *const [SAMPLE_LEN]u8, hp_key: [max_key_len]u8, cipher_suite: CipherSuite) [MASK_LEN]u8 {
     switch (cipher_suite) {
         .aes_128_gcm_sha256 => {
@@ -277,8 +439,18 @@ pub fn computeHpMask(sample: *const [SAMPLE_LEN]u8, hp_key: [max_key_len]u8, cip
     }
 }
 
-/// Apply header protection to an outgoing packet.
+/// Apply header protection to an outgoing packet, in place.
 /// RFC 9001 Section 5.4.
+///
+/// `pkt_buf` is the packet as it will go on the wire, with the packet number
+/// already written at `pn_offset` in `pn_len` bytes (1 to 4); only
+/// `buf[0]` and `buf[pn_offset..pn_offset + pn_len]` are written. A packet
+/// with fewer than `pn_offset + 4 + SAMPLE_LEN` bytes carries no sample and
+/// is left untouched.
+///
+/// `hp_key` is passed by value; nothing is retained and nothing is allocated.
+/// `Seal.applyHeaderProtection` is the same operation and prefers that key's
+/// prepared AES schedule.
 pub fn applyHeaderProtection(
     pkt_buf: []u8,
     pn_offset: usize,
@@ -305,8 +477,17 @@ pub fn applyHeaderProtection(
     }
 }
 
-/// Remove header protection from an incoming packet.
+/// Remove header protection from an incoming packet, in place.
 /// Returns the decoded packet number length (1-4) from the first byte.
+///
+/// A packet with fewer than `pn_offset + 4 + SAMPLE_LEN` bytes carries no
+/// sample: `pkt_buf` is left untouched and 0 is returned, which is not a
+/// packet-number length, so a caller reads it as a malformed packet rather
+/// than as a one-byte packet number. Otherwise the first byte is unmasked
+/// first and its low two bits give the length that then unmasks the packet
+/// number, which is why the caller passes no `pn_len` here.
+///
+/// `hp_key` is passed by value; nothing is retained and nothing is allocated.
 pub fn removeHeaderProtection(
     pkt_buf: []u8,
     pn_offset: usize,
@@ -343,6 +524,16 @@ fn isLongHeader(first_byte: u8) bool {
 /// Encode a packet number using the minimum number of bytes.
 /// RFC 9000 Appendix A.2.
 /// Returns the number of bytes used (1-4) and writes to `out`.
+///
+/// `largest_acked` is the largest packet number this side has seen
+/// acknowledged, and null means nothing has been acknowledged yet. The width
+/// is the smallest that holds twice the unacknowledged count, capped at the
+/// four bytes a packet number occupies on the wire, and the low 32 bits of
+/// `pn` are what is written — so the caller has already kept `pn` below 2^62
+/// (RFC 9000 §12.3). Bytes of `out` past the returned length are untouched.
+///
+/// The returned length is also what goes into the header's own low two bits,
+/// so a caller writes both from one answer. Nothing is allocated.
 pub fn encodePacketNumber(pn: u64, largest_acked: ?u64, out: *[4]u8) usize {
     // Calculate the number of bits needed
     const num_unacked: u64 = if (largest_acked) |la|
@@ -375,6 +566,27 @@ pub fn encodePacketNumber(pn: u64, largest_acked: ?u64, out: *[4]u8) usize {
     return pn_len;
 }
 
+/// The Initial keys for `cid` at `version`, as the pair that opens and seals
+/// them (RFC 9001 §5.2). The result is `[0]` the `Open` for what arrives at
+/// this level and `[1]` the `Seal` for what this side sends.
+///
+/// Initial keys are public by construction — they are derived from the
+/// destination connection id, which is on the wire — which is why they are
+/// only ever used until the handshake keys replace them, and why they are
+/// always AES-128-GCM whatever suites TLS later negotiates. The contexts are
+/// prepared, so the result is ready to use.
+///
+/// `is_server` is which side this side is, and it decides which half is
+/// which: a server opens the client's Initial keys and seals its own, a
+/// client the reverse. It is comptime, so the branch is resolved here.
+/// `cid` is the destination connection id those packets carry — borrowed for
+/// the call, retained by nothing, and of any length, including the zero a
+/// client's first Initial sends.
+///
+/// The only refusal is `InvalidVersion`, for a version this core does not
+/// speak; on it nothing is derived and no half-built pair is returned.
+/// `version` chooses the salt and the HKDF labels as well, so the same cid
+/// under v1 and under v2 yields different keys.
 pub fn deriveInitialKeyMaterial(
     cid: []const u8,
     version: u32,
@@ -577,6 +789,11 @@ test "header protection key" {
 }
 
 /// RFC 8446 §7.1 HKDF-Expand-Label.
+///
+/// `secret` and the returned array are both values; `label` and `context` are
+/// read during the call and retained by nothing, and nothing is allocated.
+/// `length` is comptime because it is what sizes the result, so a caller
+/// gets an array of a width known at the call site.
 pub fn hkdfExpandLabel(
     secret: [32]u8,
     label: []const u8,
@@ -588,6 +805,16 @@ pub fn hkdfExpandLabel(
 
 /// Derive a QUIC key and pad to max_key_len.
 /// `actual_len` is the real key length (16 for AES, 32 for ChaCha20).
+///
+/// The width is chosen by testing `actual_len` against 32, so any other
+/// value derives a 16-byte key; the length a suite actually uses comes from
+/// `CipherSuite.keyLen`. Bytes past the key that is really there are zero
+/// padding, and the AEAD never reads them.
+///
+/// The label is the one `version` spells, and a version that is not v2 —
+/// including one this core does not support — derives under the v1 label
+/// rather than being refused. `secret` is a value, the result is a value, and
+/// nothing is allocated.
 pub fn deriveKeyPaddedV(secret: [32]u8, actual_len: usize, version: u32) [max_key_len]u8 {
     return deriveKeyPaddedL(secret, actual_len, protocol.quicLabel(version, .key));
 }
@@ -604,21 +831,45 @@ fn deriveKeyPaddedL(secret: [32]u8, actual_len: usize, label: []const u8) [max_k
     return result;
 }
 
+/// The header-protection key for `secret`, zero-padded to the widest key
+/// array, under the label `version` spells (RFC 9001 §5.4).
+///
+/// `actual_len` is the key length the traffic secret was derived for — 32 for
+/// the SHA-256 suites, 16 for the Initial keys — and the difference shows up
+/// as zeros past the key that is really there. As in `deriveKeyPaddedV`, 32
+/// is the width that is tested, so anything else derives 16 bytes.
+///
+/// A `version` that is not v2 gets the v1 label rather than a refusal.
+///
 pub fn deriveHpKeyPaddedV(secret: [32]u8, actual_len: usize, version: u32) [max_key_len]u8 {
     return deriveKeyPaddedL(secret, actual_len, protocol.quicLabel(version, .hp));
 }
 
 /// AES-128-GCM confidentiality limit: 2^23 packets (~8M).
 /// After this many packets, keys must be rotated to maintain security.
+///
+/// The AES number as a constant. The limit that applies to whatever suite a
+/// connection negotiated is `CipherSuite.confidentialityLimit`, and that is
+/// the one `KeyUpdateManager.shouldInitiateUpdate` counts against.
 pub const CONFIDENTIALITY_LIMIT: u64 = 1 << 23;
 
-/// Derive the next traffic secret for key update.
+/// Derive the next traffic secret for key update, under the v1 label.
 /// RFC 9001 Section 6.1:
 ///   secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku", "", 32)
+///
+/// `current` is a value and so is the result; nothing is allocated.
 pub fn deriveNextTrafficSecret(current: [32]u8) [32]u8 {
     return deriveNextTrafficSecretV(current, protocol.QUIC_V1);
 }
 
+/// The next traffic secret in a key update, under `version`'s label
+/// (RFC 9001 §6.1). A pure derivation: no state, no randomness, and the same
+/// input always gives the same output.
+///
+/// A `version` that is not v2 derives under the v1 label rather than being
+/// refused, so this is a v2 chain only when `version` says so. `current` is a
+/// value and so is the result; nothing is allocated.
+///
 pub fn deriveNextTrafficSecretV(current: [32]u8, version: u32) [32]u8 {
     return hkdfExpandLabel(current, protocol.quicLabel(version, .ku), "", 32);
 }
@@ -628,63 +879,117 @@ pub fn deriveNextTrafficSecretV(current: [32]u8, version: u32) [32]u8 {
 /// Holds three generations of keys (previous/current/next) to handle
 /// packet reordering during key transitions. The header protection key
 /// never changes across updates (RFC 9001 Section 6.6).
+///
+/// A value that owns nothing: no allocator, no buffers, no clock. Every
+/// instant reaches it as an argument, and it belongs to the one thread that
+/// owns it. The keys `getOpenKeys` and `getSealAndPhase` hand out are
+/// pointers into this value, so a `rollKeys` while one is held moves what it
+/// points at, and moving the manager leaves any such pointer behind.
 pub const KeyUpdateManager = struct {
-    // Current keys for decrypt/encrypt
+    /// The keys for the current generation: `current_open` decrypts what
+    /// arrives, `current_seal` encrypts what leaves. A `rollKeys` replaces
+    /// both and keeps the old `current_open` in `prev_open`.
     current_open: Open,
     current_seal: Seal,
 
-    // Previous open keys for decrypting reordered packets from the prior generation
+    /// The previous generation's opening keys, kept so a reordered packet
+    /// from it still verifies. Null until the first `rollKeys`, and null
+    /// again once `maybeDropPrevKeys` has reached `prev_open_expires`.
+    /// There is no previous `Seal`: a peer does not accept a packet sealed
+    /// under keys this side has stopped using.
     prev_open: ?Open = null,
 
-    // Pre-computed next keys for fast key update processing
+    /// The next generation's keys, derived once at construction and again
+    /// by every `rollKeys`, so adopting a peer's update costs no derivation.
     next_open: Open,
     next_seal: Seal,
 
-    // Current key phase bit (toggled on each update)
+    /// The key phase bit this side writes into its short headers and the one
+    /// an incoming packet's is compared against. False after construction;
+    /// every `rollKeys` toggles it.
     key_phase: bool = false,
 
-    // Header protection keys (never change across updates)
+    /// The header-protection keys, which never change across updates. The
+    /// AEAD keys of every generation above are built to use these.
     hp_open: [max_key_len]u8,
     hp_seal: [max_key_len]u8,
 
-    // Pre-expanded AES-128 round keys for HP (AES suites only). HP keys never
-    // change, so these are computed once during init.
+    /// Pre-expanded AES-128 round keys for the two HP keys above (AES suites
+    /// only, null under ChaCha20). Built once at construction, because the
+    /// HP keys themselves never change.
     hp_open_ctx: ?Aes128HpCtx = null,
     hp_seal_ctx: ?Aes128HpCtx = null,
 
-    // Cipher suite for this key generation
+    /// The suite every generation's keys were derived for. It is fixed at
+    /// construction: a different suite is a new manager, not a new field.
     cipher_suite: CipherSuite = .aes_128_gcm_sha256,
 
-    // QUIC version (affects HKDF labels: "quic ku" vs "quicv2 ku")
+    /// The version whose HKDF labels this chain advances under — `quic ku`
+    /// under v1, `quicv2 ku` under v2. A version that is not v2 advances
+    /// under the v1 labels.
     version: u32 = protocol.QUIC_V1,
 
-    // Traffic secrets for deriving next-generation keys
+    /// The current generation's traffic secrets, which the next one is
+    /// derived from. Only `rollKeys` replaces them, with the next
+    /// generation's.
     recv_secret: [32]u8,
     send_secret: [32]u8,
 
-    // Timestamp when previous keys expire (now + 3×PTO)
+    /// Nanoseconds on the caller's clock at which `prev_open` stops being
+    /// kept — the `now + 3 * pto_ns` of the last `rollKeys`. Null whenever
+    /// there is no previous generation.
     prev_open_expires: ?i64 = null,
 
-    // Packet number of first packet sent with current keys
+    /// Packet number of the first packet sent under the current keys, set
+    /// by the first `onPacketSent` after a rotation and null before that.
     first_sent_with_current: ?u64 = null,
 
-    // Whether a packet sent with current keys has been ACKed
+    /// Whether the peer has acknowledged a packet sent under the current
+    /// keys. Nothing here sets it: the caller compares an incoming
+    /// acknowledgement against `first_sent_with_current` and writes the
+    /// answer, because only it knows which packet numbers the peer has
+    /// acknowledged. A `rollKeys` clears it again.
     first_acked_with_current: bool = false,
 
-    // Number of packets sent with current keys
+    /// Packets sent under the current keys, counted by `onPacketSent` and
+    /// reset by `rollKeys`. It is the number `shouldInitiateUpdate` compares
+    /// against the suite's confidentiality limit.
     packets_sent_with_current: u64 = 0,
 
     /// Initialize the key update manager from initial traffic secrets.
     /// `recv_secret` is the peer's traffic secret (for decryption).
     /// `send_secret` is our traffic secret (for encryption).
+    ///
+    /// All four arguments are values and are copied in; the manager is
+    /// returned by value, borrows nothing and allocates nothing. This is
+    /// `initWithCipherSuite` under AES-128-GCM, deriving with the v1
+    /// labels — a v2 connection wants `initFull`.
     pub fn init(recv_secret: [32]u8, send_secret: [32]u8, recv_hp: [max_key_len]u8, send_hp: [max_key_len]u8) KeyUpdateManager {
         return initWithCipherSuite(recv_secret, send_secret, recv_hp, send_hp, .aes_128_gcm_sha256);
     }
 
+    /// `init` for a suite TLS negotiated, still under the v1 labels.
+    ///
+    /// The arguments mean what `init` says they mean; the suite adds the
+    /// AEAD and the key width the secrets are derived at, and the prepared
+    /// contexts are built for it.
     pub fn initWithCipherSuite(recv_secret: [32]u8, send_secret: [32]u8, recv_hp: [max_key_len]u8, send_hp: [max_key_len]u8, cipher_suite: CipherSuite) KeyUpdateManager {
         return initFull(recv_secret, send_secret, recv_hp, send_hp, cipher_suite, protocol.QUIC_V1);
     }
 
+    /// The full constructor: a suite, and the version whose HKDF labels
+    /// every generation of this chain advances under.
+    ///
+    /// The four traffic-secret arguments mean what `init` says they mean.
+    /// The HP keys are taken as given rather than re-derived, so they must
+    /// already be the header-protection keys of these secrets: `keyLen`
+    /// bytes that are really the key, the rest ignored. `version` is not
+    /// validated — a version that is not v2 derives under the v1 labels.
+    ///
+    /// The result holds the current generation with the next one already
+    /// derived from it, no previous generation, key phase false and every
+    /// counter at zero. It allocates nothing; a caller that later takes a
+    /// pointer into it must not move it.
     pub fn initFull(recv_secret: [32]u8, send_secret: [32]u8, recv_hp: [max_key_len]u8, send_hp: [max_key_len]u8, cipher_suite: CipherSuite, version: u32) KeyUpdateManager {
         const kl = cipher_suite.keyLen();
         const label_key = protocol.quicLabel(version, .key);
@@ -731,6 +1036,17 @@ pub const KeyUpdateManager = struct {
 
     /// Rotate keys: prev←current, current←next, pre-compute new next.
     /// Toggles the key phase bit. Sets prev_open expiry to now + 3×PTO.
+    ///
+    /// `now` and `pto_ns` are nanoseconds on the caller's own clock, the
+    /// same clock `maybeDropPrevKeys` is later given; the expiry is written
+    /// as `now + 3 * pto_ns`, so this side's own PTO is what bounds how long
+    /// `prev_open` is kept.
+    ///
+    /// The secrets advance under this manager's `version` labels and the
+    /// generation counters start over: `first_sent_with_current` null,
+    /// `first_acked_with_current` false, `packets_sent_with_current` zero. A
+    /// pointer handed out by `getOpenKeys` or `getSealAndPhase` before this
+    /// call points at keys that have just changed generation.
     pub fn rollKeys(self: *KeyUpdateManager, now: i64, pto_ns: i64) void {
         // Move current → previous
         self.prev_open = self.current_open;
@@ -775,7 +1091,17 @@ pub const KeyUpdateManager = struct {
     }
 
     /// Get the Open keys for decrypting a packet based on its key phase bit.
-    /// Returns null if the key phase doesn't match any available generation.
+    ///
+    /// A bit equal to this side's is the current generation. A bit that
+    /// differs is either a reordered packet from the previous generation —
+    /// `prev_open`, while one is kept — or the peer having rotated first
+    /// (RFC 9001 §6.1), which is `next_open`. There is no third answer, and
+    /// the result is never null: a caller that reads null as "packet
+    /// rejected" never sees it, and a packet from an older generation than
+    /// `prev_open` is left to fail authentication.
+    ///
+    /// The pointer is into this manager, so the next `rollKeys` invalidates
+    /// it, and so does moving the manager. Nothing is allocated.
     pub fn getOpenKeys(self: *KeyUpdateManager, key_phase_bit: bool) ?*Open {
         if (key_phase_bit == self.key_phase) {
             return &self.current_open;
@@ -790,11 +1116,23 @@ pub const KeyUpdateManager = struct {
     }
 
     /// Get the current Seal keys and key phase bit for encrypting a packet.
+    ///
+    /// They are answered together because a short header carries the phase
+    /// bit the packet went out with, and a caller that reads the bit from the
+    /// field separately can seal under one generation and mark another.
+    /// `seal` points into this manager, so the next `rollKeys` invalidates
+    /// it, and so does moving the manager. Nothing is allocated.
     pub fn getSealAndPhase(self: *KeyUpdateManager) struct { seal: *const Seal, key_phase: bool } {
         return .{ .seal = &self.current_seal, .key_phase = self.key_phase };
     }
 
     /// Record that a packet was sent with current keys.
+    ///
+    /// `pn` is the packet number that packet went out with. Only the first
+    /// one after a rotation is recorded, in `first_sent_with_current`; every
+    /// call advances `packets_sent_with_current`. A caller sends nothing and
+    /// must call this nothing, because that count is what the
+    /// confidentiality limit is measured against.
     pub fn onPacketSent(self: *KeyUpdateManager, pn: u64) void {
         if (self.first_sent_with_current == null) {
             self.first_sent_with_current = pn;
@@ -803,6 +1141,12 @@ pub const KeyUpdateManager = struct {
     }
 
     /// Drop previous-generation keys if they have expired.
+    ///
+    /// `now` is nanoseconds on the same clock `rollKeys` was given, and the
+    /// comparison is against the `now + 3 * pto_ns` written there. With no
+    /// previous generation there is nothing to compare and nothing happens.
+    /// After a drop, a reordered packet from that generation fails to
+    /// authenticate, which is the intent (RFC 9001 §6.1).
     pub fn maybeDropPrevKeys(self: *KeyUpdateManager, now: i64) void {
         if (self.prev_open_expires) |expires| {
             if (now >= expires) {
@@ -814,12 +1158,21 @@ pub const KeyUpdateManager = struct {
 
     /// Check if we should proactively initiate a key update.
     /// Returns true if packets sent with current keys >= confidentiality limit.
+    ///
+    /// The limit is `cipher_suite.confidentialityLimit`, counted in packets
+    /// and not in bytes. This is a reason to rotate, not permission to: the
+    /// caller still has to ask `canUpdate`.
     pub fn shouldInitiateUpdate(self: *const KeyUpdateManager) bool {
         return self.packets_sent_with_current >= self.cipher_suite.confidentialityLimit();
     }
 
     /// Check if we are allowed to initiate a key update.
     /// Must have sent and received ACK for a packet with current keys.
+    ///
+    /// It reads `first_acked_with_current`, which the caller writes when an
+    /// acknowledgement of a packet at or after `first_sent_with_current`
+    /// arrives and which a `rollKeys` clears. It says nothing about the
+    /// confidentiality limit; both answers are needed before rotating.
     pub fn canUpdate(self: *const KeyUpdateManager) bool {
         return self.first_acked_with_current;
     }

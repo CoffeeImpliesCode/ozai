@@ -1,8 +1,30 @@
+//! QUIC streams for one connection: stream-id encoding, receive-side
+//! reassembly and flow control, send-side buffering, retransmission
+//! bookkeeping, and the stream table that owns them.
+//!
+//! Reached through `Connection.streams`, which holds one `StreamsMap`;
+//! `crypto_stream.zig` borrows `FrameSorter` from here for the CRYPTO
+//! direction. Nothing here opens a socket, reads a clock or draws
+//! randomness: every bound it enforces comes from the peer's transport
+//! parameters, from the configuration `Connection` copies in, or from the
+//! compile-time ceilings in `limits.zig`.
+//!
+//! One `StreamsMap.deinit` releases every stream the map holds and its send
+//! ledger. A stream reached through the map's accessors is freed by the map
+//! when it is disposed, and must not be `deinit`'d by whoever holds the
+//! pointer. Two calls hand memory out rather than taking it:
+//! `ReceiveStream.read` and `FrameSorter.pop` return a whole allocation the
+//! caller owns and frees with the allocator its stream was built with, while
+//! `SendStream.popStreamFrame` returns a frame borrowing the send buffer,
+//! valid until the next write, acknowledgement or teardown.
+//!
+//! Not in this module: pacing, loss detection and retransmission timing. The
+//! connection drives those and asks here only for the next frame to send and
+//! for the ranges a lost packet has to be queued for again.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
-const flow_control = @import("flow_control.zig");
 const Frame = @import("frame.zig").Frame;
 const limits = @import("limits.zig");
 const ranges = @import("ranges.zig");
@@ -40,10 +62,21 @@ pub fn isLocal(stream_id: u64, is_server: bool) bool {
 
 /// Gap-based frame sorter for out-of-order reassembly of stream data.
 /// Tracks received byte ranges and returns contiguous data starting from read_pos.
+///
+/// Owns every chunk still in `chunks` and retains the allocator `init` was
+/// given; `deinit` releases both, exactly once. A copy is a second owner of
+/// that storage, not an independent sorter, so a copied sorter must not be
+/// `deinit`'d. Nothing in it borrows the caller's bytes: `push` copies.
+///
+/// The one value that leaves is `pop`'s, and the caller owns it — see there.
 pub const FrameSorter = struct {
     /// One buffered run of stream bytes.
     pub const Chunk = struct {
+        /// Stream offset of `data[0]`.
         offset: u64,
+        /// The bytes themselves, always at or past the sorter's `read_pos`.
+        /// They sit in an allocation the sorter owns and frees in `deinit`,
+        /// unless `pop` has already handed them to its caller.
         data: []const u8,
         /// The allocation behind `data` when it has room to grow at either
         /// end; empty when it is exactly `data`.
@@ -74,6 +107,8 @@ pub const FrameSorter = struct {
     /// Chunk slots a drained sorter keeps; in-order delivery never needs more.
     const RETAINED_CHUNKS: usize = 64;
 
+    /// Retained at `init` and used for every chunk, for the chunk table, and
+    /// for the copy-out `pop` hands its caller.
     allocator: Allocator,
 
     /// Buffered data chunks, sorted ascending by offset and never overlapping.
@@ -97,6 +132,9 @@ pub const FrameSorter = struct {
     /// chunks too (see MAX_COALESCED).
     breaks: usize = 0,
 
+    /// An empty sorter: no chunks, no table allocation, nothing buffered and
+    /// no final size known. The allocator is retained immediately, so one
+    /// `deinit` is owed whether or not data is ever pushed.
     pub fn init(allocator: Allocator) FrameSorter {
         return .{
             .allocator = allocator,
@@ -104,6 +142,10 @@ pub const FrameSorter = struct {
         };
     }
 
+    /// Releases every chunk still buffered and the chunk table. Does not free
+    /// the allocator, and does not free what `pop` already handed out — that
+    /// allocation belongs to its caller. The sorter is unusable afterwards,
+    /// and a second call frees the same bytes twice.
     pub fn deinit(self: *FrameSorter) void {
         for (self.chunks.items) |c| self.allocator.free(c.allocation());
         self.chunks.deinit(self.allocator);
@@ -166,7 +208,15 @@ pub const FrameSorter = struct {
         return @max(self.read_pos, self.highest_buffered);
     }
 
-    /// Push received data at the given offset.
+    /// Copy received bytes at `offset`; the caller's data is not retained.
+    ///
+    /// `FinalSizeError` changes neither chunks nor an existing final size.
+    /// `TooManyChunks` can refuse a new gap before copying or report the bound
+    /// after a merge; merged bytes then remain buffered. A FIN's final size is
+    /// already latched on these local resource refusals.
+    /// `OutOfMemory` leaves a new chunk or failed end-growth unchanged, but an
+    /// overlapping merge can remove swallowed chunks or retain its first half
+    /// before failing. Break counts are recomputed; there is no rollback.
     pub fn push(self: *FrameSorter, offset: u64, data: []const u8, fin: bool) !void {
         if (fin) {
             const new_fin = offset + data.len;
@@ -356,8 +406,19 @@ pub const FrameSorter = struct {
         c.buf = buf;
     }
 
+    /// Size of the next contiguous run, without allocation or consumption.
+    /// Null means no run is available. `pop` can still return null on OOM.
+    pub fn peekLen(self: *const FrameSorter) ?usize {
+        if (self.chunks.items.len == 0) return null;
+        const first = self.chunks.items[0];
+        if (first.offset > self.read_pos or first.end() <= self.read_pos) return null;
+        const consumed: usize = @intCast(self.read_pos - first.offset);
+        return first.data.len - consumed;
+    }
+
     /// Pop the next contiguous chunk of data from the read position.
-    /// Returns null if there's no data available at the current read position.
+    /// Null means no contiguous run, or a refused copy-out allocation.
+    /// Allocation failure keeps the run pending and permits retry.
     ///
     /// The caller owns what this returns and must free it with
     /// `self.allocator`. The chunk has left `chunks` and nothing else refers
@@ -373,11 +434,6 @@ pub const FrameSorter = struct {
 
         if (self.chunks.items.len > 1 and first.end() != self.chunks.items[1].offset) self.breaks -= 1;
         _ = self.chunks.orderedRemove(0);
-        // A reordering burst can leave room for up to a thousand holes' worth
-        // of chunks; hand it back once drained.
-        if (self.chunks.items.len == 0 and self.chunks.capacity > RETAINED_CHUNKS) {
-            self.chunks.clearAndFree(self.allocator);
-        }
         const skip: usize = @intCast(self.read_pos - first.offset);
         const readable = first.data[skip..];
         // The caller frees what we return, so it must be a whole allocation;
@@ -388,23 +444,38 @@ pub const FrameSorter = struct {
             first.data
         else blk: {
             const copy = self.allocator.dupe(u8, readable) catch {
-                self.allocator.free(first.allocation());
+                // The chunk has left the list but nothing was read and nothing
+                // was delivered, so freeing it here would drop a run the peer
+                // cannot retransmit — it has been received, and from its side
+                // that is done. Put it back at the head and undo the hole its
+                // removal closed; the list still has the slot it vacated, so
+                // this cannot fail and the retry sees the same run.
+                self.chunks.insertAssumeCapacity(0, first);
+                if (self.chunks.items.len > 1 and first.end() != self.chunks.items[1].offset) self.breaks += 1;
                 return null;
             };
             self.allocator.free(first.allocation());
             break :blk copy;
         };
+        // A reordering burst can leave room for up to a thousand holes' worth
+        // of chunks; hand it back once the chunk is out of the way.
+        if (self.chunks.items.len == 0 and self.chunks.capacity > RETAINED_CHUNKS) {
+            self.chunks.clearAndFree(self.allocator);
+        }
         self.read_pos += readable.len;
         return owned;
     }
 
-    /// Check if all data has been received (FIN reached and all data consumed).
-    /// Every byte up to the final size has arrived, read or not.
+    /// Every byte up to the final size has arrived, whether read or not.
     pub fn isFullyReceived(self: *const FrameSorter) bool {
         const fin = self.fin_offset orelse return false;
         return self.holes() == 0 and self.highestReceived() >= fin;
     }
 
+    /// Every byte up to the final size has been popped, so nothing more will
+    /// ever be handed out. False while no final size is known, however much
+    /// has arrived: `isFullyReceived` is the check for bytes in hand, this one
+    /// for bytes delivered.
     pub fn isComplete(self: *const FrameSorter) bool {
         if (self.fin_offset) |fin| {
             return self.read_pos >= fin;
@@ -416,21 +487,41 @@ pub const FrameSorter = struct {
 /// Fraction of receive window that triggers a MAX_STREAM_DATA update.
 const STREAM_WINDOW_UPDATE_FRACTION: u64 = 4; // send update when 1/4 consumed
 
-/// A QUIC receive stream.
+/// A QUIC receive stream: one direction's reassembly, flow-control window,
+/// reset/FIN state and connection-credit accounting.
+///
+/// Owns the chunks `sorter` holds and retains the allocator its constructor
+/// was given; `deinit` releases both, exactly once. A copy is a second owner
+/// of that storage rather than an independent stream, and must not be
+/// `deinit`'d. `handleStreamFrame` copies the frame's bytes, so nothing here
+/// borrows the datagram.
+///
+/// `read` is the one value that leaves: it is a whole allocation the caller
+/// owns, and nothing in the stream points at it afterwards, so it stays valid
+/// past `deinit`. A `StreamsMap` heap-allocates every stream it owns, so the
+/// pointers its accessors hand out stay valid until the map disposes the
+/// stream.
+///
+/// Nothing here synchronizes: a stream is driven by the one thread driving
+/// the connection, and concurrent calls on the same value are not safe.
 pub const ReceiveStream = struct {
+    /// The stream this is the receive half of.
     stream_id: u64,
+    /// Reassembly buffer. Owned; released by `deinit`.
     sorter: FrameSorter,
 
     /// Final offset (set when FIN received).
     fin_received: bool = false,
 
-    /// Error code from RESET_STREAM.
+    /// Error code from a RESET_STREAM the peer sent, or `null` while the
+    /// stream is live. Once set, `read` and `peekLen` report null and every
+    /// later data frame on this stream is ignored.
     reset_err: ?u64 = null,
 
-    /// Error code for STOP_SENDING frame to send to peer.
+    /// Error code a `stopSending` asked for, or `null` while none has been, and
+    /// whether the caller has since queued the frame. The code alone does not
+    /// mean one went out.
     stop_sending_err: ?u64 = null,
-
-    /// Whether the STOP_SENDING frame has been queued.
     stop_sending_sent: bool = false,
 
     /// Whether all data has been read.
@@ -449,10 +540,11 @@ pub const ReceiveStream = struct {
     /// FIN must not count a second time.
     closed_counted: bool = false,
 
-    /// Receive-side flow control. `receive_window` is the highest offset we
-    /// have allowed the peer (RFC 9000 4.1) and is enforced on every frame;
+    /// Receive-side flow control, all in stream bytes. `bytes_read` is what
+    /// `read` has handed out; `receive_window` is the highest offset we have
+    /// allowed the peer (RFC 9000 4.1) and is enforced on every frame;
     /// `receive_window_size` is the increment MAX_STREAM_DATA re-grants as
-    /// data is read, zero for a stream nothing configured, which never
+    /// data is consumed, zero for a stream nothing configured, which never
     /// re-grants.
     bytes_read: u64 = 0,
     receive_window: u64 = std.math.maxInt(u64),
@@ -462,14 +554,32 @@ pub const ReceiveStream = struct {
     /// (an HTTP/3 frame not yet taken by the application). Flow control
     /// credits only what was read and then let go, so the peer is held to a
     /// window of what the application actually took.
+    ///
+    /// **Maintained by the consumer, not by this module.** Nothing here
+    /// writes it: a consumer that buffers what it reads raises it as the bytes
+    /// arrive and lowers it as it finally takes them, and it must stay at or
+    /// below `bytes_read` — `consumed` subtracts it, and a value above what
+    /// was read would underflow into a huge credit.
+    ///
+    /// With no such consumer it stays zero and `consumed` is `bytes_read`. A
+    /// consumer that adopts it moves three things with it: `consumed`, the
+    /// window `getWindowUpdate` grants, and the connection credit
+    /// `takeConnCredit` hands back.
     retained: u64 = 0,
 
     /// Connection-level flow control (RFC 9000 4.1): the highest offset, or
     /// final size, this stream has charged against MAX_DATA, and how much of
     /// that has been handed back as consumed or abandoned.
     conn_counted: u64 = 0,
+    /// How much of `conn_counted` has already been handed back, as one of the
+    /// three things `conn_credited` and `freed_conn_credit` hold.
     conn_credited: u64 = 0,
 
+    /// A stream with no receive window configured: `receive_window` is
+    /// `std.math.maxInt(u64)` and `receive_window_size` zero, so no offset the
+    /// peer names is out of window and `getWindowUpdate` never grants. A
+    /// caller that wants flow control sets both, as `initWithWindow` and
+    /// `StreamsMap` do before the stream sees a frame.
     pub fn init(allocator: Allocator, stream_id: u64) ReceiveStream {
         return .{
             .stream_id = stream_id,
@@ -477,6 +587,12 @@ pub const ReceiveStream = struct {
         };
     }
 
+    /// As `init`, with `window` set as both the limit already granted the peer
+    /// and the increment `getWindowUpdate` re-grants: `handleStreamFrame`
+    /// refuses a frame ending past it with `error.FlowControlError`, and each
+    /// MAX_STREAM_DATA hands over another `window` once a quarter of one has
+    /// been consumed. Zero is a valid window — the peer may send no data, and
+    /// no update is ever sent.
     pub fn initWithWindow(allocator: Allocator, stream_id: u64, window: u64) ReceiveStream {
         return .{
             .stream_id = stream_id,
@@ -486,20 +602,69 @@ pub const ReceiveStream = struct {
         };
     }
 
+    /// Releases every reassembly chunk still buffered. Does not free the
+    /// allocator, and does not free what `read` already handed out — those
+    /// bytes belong to the caller. The stream is unusable afterwards, and a
+    /// second call frees the same bytes twice.
     pub fn deinit(self: *ReceiveStream) void {
         self.sorter.deinit();
     }
 
-    /// Handle an incoming STREAM frame.
-    pub fn handleStreamFrame(self: *ReceiveStream, offset: u64, data: []const u8, fin: bool) !void {
+    /// Buffers one incoming STREAM frame's data, and latches its FIN once the
+    /// frame is accepted. A frame with no data and no FIN is accepted and
+    /// changes nothing.
+    ///
+    /// A frame after a reset is ignored and returns without error: the peer
+    /// has already ended this direction, and the connection does not close on
+    /// the retransmission.
+    ///
+    /// Three errors, and the caller closes the connection on each:
+    /// `error.FlowControlError` when the frame ends past `receive_window`,
+    /// `error.FinalSizeError` when the frame contradicts a final size already
+    /// known — the first two are peer protocol errors (RFC 9000 §4.1 and
+    /// §4.5); and `error.TooManyChunks` when the frame leaves more reassembly
+    /// gaps than `limits.max_reassembly_chunks`, which is this endpoint's
+    /// resource bound rather than anything the peer did wrong.
+    ///
+    /// On the first two nothing is buffered and `fin_received` is unchanged, so
+    /// a refused FIN is not latched. `error.TooManyChunks` is a local bound and
+    /// is refused where it is found, which is either side of the copy, so what
+    /// it leaves depends on the path: a frame that fills a hole is merged in
+    /// first and its bytes stay buffered, while a frame that would open one
+    /// more hole is refused with nothing copied at all. Either way the final
+    /// size the frame carried is already in `sorter.fin_offset`, and
+    /// `fin_received` is not — the frame that would have finished this stream
+    /// did not.
+    ///
+    /// `error.OutOfMemory` is the one tag the caller propagates instead of
+    /// closing on. The copy it names either changed nothing — a new chunk, or
+    /// one grown at an end — or, when the frame swallowed a chunk lying wholly
+    /// inside it, left a hole where that chunk was: the sorter frees those
+    /// before it copies, so those bytes wait for the peer to retransmit them.
+    pub fn handleStreamFrame(
+        self: *ReceiveStream,
+        offset: u64,
+        data: []const u8,
+        fin: bool,
+    ) error{ FlowControlError, FinalSizeError, TooManyChunks, OutOfMemory }!void {
         if (offset + data.len > self.receive_window) return error.FlowControlError;
         if (self.reset_err != null) return; // Ignore data after reset
-        if (fin) self.fin_received = true;
         try self.sorter.push(offset, data, fin);
+        if (fin) self.fin_received = true;
     }
 
-    /// Handle a RESET_STREAM frame.
-    /// Returns FinalSizeError if final_size conflicts with known data.
+    /// Records a RESET_STREAM: `error_code` is the code the stream now reports
+    /// as reset, and `final_size` its final size, so the peer stopped at a
+    /// known offset. A retransmission carrying the same final size re-records
+    /// the code and changes nothing else.
+    ///
+    /// `error.FinalSizeError` when `final_size` contradicts one already known
+    /// or names less than the highest offset received, and
+    /// `error.FlowControlError` when it runs past `receive_window`. Both are
+    /// peer protocol errors (RFC 9000 §4.5, §4.1) and the caller closes the
+    /// connection on either. Neither writes anything: `reset_err` and the
+    /// recorded final size are as they were, so a frame refused for one reason
+    /// may be presented again.
     pub fn handleResetStream(self: *ReceiveStream, error_code: u64, final_size: u64) !void {
         // RFC 9000 §4.5: final size cannot change once known
         if (self.sorter.fin_offset) |existing| {
@@ -513,13 +678,30 @@ pub const ReceiveStream = struct {
         self.sorter.fin_offset = final_size;
     }
 
-    /// Read contiguous data from the stream.
-    /// Returns the data slice or null if no data is available.
+    /// Length of the next contiguous run, without consuming it.
+    /// Null means a reset or no ready run. A later `read` can still return null
+    /// if its copy-out allocation fails; in that case the same run stays ready.
+    pub fn peekLen(self: *const ReceiveStream) ?usize {
+        if (self.reset_err != null) return null;
+        return self.sorter.peekLen();
+    }
+
+    /// Read contiguous data from the stream, advancing everything that counts.
+    ///
+    /// Returns a caller-owned contiguous run, or null for no ready data,
+    /// completed input, a peer reset (`reset_err`), or a refused copy-out
+    /// allocation. Allocation failure preserves the run for retry; null alone
+    /// is not proof of clean EOF. Completion sets `finished`.
     ///
     /// A non-null result is owned by the caller, who must free it with the
     /// allocator this stream was built with. It is not a view into the stream
     /// and it stays valid past `deinit`, because nothing in the stream holds
     /// it any more. See `FrameSorter.pop`.
+    ///
+    /// The read position, `bytes_read` and the credit this stream has earned
+    /// from the connection all move before the caller sees the slice, so a
+    /// caller that cannot keep what it is handed has lost it. `peekLen` is how
+    /// it asks whether it can keep it first.
     pub fn read(self: *ReceiveStream) ?[]const u8 {
         if (self.reset_err != null) return null;
 
@@ -532,11 +714,17 @@ pub const ReceiveStream = struct {
         return data;
     }
 
-    /// The peer can send nothing more: the FIN and every byte before it have
-    /// arrived. A FIN alone is not enough while a hole before it is open —
-    /// the retransmission filling it still has to find the stream.
+    /// The peer can send nothing more. Either the FIN and every byte before it
+    /// have arrived, or the peer reset the stream: RFC 9000 §3.2 makes a
+    /// STREAM frame after RESET_STREAM a STREAM_STATE_ERROR, so a reset ends
+    /// the receive side as surely as a clean FIN. A FIN alone is not enough
+    /// while a hole before it is open — the retransmission filling it still
+    /// has to find the stream.
+    ///
+    /// A reset answers true however much was left unread, because `read`
+    /// reports null from then on and those bytes can never be delivered.
     pub fn allReceived(self: *const ReceiveStream) bool {
-        return self.finished or (self.reset_err == null and self.sorter.isFullyReceived());
+        return self.finished or self.reset_err != null or self.sorter.isFullyReceived();
     }
 
     /// Bytes the consumer has read and let go of.
@@ -560,8 +748,11 @@ pub const ReceiveStream = struct {
         return self.conn_counted -| self.conn_credited;
     }
 
-    /// Check if a MAX_STREAM_DATA update should be sent.
-    /// Returns the new window offset, or null if no update needed.
+    /// The new limit to put in a MAX_STREAM_DATA frame, or `null` when none is
+    /// due: a stream configured with no receive window never grants one, and
+    /// neither does one whose FIN has arrived. A grant moves
+    /// `receive_window` to `consumed() + receive_window_size`, and the next
+    /// falls due once a quarter of a window's worth has been consumed past it.
     pub fn getWindowUpdate(self: *ReceiveStream) ?u64 {
         if (self.receive_window_size == 0) return null; // no flow control configured
         if (self.fin_received) return null; // no point updating after FIN
@@ -578,7 +769,11 @@ pub const ReceiveStream = struct {
         return null;
     }
 
-    /// Request that the peer stop sending on this stream (sends STOP_SENDING).
+    /// Asks the peer to stop sending, recording `error_code` for a
+    /// STOP_SENDING frame. Records the intent only: the caller queues the
+    /// frame, which is what sets `stop_sending_sent`. Calling again before one
+    /// has gone out replaces the code; nothing is sent and no other state
+    /// moves.
     pub fn stopSending(self: *ReceiveStream, error_code: u64) void {
         self.stop_sending_err = error_code;
     }
@@ -615,9 +810,28 @@ pub const SendLedger = struct {
     committed: u64 = 0,
 };
 
-/// A QUIC send stream.
+/// A QUIC send stream: buffered application bytes, the write, send and
+/// acknowledgement cursors, retransmission bookkeeping, and the peer's
+/// stream flow-control limit.
+///
+/// Owns `write_buffer` and `acked_ranges`, both from the allocator `init` was
+/// given; `deinit` releases them, exactly once. `ledger` is a borrow — the
+/// owning `StreamsMap` destroys it — so a copy is a second owner of that
+/// buffer rather than an independent stream, and must not be `deinit`'d.
+/// `writeData` copies the caller's bytes; nothing here borrows them.
+///
+/// The frames `popStreamFrame` returns borrow `write_buffer` and are valid
+/// until the next write, acknowledgement or teardown; a `StreamsMap`
+/// heap-allocates every stream it owns, so the pointers its accessors hand
+/// out stay valid until the map disposes the stream.
+///
+/// Nothing here synchronizes: a stream is driven by the one thread driving
+/// the connection, and concurrent calls on the same value are not safe.
 pub const SendStream = struct {
+    /// The stream this is the send half of.
     stream_id: u64,
+    /// Retained at `init` and used for the write buffer and the acknowledged
+    /// range set.
     allocator: Allocator,
 
     /// Data buffered for sending. Indexed relative to `buf_base`, not by
@@ -647,7 +861,9 @@ pub const SendStream = struct {
     /// Maximum data the peer allows us to send on this stream.
     send_window: u64 = std.math.maxInt(u64),
 
-    // Track the limit at which we last sent STREAM_DATA_BLOCKED (avoid duplicates)
+    /// The send-window limit we last reported STREAM_DATA_BLOCKED at, so the
+    /// advisory frame is sent once per limit rather than once per packet.
+    /// `null` until one has gone out, and cleared by `updateSendWindow`.
     blocked_at: ?u64 = null,
 
     /// RFC 9218 priority: urgency (0=highest, 7=lowest, default 3).
@@ -673,7 +889,10 @@ pub const SendStream = struct {
     /// Whether FIN has been sent.
     fin_sent: bool = false,
 
-    /// Whether the stream has been reset.
+    /// Error code this stream was cancelled with, by `reset` or by a
+    /// STOP_SENDING the peer sent; `null` while the stream is live. A reset
+    /// ends the direction: nothing is sent after it and the unsent tail is
+    /// charged back to the ledger.
     reset_err: ?u64 = null,
 
     /// Code from a STOP_SENDING the peer sent us. `reset_err` is also set so the
@@ -697,12 +916,20 @@ pub const SendStream = struct {
     disposal_queued: bool = false,
 
     /// Retransmission queue: ranges of data that were lost and need resending.
+    /// `retransmit_count` is how many of `MAX_RETRANSMIT_RANGES` are live, and
+    /// is `0` for an empty queue. A range added to a full queue collapses the
+    /// whole queue into one broad range, so the queue's contents are always
+    /// exactly the ranges still to resend — never a dropped one.
     retransmit_ranges: [MAX_RETRANSMIT_RANGES]RetransmitRange = undefined,
     retransmit_count: u8 = 0,
 
     /// Whether a FIN that was previously sent was lost and needs retransmission.
     fin_lost: bool = false,
 
+    /// An empty stream: nothing buffered, nothing sent, nothing acknowledged,
+    /// no ledger and no peer limit beyond `send_window`'s default. The
+    /// allocator is retained immediately, so one `deinit` is owed whether or
+    /// not anything is ever written.
     pub fn init(allocator: Allocator, stream_id: u64) SendStream {
         return .{
             .stream_id = stream_id,
@@ -712,13 +939,23 @@ pub const SendStream = struct {
         };
     }
 
+    /// Releases the write buffer and the acknowledged range set. Does not free
+    /// the allocator, and does not free `ledger`, which the owning
+    /// `StreamsMap` destroys. The stream is unusable afterwards, and a second
+    /// call frees the same bytes twice.
     pub fn deinit(self: *SendStream) void {
         self.acked_ranges.deinit();
         self.write_buffer.deinit(self.allocator);
     }
 
-    /// Write data to the stream. Buffers it for later sending. Dropped once the
-    /// stream is reset: RFC 9000 §3.1 lets nothing follow RESET_STREAM.
+    /// Buffers `data` for sending and charges it against the send ledger.
+    /// Silent no-op once the stream is reset — nothing may follow
+    /// RESET_STREAM (RFC 9000 §3.1) — so a caller need not check first.
+    ///
+    /// `error.OutOfMemory` from the buffer queues nothing: `write_offset` and
+    /// the ledger do not move and the bytes are not in the stream, so the same
+    /// write may be retried. The acknowledged prefix may already have been
+    /// dropped by then, which is why it can succeed the second time.
     pub fn writeData(self: *SendStream, data: []const u8) !void {
         if (self.reset_err != null) return;
         // Reuse the acked prefix before growing, so streaming that fits the
@@ -813,13 +1050,22 @@ pub const SendStream = struct {
         return items[rel..][0..@intCast(@min(max_len, items.len - rel))];
     }
 
-    /// Close the stream (queue FIN).
+    /// Queues the FIN. Nothing goes on the wire until a `popStreamFrame` that
+    /// reaches `write_offset` carries it, and the peer still has to
+    /// acknowledge it; bytes written after this call are sent ahead of the
+    /// FIN rather than after it. Queuing twice is one FIN.
     pub fn close(self: *SendStream) void {
         self.fin_queued = true;
     }
 
-    /// Update the acknowledged offset when a packet carrying stream frames is
-    /// ACKed. `fin` is the flag the acked frame was sent with.
+    /// Records that a packet carrying `offset..offset + length` was acked, and
+    /// `fin` that it was the flag the acked frame went out with. The
+    /// acknowledged prefix is then dropped from the buffer.
+    ///
+    /// `error.OutOfMemory` from the acknowledged-range set records no range:
+    /// `fin_acked` has already been set if `fin` was, and `ack_offset`,
+    /// `send_offset`, the retransmit queue and the buffer are as they were, so
+    /// the same acknowledgement may be passed again.
     pub fn onAck(self: *SendStream, offset: u64, length: u64, fin: bool) !void {
         if (fin) self.fin_acked = true;
         if (length == 0) {
@@ -850,7 +1096,14 @@ pub const SendStream = struct {
         self.compactAcked();
     }
 
-    /// Cancel the stream with an error code (sends RESET_STREAM).
+    /// Cancels the stream with an error code. Nothing is sent on it after this,
+    /// `hasData` is false, and `send_offset` becomes the final size
+    /// RESET_STREAM will name.
+    ///
+    /// Records the intent only: the caller queues the frame, which is what sets
+    /// `reset_stream_sent` and settles the stream for disposal. The unsent
+    /// tail is charged back to the ledger once, so a second call — a
+    /// retransmitted STOP_SENDING, say — changes nothing else.
     pub fn reset(self: *SendStream, error_code: u64) void {
         // The unsent tail will never spend connection credit: RESET_STREAM
         // names send_offset as the final size.
@@ -860,7 +1113,9 @@ pub const SendStream = struct {
         self.reset_err = error_code;
     }
 
-    /// Update the send window from a MAX_STREAM_DATA frame.
+    /// Applies a MAX_STREAM_DATA limit. Only a larger `new_max` is taken: the
+    /// limit is cumulative and never falls (RFC 9000 §4.1), so a smaller value
+    /// is ignored and a taken one re-arms the STREAM_DATA_BLOCKED report.
     pub fn updateSendWindow(self: *SendStream, new_max: u64) void {
         if (new_max > self.send_window) {
             self.send_window = new_max;
@@ -875,9 +1130,10 @@ pub const SendStream = struct {
         return self.send_window -| self.write_offset;
     }
 
-    // Check if we should send STREAM_DATA_BLOCKED. Returns the limit if yes.
-    // STREAM_DATA_BLOCKED is advisory; emit once per blocked limit and re-arm
-    // when MAX_STREAM_DATA advances the send window.
+    /// The send-window limit to report in STREAM_DATA_BLOCKED, or `null` when
+    /// no report is due. True once the send cursor has reached the window with
+    /// data still to send, and once per limit since `updateSendWindow` — the
+    /// frame is advisory, so a repeated one tells the peer nothing new.
     pub fn shouldSendBlocked(self: *SendStream) ?u64 {
         if (self.send_offset >= self.send_window and self.hasData() and self.blocked_at != self.send_window) {
             self.blocked_at = self.send_window;
@@ -886,7 +1142,13 @@ pub const SendStream = struct {
         return null;
     }
 
-    /// Queue a range of stream data for retransmission (called when a packet is declared lost).
+    /// Queues `offset_in..offset_in + length_in` to be sent again, and with
+    /// `fin` that a FIN went out in the same lost packet. Ranges that overlap
+    /// or abut an existing one are merged, and a range the peer has already
+    /// acknowledged is dropped: those bytes are gone from the buffer, so
+    /// resending them would be waste. No-op on a reset stream, so the caller
+    /// need not check first; a queue that is already full collapses into one
+    /// broad range rather than losing one.
     pub fn queueRetransmit(self: *SendStream, offset_in: u64, length_in: u64, fin: bool) void {
         if (self.reset_err != null) return;
 
@@ -1000,9 +1262,16 @@ pub const SendStream = struct {
         return self.fin_acked and self.ack_offset >= self.write_offset;
     }
 
-    /// Pop a STREAM frame with at most max_len bytes of payload.
-    /// Prioritizes retransmissions over new data.
-    /// Returns null if there's nothing to send.
+    /// Pop a STREAM frame with at most `max_len` bytes of payload.
+    /// Prioritizes retransmissions over new data. Returns null if there's
+    /// nothing to send, which is also the answer for a stream this side reset.
+    ///
+    /// The frame's `data` is a **borrow of this stream's write buffer**, not a
+    /// copy the caller owns: `Frame.write` is what turns it into bytes on the
+    /// wire, and the caller must do that before the next call here.
+    /// `writeData`, `onAck` (which compacts or reallocates the buffer) and
+    /// `deinit` all invalidate it. A FIN-only frame has no borrow and points at
+    /// a static empty slice.
     pub fn popStreamFrame(self: *SendStream, max_len: u64) ?Frame {
         if (self.reset_err != null) return null;
 
@@ -1152,10 +1421,23 @@ pub const SendStream = struct {
     }
 };
 
-/// A bidirectional QUIC stream combining send and receive.
+/// A bidirectional QUIC stream: a `SendStream` and a `ReceiveStream` over one
+/// stream id, plus the two flags the map reclaims it by.
+///
+/// Owns both halves and the allocator they retain; `deinit` releases them,
+/// exactly once. A copy is a second owner of that storage rather than an
+/// independent stream, and must not be `deinit`'d. A `StreamsMap`
+/// heap-allocates every stream it owns, so the pointers its accessors hand
+/// out stay valid until the map disposes the stream.
+///
+/// Nothing here synchronizes: a stream is driven by the one thread driving
+/// the connection, and concurrent calls on the same value are not safe.
 pub const Stream = struct {
+    /// The stream both halves belong to.
     stream_id: u64,
+    /// Send half. Owned; released by `deinit`.
     send: SendStream,
+    /// Receive half. Owned; released by `deinit`.
     recv: ReceiveStream,
     /// Set when closeStream has been called for consumed stream counting.
     /// Prevents double-counting while keeping the stream in the map for retransmission.
@@ -1165,6 +1447,11 @@ pub const Stream = struct {
     /// collectClosedStreams backstop cannot enqueue it twice.
     disposal_queued: bool = false,
 
+    /// Both halves empty and sharing `allocator`, which each retains, so one
+    /// `deinit` is owed whichever half did the allocating. A caller that
+    /// wants flow control sets `recv.receive_window` and
+    /// `recv.receive_window_size` before the stream sees a frame; the map
+    /// does that for every stream it opens.
     pub fn init(allocator: Allocator, stream_id: u64) Stream {
         return .{
             .stream_id = stream_id,
@@ -1173,6 +1460,11 @@ pub const Stream = struct {
         };
     }
 
+    /// Releases both halves — the write buffer, the acknowledged ranges and
+    /// every reassembly chunk still buffered. Does not free the allocator, the
+    /// shared `SendLedger`, or anything `recv.read` already handed out, which
+    /// belong to their callers. The stream is unusable afterwards, and a
+    /// second call frees the same bytes twice.
     pub fn deinit(self: *Stream) void {
         self.send.deinit();
         self.recv.deinit();
@@ -1180,20 +1472,46 @@ pub const Stream = struct {
 
     /// Whether the stream can be removed from the map and freed.
     ///
-    /// `closed_for_gc` only means both FINs have crossed. The FIN we sent may
-    /// still be lost, and PTO recovers it by resetting `send_offset` — which it
-    /// cannot do once the stream is gone. Nothing is left to recover only when
-    /// every byte is acknowledged and no retransmit range is outstanding.
+    /// `closed_for_gc` only means both directions are finished. The FIN we
+    /// sent may still be lost, and PTO recovers it by resetting `send_offset`
+    /// — which it cannot do once the stream is gone. Nothing is left to
+    /// recover only when every byte is acknowledged and no retransmit range
+    /// is outstanding. A stream whose receive side the peer reset with bytes
+    /// still unread meets this too: `read` reports null from then on, so the
+    /// buffered runs can never be delivered and holding them serves nobody.
+    ///
+    /// A pinned stream is never reclaimed whatever its state, because a
+    /// protocol layer holds a pointer to it for the whole connection.
     pub fn isDisposable(self: *const Stream) bool {
+        if (self.send.pinned) return false;
         return self.closed_for_gc and
             self.send.retransmit_count == 0 and
             !self.send.hasUnackedData();
     }
 };
 
-/// Manages all streams for a connection.
+/// The stream table for one connection: it allocates every stream, owns them
+/// until they are disposed, allocates the stream ids, and holds the counters
+/// behind the peer's MAX_STREAMS credit.
+///
+/// Retains the allocator and owns every stream in `streams`, `send_streams`
+/// and `recv_streams`, plus the `send_ledger` they share. `deinit` releases all
+/// of them, exactly once; a copy is a second owner rather than an
+/// independent map, and must not be `deinit`'d.
+///
+/// Every stream is heap-allocated, so the pointers its accessors return stay
+/// valid until the stream is disposed — by `drainDisposalQueue`, or by
+/// `deinit` for the ones still held. A stream that has been disposed is freed
+/// whether or not its holder still has the pointer, so the accessors are the
+/// only safe way to name one.
+///
+/// Nothing here synchronizes: the map is driven by the one thread driving the
+/// connection, and concurrent calls on the same value are not safe.
 pub const StreamsMap = struct {
+    /// Retained at `init` and used for every stream, every id and the ledger.
     allocator: Allocator,
+    /// Whether this connection is the server, which decides the parity of the
+    /// stream ids it hands out and the watermark of the ones it expects.
     is_server: bool,
 
     /// All active streams indexed by stream ID.
@@ -1261,6 +1579,9 @@ pub const StreamsMap = struct {
     /// Targeted disposal queue: stream IDs ready for removal. Populated by
     /// queueDisposal() at the point where a stream is known to be fully done,
     /// drained by drainDisposalQueue() once per event loop cycle. O(k) not O(n).
+    /// `disposal_count` is how many of the 64 slots are live, and is `0` for an
+    /// empty queue; a settled stream the queue has no room for is left out and
+    /// picked up by the next drain's rescan.
     disposal_queue: [64]u64 = undefined,
     disposal_count: usize = 0,
 
@@ -1304,6 +1625,11 @@ pub const StreamsMap = struct {
     /// Connection credit held by receive streams that have since been freed.
     freed_conn_credit: u64 = 0,
 
+    /// An empty table with the stream ids and watermarks `is_server` implies:
+    /// a client hands out bidi 0, 4, 8, … and uni 2, 6, 10, … and expects 1,
+    /// 5, 9, … and 3, 7, 11, …, and a server the other way round. No stream,
+    /// credit or ledger yet, but the allocator is retained immediately, so one
+    /// `deinit` is owed whether or not a stream is ever opened.
     pub fn init(allocator: Allocator, is_server: bool) StreamsMap {
         // Stream IDs: client bidi = 0, 4, 8, ...; server bidi = 1, 5, 9, ...
         // Client uni = 2, 6, 10, ...; server uni = 3, 7, 11, ...
@@ -1326,6 +1652,17 @@ pub const StreamsMap = struct {
         };
     }
 
+    /// Releases every stream still held — both halves of each bidirectional
+    /// one — and the `send_ledger` they share, then the three maps. Does not
+    /// free the allocator.
+    ///
+    /// Every `*Stream`, `*SendStream` and `*ReceiveStream` this map handed out
+    /// dangles afterwards, settled or not, and anything `ReceiveStream.read`
+    /// already handed to a caller stays theirs: it left its stream and is no
+    /// longer freed here. A stream `drainDisposalQueue` already freed is gone
+    /// from the maps, so nothing is released twice; a caller that never drains
+    /// simply has more released here. The map is unusable afterwards, and a
+    /// second call is a double free.
     pub fn deinit(self: *StreamsMap) void {
         // Free all stream objects
         var stream_it = self.streams.valueIterator();
@@ -1382,6 +1719,12 @@ pub const StreamsMap = struct {
     }
 
     /// Open a new bidirectional stream. Returns error if stream limit reached.
+    ///
+    /// `error.StreamLimitError` when the peer's MAX_STREAMS is spent, and
+    /// `error.OutOfMemory` from the allocation. On either the stream ID, the
+    /// open count and the map are exactly what they were: nothing is consumed
+    /// for a stream that was not created, so a retry after `OutOfMemory`
+    /// returns the same ID rather than skipping one.
     pub fn openBidiStream(self: *StreamsMap) !*Stream {
         // MAX_STREAMS is cumulative: check total streams opened, not concurrent count
         if (self.next_bidi_stream_id / 4 >= self.max_bidi_streams) {
@@ -1390,11 +1733,13 @@ pub const StreamsMap = struct {
 
         const ledger = try self.sendLedger();
         const id = self.next_bidi_stream_id;
-        self.next_bidi_stream_id += 4;
-        self.open_bidi_streams += 1;
 
         const s = try self.allocator.create(Stream);
         s.* = Stream.init(self.allocator, id);
+        errdefer {
+            s.deinit();
+            self.allocator.destroy(s);
+        }
         s.send.ledger = ledger;
         // We initiated this stream → peer's "bidi_remote" limit applies to our sends
         s.send.send_window = self.peer_initial_max_stream_data_bidi_remote;
@@ -1402,10 +1747,17 @@ pub const StreamsMap = struct {
         s.recv.receive_window = self.local_max_stream_data_bidi_local;
         s.recv.receive_window_size = self.local_max_stream_data_bidi_local;
         try self.streams.put(id, s);
+
+        // Committed: the stream is in the map, so the ID and the count move.
+        self.next_bidi_stream_id += 4;
+        self.open_bidi_streams += 1;
         return s;
     }
 
     /// Open a new unidirectional send stream. Returns error if stream limit reached.
+    ///
+    /// The same error set and the same failure contract as `openBidiStream`: a
+    /// refused open consumes no stream ID and leaves `send_streams` untouched.
     pub fn openUniStream(self: *StreamsMap) !*SendStream {
         // MAX_STREAMS is cumulative: check total streams opened, not concurrent count
         if (self.next_uni_stream_id / 4 >= self.max_uni_streams) {
@@ -1414,18 +1766,36 @@ pub const StreamsMap = struct {
 
         const ledger = try self.sendLedger();
         const id = self.next_uni_stream_id;
-        self.next_uni_stream_id += 4;
-        self.open_uni_streams += 1;
 
         const s = try self.allocator.create(SendStream);
         s.* = SendStream.init(self.allocator, id);
+        errdefer {
+            s.deinit();
+            self.allocator.destroy(s);
+        }
         s.ledger = ledger;
         s.send_window = self.peer_initial_max_stream_data_uni;
         try self.send_streams.put(id, s);
+
+        // Committed: the stream is in the map, so the ID and the count move.
+        self.next_uni_stream_id += 4;
+        self.open_uni_streams += 1;
         return s;
     }
 
-    /// Get or create a stream from an incoming STREAM frame.
+    /// The bidirectional stream `stream_id` names, creating it if the peer has
+    /// just opened it. The returned pointer is one the map owns: it must not
+    /// be `deinit`'d, and it is invalidated when the stream is disposed.
+    ///
+    /// Three errors, and the caller closes the connection on the first two,
+    /// which are peer protocol errors (RFC 9000 §2.1, §3.2):
+    /// `error.StreamStateError` for a locally-initiated id this map never
+    /// opened and for a peer-initiated unidirectional one, which belongs to
+    /// `getOrCreateRecvStream`; `error.StreamAlreadyClosed` for an id below
+    /// the watermark, which was opened once and has since been reclaimed.
+    /// `error.OutOfMemory` leaves the map and the watermark describing the
+    /// same set of streams — the ids this call opened before failing stay
+    /// open, and the retry resumes at the first one that was not.
     pub fn getOrCreateStream(self: *StreamsMap, stream_id: u64) !*Stream {
         if (self.streams.get(stream_id)) |existing| {
             return existing;
@@ -1450,10 +1820,21 @@ pub const StreamsMap = struct {
         // type. Materialising them is what makes the watermark above exact.
         // Bounded by the MAX_STREAMS credit we granted, which the caller checks
         // before we get here.
+        //
+        // The watermark advances with each stream actually created, so an
+        // `error.OutOfMemory` part-way through leaves the map and the
+        // watermark describing the same set of streams: the caller's retry
+        // resumes at the first one that was not created instead of replacing
+        // the ones that were, which would leak them and count each of their
+        // closes twice against MAX_STREAMS.
         var id = self.next_peer_bidi_to_open;
-        while (id < stream_id) : (id += 4) _ = try self.openPeerBidiStream(id);
+        while (id < stream_id) : (id += 4) {
+            _ = try self.openPeerBidiStream(id);
+            self.next_peer_bidi_to_open = id + 4;
+        }
+        const s = try self.openPeerBidiStream(stream_id);
         self.next_peer_bidi_to_open = stream_id + 4;
-        return try self.openPeerBidiStream(stream_id);
+        return s;
     }
 
     /// Build one peer-initiated bidi stream and add it to the map.
@@ -1481,7 +1862,15 @@ pub const StreamsMap = struct {
         return s;
     }
 
-    /// Get or create a receive stream for an incoming unidirectional stream.
+    /// The peer's unidirectional receive stream `stream_id` names, creating it
+    /// if the peer has just opened it, with `local_max_stream_data_uni` as its
+    /// window. The returned pointer is one the map owns: it must not be
+    /// `deinit`'d, and it is invalidated when the stream is disposed.
+    ///
+    /// `error.StreamAlreadyClosed` for an id below the watermark — opened once
+    /// and since reclaimed — and `error.OutOfMemory` from the allocation,
+    /// which leaves the map and the watermark describing the same set of
+    /// streams, so the retry resumes at the first id that was not created.
     pub fn getOrCreateRecvStream(self: *StreamsMap, stream_id: u64) !*ReceiveStream {
         if (self.recv_streams.get(stream_id)) |existing| {
             return existing;
@@ -1494,10 +1883,16 @@ pub const StreamsMap = struct {
 
         // RFC 9000 §3.2: using a stream ID opens every lower one of the same
         // type. Materialising them is what makes the watermark above exact.
+        // The watermark advances per stream created, as in `getOrCreateStream`,
+        // so a retry after `error.OutOfMemory` resumes rather than replacing.
         var id = self.next_peer_uni_to_open;
-        while (id < stream_id) : (id += 4) _ = try self.openPeerUniStream(id);
+        while (id < stream_id) : (id += 4) {
+            _ = try self.openPeerUniStream(id);
+            self.next_peer_uni_to_open = id + 4;
+        }
+        const s = try self.openPeerUniStream(stream_id);
         self.next_peer_uni_to_open = stream_id + 4;
-        return try self.openPeerUniStream(stream_id);
+        return s;
     }
 
     /// Build one peer-initiated receive stream and add it to the map.
@@ -1528,7 +1923,11 @@ pub const StreamsMap = struct {
         if (!rs.disposal_queued) self.recv_disposal_overflow = true;
     }
 
-    /// Get a stream by ID.
+    /// The bidirectional stream `stream_id` names, or `null` — including for a
+    /// unidirectional id, which lives in `send_streams` or `recv_streams` and
+    /// is reached through `getSendStream` or `getRecvStream`. A non-null
+    /// pointer is one the map owns: it must not be `deinit`'d, and it is
+    /// invalidated when the stream is disposed.
     pub fn getStream(self: *StreamsMap, stream_id: u64) ?*Stream {
         return self.streams.get(stream_id);
     }
@@ -1543,13 +1942,16 @@ pub const StreamsMap = struct {
     }
 
     /// The send half of any stream we can send on: a bidi stream, or our uni.
+    /// A non-null pointer is map-owned and is invalidated when the stream is
+    /// disposed.
     pub fn getSendStream(self: *const StreamsMap, stream_id: u64) ?*SendStream {
         if (self.streams.get(stream_id)) |s| return &s.send;
         return self.send_streams.get(stream_id);
     }
 
     /// The receive half of any stream we can receive on: a bidi stream, or
-    /// the peer's uni.
+    /// the peer's uni. A non-null pointer is map-owned and is invalidated when
+    /// the stream is disposed.
     pub fn getRecvStream(self: *const StreamsMap, stream_id: u64) ?*ReceiveStream {
         if (self.streams.get(stream_id)) |s| return &s.recv;
         return self.recv_streams.get(stream_id);
@@ -1719,12 +2121,12 @@ pub const StreamsMap = struct {
         return total;
     }
 
-    /// Mark a stream as fully closed and update consumed counters.
-    /// Only counts peer-initiated streams (those count against our MAX_STREAMS limit).
-    /// Scan bidi streams for ones that are fully closed (both FIN sent and FIN received)
-    /// and call closeStream for each. This ensures consumed_*_streams advances even when
-    /// the close was never triggered by a received STREAM/RESET_STREAM frame.
-    /// Backstop for closeIfDone and the ACK-time disposal, which drop what
+    /// Close every bidi stream that is finished on both sides but whose close
+    /// no frame has triggered, and offer each for reclamation. This is what
+    /// advances `consumed_*_streams` when the peer's FIN, or its reset,
+    /// arrived without ours having gone out yet.
+    ///
+    /// Backstop for `closeIfDone` and the ACK-time disposal, which drop what
     /// the disposal queue cannot hold. Runs only when armed: a scan per
     /// packet was 2% of CPU on a server with responses always in flight.
     pub fn collectClosedStreams(self: *StreamsMap) void {
@@ -1735,7 +2137,6 @@ pub const StreamsMap = struct {
         while (it.next()) |kv| {
             const s = kv.value_ptr.*;
             if (!s.closed_for_gc and s.recv.allReceived() and s.send.fin_sent) {
-                s.closed_for_gc = true;
                 self.closeStream(s.stream_id);
             }
             self.disposeIfSettled(s);
@@ -1744,25 +2145,48 @@ pub const StreamsMap = struct {
 
     /// Close a bidi stream once both directions are done, and reclaim it if
     /// that also settles it. Called wherever either direction finishes: the
-    /// peer's last byte arriving, or our FIN going out.
+    /// peer's last byte arriving, the peer resetting, or our FIN going out.
     pub fn closeIfDone(self: *StreamsMap, s: *Stream) void {
         if (s.closed_for_gc) return;
-        if (!s.recv.fin_received or !s.recv.allReceived()) return;
+        // `allReceived` is the whole receive-side condition: it covers the FIN
+        // with every byte before it, and a reset, which never sets a FIN.
+        if (!s.recv.allReceived()) return;
         if (!s.send.fin_sent and s.send.reset_err == null) return;
-        s.closed_for_gc = true;
         self.closeStream(s.stream_id);
-        self.disposeIfSettled(s);
     }
 
+    /// Mark a stream closed: count it against MAX_STREAMS and, for a bidi
+    /// stream, offer it for reclamation once its send side has nothing left.
+    ///
+    /// This is the one place a stream becomes closed, so it is also where
+    /// `closed_for_gc` is set, and a bidirectional stream is counted exactly
+    /// once however many times it is closed: a retransmitted RESET_STREAM, a
+    /// stream closed once by a frame and again by a scan, and a close that
+    /// arrives after the stream was reclaimed all reach the same stream, and
+    /// none of them grants MAX_STREAMS credit twice. A bidirectional stream
+    /// this map no longer holds has been counted already — only a close takes
+    /// one out, and a close counts.
+    ///
+    /// A unidirectional stream is counted through the counters alone, in or
+    /// out of the map: it lives in `send_streams` or `recv_streams`, and its
+    /// own `closed_counted` flag is what guards a repeated close there.
     pub fn closeStream(self: *StreamsMap, stream_id: u64) void {
         const peer_initiated = !isLocal(stream_id, self.is_server);
         if (isBidi(stream_id)) {
+            const s = self.streams.get(stream_id) orelse return;
+            if (s.closed_for_gc) return;
+            s.closed_for_gc = true;
             if (self.open_bidi_streams > 0) self.open_bidi_streams -= 1;
             if (peer_initiated) self.consumed_bidi_streams += 1;
-        } else {
-            if (self.open_uni_streams > 0) self.open_uni_streams -= 1;
-            if (peer_initiated) self.consumed_uni_streams += 1;
+            // Nothing is reclaimed here that still owes the peer an ACK; the
+            // ACK path calls `disposeIfSettled` per acked frame, and that is
+            // the call that settles a stream closed before its last byte came
+            // back.
+            self.disposeIfSettled(s);
+            return;
         }
+        if (self.open_uni_streams > 0) self.open_uni_streams -= 1;
+        if (peer_initiated) self.consumed_uni_streams += 1;
     }
 
     /// Queue a stream for removal if it is closed and fully acknowledged.
@@ -1869,10 +2293,16 @@ pub const StreamsMap = struct {
         return false;
     }
 
-    /// Check if MAX_STREAMS updates should be sent (sliding window pattern).
-    /// Returns new limits when consumed streams reach half the current max.
+    /// The MAX_STREAMS credit one `getMaxStreamsUpdates` call found due, as
+    /// stream counts. A `null` field means that direction had nothing to give
+    /// and its counters are untouched; a non-null one is the new limit the
+    /// caller must put in a MAX_STREAMS frame, and the map has already moved
+    /// `last_sent_max_bidi`/`last_sent_max_uni` and the matching
+    /// `max_incoming_*_streams` to it.
     pub const MaxStreamsUpdate = struct {
+        /// New limit for peer-initiated bidirectional streams, or `null`.
         bidi: ?u64 = null,
+        /// New limit for peer-initiated unidirectional streams, or `null`.
         uni: ?u64 = null,
     };
 
@@ -1909,6 +2339,17 @@ pub const StreamsMap = struct {
         return if (highest) |id| (id / 4) + 1 >= max_incoming else false;
     }
 
+    /// The credit closed streams have earned, per direction, consuming the
+    /// counters behind it: each non-null field is a new limit the caller must
+    /// put in a MAX_STREAMS frame, and calling again with no further closes
+    /// returns `null` rather than the same limit twice.
+    ///
+    /// A grant falls due once a quarter of the initial limit has been consumed
+    /// — or once one has, where that limit is under four — or once the peer
+    /// has opened as many streams as it currently holds credit for, which
+    /// hands the last partial batch over early instead of leaving a peer
+    /// sitting at its limit. A direction with nothing due keeps its counters,
+    /// so this is safe to call on every send pass.
     pub fn getMaxStreamsUpdates(self: *StreamsMap) MaxStreamsUpdate {
         return .{
             .bidi = if (self.maxStreamsDue(true)) self.flushMaxStreams(true) else null,
@@ -2504,7 +2945,7 @@ test "StreamsMap: getMaxStreamsUpdates uni direction" {
 
     sm.setMaxIncomingStreams(0, 6);
 
-    sm.consumed_uni_streams = 3; // >= 6/2=3
+    sm.consumed_uni_streams = 3;
     const update = sm.getMaxStreamsUpdates();
     try testing.expect(update.bidi == null);
     try testing.expectEqual(@as(u64, 9), update.uni.?); // 3 + 6 = 9
@@ -2544,7 +2985,6 @@ test "StreamsMap: closeStream and getMaxStreamsUpdates integration" {
     try testing.expectEqual(@as(u64, 0), sm.open_bidi_streams);
     try testing.expectEqual(@as(u64, 2), sm.consumed_bidi_streams);
 
-    // 2 >= 4/2=2, so MAX_STREAMS update should fire
     const update = sm.getMaxStreamsUpdates();
     try testing.expectEqual(@as(u64, 6), update.bidi.?); // 2 + 4 = 6
 }
@@ -3806,4 +4246,303 @@ test "FrameSorter: chunk slots from a reordering burst are released once drained
 
     try testing.expectEqual(@as(u64, 2 * n), sorter.read_pos);
     try testing.expectEqual(@as(usize, 0), sorter.chunks.capacity);
+}
+
+test "FrameSorter: peekLen reports the next run without consuming it" {
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
+
+    // A gap first, so the head of the list is not the read position.
+    try sorter.push(64, "the second run", false);
+    try testing.expectEqual(@as(?usize, null), sorter.peekLen());
+
+    try sorter.push(0, "the first run", false);
+    try testing.expectEqual(@as(?usize, "the first run".len), sorter.peekLen());
+    // Reading what was peeked does not move it out from under the next peek.
+    try testing.expectEqual(@as(?usize, "the first run".len), sorter.peekLen());
+    const first = sorter.pop().?;
+    try testing.expectEqualStrings("the first run", first);
+    testing.allocator.free(first);
+    // The gap is still open, so the run at 64 is not yet the next one.
+    try testing.expectEqual(@as(?usize, null), sorter.peekLen());
+    try sorter.push(13, "the second run", false);
+    try testing.expectEqual(@as(?usize, "the second run".len), sorter.peekLen());
+}
+
+test "FrameSorter: a copy that cannot be made leaves the run on the stream" {
+    var sorter = FrameSorter.init(testing.allocator);
+    defer sorter.deinit();
+
+    // Two runs that abut, pushed from the back so the merged chunk carries
+    // room in front of it: that is the case where `pop` has to copy rather
+    // than hand over the allocation it already has.
+    try sorter.push(4, "bbbb", false);
+    try sorter.push(0, "aaaa", false);
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    sorter.allocator = failing.allocator();
+    try testing.expectEqual(@as(?[]const u8, null), sorter.pop());
+    sorter.allocator = testing.allocator;
+
+    // The refused pop is not a delivery: nothing was read, and the bytes are
+    // still the stream's to hand over. A peer cannot retransmit them, because
+    // from its side they were received.
+    try testing.expectEqual(@as(u64, 0), sorter.read_pos);
+    try testing.expectEqual(@as(?usize, "aaaabbbb".len), sorter.peekLen());
+    const both = sorter.pop().?;
+    try testing.expectEqualStrings("aaaabbbb", both);
+    testing.allocator.free(both);
+}
+
+test "ReceiveStream: a refused read costs the consumer nothing and no credit" {
+    var stream = ReceiveStream.init(testing.allocator, 0);
+    defer stream.deinit();
+    try stream.handleStreamFrame(4, "bbbb", false);
+    try stream.handleStreamFrame(0, "aaaa", false);
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    stream.sorter.allocator = failing.allocator();
+    try testing.expectEqual(@as(?[]const u8, null), stream.read());
+    stream.sorter.allocator = testing.allocator;
+
+    try testing.expectEqual(@as(u64, 0), stream.bytes_read);
+    try testing.expectEqual(@as(u64, 0), stream.takeConnCredit());
+    const payload = stream.read().?;
+    try testing.expectEqualStrings("aaaabbbb", payload);
+    testing.allocator.free(payload);
+    try testing.expectEqual(@as(u64, "aaaabbbb".len), stream.bytes_read);
+}
+
+/// One `openBidiStream` under whatever the allocator answers.
+/// `checkAllAllocationFailures` runs it once per allocation index, so every
+/// point at which the call can be refused is exercised, and the run that
+/// answers everything says what a completed open looks like.
+fn openBidiUnderAnyRefusal(gpa: Allocator) !void {
+    var sm = StreamsMap.init(gpa, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    if (sm.openBidiStream()) |_| {
+        try testing.expectEqual(@as(u64, 4), sm.next_bidi_stream_id);
+        try testing.expectEqual(@as(u64, 1), sm.open_bidi_streams);
+        try testing.expectEqual(@as(usize, 1), sm.streams.count());
+        return;
+    } else |err| {
+        try testing.expectEqual(error.OutOfMemory, err);
+    }
+
+    // Refused: nothing is consumed for a stream that does not exist, so the
+    // ID, the open count and the map are what they were before the call.
+    try testing.expectEqual(@as(u64, 0), sm.next_bidi_stream_id);
+    try testing.expectEqual(@as(u64, 0), sm.open_bidi_streams);
+    try testing.expectEqual(@as(usize, 0), sm.streams.count());
+    // Handed back so the sweep reads a refusal as the refusal it induced:
+    // a stream that survived this call is never freed by `deinit`, and the
+    // sweep is what notices.
+    return error.OutOfMemory;
+}
+
+/// The same contract for `openUniStream`.
+fn openUniUnderAnyRefusal(gpa: Allocator) !void {
+    var sm = StreamsMap.init(gpa, false);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    if (sm.openUniStream()) |_| {
+        try testing.expectEqual(@as(u64, 6), sm.next_uni_stream_id);
+        try testing.expectEqual(@as(u64, 1), sm.open_uni_streams);
+        try testing.expectEqual(@as(usize, 1), sm.send_streams.count());
+        return;
+    } else |err| {
+        try testing.expectEqual(error.OutOfMemory, err);
+    }
+
+    try testing.expectEqual(@as(u64, 2), sm.next_uni_stream_id);
+    try testing.expectEqual(@as(u64, 0), sm.open_uni_streams);
+    try testing.expectEqual(@as(usize, 0), sm.send_streams.count());
+    return error.OutOfMemory;
+}
+
+test "StreamsMap: a refused local open consumes no stream ID and frees nothing" {
+    // Each run either completes the open or hands back the refusal, and the
+    // sweep fails on a stream that was created and then lost.
+    try std.testing.checkAllAllocationFailures(testing.allocator, openBidiUnderAnyRefusal, .{});
+    try std.testing.checkAllAllocationFailures(testing.allocator, openUniUnderAnyRefusal, .{});
+}
+
+test "getOrCreateStream: a retry after a refused implicit open replaces no stream" {
+    // Server: peer-initiated bidi IDs are 0, 4, 8, so reaching 8 opens three.
+    for (0..6) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var sm = StreamsMap.init(testing.allocator, true);
+        defer sm.deinit();
+        sm.setMaxStreams(10, 10);
+        sm.allocator = failing.allocator();
+
+        _ = sm.getOrCreateStream(8) catch |err| try testing.expectEqual(error.OutOfMemory, err);
+        sm.allocator = testing.allocator;
+
+        // The map and the watermark describe the same set of streams: every
+        // ID below the watermark is present, and each is counted once.
+        try testing.expectEqual(@as(u64, @intCast(sm.streams.count())), sm.open_bidi_streams);
+        var below: u64 = 0;
+        while (below < sm.next_peer_bidi_to_open) : (below += 4) {
+            try testing.expect(sm.streams.get(below) != null);
+        }
+
+        // The frame is re-raised, which is what the connection does with one
+        // it could not hand over. The retry fills the gap; it must not replace
+        // what the first attempt already built, and it must not count those
+        // streams a second time against MAX_STREAMS.
+        var first: [3]?*Stream = .{ null, null, null };
+        var k: u64 = 0;
+        while (k < 3) : (k += 1) first[k] = sm.streams.get(4 * k);
+
+        _ = try sm.getOrCreateStream(8);
+        try testing.expectEqual(@as(usize, 3), sm.streams.count());
+        try testing.expectEqual(@as(u64, 3), sm.open_bidi_streams);
+        try testing.expectEqual(@as(u64, 12), sm.next_peer_bidi_to_open);
+        for (first, 0..) |was, i| {
+            const rebuilt = sm.streams.get(4 * @as(u64, i)).?;
+            if (was) |kept| try testing.expectEqual(kept, rebuilt);
+        }
+    }
+}
+
+test "getOrCreateRecvStream: a retry after a refused implicit open replaces no stream" {
+    // Server: peer-initiated uni IDs are 2, 6, 10, so reaching 10 opens three.
+    for (0..6) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var sm = StreamsMap.init(testing.allocator, true);
+        defer sm.deinit();
+        sm.setMaxStreams(10, 10);
+        sm.allocator = failing.allocator();
+
+        _ = sm.getOrCreateRecvStream(10) catch |err| try testing.expectEqual(error.OutOfMemory, err);
+        sm.allocator = testing.allocator;
+
+        try testing.expectEqual(@as(u64, @intCast(sm.recv_streams.count())), sm.open_uni_streams);
+        var below: u64 = 2;
+        while (below < sm.next_peer_uni_to_open) : (below += 4) {
+            try testing.expect(sm.recv_streams.get(below) != null);
+        }
+
+        var first: [3]?*ReceiveStream = .{ null, null, null };
+        var k: u64 = 0;
+        while (k < 3) : (k += 1) first[k] = sm.recv_streams.get(2 + 4 * k);
+
+        _ = try sm.getOrCreateRecvStream(10);
+        try testing.expectEqual(@as(usize, 3), sm.recv_streams.count());
+        try testing.expectEqual(@as(u64, 3), sm.open_uni_streams);
+        try testing.expectEqual(@as(u64, 14), sm.next_peer_uni_to_open);
+        for (first, 0..) |was, i| {
+            const rebuilt = sm.recv_streams.get(2 + 4 * @as(u64, i)).?;
+            if (was) |kept| try testing.expectEqual(kept, rebuilt);
+        }
+    }
+}
+
+test "ReceiveStream: a reset stream is all received" {
+    var rs = ReceiveStream.init(testing.allocator, 0);
+    defer rs.deinit();
+    try rs.handleStreamFrame(0, "payload", false);
+    try testing.expect(!rs.allReceived());
+
+    try rs.handleResetStream(7, 7);
+    // The peer sent RESET_STREAM and may send nothing more, so whatever is
+    // still buffered can never be delivered.
+    try testing.expect(rs.allReceived());
+    try testing.expectEqual(@as(?[]const u8, null), rs.read());
+}
+
+test "ReceiveStream: a FIN the stream refuses is not latched" {
+    var rs = ReceiveStream.init(testing.allocator, 0);
+    defer rs.deinit();
+
+    // One run per hole up to the reassembly cap, then one more.
+    var i: u64 = 1;
+    while (i <= limits.max_reassembly_chunks) : (i += 1) try rs.handleStreamFrame(i * 2, "x", false);
+    try testing.expectError(error.TooManyChunks, rs.handleStreamFrame(1_000_000, "y", true));
+    // The frame was refused, so its FIN never became this stream's.
+    try testing.expect(!rs.fin_received);
+}
+
+test "ReceiveStream: the reassembly cap is enforced before a new hole's bytes are copied" {
+    // The cap is this endpoint's resource bound rather than anything the peer
+    // did, so it is checked where it is found: a frame that would open one more
+    // hole is refused without its bytes being copied at all. A sorter whose
+    // allocator refuses the first allocation is what says so — the error is
+    // the cap's, not the allocation's.
+    var rs = ReceiveStream.init(testing.allocator, 0);
+    defer rs.deinit();
+
+    // One run per hole up to the reassembly cap.
+    var i: u64 = 1;
+    while (i <= limits.max_reassembly_chunks) : (i += 1) try rs.handleStreamFrame(i * 2, "x", false);
+    const buffered = rs.sorter.chunks.items.len;
+    const holes = rs.sorter.holes();
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    rs.sorter.allocator = failing.allocator();
+    defer rs.sorter.allocator = testing.allocator;
+    try testing.expectError(error.TooManyChunks, rs.handleStreamFrame(1_000_000, "y", true));
+
+    // What the refusal leaves: the final size it recorded before the cap was
+    // reached, and not one byte of the frame — no FIN latched on the stream,
+    // no chunk, no hole.
+    try testing.expectEqual(@as(?u64, 1_000_001), rs.sorter.fin_offset);
+    try testing.expect(!rs.fin_received);
+    try testing.expectEqual(buffered, rs.sorter.chunks.items.len);
+    try testing.expectEqual(holes, rs.sorter.holes());
+}
+
+test "StreamsMap: a bidi stream the peer reset is reclaimed once its send side settles" {
+    var sm = StreamsMap.init(testing.allocator, true); // server: peer bidi = 0, 4, 8
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s = try sm.getOrCreateStream(0);
+    try s.recv.handleStreamFrame(0, "request", false);
+    try s.recv.handleResetStream(7, 7);
+
+    // The response is still in flight when the peer gives up on the request.
+    try s.send.writeData("12345678");
+    _ = s.send.popStreamFrame(8);
+    s.send.fin_sent = true;
+
+    // What the connection does on RESET_STREAM once the send side is done.
+    sm.closeStream(0);
+    try testing.expect(s.closed_for_gc);
+    try testing.expectEqual(@as(u64, 1), sm.consumed_bidi_streams);
+
+    // Bytes the peer has not acknowledged yet are still recoverable, so the
+    // stream stays until the last ACK arrives.
+    sm.drainDisposalQueue();
+    try testing.expect(sm.streams.get(0) != null);
+
+    try s.send.onAck(0, 8, false);
+    sm.disposeIfSettled(s);
+    sm.drainDisposalQueue();
+    try testing.expect(sm.streams.get(0) == null);
+
+    // A second RESET_STREAM for the same stream grants no further credit.
+    sm.closeStream(0);
+    try testing.expectEqual(@as(u64, 1), sm.consumed_bidi_streams);
+}
+
+test "Stream.isDisposable: a pinned bidi stream is never reclaimed" {
+    var sm = StreamsMap.init(testing.allocator, true);
+    defer sm.deinit();
+    sm.setMaxStreams(10, 10);
+
+    const s = try sm.getOrCreateStream(0);
+    s.send.pinned = true;
+    s.send.fin_sent = true;
+    try s.recv.handleResetStream(7, 0);
+
+    sm.closeStream(0);
+    sm.disposeIfSettled(s);
+    sm.drainDisposalQueue();
+    try testing.expect(!s.isDisposable());
+    try testing.expect(sm.streams.get(0) != null);
 }

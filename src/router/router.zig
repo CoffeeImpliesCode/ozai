@@ -39,47 +39,86 @@ const ula = @import("../base/ula.zig");
 ///
 /// `accept` is the only non-optional field, and that is upstream's shape too:
 /// it is the whole of a handler, so there is nothing to default it to.
+///
+/// **All three calls are made synchronously, by the thread stepping the
+/// router**, and that thread is the caller's own: the accept loop's pass, or a
+/// caller driving `dispatchStep` itself. Nothing here spawns, defers, or moves
+/// a call onto a thread of its own. Upstream runs each `accept` on a freshly
+/// spawned task (`protocol.rs:258-261`) and a vtable has nowhere to put a join
+/// set, so the caller is what runs the body — a handler that blocks blocks the
+/// pass, and there is no thread here for it to move to.
+///
+/// **Every argument is borrowed for the duration of the call.** `ptr` comes
+/// back unchanged and is never dereferenced here. `Accepting` and `Connection`
+/// are opaque handles the endpoint layer minted and the router never looks
+/// inside, so a handler has nothing of its own to keep: what a handle means,
+/// and how long it stays valid, belongs to the layer that minted it.
+///
+/// **`ptr` must stay valid and unchanged from registration until the router is
+/// dropped.** That outlives every individual call, and it is the handler's own
+/// discipline rather than the router's: a handler torn down before its
+/// registration is gone leaves a dangling context, and nothing here can see it
+/// coming.
+///
+/// **None of the three may re-enter the router**, and `shutdown` is the one
+/// that most needs saying. It runs from inside the close, before the machine
+/// has advanced past the handlers, and the ordering the whole shutdown exists
+/// for is that a handler's state is released *while* the accepts that might
+/// still be using it are running and never after (`protocol.rs:284-286`,
+/// `:609-611`). A `shutdown` that closed the endpoint or stepped the accept
+/// loop from inside that call cuts the graceful close in half; `Node`'s own
+/// `shutdownHandler` is the discipline to copy — it gives up the handler's own
+/// state and touches nothing else.
 pub const ProtocolHandler = struct {
     /// The handler's own state, handed to every call unchanged and never
     /// dereferenced here. A handler that needs nothing still has to name
     /// something; upstream's `&self` is a real borrow and this is the thinnest
-    /// honest equivalent.
+    /// honest equivalent. It must outlive every registration that names it,
+    /// and it is not the router's job to say when: see this struct's note.
     ptr: *anyopaque,
     /// Take the connection over before the handshake finishes. Upstream
     /// `ProtocolHandler::on_accepting`.
     ///
-    /// Called once, on the accept loop's own task, with the pre-handshake
-    /// handle. Returning a `Connection` means the handshake is done and
-    /// `accept` is owed; returning an error drops the connection with a
-    /// warning and no error code (`protocol.rs:657-670`).
+    /// Called at most once per connection, on the thread stepping the router,
+    /// with the pre-handshake handle borrowed for the call and not to be
+    /// stored. Returning a `Connection` means the handshake is done and `accept`
+    /// is owed; returning an error drops the connection with a warning and no
+    /// error code (`protocol.rs:657-670`).
     ///
     /// It may be the whole protocol: upstream notes that 0-RTT means a handler
     /// can implement everything here and have `accept` return immediately
     /// (`protocol.rs:239-247`).
     ///
-    /// Null is upstream's default body: the router awaits the handshake itself
-    /// and reports the same two outcomes under the same log line.
+    /// Null is upstream's default body, and it is not a stub that skips the
+    /// handshake: the router awaits it itself and reports the same two outcomes
+    /// under the same log line.
     on_accepting: ?*const fn (ptr: *anyopaque, accepting: Accepting) AcceptError!Connection,
     /// Handle one connection. Upstream `ProtocolHandler::accept`.
     ///
     /// This is the long-lived one, and it is what makes the shutdown ordering
-    /// load-bearing: the returned future runs on a freshly spawned task, so it
-    /// outlives the handshake and can outlive the connection. A handler's
+    /// load-bearing: upstream's returned future runs on a freshly spawned task,
+    /// so it outlives the handshake and can outlive the connection. A handler's
     /// `shutdown` closes connections its own `accept` is still using, so the
-    /// router may not cancel the accepts until every handler has been given
-    /// its `shutdown` — which is why `Shutdown` counts running accepts rather
-    /// than remembering that some exist.
+    /// router may not cancel the accepts until every handler has been given its
+    /// `shutdown` — which is why `Shutdown` counts running accepts rather than
+    /// remembering that some exist. Here the caller runs the body inside its own
+    /// pass, so "long-lived" means "for as many passes as it takes": a handler
+    /// that wants a connection past this call has to be re-entered by the loop
+    /// driving it, not left running.
     ///
-    /// When it returns, the connection is dropped unless the handler kept a
-    /// clone (`protocol.rs:262-265`). An error drops it too, and sends
-    /// nothing: see `Failure.accept`.
+    /// Called once per connection that got past the handshake, on the thread
+    /// stepping the router, with the handle borrowed for the call. An error
+    /// drops the connection and sends nothing: see `Failure.accept`. What the
+    /// router does *not* do is close or drop anything itself — it never
+    /// dereferences the handle, so what becomes of the connection when this
+    /// returns is the endpoint layer's business.
     accept: *const fn (ptr: *anyopaque, connection: Connection) AcceptError!void,
-    /// Called once per shutdown, on every registered handler, before any
-    /// accept is cancelled. Upstream `ProtocolHandler::shutdown`, whose future
-    /// is awaited for all of them before the cancel
-    /// (`protocol.rs:284-286`, `:609-611`).
+    /// Called once per shutdown, on every registered handler, before any accept
+    /// is cancelled, on the thread stepping the router. Upstream
+    /// `ProtocolHandler::shutdown`, whose future is awaited for all of them
+    /// before the cancel (`protocol.rs:284-286`, `:609-611`).
     ///
-    /// Null is upstream's default body: nothing to do.
+    /// Null is upstream's default body: nothing to do, and nothing owed.
     shutdown: ?*const fn (ptr: *anyopaque) void,
 };
 
@@ -91,11 +130,19 @@ pub const ProtocolHandler = struct {
 /// different type from `Connection`, so a pre-handshake handle cannot be handed
 /// to a handler that is about to call `accept_bi` on it.
 pub const Accepting = struct {
-    /// The endpoint's own value. Never dereferenced here.
+    /// The endpoint's own value, never dereferenced here and borrowed for the
+    /// call that carries it. What it *is* — and how long it stays usable — is
+    /// the minting layer's rule: for this project's endpoint, as long as the
+    /// accept task it was handed to is held.
     ptr: *anyopaque,
 };
 
 /// A connection whose handshake finished. Upstream `Connection`.
+///
+/// The same handle as `Accepting` with the other half of the handshake done,
+/// and the same rule about who owns its lifetime: the endpoint layer mints it,
+/// the router lends it for the call, and nothing in this file closes, drops or
+/// keeps it.
 pub const Connection = struct {
     /// The endpoint's own value. Never dereferenced here.
     ptr: *anyopaque,
@@ -125,10 +172,15 @@ pub const AcceptError = error{
 /// the relay and by address lookup. Captured from `ALPN_QUIC_ADDR_DISC` at
 /// `iroh-relay/src/quic.rs:10`.
 ///
-/// An application cannot register it: `Builder.accept` refuses. The
-/// registration belongs to the endpoint layer, which holds the QAD handler,
-/// and it goes in through `Builder.acceptInternal`, which takes no ALPN at all
-/// so there is no string to pass wrongly.
+/// No application registration reaches it: `Builder.accept` refuses this ALPN
+/// with `error.reserved_alpn`. `Builder.acceptInternal` is the only way in, and
+/// it takes no ALPN at all so there is no string to pass wrongly.
+///
+/// **Nothing under `src/` calls `acceptInternal` today**, so this is a
+/// reservation and not a wired route: a table built in this tree never offers
+/// `/iroh-qad/0`, and a peer that negotiates it is dropped rather than served
+/// (`negotiatingStep`, `router.zig:616-617`). Registering the handler that
+/// would answer it is the endpoint layer's job and it has not been done.
 pub const qad_alpn: []const u8 = "/iroh-qad/0";
 
 /// One registration: an ALPN and the handler that claims it.
@@ -200,6 +252,8 @@ pub const Builder = struct {
     /// Registers `qad_alpn`. No ALPN argument on purpose: the one internal
     /// ALPN is not reachable by passing a different string, and a call site
     /// that says `acceptInternal` says which ALPN it meant.
+    ///
+    /// Nothing under `src/` calls this: see `qad_alpn`.
     pub fn acceptInternal(
         self: *Builder,
         handler: ProtocolHandler,
@@ -459,9 +513,14 @@ pub const ConnState = union(enum) {
     /// is held because finding it is part of this step, and a caller that has
     /// to report which protocol a connection landed on reads it here.
     accepting: ProtocolHandler,
-    /// `accept` is running, on its own task, and may be long-lived. This is the
-    /// arm the shutdown ordering protects.
+    /// The handler's `accept` has been called and has not come back. There is no
+    /// task here: the caller ran it inside the pass that reached this state and
+    /// is holding the state until it reports an outcome, which may be several
+    /// passes later. This is the arm the shutdown ordering protects — see
+    /// `ProtocolHandler`'s note on what a long-lived `accept` means without a
+    /// thread.
     handling: ProtocolHandler,
+    ///
     /// The filter answered with a retry token. Terminal: the client comes back
     /// as a new attempt carrying the token.
     retried: Retry,
@@ -659,16 +718,32 @@ pub const Shutdown = struct {
     /// Registered handlers, which become running when the shutdown starts and
     /// reach zero when the last of them has returned. The count is not in the
     /// phase because the table is the caller's and the machine holds no table.
+    ///
+    /// **Zero means the close owes no report at all**, and the machine takes
+    /// that as a fact on the first step rather than as a phase to wait in.
     handlers: usize = 0,
     /// `accept` futures still running. This is what a cancel has to account
     /// for, and it is why the state is more than the phase: a router with three
     /// accepts running and one that has been told they are gone are the same
     /// phase and a different fact.
+    ///
+    /// **`accepts` does not gate anything.** The cancel is one step whatever
+    /// the count is, exactly as `cancel()` is one call upstream
+    /// (`protocol.rs:611`); the count is what a caller reads to know how many
+    /// accept futures its own cancel has to account for, and it saturates at
+    /// zero rather than wrapping.
     accepts: usize = 0,
 
     pub const Phase = enum {
         /// The accept loop is taking connections. Upstream's `select!` body
         /// before the cancel token fires.
+        ///
+        /// Nothing waits here, and a close taken with no handler registered
+        /// passes straight through this phase to the cancel rather than resting
+        /// in the drain (`beginShutdown`). Upstream's `protocols.shutdown().await`
+        /// over an empty map returns at once and the cancel follows it
+        /// (`protocol.rs:609-611`), so the two agree on what happens and only
+        /// the representation differs.
         serving,
         /// Intake has stopped and the handlers are draining. Upstream
         /// `protocols.shutdown().await`.
@@ -732,6 +807,12 @@ pub const Shutdown = struct {
     /// A router that has not been asked to close, with `handlers` registered and
     /// `accepts` running. The counts are the caller's to know and the machine's
     /// to keep.
+    ///
+    /// **`handlers == 0` is a legitimate answer, not an empty one.** It is what
+    /// an endpoint over a table with no registrations hands here, and it makes
+    /// the first close step emit the cancel directly — see `beginShutdown`. A
+    /// caller that reads it as "drain nothing, then wait" has read it wrong:
+    /// there is no report to wait for and the machine will not invent one.
     pub fn init(handlers: usize, accepts: usize) Shutdown {
         return .{ .handlers = handlers, .accepts = accepts };
     }
@@ -744,14 +825,7 @@ pub const Shutdown = struct {
     pub fn step(self: Shutdown, event: Event) Step {
         return switch (self.phase) {
             .serving => switch (event) {
-                .close_requested => .{
-                    .shutdown = .{
-                        .phase = .draining_handlers,
-                        .handlers = self.handlers,
-                        .accepts = self.accepts,
-                    },
-                    .action = .{ .shutdown_handlers = self.handlers },
-                },
+                .close_requested => beginShutdown(self),
                 .accept_finished => .{ .shutdown = self.fewerAccepts(), .action = .none },
                 // Nothing has been asked for yet, and a report from a phase
                 // that has not been entered is not this one's business.
@@ -801,7 +875,9 @@ pub const Shutdown = struct {
     /// cancel would never be emitted, and the endpoint would never close.
     fn handlerFinished(self: Shutdown) Step {
         // A report past zero is a handler the count never had, and holding is
-        // the only honest answer: there is nothing left to drain.
+        // the only honest answer: there is nothing left to drain. `beginShutdown`
+        // is why that arm is unreachable on the way in — a close taken with no
+        // handler registered never enters the phase this runs in.
         if (self.handlers == 0) return self.hold();
         var next = self;
         next.handlers -= 1;
@@ -809,6 +885,45 @@ pub const Shutdown = struct {
         return .{
             .shutdown = .{ .phase = .cancelling_accepts, .accepts = self.accepts },
             .action = .cancel_accepts,
+        };
+    }
+
+    /// A close, and the first thing it owes.
+    ///
+    /// **The counts decide the phase, and the phase is settled before the
+    /// action is named.** A close with a handler registered owes
+    /// `shutdown_handlers` and then one `handler_finished` per handler, and it
+    /// cannot leave `.draining_handlers` until every one of those has been
+    /// reported. A close with *no* handler registered owes no report at all, so
+    /// entering that phase with a `shutdown_handlers` of zero would be a phase
+    /// nothing can leave: `handler_finished` past zero is held, because there
+    /// is nothing left to drain, and the cancel this close owes is never
+    /// emitted — the endpoint stays open for ever.
+    ///
+    /// So the zero case is decided here, on the counts, rather than left to a
+    /// caller to notice: no handler means the cancel is owed the moment the
+    /// close is asked for, and the machine says so in one step. `accepts`
+    /// crosses either way, because the cancel has to account for them whatever
+    /// the handlers did.
+    ///
+    /// Upstream cannot reach the shape this avoids. `protocols.shutdown()`
+    /// awaits one future per *map value* (`protocol.rs:404-407`), and a map
+    /// with no values has nothing to await, so the cancel at `:611` is the very
+    /// next statement to run. `handlerCount` is what makes the count knowable
+    /// on this side, and it is the same count the phase it feeds would have
+    /// waited for.
+    fn beginShutdown(self: Shutdown) Step {
+        if (self.handlers == 0) return .{
+            .shutdown = .{ .phase = .cancelling_accepts, .accepts = self.accepts },
+            .action = .cancel_accepts,
+        };
+        return .{
+            .shutdown = .{
+                .phase = .draining_handlers,
+                .handlers = self.handlers,
+                .accepts = self.accepts,
+            },
+            .action = .{ .shutdown_handlers = self.handlers },
         };
     }
 
@@ -1441,6 +1556,36 @@ test "the shutdown order is handlers, then cancel, then close" {
         try t.expectEqual(Shutdown.Action.none, again.action);
         try t.expectEqual(Shutdown.Phase.closed, again.shutdown.phase);
     }
+}
+
+test "a close with nothing registered still cancels the accepts and closes" {
+    // The shape an endpoint over a table with no registrations hands this
+    // machine, and the one place the counts have to be read before the phase is
+    // chosen. A close that entered `draining_handlers` here would owe a
+    // `handler_finished` that nobody can send, and every later event is held
+    // while it waits: the accepts are never cancelled and the endpoint is never
+    // closed.
+    const first = Shutdown.init(0, 0).step(.close_requested);
+    try t.expectEqual(Shutdown.Action.cancel_accepts, first.action);
+    try t.expectEqual(Shutdown.Phase.cancelling_accepts, first.shutdown.phase);
+    try t.expectEqual(@as(usize, 0), first.shutdown.handlers);
+
+    // So the order is reached by the two reports the close still owes, with no
+    // handler drain in between to stall in.
+    const cancelled = first.shutdown.step(.accepts_cancelled);
+    try t.expectEqual(Shutdown.Action.close_endpoint, cancelled.action);
+    try t.expectEqual(Shutdown.Phase.closing_endpoint, cancelled.shutdown.phase);
+    const closed = cancelled.shutdown.step(.endpoint_closed);
+    try t.expectEqual(Shutdown.Phase.closed, closed.shutdown.phase);
+
+    // And accepts that were running are still counted across the cancel, so a
+    // caller knows what its cancellation has to account for even though no
+    // handler ever reported and the close never waited for one.
+    const running = Shutdown.init(0, 2).step(.close_requested);
+    try t.expectEqual(Shutdown.Action.cancel_accepts, running.action);
+    try t.expectEqual(@as(usize, 2), running.shutdown.accepts);
+    try t.expectEqual(@as(usize, 1), running.shutdown.step(.accept_finished).shutdown.accepts);
+    try t.expectEqual(@as(usize, 0), running.shutdown.step(.accepts_cancelled).shutdown.accepts);
 }
 
 test "an accept finishing counts down and never advances the shutdown" {

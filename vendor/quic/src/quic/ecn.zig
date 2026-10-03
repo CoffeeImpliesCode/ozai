@@ -1,3 +1,8 @@
+//! The RFC 9000 §13.4.2.1 ECN validation state machine: one value per path,
+//! moved by four calls, holding no clock and no timer. It is reached through
+//! `Connection.ecn_validator`, and its answer to `shouldMark` is what the
+//! packet packer turns into the ECT(0) bit on outgoing 1-RTT packets.
+
 const std = @import("std");
 const testing = std.testing;
 
@@ -5,23 +10,69 @@ const testing = std.testing;
 ///
 /// Tracks whether the network path supports ECN by monitoring
 /// peer-reported ECN counts in ACK_ECN frames against what we sent.
+///
+/// It owns nothing and borrows nothing: it holds no allocator, no buffer and
+/// no clock, and every instant and every peer count reaches it as an
+/// argument. Copying the value copies the state, so a caller that hands a
+/// copy to a path and keeps the original has two independent machines rather
+/// than two views of one. `shouldMark` reads it and the other four move it,
+/// so every method here belongs to the one thread that owns this value; a
+/// copy handed to another thread is that thread's own machine.
 pub const EcnValidator = struct {
+    /// Which of the five RFC 9000 §13.4.2.1 states the path is in. Starts at
+    /// `.disabled`, and `start` is the only way into `.testing`. Nothing
+    /// returns it to `.disabled` except `reset`, so a peer whose validation
+    /// failed cannot be retried on the same path without one.
     state: State = .disabled,
+
+    /// ECT(0)-marked packets this validator has been told about, counted
+    /// since the last `start` or `reset`. Nothing reads it: `onPacketSent`
+    /// adds and no method compares against it, so it is a running total a
+    /// caller may read for its own accounting and nothing more.
     sent_ect0_count: u64 = 0,
+
+    /// ECT(0)-marked packets the peer has acknowledged, accumulated by
+    /// `validate` across calls. Also unread by every method here — a run
+    /// that fails validation stops accumulating at the value it had reached,
+    /// so it is not a total for the path and must not be read as one.
     acked_ect0_count: u64 = 0,
+
+    /// ECT(0)-marked packets counted since `start`, against the ten-packet
+    /// threshold in `onPacketSent`. Reset by `start` and `reset`; it is what
+    /// `.testing` counts.
     testing_count: u8 = 0,
 
     const TESTING_THRESHOLD: u8 = 10;
 
+    /// The five states of RFC 9000 §13.4.2.1, exhaustive and with no other
+    /// value: a validator is in exactly one of them, and only `start` and
+    /// `reset` leave `.disabled`.
     pub const State = enum {
+        /// The default, and the state of a freshly declared validator.
+        /// Nothing is validated and nothing is marked ECT(0). `validate`
+        /// reports false without changing it, and `onPacketSent` only counts.
         disabled,
+        /// `start` has run and fewer than ten ECT(0) packets have gone out.
+        /// Outgoing packets are marked, and no ACK_ECN can move the path to
+        /// `.capable` yet.
         testing,
+        /// Enough packets have gone out to judge. Still marked, and the first
+        /// `validate` call that reports any ECT(0) or CE increase makes it
+        /// `.capable`.
         unknown,
+        /// The path validated. Terminal for this path: nothing leaves
+        /// `.capable` except `reset`.
         capable,
+        /// A peer report failed validation. Terminal for this path, and
+        /// permanent until `reset`: `validate` keeps reporting false and
+        /// `shouldMark` keeps answering false, so a caller must not retry
+        /// validation without moving to a new path first.
         failed,
     };
 
-    /// Begin ECN validation (called after handshake confirmed).
+    /// Enters `.testing` from `.disabled`, zeroing both counters. A call in
+    /// any other state is a no-op, so a path that has already failed cannot
+    /// be restarted into validation without a `reset` first.
     pub fn start(self: *EcnValidator) void {
         if (self.state == .disabled) {
             self.state = .testing;
@@ -31,7 +82,12 @@ pub const EcnValidator = struct {
         }
     }
 
-    /// Called for each ack-eliciting packet sent with ECT(0) marking.
+    /// Records one outgoing ack-eliciting packet marked ECT(0), and moves
+    /// `.testing` to `.unknown` once ten of them have gone out in this epoch.
+    /// Called for every ECT(0) packet, or the threshold is never reached and
+    /// the path is never judged. A packet sent while the state is
+    /// `.disabled` or `.failed` still increments `sent_ect0_count`; the
+    /// threshold check runs only from `.testing`.
     pub fn onPacketSent(self: *EcnValidator) void {
         self.sent_ect0_count += 1;
         if (self.state == .testing) {
@@ -42,7 +98,10 @@ pub const EcnValidator = struct {
         }
     }
 
-    /// Whether outgoing packets should be marked ECT(0).
+    /// Whether outgoing packets carry ECT(0). True in `.testing`, `.unknown`
+    /// and `.capable`; false in `.disabled` and `.failed`. A pure read of
+    /// `state` — it does not advance validation, so a path that sends no
+    /// ECT(0) packets never leaves `.testing`.
     pub fn shouldMark(self: *const EcnValidator) bool {
         return switch (self.state) {
             .testing, .unknown, .capable => true,
@@ -56,6 +115,20 @@ pub const EcnValidator = struct {
     /// peer_ect0/ect1/ce: newly reported counts from ACK_ECN
     /// prev_ect0/ect1/prev_ce: previously stored counts for this PN space
     /// newly_acked_ect0: number of ECT(0)-marked packets acknowledged in this ACK
+    ///
+    /// False means either the validator was already `.disabled` or `.failed`
+    /// and nothing changed, or the peer reported an ECT(1) increase, or an
+    /// ECT(0)+CE increase below `newly_acked_ect0` — and then the state is
+    /// `.failed`. Only the caller can tell which of the three it was. A
+    /// rejected report leaves `acked_ect0_count` at its previous value,
+    /// because the count is credited only on the accepted path, and `.failed`
+    /// is not re-examined by any later call.
+    ///
+    /// The three `prev_*` arguments are the peer's last reported counts and
+    /// the validator stores none of them, so the caller must keep them per
+    /// packet number space and pass them back; the deltas are computed with
+    /// saturating subtraction, so a peer that lowers a count reads as no
+    /// change rather than as a wrap.
     pub fn validate(
         self: *EcnValidator,
         peer_ect0: u64,
@@ -98,7 +171,10 @@ pub const EcnValidator = struct {
         return true;
     }
 
-    /// Reset to disabled (called on path migration with IP change).
+    /// Returns the validator to `.disabled` with both counters at zero,
+    /// discards `.failed` along with the rest. Called when the path moves to
+    /// a different IP: the old verdict described a path that is gone, and
+    /// carrying it onto the new one would mark it `failed` without evidence.
     pub fn reset(self: *EcnValidator) void {
         self.* = .{};
     }

@@ -1,32 +1,98 @@
+//! QUIC packet headers, packet-number spaces, the header-protection and AEAD
+//! steps, and the Retry and NEW_TOKEN address tokens.
+//!
+//! **What borrows.** `parseQuicHeader` — and `Header.parse`, which is it —
+//! returns a `Header` whose `dcid`, `scid` and `token` view `fbs.buffer`, so
+//! that buffer must stay alive and unmodified while they are read; copying the
+//! `Header` copies the views, not the bytes. Everything else returned here is
+//! self-contained: `ValidatedToken` carries both CIDs inline,
+//! `computeRetryIntegrityTag` returns a by-value array, and both decryptors
+//! hand plaintext back inside the caller's own buffer.
+//!
+//! **What mutates.** `decrypt` and `decryptWithKeyUpdate` work in place: they
+//! rewrite the first byte and the packet-number bytes, advance `fbs.seek`, and
+//! fill `header` with the unprotected values. A failed call may have done any
+//! of that already and leaves the plaintext region undefined, so a packet that
+//! does not authenticate is discarded, not read again and not retried.
+//!
+//! **Who owns the output.** `generateRetryToken` and `generateNewToken` seal
+//! into the caller's `out` and return the written prefix length, refusing a
+//! short `out` with `error.BufferTooSmall` before touching it or the entropy;
+//! `negotiateVersion`, `retry` and `Header.encode` write through a
+//! caller-supplied writer and keep nothing. A writer failure leaves a prefix
+//! to discard.
+//!
+//! **What is injected.** Nothing here allocates, reads a clock, or reaches for
+//! a global RNG. Time arrives as an injected `now` in nanoseconds, and every
+//! random draw as an injected `std.Random`: the token generators need fresh
+//! nonces under their key, while `negotiateVersion` draws only the public
+//! grease bytes, which a seeded generator serves as well as a CSPRNG.
+
 const std = @import("std");
 const io = @import("../io_compat.zig");
 const address = @import("../address.zig");
 const assert = std.debug.assert;
-// const tls = std.crypto.tls;
 
 const protocol = @import("protocol.zig");
 const crypto = @import("crypto.zig");
 const util = @import("util.zig");
 const stream = @import("stream.zig");
 
-// network byte order
+/// Network byte order, the order every field this module reads or writes is
+/// in. It is a constant rather than a parameter because the wire is not
+/// negotiable.
 pub const ENDIAN = std.builtin.Endian.big;
 
+/// Bit 7 of the first byte: set on every long-header packet, clear on every
+/// short-header one. It is what tells a parser which header it is looking at
+/// before anything else is read.
+///
 pub const LONG_HEADER_BIT: u8 = 0x80;
+/// Bit 6 of the first byte. QUIC requires it on every packet a version of
+/// this protocol defines, and a long-header packet without it is invalid
+/// (RFC 9000 §17.2); on a short header it is part of what header protection
+/// hides.
+///
 pub const FIXED_BIT: u8 = 0x40;
+/// Bit 2 of a short header's first byte: which generation of 1-RTT keys
+/// protected it, flipped on a key update (RFC 9001 §6.1).
+///
 pub const KEY_PHASE_BIT: u8 = 0x04;
 
+/// Bit 5 of a short header's first byte, used for passive round-trip
+/// measurement by the two ends rather than by the network (RFC 9000 §17.4).
+///
 pub const PACKET_SPIN_BIT = 0x20;
+/// Mask for the two bits of a long header's first byte that carry the packet
+/// type. The mapping from those bits to a type is version-dependent, which is
+/// what `longHeaderPacketType` is for.
+///
 pub const PACKET_TYPE_MASK = 0xF0;
 
+/// Capacity of this core's packet staging arrays. This is a local bound,
+/// not a protocol-wide limit on UDP datagrams.
 pub const MAX_PACKET_LEN = 1536;
+/// Bytes of a packet number on the wire at most: QUIC encodes one in one to
+/// four bytes, so the packet's own first byte says how long it is.
+///
 pub const MAX_PACKET_NUMBER_LEN = 4; // maxlength of a "packet number"
 
+/// Longest connection id a peer may send, and the width every cid buffer in
+/// this tree is sized to. A header naming a longer one is refused rather than
+/// truncated, because a truncated id routes nowhere (RFC 9000 §17.2).
+///
 pub const CONNECTION_ID_MAX_SIZE: u8 = 20;
 
 const PACKET_NUM_MASK: u8 = 0x03;
 
-pub const STATELESS_RESET_TOKEN_SIZE = 16; // aren't these 2 the same?
+/// Bytes of a stateless reset token. Same size as the Retry integrity tag
+/// below and for the same reason — both are 128-bit tags on the wire — but
+/// they are different things and neither is defined in terms of the other.
+///
+pub const STATELESS_RESET_TOKEN_SIZE = 16;
+/// Bytes of the tag at the end of a Retry packet, checked before the token it
+/// follows is used (RFC 9000 §17.2.5).
+///
 pub const RETRY_INTEGRITY_TAG_SIZE = 16;
 // RFC 9001 §5.8: QUIC v1 Retry integrity key/nonce
 const RETRY_INTEGRITY_KEY_V1: [crypto.key_len]u8 = .{ 0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e };
@@ -35,6 +101,14 @@ const RETRY_INTEGRITY_NONCE_V1: [crypto.nonce_len]u8 = .{ 0x46, 0x15, 0x99, 0xd3
 const RETRY_INTEGRITY_KEY_V2: [crypto.key_len]u8 = .{ 0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2, 0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92 };
 const RETRY_INTEGRITY_NONCE_V2: [crypto.nonce_len]u8 = .{ 0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a };
 
+/// A packet type, as the value the header encodes it: a long header's bit
+/// pattern with the header bit and fixed bit already in it, so the enum value
+/// *is* the first byte for every type that carries one.
+///
+/// The value matters for short-header types (`.one_rtt` is `FIXED_BIT`) and is
+/// only the canonical encoding for long ones, which v2 remaps; see
+/// `longHeaderPacketType`.
+///
 pub const PacketType = enum(u8) {
     /// Initial packet
     initial = LONG_HEADER_BIT | FIXED_BIT | 0x00,
@@ -100,12 +174,15 @@ pub fn encodeLongHeaderTypeBits(pkt_type: PacketType, version: u32) u8 {
     return LONG_HEADER_BIT | FIXED_BIT | (bits << 4);
 }
 
+/// Encryption level for protected packet types, independent of QUIC version.
+/// Retry and Version Negotiation have no encryption epoch.
 pub const Epoch = enum(u8) {
     initial = 0,
     zero_rtt = 1,
     handshake = 2,
     application = 3,
 
+    /// Map a protected packet type; otherwise return `error.InvalidPacketType`.
     pub fn fromPacketType(int: PacketType) !Epoch {
         return switch (int) {
             PacketType.initial => Epoch.initial,
@@ -127,13 +204,16 @@ test "Epoch fromPacketType" {
     try std.testing.expectError(error.InvalidPacketType, err);
 }
 
+/// Packet-shape and key-setup error tags. Individual operations also propagate
+/// reader, writer and cryptographic errors. These are not wire close codes.
 pub const PacketError = error{
     InvalidVersion,
     InvalidPacket,
     InvalidPacketType,
-    InvalidVarLength,
 };
 
+/// QUIC transport close codes. `crypto_error` is the base plus a TLS alert;
+/// `no_error` denotes a graceful close.
 pub const ErrorCode = enum(u16) {
     no_error = 0x0,
     internal_error = 0x1,
@@ -154,11 +234,15 @@ pub const ErrorCode = enum(u16) {
     crypto_error = 0x100,
 };
 
-/// A QUIC packet's header.
+/// Header metadata with CID/token views borrowing the parsed buffer. Keep that
+/// buffer live and unchanged while using them. Copies share those views.
+/// The default has no valid packet type or length; parse or initialize both.
 pub const Header = struct {
     const Self = @This();
 
+    /// Long-header wire version; zero for Version Negotiation and short headers.
     version: u32 = 0,
+    /// Must be initialized before encoding or dispatching the header.
     packet_type: PacketType = undefined,
 
     /// Destination Connection ID. Empty until the parser fills it — a short
@@ -173,6 +257,16 @@ pub const Header = struct {
     /// The address verification token of the packet. Only present in `Initial`
     /// and `Retry` packets.
     token: ?[]const u8 = null,
+    /// What is left of this packet: everything after the header, up to and
+    /// including the packet number. Set by `parse` for every packet type, and
+    /// it is the only thing a reader of a coalesced datagram has to step to
+    /// the next packet.
+    ///
+    /// For the types with a Length field — Initial, 0-RTT, Handshake — it is
+    /// that field. For the types without one — Retry, 1-RTT, and Version
+    /// Negotiation, which is a whole datagram by definition — it is
+    /// everything left in the datagram. Nothing may read it as a length
+    /// without knowing which of those it has.
     remainder_len: usize = undefined,
 
     /// The packet number. It's only meaningful after the header protection is
@@ -199,10 +293,15 @@ pub const Header = struct {
     /// Used to correctly handle coalesced packets.
     packet_start: usize = 0,
 
+    /// Equivalent to `parseQuicHeader`; returned slices borrow `fbs.buffer`.
     pub fn parse(fbs: anytype, short_dcid_len: u8) !Header {
         return parseQuicHeader(fbs, short_dcid_len);
     }
 
+    /// Encode the unprotected header prefix, not the Length, packet number,
+    /// payload or Retry integrity tag. Borrows slices for the call.
+    /// CID lengths must be at most 20; protected packet-number width is 1..4.
+    /// Retry requires a token. Writer failures may leave a prefix to discard.
     pub fn encode(self: *Self, writer: anytype) !void {
         var first: usize = 0;
 
@@ -264,36 +363,35 @@ pub const Header = struct {
     }
 };
 
+/// Inline 128-bit packet-number bitmap; `lower` is the number for bit zero.
+/// Owns no resources. A copy is independent.
 pub const PktNumWindow = struct {
     lower: u64,
     window: u128,
 };
 
+/// Packet protection state. Null key fields mean that direction has no keys.
+/// Initialize `crypto_stream` before using it and release it with its allocator;
+/// copies of an initialized stream share ownership, unlike inline key copies.
+/// The default is sufficient only for key setup and packet-number tracking.
 pub const PacketNumSpace = struct {
-    // largest_rx_pkt_num: u64,
-    // largest_rx_pkt_time: time.Instant,
-    //
-    // next_pkt_num: u64,
-    // // recv_pkt_need_ack: ranges::RangeSet,
-    //
-    // recv_pkt_num: PktNumWindow,
-    // ack_elicited: bool,
-    next_packet_number: u64 = 0, // TODO: largest_recv_packet_number
+    /// Expected receive packet number used to reconstruct truncated numbers.
+    next_packet_number: u64 = 0,
 
     crypto_open: ?crypto.Open = null,
     crypto_seal: ?crypto.Seal = null,
 
-    // crypto_0rtt_open: Option<crypto::Open>,
-    // crypto_0rtt_seal: Option<crypto::Seal>,
-
-    // crypto_stream: stream.Stream = stream.Stream{},
     crypto_stream: stream.Stream = undefined,
 
+    /// Current AEAD tag width; does not mutate the space.
     pub fn cryptoTagLen(self: *PacketNumSpace) usize {
         _ = self;
         return crypto.Aead.tag_length;
     }
 
+    /// Derive and replace both Initial key directions for `dcid` and `version`.
+    /// Borrows input bytes only for the call. Unsupported versions propagate
+    /// derivation errors without replacing the existing keys. Allocates nothing.
     pub fn setupInitial(self: *PacketNumSpace, dcid: []const u8, version: u32, comptime is_server: bool) !void {
         const keys = try crypto.deriveInitialKeyMaterial(dcid, version, is_server);
         self.crypto_open = keys[0];
@@ -332,6 +430,20 @@ fn splitProtected(header: *const Header, fbs: anytype, first_byte: u8, ad_buf: [
     };
 }
 
+/// Remove header protection from `header` and open its payload with the keys
+/// `space` holds for its epoch, in place.
+///
+/// Returns the plaintext, which is the same memory the ciphertext was in: the
+/// AEAD tag is consumed and the caller keeps the buffer it had, so this
+/// allocates nothing. `header` is updated — first byte restored, packet
+/// number decoded, reserved bits recorded — because the caller needs those
+/// to process what comes out.
+///
+/// `header.packet_start` and `fbs.seek` must describe this packet in the buffer.
+/// Missing keys return `error.UndecryptablePacket`; malformed bounds return
+/// `error.InvalidPacket`; tag verification can return `error.AuthenticationFailed`.
+/// Failure may advance the cursor and mutate header or buffer bytes: discard
+/// the packet rather than retrying that mutated input.
 pub fn decrypt(header: *Header, fbs: anytype, space: *const PacketNumSpace) ![]u8 {
     // We need at least 4 bytes for packet number + 16 for sample
     if (fbs.seek + 4 + crypto.SAMPLE_LEN > fbs.buffer.len) {
@@ -423,6 +535,10 @@ pub fn decrypt(header: *Header, fbs: anytype, space: *const PacketNumSpace) ![]u
 /// Decrypt a 1-RTT packet using the KeyUpdateManager for key phase handling.
 /// Uses the (unchanging) HP key for header unprotection, then selects the
 /// appropriate AEAD keys based on the key phase bit (RFC 9001 Section 6).
+/// Borrows every receiver for the call and returns plaintext in `fbs.buffer`.
+/// As with `decrypt`, failure can mutate the header, cursor and bytes; discard
+/// the packet. Null phase keys or malformed bounds return `error.InvalidPacket`;
+/// AEAD authentication errors propagate. Allocates nothing.
 pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *const PacketNumSpace, ku: *crypto.KeyUpdateManager) ![]u8 {
     if (fbs.seek + 4 + crypto.SAMPLE_LEN > fbs.buffer.len) {
         return error.InvalidPacket;
@@ -503,11 +619,18 @@ pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *const PacketN
     return decrypted;
 }
 
-// inline
+/// Whether the header-form bit selects the long-header layout.
 pub fn isLongHeader(first_byte: u8) bool {
     return (first_byte & LONG_HEADER_BIT) == LONG_HEADER_BIT;
 }
 
+/// Parse at `fbs.seek`, leaving the cursor at this packet's remainder.
+/// Requires a valid cursor and a known short-header CID length of at most 20.
+/// CIDs and token borrow `fbs.buffer`; no storage is allocated.
+/// Truncated fields propagate reader errors or `error.BufferTooShort`; invalid
+/// CID lengths/fixed bits return packet errors. Errors may consume a prefix.
+/// A short header with missing DCID bytes leaves an empty CID for the caller
+/// to reject. Remainder bounds and protection are validated by decryption.
 pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
     const packet_start_pos = fbs.seek;
     const first_byte = try fbs.takeByte();
@@ -585,7 +708,12 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
                 header.remainder_len = remaining;
             },
 
-            PacketType.version_negotiation => {},
+            // No Length field, and no need of one: a VN packet is a whole
+            // datagram by definition (RFC 9000 §6.1), so what is left of the
+            // datagram is the packet.
+            PacketType.version_negotiation => {
+                header.remainder_len = fbs.buffer.len - fbs.seek;
+            },
 
             PacketType.handshake, PacketType.zero_rtt => {
                 // Long header packets (like Initial but without Token field)
@@ -624,6 +752,9 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
     return header;
 }
 
+/// Write Version Negotiation with swapped CIDs, supported versions and grease.
+/// Borrows header slices, writer and random engine for the call. CID lengths
+/// must be at most 20. Writer errors leave a prefix; random draws are not undone.
 pub fn negotiateVersion(header: Header, writer: anytype, random: std.Random) !void {
     // RFC 9000 §6.1: a long header's unused bits carry an arbitrary value
     // set by the server. That is greasing, not a secret — the byte goes out
@@ -657,6 +788,9 @@ pub fn negotiateVersion(header: Header, writer: anytype, random: std.Random) !vo
     try writer.writeInt(u32, grease_version, ENDIAN);
 }
 
+/// Encode a complete Retry with `new_scid`, `token` and the version's tag.
+/// Inputs are borrowed only for the call; CID lengths must be at most 20.
+/// `fbs` must start empty. Encoding/capacity errors leave a prefix to discard.
 pub fn retry(
     header: Header,
     new_scid: []u8, // original destination connection id
@@ -681,19 +815,9 @@ pub fn retry(
     try writer.writeAll(&integrity_tag);
 }
 
-///
-/// Compute the integrity tag for a RETRY packet.
-///
-/// ---------------------------------------------
-///
-/// Retry packets carry a Retry Integrity Tag that provides two properties: it
-/// allows the discarding of packets that have accidentally been corrupted by the
-/// network, and only an entity that observes an Initial packet can send a valid
-/// Retry packet.
-///
-/// - Retry Packets: https://datatracker.ietf.org/doc/html/rfc9000#section-17.2.5
-/// - Retry Packet Integrity: https://datatracker.ietf.org/doc/html/rfc9001#section-5.8
-///
+/// Compute the v1/v2 Retry integrity tag, borrowing both byte slices.
+/// `odcid.len <= 20`; the pseudo-packet must fit 1400 bytes or returns
+/// `error.NoSpaceLeft`. Allocates nothing and returns independent inline bytes.
 pub fn computeRetryIntegrityTag(
     packet_bytes_without_tag: []const u8,
     odcid: []const u8,
@@ -718,7 +842,9 @@ pub fn computeRetryIntegrityTag(
     return tag;
 }
 
-// Verify the integrity tag of a received Retry packet.
+/// Check a Retry tag without retaining or mutating inputs. Short packets and
+/// mismatches return false; pseudo-packet capacity errors propagate as in
+/// `computeRetryIntegrityTag`. `odcid.len` must be at most 20.
 pub fn verifyRetryIntegrity(
     raw_packet: []const u8,
     odcid: []const u8,
@@ -737,11 +863,21 @@ pub fn verifyRetryIntegrity(
 // nonce(12) || AES-128-GCM-encrypt(plaintext) || tag(16)
 // Plaintext: odcid_len(1) + odcid(<=20) + retry_scid_len(1) + retry_scid(<=20)
 //          + timestamp_ns(8) + address(Address.identity_length)
+/// Nonce width of this issuer-private token format.
 pub const TOKEN_NONCE_LEN = 12;
+/// Authentication tag width of this issuer-private token format.
 pub const TOKEN_TAG_LEN = 16;
+/// Maximum plaintext with two at-most-20-byte CIDs and the complete address.
 pub const TOKEN_MAX_PLAINTEXT_LEN = 1 + 20 + 1 + 20 + 8 + address.identity_length;
+/// Output capacity required by `generateRetryToken`.
 pub const TOKEN_MAX_LEN = TOKEN_NONCE_LEN + TOKEN_MAX_PLAINTEXT_LEN + TOKEN_TAG_LEN;
 
+/// Seal an address-bound Retry token into caller-owned `out`.
+/// CID lengths must be at most 20. `now` is nonnegative nanoseconds on the
+/// validator's clock epoch. Production `random` must provide fresh CSPRNG
+/// nonces under `token_key`; the engine is borrowed for the call.
+/// `error.BufferTooSmall` leaves output and entropy untouched. Other encoding
+/// errors may leave a prefix. Returns the written prefix length; allocates nothing.
 pub fn generateRetryToken(
     out: []u8,
     odcid: []const u8,
@@ -770,10 +906,7 @@ pub fn generateRetryToken(
     try pt_writer.writeAll(odcid);
     try pt_writer.writeByte(@intCast(retry_scid.len));
     try pt_writer.writeAll(retry_scid);
-    // Monotonic nanoseconds, compared later against the `now` the validator
-    // is handed. Not a wall clock and never a date: the token lives in one
-    // process's memory, and both ends of the age check read the same
-    // injected instant.
+    // Issuer and validator must use the same injected clock epoch.
     try pt_writer.writeInt(i64, now, ENDIAN);
     // The address is bound whole, family and scope included; `Address.identity`
     // is why the bytes are written rather than sliced out of a struct.
@@ -800,16 +933,20 @@ pub fn generateRetryToken(
     return TOKEN_NONCE_LEN + pt_len + TOKEN_TAG_LEN;
 }
 
+/// Authenticated Retry CIDs copied into inline storage. Lengths are 0..20;
+/// manual writes must preserve those bounds. Copies are independent.
 pub const ValidatedToken = struct {
     odcid_buf: [20]u8 = .{0} ** 20,
     odcid_len: u8 = 0,
     retry_scid_buf: [20]u8 = .{0} ** 20,
     retry_scid_len: u8 = 0,
 
+    /// Borrow the original DCID from this receiver until it is moved or rewritten.
     pub fn getOdcid(self: *const ValidatedToken) []const u8 {
         return self.odcid_buf[0..self.odcid_len];
     }
 
+    /// Borrow the Retry SCID from this receiver until it is moved or rewritten.
     pub fn getRetryScid(self: *const ValidatedToken) []const u8 {
         return self.retry_scid_buf[0..self.retry_scid_len];
     }
@@ -818,6 +955,10 @@ pub const ValidatedToken = struct {
 // Token validity duration: 60 seconds
 const TOKEN_MAX_AGE_NS: i64 = 60 * std.time.ns_per_s;
 
+/// Open an address-bound Retry token. `now` is nonnegative nanoseconds on the
+/// issuer's clock epoch. Invalid format, authentication, address, future time
+/// or age over 60 seconds returns null. Inputs are borrowed for the call;
+/// a returned value owns its CIDs inline and needs no release.
 pub fn validateRetryToken(
     token_data: []const u8,
     client_addr: address.Address,
@@ -879,6 +1020,10 @@ pub fn validateRetryToken(
 const NEW_TOKEN_PLAINTEXT_LEN: usize = 8 + address.identity_length; // timestamp + address
 const NEW_TOKEN_MAX_LEN: usize = TOKEN_NONCE_LEN + NEW_TOKEN_PLAINTEXT_LEN + TOKEN_TAG_LEN;
 
+/// Seal a NEW_TOKEN address proof into caller storage using a fresh CSPRNG nonce.
+/// `now` is nonnegative nanoseconds on the validator's clock epoch.
+/// `error.BufferTooSmall` leaves output/entropy unchanged; returns the written
+/// prefix length. Allocates nothing and retains no input.
 pub fn generateNewToken(
     out: []u8,
     client_addr: address.Address,
@@ -898,10 +1043,7 @@ pub fn generateNewToken(
     var plaintext: [NEW_TOKEN_PLAINTEXT_LEN]u8 = undefined;
     var pt_fbs = io.fixedBufferStream(&plaintext);
     const pt_writer = &pt_fbs;
-    // Monotonic nanoseconds, aged against the `now` `validateNewToken` is
-    // handed — the same clock as the Retry token's, and still not a date.
-    // The token proves the peer held this address; it is not a record of
-    // when anything happened, and nothing reads it after this process does.
+    // This is an age check on the issuer's injected clock, not a wall date.
     try pt_writer.writeInt(i64, now, ENDIAN);
     try pt_writer.writeAll(&client_addr.identity());
 
@@ -922,6 +1064,9 @@ pub fn generateNewToken(
     return NEW_TOKEN_MAX_LEN;
 }
 
+/// Verify format, tag, full address and age at most 60 seconds.
+/// `now` is nonnegative nanoseconds on the issuer's epoch. Invalid or future
+/// tokens return false. Inputs are read only for the call; allocates nothing.
 pub fn validateNewToken(
     token_data: []const u8,
     client_addr: address.Address,
@@ -958,6 +1103,9 @@ pub fn validateNewToken(
     return true;
 }
 
+/// Decode a QUIC varint through `takeByte` and `takeInt`, borrowing the reader
+/// for the call. Truncation propagates reader errors after a consumed prefix;
+/// callers discard the enclosing malformed packet. Allocates nothing.
 pub fn readVarInt(reader: anytype) !u64 {
     //
     // https://datatracker.ietf.org/doc/html/draft-ietf-quic-transport-16#section-16
@@ -993,6 +1141,8 @@ pub fn readVarIntUsize(reader: anytype) !usize {
     return std.math.cast(usize, try readVarInt(reader)) orelse error.VarIntTooLarge;
 }
 
+/// Varint width for values up to 2^62-1. Larger values also return 8 here:
+/// this sizes encodings but does not validate them; `writeVarInt` does.
 pub fn varIntLength(value: u64) usize {
     if (value <= 63) return 1;
     if (value <= 16383) return 2;
@@ -1000,7 +1150,9 @@ pub fn varIntLength(value: u64) usize {
     return 8;
 }
 
-/// Writes a QUIC variable-length integer (RFC 9000 Section 16).
+/// Encode `value` through `writeByte` and `writeInt`, borrowing the writer.
+/// Values above 2^62-1 return `error.VarIntTooLarge` without writing. Writer
+/// failures may leave a prefix to discard. Allocates nothing.
 pub fn writeVarInt(writer: anytype, value: u64) !void {
     if (value <= 63) {
         // 1-byte encoding: 00xxxxxx
@@ -1438,4 +1590,27 @@ test "decodePacketNumber: RFC 9000 Appendix A examples" {
     // Half = 128. candidate = (0xfe & ~0xff) | 0x00 = 0xfe00? No...
     // Let's use the simplest case: largest=0, truncated=0, nbits=8 -> 0
     try std.testing.expectEqual(@as(u64, 0), decodePacketNumber(0, 0, 8));
+}
+
+test "a version negotiation packet carries no length field, so it is the whole datagram" {
+    // RFC 9000 §6.1: first byte with the long-header bit, a version of zero,
+    // both connection ids, then the versions a peer may choose from. There is
+    // no Length field anywhere in it.
+    var bytes = [_]u8{0} ** 40;
+    bytes[0] = 0xc0;
+    std.mem.writeInt(u32, bytes[1..5], 0, .big);
+    bytes[5] = 4;
+    @memcpy(bytes[6..10], &[_]u8{ 1, 2, 3, 4 });
+    bytes[10] = 4;
+    @memcpy(bytes[11..15], &[_]u8{ 5, 6, 7, 8 });
+    std.mem.writeInt(u32, bytes[15..19], protocol.QUIC_V1, .big);
+    std.mem.writeInt(u32, bytes[19..23], protocol.QUIC_V2, .big);
+
+    var fbs = io.fixedBufferStream(&bytes);
+    const header = try Header.parse(&fbs, 0);
+    try std.testing.expectEqual(PacketType.version_negotiation, header.packet_type);
+    // What is left of the datagram is the packet, and a reader that walks a
+    // coalesced datagram by this number steps over the whole thing instead of
+    // a value it never had.
+    try std.testing.expectEqual(bytes.len - fbs.seek, header.remainder_len);
 }

@@ -12,6 +12,11 @@ pub const datagram_static_items: usize = 32;
 
 /// Packets buffered while their keys are missing (RFC 9001 4.1.4 permits
 /// dropping when full).
+///
+/// `undecryptable_buf_len` is the byte budget for the packet bodies held
+/// there and `undecryptable_max_pkts` the count of packets that budget will
+/// hold; whichever runs out first drops, so a peer can be made to lose
+/// packets either way.
 pub const undecryptable_buf_len: usize = 32 * 1024;
 pub const undecryptable_max_pkts: usize = 32;
 
@@ -25,11 +30,14 @@ pub const pending_frames: usize = 128;
 /// comparably — quic-go 1000, quinn 1024, ngtcp2 4000.
 pub const max_reassembly_chunks: usize = 1000;
 
-/// How far past the consumed offset a CRYPTO stream will buffer, per
+/// How far past the consumed offset a CRYPTO stream will buffer, in bytes, per
 /// encryption level. CRYPTO frames are not flow controlled (RFC 9000 7.5), so
 /// this is the only ceiling on pre-handshake reassembly memory; past it the
 /// peer gets CRYPTO_BUFFER_EXCEEDED. Matches `tls_handshake_in`, which is all
 /// of one peer flight we can stage anyway.
+///
+/// It is per level, not a total: a peer holding pre-handshake state in all
+/// three spaces can have three times this staged at once.
 pub const max_crypto_stream_offset: u64 = tls_handshake_in;
 
 /// Largest QPACK dynamic table capacity we will honour, in bytes, and the
@@ -42,7 +50,9 @@ pub const qpack_table_capacity: usize = 4096;
 /// `Connection` (`tls13_hs`) and the largest single allocation unit left.
 /// The out buffer holds one outgoing flight, dominated by the Certificate
 /// message, so it scales with the local cert chain — 32 KB covers the
-/// 9-cert amplificationlimit interop case. The in buffer reassembles one
+/// 9-cert amplification limit interop case. The in buffer reassembles one
 /// peer flight.
+/// `tls_handshake_in` is the reassembly ceiling for one peer flight, and it
+/// also sizes `max_crypto_stream_offset`, so raising it raises that with it.
 pub const tls_handshake_out: usize = 32 * 1024;
 pub const tls_handshake_in: usize = 16 * 1024;

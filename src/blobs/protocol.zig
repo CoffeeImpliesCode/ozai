@@ -177,14 +177,51 @@ pub const Error = postcard.Error || error{
 /// needs room it was not given is `error.BufferFull`, the same condition
 /// `postcard.Writer` names for a writer, and it is checked against the count
 /// the frame declared rather than against the bytes that remain.
+///
+/// **A decode overwrites the fields it uses, and that is what invalidates an
+/// earlier result.** The exact operations, so a caller can say whether the
+/// message it is still holding has been written over:
+///
+/// - `Request.read`, `EofFraming.read`, `LengthPrefixedFraming.read`,
+///   `GetRequest.parse`, `GetManyRequest.parse` and `PushRequest.parse` all
+///   write `items` and `widths` through `RangeSpecSeq.parse`. `GetRequest.parse`
+///   and `PushRequest.parse` write nothing else; `GetManyRequest.parse` writes
+///   `hashes` as well.
+/// - `ObserveRequest.parse` writes `widths`.
+/// - `ObserveItem.parse` writes `boundaries`, and so does every
+///   `ObserveResponse.next` — the returned item of one call is overwritten by
+///   the next.
+///
+/// A decode that does not reach a field leaves it alone, so two messages
+/// decoded into *different* `Storage` values are independent, and one field
+/// being invalidated does not invalidate the others.
+///
+/// A decode that fails part way leaves the fields it reached partly written,
+/// and each field below says what its own parse leaves behind.
 pub const Storage = struct {
-    /// Pairs for a `RangeSpecSeq`, whose specs borrow `widths`.
+    /// RangeSpecSeq pairs; returned ranges borrow them and specs borrow widths.
+    /// A failed parse keeps completed pairs in the prefix and prior contents in
+    /// the rest. A later decode overwrites the pairs it reaches.
     items: []range_spec.Item = &.{},
-    /// Widths, shared by every spec in `items`.
+    /// Widths, shared by every spec in `items`. Overwritten by the next
+    /// `RangeSpec.parse` or `RangeSpecSeq.parse` through this `Storage`.
+    ///
+    /// A parse that fails leaves them as `RangeSpec.parse` states:
+    /// `error.BufferFull` writes nothing, and any other failure leaves the
+    /// widths read so far in the leading slots, with the rest of the slice
+    /// holding whatever it held before.
     widths: []u64 = &.{},
-    /// Hashes for a `GetManyRequest`.
+    /// GetManyRequest.hashes borrows this buffer. A failed parse keeps complete
+    /// hashes in the prefix and prior contents in the rest; later parses overwrite it.
     hashes: []Hash = &.{},
-    /// Boundaries for an `ObserveItem`'s chunk range set.
+    /// Boundaries for an `ObserveItem`'s chunk range set. Borrowed by that
+    /// item's `ranges`, and overwritten by the next `ObserveItem.parse` or
+    /// `ObserveResponse.next` through this `Storage`.
+    ///
+    /// A parse that fails leaves them as `ChunkRangeSet.parse` states: the
+    /// boundaries read so far sit in the leading slots in wire order, neither
+    /// sorted nor deduplicated, and the rest of the slice holds whatever it
+    /// held before. `error.BufferFull` writes nothing.
     boundaries: []u64 = &.{},
 };
 
@@ -283,14 +320,27 @@ pub const Closed = enum(u16) {
 };
 
 /// A byte range, half-open, in the unit the protocol does not use on the wire.
+///
+/// `end` is the first byte *past* the range, so `end <= start` is an empty or
+/// inverted range and `len` is not derivable from these fields without that
+/// case being handled. `bytesToChunks` is the conversion that keeps the two
+/// cases apart.
 pub const ByteRange = struct {
+    /// The first byte of the range.
     start: u64,
+    /// One past the last byte. Nothing keeps it above `start`: a value built
+    /// by the caller may be empty or inverted, and `chunksToBytes` saturates
+    /// rather than wrapping.
     end: u64,
 };
 
 /// A chunk range, half-open. This *is* the wire unit: see the module comment.
 pub const ChunkRange = struct {
+    /// The first chunk of the range.
     start: u64,
+    /// One past the last chunk. A `ChunkRange` off a peer's wire can be
+    /// `u64.max`, and `start > end` is possible in a hand-built value, which
+    /// is why `len` saturates rather than the type promising an order.
     end: u64,
 
     /// Chunks this range covers, zero when it is empty or inverted.
@@ -328,13 +378,18 @@ pub fn chunkAfterByte(end: u64) u64 {
 /// `ChunkRanges::bytes` (`src/protocol.rs:745`), which is the only direction a
 /// byte range reaches a request through. Two roundings, in opposite
 /// directions: the start goes *down* to the chunk that contains the first byte
-/// and the end goes *up* to the first chunk past the last one. A range that is
-/// empty or inverted rounds to an empty range, which is not a zero-width one.
+/// and the end goes *up* to the first chunk past the last one.
+///
+/// A byte range whose end is not past its start covers no byte and so covers
+/// no chunk: it returns the empty range at the chunk holding `start`, and
+/// never the one-chunk range the outward rounding would otherwise name. That
+/// is what keeps `start <= end` on every result, so `ChunkRange.len` reads the
+/// count off a range a peer can be sent without the answer covering data the
+/// request never asked for.
 pub fn bytesToChunks(range: ByteRange) ChunkRange {
-    return .{
-        .start = chunkOfByte(range.start),
-        .end = chunkAfterByte(range.end),
-    };
+    const start = chunkOfByte(range.start);
+    if (range.end <= range.start) return .{ .start = start, .end = start };
+    return .{ .start = start, .end = chunkAfterByte(range.end) };
 }
 
 /// The bytes a chunk range covers.
@@ -397,6 +452,7 @@ pub const ChunkRangeSet = struct {
     /// range runs to the end of whatever blob is read against.
     pub const last_chunk: ChunkRangeSet = .{ .boundaries = &.{ 0, std.math.maxInt(u64) } };
 
+    /// The set naming no chunks at all, which is an empty boundary list.
     pub fn isEmpty(self: ChunkRangeSet) bool {
         return self.boundaries.len == 0;
     }
@@ -407,6 +463,9 @@ pub const ChunkRangeSet = struct {
         return self.boundaries.len == 1 and self.boundaries[0] == 0;
     }
 
+    /// Equality of the boundary lists. Two sets a peer spelled differently
+    /// compare equal when they name the same ranges, because a decode sorts
+    /// and deduplicates before this sees them.
     pub fn eql(a: ChunkRangeSet, b: ChunkRangeSet) bool {
         return std.mem.eql(u64, a.boundaries, b.boundaries);
     }
@@ -425,6 +484,13 @@ pub const ChunkRangeSet = struct {
     /// else — not the parity, not the order. Normalising here is what keeps
     /// this total over arbitrary bytes, and it is also what makes the boundary
     /// parity of the result mean anything.
+    ///
+    /// On error the reader may have advanced and a prefix of `boundaries` may
+    /// already hold the boundaries read so far — in wire order, unsorted and
+    /// undeduplicated, because the two steps below run only on success — while
+    /// the rest of the slice keeps what the caller had. `error.BufferFull` is
+    /// the one failure that writes nothing: the declared count is checked
+    /// against `boundaries.len` before the first boundary is read.
     pub fn parse(
         reader: *postcard.Reader,
         boundaries: []u64,
@@ -495,6 +561,8 @@ pub const GetRequest = struct {
         return .{ .hash = hash, .ranges = .{ .items = &all_ranges } };
     }
 
+    /// The same blob and the same ranges, comparing the borrowed widths by
+    /// value.
     pub fn eql(a: GetRequest, b: GetRequest) bool {
         return std.mem.eql(u8, &a.hash, &b.hash) and a.ranges.eql(b.ranges);
     }
@@ -507,6 +575,11 @@ pub const GetRequest = struct {
         try self.ranges.write(writer);
     }
 
+    /// The body of a `get`, which writes `storage.items` and `storage.widths`
+    /// and returns a request borrowing them.
+    ///
+    /// `error.BufferFull` is `storage` being too small for a count the frame
+    /// declared, and `storage` is left holding a prefix of what it did hold.
     pub fn parse(reader: *postcard.Reader, storage: *Storage) postcard.Error!GetRequest {
         return .{
             .hash = try reader.readArray(hash_length),
@@ -555,6 +628,12 @@ pub const GetManyRequest = struct {
     /// hash, and an empty spec `count` hashes on to end the run. The items go
     /// into `storage` because the count is not known until the caller's slice
     /// is, and nothing here allocates.
+    ///
+    /// Room for fewer than the two pairs this form writes is not a failure and
+    /// writes nothing to `storage`. The answer is `RangeSpecSeq.empty`, the
+    /// legal sequence that names no blob at all, so the request asks for
+    /// nothing; a caller that must ask for every chunk of `count` hashes hands
+    /// over the two slots the form needs.
     pub fn allRanges(
         storage: []range_spec.Item,
         count: u64,
@@ -565,6 +644,8 @@ pub const GetManyRequest = struct {
         return .{ .items = storage[0..2] };
     }
 
+    /// The same hashes in the same order and the same ranges. Order matters:
+    /// one spec lines up with one hash.
     pub fn eql(a: GetManyRequest, b: GetManyRequest) bool {
         if (a.hashes.len != b.hashes.len) return false;
         for (a.hashes, b.hashes) |left, right| {
@@ -582,6 +663,13 @@ pub const GetManyRequest = struct {
         try self.ranges.write(writer);
     }
 
+    /// The body of a `get_many`, which writes `storage.hashes`,
+    /// `storage.items` and `storage.widths`, and returns a request borrowing
+    /// all three.
+    ///
+    /// `error.BufferFull` is any of those buffers being too small for a count
+    /// the frame declared; the buffers hold a prefix of what they did hold,
+    /// and no part of the request is returned.
     pub fn parse(
         reader: *postcard.Reader,
         storage: *Storage,
@@ -611,15 +699,24 @@ pub const ObserveRequest = struct {
     /// The chunks to observe. Upstream's `ObserveRequest::new` sends `all`.
     ranges: range_spec.RangeSpec,
 
+    /// The same blob and the same chunks to watch.
     pub fn eql(a: ObserveRequest, b: ObserveRequest) bool {
         return std.mem.eql(u8, &a.hash, &b.hash) and a.ranges.eql(b.ranges);
     }
 
+    /// The wire form: 32 raw hash bytes, then a `RangeSpec`.
     pub fn write(self: ObserveRequest, writer: *postcard.Writer) postcard.Error!void {
         try writer.writeArray(hash_length, &self.hash);
         try self.ranges.write(writer);
     }
 
+    /// The body of an `observe`, which writes `storage.widths` and returns a
+    /// request borrowing them.
+    ///
+    /// On error the reader may have advanced past the hash and into the range
+    /// widths, and `storage.widths` may already hold the prefix
+    /// `RangeSpec.parse` wrote; no request is returned. `error.BufferFull` is a
+    /// declared width count larger than `storage.widths` and writes nothing.
     pub fn parse(reader: *postcard.Reader, storage: *Storage) postcard.Error!ObserveRequest {
         return .{
             .hash = try reader.readArray(hash_length),
@@ -634,23 +731,33 @@ pub const ObserveRequest = struct {
 /// over exactly one `GetRequest`, which is why the wire form is identical and
 /// the only difference is the byte in front and the framing behind it.
 pub const PushRequest = struct {
+    /// The `get` this framing carries. After a decode its `ranges` borrow
+    /// `storage.items` and `storage.widths`.
     get: GetRequest,
 
     // `Hash` is a private alias of the public builtin `[32]u8]`, so a caller
     // passes those 32 bytes and names no private type.
     // ziglint-ignore: Z012
+    /// A `push` for `hash` over `ranges`. `ranges` is borrowed, and the
+    /// discriminant and the framing around it are what make this a `push`
+    /// rather than a `get`.
     pub fn new(hash: Hash, ranges: range_spec.RangeSpecSeq) PushRequest {
         return .{ .get = .{ .hash = hash, .ranges = ranges } };
     }
 
+    /// Equality of the wrapped `get`.
     pub fn eql(a: PushRequest, b: PushRequest) bool {
         return a.get.eql(b.get);
     }
 
+    /// The wire form, which is `GetRequest`'s: the discriminant in front of it
+    /// is what makes this a `push`.
     pub fn write(self: PushRequest, writer: *postcard.Writer) postcard.Error!void {
         try self.get.write(writer);
     }
 
+    /// The body of a `push`, which writes `storage.items` and
+    /// `storage.widths` exactly as `GetRequest.parse` does.
     pub fn parse(reader: *postcard.Reader, storage: *Storage) postcard.Error!PushRequest {
         return .{ .get = try GetRequest.parse(reader, storage) };
     }
@@ -673,15 +780,28 @@ pub const ObserveItem = struct {
     /// Which chunks the provider has, as a boundary list.
     ranges: ChunkRangeSet,
 
+    /// The same size and the same chunk range set.
     pub fn eql(a: ObserveItem, b: ObserveItem) bool {
         return a.size == b.size and a.ranges.eql(b.ranges);
     }
 
+    /// The wire form: the size as a `varint(u64)`, then the range set.
     pub fn write(self: ObserveItem, writer: *postcard.Writer) postcard.Error!void {
         try writer.writeU64(self.size);
         try self.ranges.write(writer);
     }
 
+    /// One item, which writes `storage.boundaries` and returns an item
+    /// borrowing them.
+    ///
+    /// The next item read through the same `Storage` overwrites those
+    /// boundaries; see `ObserveResponse.next`.
+    ///
+    /// On error the reader may have advanced past the size and into the
+    /// boundary list, and `storage.boundaries` may already hold the boundaries
+    /// read so far, unsorted and undeduplicated; no item is returned.
+    /// `error.BufferFull` is a declared boundary count larger than
+    /// `storage.boundaries` and writes nothing.
     pub fn parse(reader: *postcard.Reader, storage: *Storage) postcard.Error!ObserveItem {
         return .{
             .size = try reader.readU64(),
@@ -700,8 +820,13 @@ pub const ObserveItem = struct {
 /// a separate type from `PushFraming` and not a flag on one request: the two
 /// have different rules, and a value of one is not a value of the other.
 pub const EofRequest = union(enum) {
+    /// One blob, or a collection and its children. Its `ranges` borrow
+    /// `storage.items` and `storage.widths` after a decode.
     get: GetRequest,
+    /// Several unrelated blobs. Its `hashes` borrow `storage.hashes` after a
+    /// decode.
     get_many: GetManyRequest,
+    /// One blob's availability, whose `ranges` borrow `storage.widths`.
     observe: ObserveRequest,
 
     /// The discriminant this request is written under.
@@ -713,6 +838,8 @@ pub const EofRequest = union(enum) {
         };
     }
 
+    /// The same request, and only between arms that carry the same one: a `get`
+    /// is never equal to an `observe`.
     pub fn eql(a: EofRequest, b: EofRequest) bool {
         return switch (a) {
             .get => |left| switch (b) {
@@ -797,6 +924,8 @@ pub const Request = union(enum) {
         };
     }
 
+    /// The same request in the same framing. A request read in one framing is
+    /// never equal to one read in the other, whatever its body says.
     pub fn eql(a: Request, b: Request) bool {
         return switch (a) {
             .to_eof => |left| switch (b) {
@@ -964,10 +1093,25 @@ pub const BaoResponse = struct {
 /// `push` request is written with. The prefix is here for the reason it is
 /// there: a run has no other boundary, so without it a getter could not tell
 /// one update from the next.
+///
+/// The response is a cursor, not a container: it holds the reader it consumes
+/// and the storage its items are read into, and neither is copied. Both must
+/// stay alive, and the reader must stay at the position `read` left it, for as
+/// long as the response is used — `read` does not consume anything, and every
+/// `next` advances the shared reader.
 pub const ObserveResponse = struct {
+    /// The reader the run is read from. `next` advances it; nothing else
+    /// touches it, and a second reader over the same bytes reads the run from
+    /// its own position.
     reader: *postcard.Reader,
+    /// Where each item is decoded. Every `next` overwrites its `boundaries`.
     storage: *Storage,
 
+    /// A response reading `reader` to its end, through `storage`.
+    ///
+    /// Nothing is consumed and nothing is decoded here, so the response is
+    /// valid the moment it is returned and reads nothing until `next` is
+    /// called.
     pub fn read(reader: *postcard.Reader, storage: *Storage) ObserveResponse {
         return .{ .reader = reader, .storage = storage };
     }
@@ -980,6 +1124,14 @@ pub const ObserveResponse = struct {
     /// stopped *inside* an item has lost bytes, and one that stopped *between*
     /// two has not. Keeping them apart is the point — the first ends a
     /// transfer cleanly and the second means the answer is incomplete.
+    ///
+    /// **The item borrows `storage.boundaries`, and the next call overwrites
+    /// them.** Only `ranges` is invalidated; `size` is a value in the returned
+    /// item and stays readable. A caller that needs the boundaries of two items
+    /// at once has to copy each one before asking for the next.
+    ///
+    /// On success the reader is past this item. On error it may have consumed
+    /// a length prefix or body. Abandon this iteration; retry is not promised.
     pub fn next(self: *ObserveResponse) Error!?ObserveItem {
         if (self.reader.remaining() == 0) return null;
         var body = try readLengthPrefaced(self.reader);
@@ -1528,6 +1680,66 @@ test "bytes to chunks: the four roundings upstream's tests pin" {
     );
     // An inverted range covers no chunks rather than wrapping to a huge one.
     try testing.expectEqual(@as(u64, 0), (ChunkRange{ .start = 5, .end = 3 }).len());
+}
+
+test "an empty or inverted byte range covers no chunk" {
+    // The audit case: bytes 5 through 5 is no bytes, so it is no chunks. The
+    // outward rounding alone named chunk 0 through 1 and the answer covered a
+    // chunk the request never asked for.
+    const empty = bytesToChunks(.{ .start = 5, .end = 5 });
+    try testing.expectEqual(@as(u64, 0), empty.len());
+    try testing.expectEqual(ChunkRange{ .start = 0, .end = 0 }, empty);
+
+    // The empty range at zero, and one straddling a chunk boundary, so the
+    // answer is at the chunk the start byte is in rather than at zero.
+    try testing.expectEqual(
+        ChunkRange{ .start = 0, .end = 0 },
+        bytesToChunks(.{ .start = 0, .end = 0 }),
+    );
+    const straddling = bytesToChunks(.{ .start = 1024, .end = 1024 });
+    try testing.expectEqual(ChunkRange{ .start = 1, .end = 1 }, straddling);
+    try testing.expectEqual(@as(u64, 0), straddling.len());
+    try testing.expectEqual(
+        ChunkRange{ .start = 4, .end = 4 },
+        bytesToChunks(.{ .start = 4096, .end = 4096 }),
+    );
+
+    // Inverted is the same answer: end before start names no bytes, and
+    // rounding its end up would name chunks past the ones a caller asked
+    // about. `start <= end` holds on every result, so the count reads zero
+    // rather than wrapping.
+    for ([_]ByteRange{
+        .{ .start = 5, .end = 3 },
+        .{ .start = 2048, .end = 1024 },
+        .{ .start = 1024, .end = 1 },
+    }) |range| {
+        const chunks = bytesToChunks(range);
+        try testing.expect(chunks.start <= chunks.end);
+        try testing.expectEqual(@as(u64, 0), chunks.len());
+        try testing.expectEqual(chunkOfByte(range.start), chunks.start);
+    }
+
+    // The one-byte range is the boundary this fix must not move: it is the
+    // smallest range that covers a byte, and it still rounds outward to a
+    // whole chunk.
+    try testing.expectEqual(
+        ChunkRange{ .start = 0, .end = 1 },
+        bytesToChunks(.{ .start = 5, .end = 6 }),
+    );
+    try testing.expectEqual(
+        ChunkRange{ .start = 1, .end = 2 },
+        bytesToChunks(.{ .start = 1024, .end = 1025 }),
+    );
+
+    // And the other direction agrees: an empty chunk range is an empty byte
+    // range, so a round trip through both conversions cannot widen one.
+    for ([_]ChunkRange{
+        .{ .start = 0, .end = 0 },
+        .{ .start = 1, .end = 1 },
+        .{ .start = 4, .end = 4 },
+    }) |chunks| {
+        try testing.expectEqual(@as(u64, 0), chunksToBytes(chunks).end -| chunksToBytes(chunks).start);
+    }
 }
 
 test "GetManyRequest.allRanges is upstream's FromIterator" {

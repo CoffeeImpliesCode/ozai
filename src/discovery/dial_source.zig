@@ -111,7 +111,7 @@
 //! `AddressLookupItem::new` on both, as `discovery/resolve.zig` records — and a
 //! stamp invented here would be the same value on every item, which is a key
 //! that orders nothing while looking like freshness. `item.Item.order` falls
-//! through to the encoded address, and this file does not touch it.
+//! through to the address value order, and this file does not touch it.
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
@@ -134,6 +134,10 @@ pub const Error = resolve.ResolveError || dial.Error;
 /// The run needs six of them and a positional list that long is a list
 /// nothing distinguishes, so they are named here once. `at` and `random` are
 /// the caller's for the reason the module doc gives.
+///
+/// Nothing here is copied and nothing here is owned except what the run puts
+/// into `map`: `map` is written to and has to outlive the `Outcome`, and the
+/// `Selector` is called into, so both have to outlive the call.
 pub const Request = struct {
     /// The node being dialled: what every source is asked about, the pin the
     /// connection carries, and the node half of every synthetic map key.
@@ -183,12 +187,21 @@ pub const Request = struct {
 /// oscillating rather than carrying twice the load. Pick once, dial once, run
 /// again for the rest.
 pub const Selector = struct {
+    /// The policy's own value, borrowed and reached by `pick`. It has to stay
+    /// alive for the whole run, which reaches it exactly once.
     ctx: *anyopaque,
     /// The one address to dial, or null when this node will take none of them.
     ///
     /// Handed a list that is never empty: a winner with no address is settled
     /// before the policy is asked, because there is nothing in it to choose
     /// from. `addr.TransportAddr.order` is the caller's to sort with.
+    ///
+    /// Called once per run, synchronously, on the thread that called
+    /// `dialFromSources` and before anything is dialled. `endpoint` points at
+    /// the winning item, which belongs to a stream this call closes before it
+    /// returns: the pointer and every slice read out of it are good for this
+    /// call and not after it, and an address to keep is one to copy here.
+    /// Nothing reenters the run from this callback.
     pick: *const fn (ctx: *anyopaque, endpoint: *const addr.NodeAddr) ?addr.TransportAddr,
 };
 
@@ -251,6 +264,13 @@ pub const Dialed = struct {
 /// The dialer is borrowed for one call. A run that resolves to nothing never
 /// touches it, and one that dials hands back a connection the dialer's bridge
 /// owns.
+///
+/// Every path out closes every stream the walk started and tells the retrieval
+/// behind each one to stop, including the paths that end in an `Outcome` and
+/// the path that returns an error. So an error here leaves nothing running and
+/// nothing for the caller to release but the `Outcome`, and the items the run
+/// read are already gone by the time it returns — which is why no field of
+/// `Outcome` borrows them.
 pub fn dialFromSources(
     alloc: std.mem.Allocator,
     sources: []const resolve.AddressLookup,
@@ -672,15 +692,9 @@ test "the merge chooses the address and the dial opens on it" {
     defer harness.deinit();
     const peer = harness.server_secret.nodeId();
 
-    // The DNS service is asked first and names one relay; the relay service is
-    // asked second and names another. `item.Item.order` compares the canonical
-    // encoding, and the two records agree on everything down to the host, so
-    // the second source's relay is the greater and the winner is *not* the
-    // first source's answer. The hosts are the same length on purpose, so the
-    // order is decided by the bytes a reader can see rather than by a length
-    // prefix that would decide it first. A run that took the first usable
-    // address instead of the merge would dial `one.example.` and the key
-    // assertion below would fail on its first line.
+    // The second source names `two.example.`, which is greater in the address
+    // value order than the first source's `one.example.`. Taking the first
+    // usable answer instead of merging would dial the wrong relay.
     var stops: Counter = .{};
     var relay: FakeRelay = .{
         .answers = "signed\x00",
@@ -688,7 +702,6 @@ test "the merge chooses the address and the dial opens on it" {
     };
     var resolver = resolve.PkarrResolver.init(relay.source(stops.cancellation()));
     var service = dns.DnsAddressLookup.init(
-        dns.prod_origin,
         .init("relay=https://one.example./\x00"),
         null,
     );
@@ -755,7 +768,7 @@ test "a service that will not resolve stops the walk where it made its claim" {
     // Upstream's publisher implements no `resolve`
     // (`iroh/src/address_lookup/pkarr.rs:357`), so this is a service in
     // ordinary production and not a double invented to make this test pass.
-    var publisher = resolve.PkarrPublisher.init(t.allocator);
+    var publisher = resolve.PkarrPublisher.init();
     defer publisher.deinit();
     var refusing = Counted.init(publisher.lookup());
 
@@ -818,7 +831,7 @@ test "an answer with nothing in it does not stop the walk" {
     // A node that exists and has nowhere to be sent a packet, from the one
     // service that can say so: an answer set with no records is one item, the
     // node, and no addresses.
-    var service = dns.DnsAddressLookup.init(dns.prod_origin, .init(""), null);
+    var service = dns.DnsAddressLookup.init(.init(""), null);
     var published_nothing = Counted.init(service.lookup());
 
     var stops: Counter = .{};
@@ -875,7 +888,7 @@ test "an empty result, an empty address list and a refused path are told apart" 
 
     // The same absence of addresses said by the other service, which is a
     // different fact: the node was found and it has no path.
-    var service = dns.DnsAddressLookup.init(dns.prod_origin, .init(""), null);
+    var service = dns.DnsAddressLookup.init(.init(""), null);
     var nameless = Counted.init(service.lookup());
     const only_nameless = [_]resolve.AddressLookup{nameless.lookup()};
     const no_path = try dialFromSources(
@@ -960,7 +973,7 @@ test "a run that gives up mid-walk still stops every retrieval it started" {
     var quiet: FakeRelay = .{ .answers = "", .packets = &.{} };
     var quiet_resolver = resolve.PkarrResolver.init(quiet.source(quiet_stops.cancellation()));
     var silent = Counted.init(quiet_resolver.lookup());
-    var publisher = resolve.PkarrPublisher.init(t.allocator);
+    var publisher = resolve.PkarrPublisher.init();
     defer publisher.deinit();
     const cut_short = [_]resolve.AddressLookup{
         answering.lookup(),

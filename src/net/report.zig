@@ -59,10 +59,24 @@ pub const Probe = enum {
 /// One QUIC address discovery result. Upstream's `QadProbeReport`, which is
 /// `{relay, latency, addr}`.
 pub const QadProbe = struct {
+    /// The relay that answered, held by value: this probe owns its `RelayUrl`
+    /// in full and borrows nothing from whoever built it, so it can be copied
+    /// into a report, kept in an array or compared without a lifetime to
+    /// track. Two of these name the same relay when `RelayUrl.order` says so
+    /// and not when their fields match, because only the host's first
+    /// `host_length` bytes are part of the value.
     relay: RelayUrl,
-    /// When the observation was made. The fold compares this against the `now`
-    /// it is given and against its siblings; it never reads a clock itself.
+    /// When the observation was made, in `Nanos`: nanoseconds on the caller's
+    /// own monotonic timeline, the one `Nanos` defines. It is an instant and
+    /// nothing here reads a clock to produce it — the fold compares it
+    /// against the `now` it is given and against its siblings.
     instant: Nanos,
+    /// The measured round trip, in `Nanos` on that same caller-owned timeline.
+    ///
+    /// A length, not an instant: no code here subtracts one, and the only
+    /// subtraction the fold performs is an age against the `now` it was
+    /// handed. What compares two latencies is `beats`, which reads fastest
+    /// first and then freshest; see `ProbeResult.latency`.
     latency: Nanos,
     /// The public address the relay saw us come from.
     ///
@@ -79,8 +93,18 @@ pub const QadProbe = struct {
 /// and can never classify a NAT, so a fold over HTTPS probes alone reports a
 /// mapping as unknown rather than as stable.
 pub const HttpsProbe = struct {
+    /// The relay that answered, owned by value and borrowing nothing, exactly
+    /// as `QadProbe.relay` is.
     relay: RelayUrl,
+    /// When the observation was made: `Nanos`, nanoseconds on the caller's own
+    /// monotonic timeline. No HTTPS measurement reaches `Report.global_v4` or
+    /// `Report.global_v6`, because an HTTPS probe has no address to put in
+    /// either, but `instant` is carried and aged the same way regardless.
     instant: Nanos,
+    /// The measured round trip in `Nanos`, the same figure and the same units
+    /// as `QadProbe.latency`, and kept for the same reason: the fastest
+    /// showing for a relay across every probe family is what `get` returns
+    /// and what `choosePreferredRelay` compares.
     latency: Nanos,
 };
 
@@ -101,7 +125,9 @@ pub const ProbeResult = union(enum) {
 
     /// By value, not by pointer. `ProbeResult` is passed around by value and a
     /// borrowed relay would point into whichever copy the caller happened to
-    /// hold; `RelayUrl` is 258 bytes and the copy is the cheap option.
+    /// hold; the relay is already owned by whichever arm is active, so handing
+    /// one back costs a copy of a value the caller then owns outright rather
+    /// than a lifetime it has to track.
     pub fn relay(self: ProbeResult) RelayUrl {
         return switch (self) {
             .https => |probe| probe.relay,
@@ -110,6 +136,12 @@ pub const ProbeResult = union(enum) {
         };
     }
 
+    /// The measured latency, in nanoseconds on the caller's own timeline.
+    ///
+    /// Every arm carries the same figure and there is no arm without one, so
+    /// this is total: a `ProbeResult` cannot name a relay it did not time.
+    /// `instant` is not read here — a caller comparing two observations wants
+    /// the cost, and `fold` is what decides which cost wins; see `beats`.
     pub fn latency(self: ProbeResult) Nanos {
         return switch (self) {
             .https => |probe| probe.latency,
@@ -121,9 +153,23 @@ pub const ProbeResult = union(enum) {
 
 /// A relay and the fastest latency measured to it in one probe family.
 ///
-/// Upstream's `BTreeMap<RelayUrl, Duration>` entry.
+/// Upstream's `BTreeMap<RelayUrl, Duration>` entry: a key and the value that
+/// key accumulated, which is where a key and a value being separate types
+/// stops being a fiction.
 pub const RelayLatency = struct {
+    /// The relay this entry is about, owned by value and borrowing nothing.
+    /// It is the key the enclosing `RelayList` is sorted and deduplicated by
+    /// through `RelayUrl.order`, never field by field.
     relay: RelayUrl,
+    /// The fastest latency seen to `relay` in this family, in `Nanos`:
+    /// nanoseconds on the caller's own monotonic timeline, as `QadProbe.latency`
+    /// and `HttpsProbe.latency` are.
+    ///
+    /// A minimum, not a last reading — `RelayList.update` keeps the smaller of
+    /// the two. It is therefore *not* the entry's sort key: the list is
+    /// ascending by relay URL, so the latencies in it are in no order at all.
+    /// The fastest latency in a list is `RelayLatencies.get`; the fastest
+    /// relay is `choosePreferredRelay`.
     latency: Nanos,
 };
 
@@ -142,9 +188,22 @@ pub const max_relays = 5;
 /// Sorted rather than hashed because the order is load-bearing twice over: the
 /// fold breaks a latency tie on the first relay it sees, and a report is a value
 /// a test compares, so an insertion order would make it incomparable.
+///
+/// Sorted by relay and **not** by latency: the key is what the list is ordered
+/// and deduplicated by, and each entry carries a minimum over everything ever
+/// seen for its relay, so reading the list left to right gives relays in
+/// `RelayUrl.order` and latencies in no order whatsoever. Nothing in this
+/// package walks a list expecting the first entry to be the fastest one —
+/// `RelayLatencies.get` is the way to ask for a relay's figure, and
+/// `choosePreferredRelay` is the way to ask for the fastest relay.
 const RelayList = struct {
-    /// Entries past `len` are never written and are never read.
+    /// The entries, first `len` of them ascending by relay URL. Entries past
+    /// `len` are never written and are never read, so a default value is a
+    /// list with an entirely unspecified array behind it — a valid value, not
+    /// a broken one.
     items: [max_relays]RelayLatency = undefined,
+    /// How many entries of `items` are live. Zero by default, and never above
+    /// `max_relays`: `update` drops a sixth relay rather than growing past it.
     len: usize = 0,
 
     fn get(self: *const RelayList, relay: RelayUrl) ?Nanos {
@@ -194,9 +253,28 @@ const RelayList = struct {
 
 /// The measured latency to each relay, per probe family. Upstream's
 /// `RelayLatencies`, which is three `BTreeMap`s keyed by relay.
+///
+/// The three families are measured independently and merged only where a
+/// choice is made, so one relay can appear in all three lists at three
+/// different figures and `get` returns the smallest of them. Read a family
+/// through `iter`, `get` or `update`; the lists are `RelayList`s and their
+/// fields are written by those.
+///
+/// Every list defaults to empty, and an empty list is not a measurement of
+/// nothing: it is the statement that this family was never probed, which is
+/// what keeps `Report.udp_v4` and `Report.udp_v6` independent of it.
 pub const RelayLatencies = struct {
+    /// What the HTTPS probes measured: one entry per relay those probes
+    /// timed, ascending by `RelayUrl.order` and **not** by latency. Empty by
+    /// default; `update` and `merge` are what put anything in it.
     https: RelayList = .{},
+    /// The same for the IPv4 QUIC address-discovery probes, which are the
+    /// family `Report.global_v4` is chosen from. Ascending by relay URL, empty
+    /// by default.
     ipv4: RelayList = .{},
+    /// The same for the IPv6 address-discovery probes, and the family
+    /// `Report.global_v6` is chosen from. Ascending by relay URL, empty by
+    /// default.
     ipv6: RelayList = .{},
 
     fn list(self: *RelayLatencies, probe: Probe) *RelayList {
@@ -223,8 +301,15 @@ pub const RelayLatencies = struct {
 
     /// One measurement, with the family it came from.
     pub const Entry = struct {
+        /// The family this measurement was made in, which is the family the
+        /// probe *ran* with rather than any family the relay answered in.
         probe: Probe,
+        /// The relay measured, a by-value copy that borrows nothing: an `Entry`
+        /// outlives the `RelayLatencies` it came from.
         relay: RelayUrl,
+        /// The figure, in `Nanos` — nanoseconds on the caller's own monotonic
+        /// timeline. A minimum over every measurement of this relay in this
+        /// family, not the most recent one; see `RelayLatency.latency`.
         latency: Nanos,
     };
 
@@ -257,10 +342,27 @@ pub const RelayLatencies = struct {
         }
     };
 
+    /// Every measurement, in `family_order` and each family ascending by relay.
+    ///
+    /// The returned iterator borrows `self` and is over a `*const`, so it
+    /// stays valid exactly as long as the `RelayLatencies` does and cannot be
+    /// used to mutate one. Entries come back by value, so an `Entry.relay` is
+    /// a copy that borrows nothing.
     pub fn iter(self: *const RelayLatencies) Iter {
         return .{ .latencies = self };
     }
 
+    /// Record `latency` for `relay` in one probe family, keeping the fastest
+    /// seen. `true` when it was recorded, `false` when the family's list is
+    /// full of relays it has never seen.
+    ///
+    /// `false` is not a failure and not an error: `max_relays` bounds what a
+    /// round may probe, so a caller passing more is passing something the plan
+    /// cannot have produced. The fold ignores it, because a lost measurement
+    /// costs a slower preferred relay and not a wrong one.
+    ///
+    /// `latency` is nanoseconds and is not checked against a clock: the caller
+    /// measured it, and this only keeps the minimum.
     pub fn update(self: *RelayLatencies, relay: RelayUrl, latency: Nanos, probe: Probe) bool {
         return self.list(probe).update(relay, latency);
     }
@@ -288,6 +390,15 @@ pub const RelayLatencies = struct {
         return best;
     }
 
+    /// Whether two sets record the same measurements.
+    ///
+    /// Equal as *sets of measurements*, in `Iter` order: HTTPS first, then the
+    /// two address-discovery families, each ascending by relay. Both sides
+    /// therefore have to hold the same entries in the same slots, which is what
+    /// the sorted insertion in `RelayList.update` guarantees. Relays are
+    /// compared through `RelayUrl.order`, so two entries that name the same
+    /// relay are one entry whatever the unused tail of either `RelayUrl`
+    /// holds, and the entries past `len` in either inline array are never read.
     pub fn eql(self: RelayLatencies, other: RelayLatencies) bool {
         var left = self.iter();
         var right = other.iter();
@@ -311,11 +422,41 @@ pub const RelayLatencies = struct {
 /// and a flag, which makes the independence a property of the type rather than
 /// of how carefully the caller ordered its probes. See `Varying.classify` for
 /// why one observation is not an answer.
+///
+/// A `Varying` is only meaningful as the output of `observe` and read through
+/// `classify`. The fields are an accumulator, not an interface: a caller that
+/// writes `count` or `differs` directly is asserting a history no address
+/// backs, and a caller that reads `first` before the first `observe` reads
+/// undefined bytes rather than an absence — `classify`'s null is how this
+/// type says "nothing observed", and it is a method, not a field.
 pub const Varying = struct {
+    /// How many observations have been folded in. Zero on a default value, and
+    /// the only precondition under which `first` means anything: it becomes
+    /// valid at one. Nothing decrements it, so it is a total of `observe`
+    /// calls rather than of addresses still held.
     count: usize = 0,
+    /// The reference address: the first observation, which every later one is
+    /// compared against and which none of them replaces.
+    ///
+    /// **Undefined until `count` is at least one.** A default-constructed
+    /// `Varying` has no reference address, and reading this field before the
+    /// first `observe` reads poison bytes — not a zero address and not a null.
+    /// `classify` is how a caller asks the question that does not need it.
     first: SocketAddr = undefined,
+    /// Whether any observation past the first has disagreed with `first`. False
+    /// on a default value and also for one observation or for several that all
+    /// agree, which is why it is never the answer on its own: read `classify`,
+    /// which is `differs` once two or more observations are in.
     differs: bool = false,
 
+    /// Fold one observation in.
+    ///
+    /// The first observation becomes the reference and every later one is
+    /// compared with it, so the accumulator is order-independent by
+    /// construction rather than by discipline: any observation that differs
+    /// from the first sets `differs` and nothing unsets it. A caller may pass
+    /// an address of a family the probe did not run in; `fold` is what decides
+    /// which family an answer belongs to, and this is only an accumulator.
     pub fn observe(self: *Varying, socket: SocketAddr) void {
         if (self.count == 0) {
             self.first = socket;
@@ -337,6 +478,21 @@ pub const Varying = struct {
         return self.differs;
     }
 };
+
+/// Whether two optional relay URLs name the same relay.
+///
+/// Through `RelayUrl.order`, so a relay is the scheme, then the port, then the
+/// host's first `host_length` bytes — not the 253-byte array behind the host,
+/// whose tail `parse` never writes and no reader ever consults. `null` is a
+/// value here and not an absence of one: a report that has chosen no relay is
+/// not the same report as one that has chosen this.
+fn sameRelay(left: ?RelayUrl, right: ?RelayUrl) bool {
+    if (left) |url| {
+        const other = right orelse return false;
+        return url.order(other) == .eq;
+    }
+    return right == null;
+}
 
 /// What this node's NAT looks like, as measured by probes. Upstream's `Report`,
 /// field for field.
@@ -365,10 +521,11 @@ pub const Report = struct {
     preferred_relay: ?RelayUrl = null,
     /// The measured latency to each relay, per probe family.
     relay_latency: RelayLatencies = .{},
-    /// The public address a v4 probe reported. Which of several, when they
-    /// disagree, is answered in `observeGlobal`.
+    /// The v4 address selected by `fold`: lowest latency, then newest instant,
+    /// then lowest relay URL. Null means no probe supplied an address of this
+    /// family. An address is selected even when the probes disagree.
     global_v4: ?SocketAddr = null,
-    /// The public address a v6 probe reported.
+    /// The same selection over v6 probes; null has the same meaning.
     global_v6: ?SocketAddr = null,
     /// Set by a captive-portal check and by nothing else. Null means "not
     /// checked", which is not the same as `false`: a portal that was never
@@ -398,9 +555,21 @@ pub const Report = struct {
 
     /// Structural equality, field for field.
     ///
-    /// Not `==`: the latency lists are inline arrays whose tail past `len` is
-    /// never written, and a derived comparison would read those bytes. Upstream
+    /// Not `==`, and not `std.meta.eql` over the whole value either: two fields
+    /// are inline arrays whose tail past their length is never written, and a
+    /// comparison that reads those bytes is not an equivalence at all. Upstream
     /// gets equality from `BTreeMap`s, which have no such tail.
+    ///
+    /// `preferred_relay` is the second of the two. `RelayUrl` is a 253-byte
+    /// fixed array with a length beside it, and `parse` writes only
+    /// `host_length` bytes: two URLs parsed from the same text are the same
+    /// relay whatever the rest of the array holds, and `format`, `socketAddr`,
+    /// `order` and `RelayList` all read it through `hostSlice`. So the relay is
+    /// compared by `RelayUrl.order` — scheme, then port, then the host's first
+    /// `host_length` bytes — and a caller that filled the unused tail cannot
+    /// make two reports that name the same relay stop comparing equal. The
+    /// latency table already compares its relays the same way; see
+    /// `RelayLatencies.eql`.
     pub fn eql(self: Report, other: Report) bool {
         if (self.udp_v4 != other.udp_v4) return false;
         if (self.udp_v6 != other.udp_v6) return false;
@@ -409,13 +578,14 @@ pub const Report = struct {
         if (self.captive_portal != other.captive_portal) return false;
         if (!std.meta.eql(self.global_v4, other.global_v4)) return false;
         if (!std.meta.eql(self.global_v6, other.global_v6)) return false;
-        if (!std.meta.eql(self.preferred_relay, other.preferred_relay)) return false;
+        if (!sameRelay(self.preferred_relay, other.preferred_relay)) return false;
         return self.relay_latency.eql(other.relay_latency);
     }
 
     /// The claims a report makes, in one line. Upstream's `Display` is `Debug`,
-    /// and a report here is four kilobytes of inline latency table: printing all
-    /// of it is not what a reader wants.
+    /// and a report here carries `relay_latency` inline — three families of
+    /// `max_relays` entries, each holding a `RelayUrl` by value — so printing
+    /// all of it is not what a reader wants.
     pub fn format(self: Report, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("udp_v4: {} udp_v6: {} varies_by_dest: {?}/{?} captive_portal: {?}", .{
             self.udp_v4,
@@ -617,6 +787,10 @@ fn choosePreferredRelay(report: *Report, history: History, now: Nanos) void {
 /// and quietly reads another endpoint's metadata.
 pub const max_user_data_length = 245;
 
+/// Why an application's attached metadata could not be built. The single
+/// variant is upstream's `MaxLengthExceededError`, whose message is "max length
+/// exceeded", and there is no allocator in this type that could fail: the value
+/// is inline, so the only way to refuse is a length.
 pub const UserDataError = error{
     /// The value is longer than `max_user_data_length` bytes. Upstream's
     /// `MaxLengthExceededError`, whose message is "max length exceeded".
@@ -639,6 +813,15 @@ pub const UserData = struct {
     bytes: [max_user_data_length]u8 = undefined,
     len: u8 = 0,
 
+    /// The bytes, up to `max_length` of them, or `error.MaxLengthExceeded`.
+    ///
+    /// Inline rather than borrowed so a `UserData` can sit inside a discovery
+    /// record with no lifetime attached to it, and no allocation is involved.
+    /// Nothing here parses the value or looks at it; a caller that needs a
+    /// `[]const u8` takes `slice`, whose borrow ends with the value's address.
+    ///
+    /// An empty input is a `UserData` with `len == 0`, which is a value and not
+    /// an absent one: it reads back as empty rather than as unset.
     pub fn init(text: []const u8) UserDataError!UserData {
         // 245 fits a `u8`, so this cast admits nothing the length check did not.
         if (text.len > max_user_data_length) return error.MaxLengthExceeded;
@@ -1256,4 +1439,52 @@ test "a report prints the claims it can make" {
     try t.expect(std.mem.indexOf(u8, text, "varies_by_dest: null/null") != null);
     try t.expect(std.mem.indexOf(u8, text, "preferred_relay: https://a.example./") != null);
     try t.expect(std.mem.indexOf(u8, text, "global_v4: 198.51.100.7:41234") != null);
+}
+
+test "the same relay is the same relay whatever the unused host tail holds" {
+    // `RelayUrl.parse` copies the host into a 253-byte array and records only
+    // how much of it it wrote. Everything that reads a relay — `format`,
+    // `socketAddr`, `order`, `RelayList` — goes through `hostSlice`, so the
+    // bytes past `host_length` are bytes nothing consults. Two URLs parsed
+    // from the same text name the same relay whatever those bytes happen to
+    // hold, and a report that has been through a struct copy still equals
+    // itself.
+    var first = try RelayUrl.parse("https://relay.example./");
+    var second = try RelayUrl.parse("https://relay.example./");
+    @memset(first.host[first.host_length..], 0x11);
+    @memset(second.host[second.host_length..], 0x22);
+
+    // The premise first: the two are one relay to every reader of the value.
+    try t.expectEqual(std.math.Order.eq, first.order(second));
+    try t.expectEqualStrings(first.hostSlice(), second.hostSlice());
+
+    const a: Report = .{ .preferred_relay = first };
+    const b: Report = .{ .preferred_relay = second };
+    try t.expect(a.eql(b));
+    try t.expect(b.eql(a));
+
+    // `null` is a value of its own and not an absence of one: a report with no
+    // preferred relay is not the same report as one that has chosen this.
+    try t.expect(!a.eql(.{}));
+    try t.expect((Report{}).eql(.{}));
+    try t.expect(!(Report{}).eql(a));
+
+    // And a different relay is still a different relay, so the host is not
+    // simply being ignored: scheme, port and host bytes each decide it.
+    try t.expect(!a.eql(.{ .preferred_relay = try RelayUrl.parse("https://other.example./") }));
+    try t.expect(!a.eql(.{ .preferred_relay = try RelayUrl.parse("http://relay.example./") }));
+    try t.expect(!a.eql(.{
+        .preferred_relay = try RelayUrl.parse("https://relay.example.:8443/"),
+    }));
+
+    // The same rule reaches the latency table, which compared its relays by
+    // `order` already: one relay measured twice is one entry, and two reports
+    // that measured the same relay compare equal.
+    var measured: Report = .{ .preferred_relay = first };
+    try t.expect(measured.relay_latency.update(first, millis(10), .https));
+    try t.expect(measured.relay_latency.update(second, millis(10), .https));
+    try t.expectEqual(@as(usize, 1), measured.relay_latency.https.len);
+    var twin: Report = .{ .preferred_relay = second };
+    try t.expect(twin.relay_latency.update(second, millis(10), .https));
+    try t.expect(measured.eql(twin));
 }

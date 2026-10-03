@@ -17,10 +17,199 @@ from the certificate, moves bytes both ways, and carries ECN over a real socket.
 `test/relay_wire_test.zig` and `test/two_process_test.zig` exercise relay
 forwarding, payload delivery, and independent shutdown on loopback.
 
-External iroh interoperability and 0-RTT remain open. The gossip state machines
-run, but the node does not yet encode their messages on the wire.
+External iroh interoperability and node-level 0-RTT remain open. The gossip
+state machines run, but the node does not yet encode their messages on the
+wire.
 
-Before this matrix expansion, the direct nine-section gate passed over the
+### Current native gate record
+
+Direct invocations of the pinned Zig 0.16.0 compiler on native x86-64 Linux.
+The gate entry point does not run in this environment and was not used: its
+`anyzig` shim re-downloads the pinned toolchain and fails to extract it, which
+[`0004`](docs/DECISIONS/0004-vendored-core-contracts.md) records. No global
+tool, sandbox or launcher was repaired, and nothing in the table below is a
+cross-platform, iroh-interoperability or performance result.
+
+| Section | Command | Result |
+|---|---|---|
+| Build, Debug | `zig build -Doptimize=Debug` | exit 0; 5/5 build steps |
+| Build, ReleaseSafe | `zig build -Doptimize=ReleaseSafe` | exit 0; 5/5 build steps |
+| Tests, Debug | `zig build test quic-test -Doptimize=Debug` | exit 0; 22/22 steps; 1159/1159 tests |
+| Tests, ReleaseSafe | `zig build test quic-test -Doptimize=ReleaseSafe` | exit 0; 22/22 steps; 1159/1159 tests |
+| Format | `zig fmt --check .` | exit 0, no output |
+| Syntax | `zig ast-check`: 74 Zig files, 3 rechecks, 5 final-comment rechecks; manifest parsed separately | 82 source checks + 1 manifest parse, all exit 0 |
+| Lint | `zlint -c zlint.json -f json -S` | exit 0; 0 errors; 24 vendored warnings |
+| Static analysis | `zwanzig --threads 2` over 42 non-vendored changed files, 21 rules | exit 0; No issues found |
+| Fuzz | `zig build fuzz --fuzz=10000` | exit 0; 15/15 steps; 7/7 targets, at least 10 000 new runs each, no crash |
+
+**1159/1159 tests over 22 build steps** is the current figure, the same in both
+modes. It is **599 package tests — 562 in the main test root plus 37 across
+seven smaller integration and gate steps — and 560 in the separately built
+vendored core** (`zig build quic-test`). No step reported a leak under the
+test allocator.
+
+The lint run is **0 errors and 24 warnings**, and every warning is under
+`vendor/quic`: 16 `avoid-as` findings and 8 `suppressed-errors` findings on
+bounded or deliberately best-effort core paths. No non-vendored finding was
+reported. They are not described as zero lint findings.
+
+`-S` is a valid invocation, and the file list went over stdin in the shape it
+asks for: 74 changed Zig paths, one per line. An earlier retained run that
+answered `WriteFailed` handed the same list as one JSON array, so a single line
+of 2267 bytes overran the tool's fixed 1024-byte line reader; the same command
+with one path from that list exits 0 and reports that file's own four
+findings. Those runs are trace history for a caller that sent the wrong shape,
+and they are lint evidence in neither direction.
+
+Each of the seven decoder fuzz targets advanced by at least 10 000 new runs;
+the largest advance is 10 213. The `Runs:` counters those reports print are
+cumulative across the retained corpus and earlier runs, so a counter is not
+this invocation's work and the per-target advance is what the bound covers.
+
+### The actual CLI
+
+Six real `ozai-node` processes — a relay, a receiver and a sender in each of
+Debug and ReleaseSafe — carried exactly the 21-byte payload
+`api-cutover-live-wire` through the relay in both modes. Each sender reports
+`relay out: sent 1`, each relay reports `forwarded 1`, and each receiver's
+inbox holds one datagram of `bytes 21`, hex
+`6170692d6375746f7665722d6c6976652d77697265`, from that sender's node id. All
+six exited 0 after SIGTERM, each reporting `shutdown: closed` and a closed
+socket. Their seeds were 401, 402 and 403: the CLI's fixed default is a replay
+aid, not independent entropy for several processes.
+
+### The out-of-tree consumer
+
+Six programs built against the registered package modules: contract, TLS,
+decoder, cancellation, core-wire and package-state consumers. All six passed
+in Debug and ReleaseSafe, **18/18 build steps** in each mode. The two added
+consumers exercise ownership, state transitions and decoded wire values,
+not source text or counter percentages.
+
+The 18 build steps, six programs and 50 000 decoder cases per mode are
+separate counts from the native 1159/1159 suite. None is added to that suite.
+
+What each program observed, the same in both modes:
+
+- A const view of 1122 bytes over a fixed buffer stream. An allocation refusal
+  that retained 62 bytes and drained them on one retry, with the second drain
+  empty. A `Join` copied after it had observed a report, still answering about
+  its own recorded candidate. A client Initial of 1200 bytes that parses as an
+  Initial.
+- A pinned full handshake. ChaCha resumption with v1 early keys after a v2
+  negotiation. A v2 ticket sealed under the version that connection ended on.
+  A ticket whose issuing version did not match, falling back to a full
+  handshake. v2 early payload decrypted under the negotiated keys. The
+  handshake's own first flight went out as 296 bytes at Initial level.
+- A seeded sweep of 50 000 bounded transport-parameter, frame, DER,
+  ClientHello and ServerHello cases per mode, driven from seed `0xdec0de` and
+  one fixed clock, so a run is a function of its seed and nothing else. Fixed
+  vectors on top of it: 127 DER refusals, each read through both of the routes
+  a caller has; 27 `version_information` refusals; 2 `version_information`
+  accepts, one of them a ten-entry list whose ninth and tenth entries validate
+  and are then dropped; and a zero-budget CRYPTO pop that returned no frame,
+  moved no cursor, kept its queued bytes and produced the expected frame once a
+  4-byte budget was given. The refusal switches carry no `else` prong, so they
+  are exhaustive over the decoders' declared error sets at compile time.
+- Eight concurrent cancellation fires collapsing into one producer stop, with
+  the pending timeout answered `Canceled`.
+- A 45-byte unidirectional STREAM decrypted from a 74-byte datagram, with the
+  exact stream id, offset, FIN and 45-byte flow-credit debit. An empty loss
+  result that claims, releases and reuses its owner. One valid preferred
+  address and six exact refusals. A queued close decoded at Initial and
+  Handshake levels in one 1200-byte datagram, retained for the higher level
+  without consuming congestion credit.
+- Duplicate custom-address spellings collapse by value; owned payloads survive
+  overwriting and freeing the input. Populated membership/topic quit disconnects
+  the right peers and leaves both gossip layers inert. Three shuffle reply
+  situations preserve origin and peer identities. A 160-entry registry survives
+  six churn rounds with correct connections, queued bytes and packet borrows.
+
+Three earlier attempts at that same run failed in the consumer's own source,
+not in this package: an `else` prong left on an error switch this cutover had
+made exhaustive, an array repeat written with a runtime length, and
+`Connection.connectInto` written as a struct member where the registered
+function is `quic.connection.connectInto`. The instrumented Debug run also had
+to link the fuzz runner's seven `runner_*` symbols; the bridge for them is the
+package's own shipped `test/coverage_abi.zig`, attached to each consumer root,
+and it panics if anything reaches it. That is a harness arrangement and not a
+claim that those symbols are a production surface. Those receipts are kept as
+trace history for the fixes above, not as a current blocker.
+
+A declared-source archive also passed through `zig fetch` and the native
+hash-cached dependency route. All six programs passed again in Debug and
+ReleaseSafe, with 18/18 steps in each mode. At archive creation, the extracted
+dependency matched all 74 changed Zig files and 16 required shipped files byte
+for byte. These include the rules, lint config, both cross-test profiles, and
+architecture/decision records; later proof-only receipt wording is not that snapshot.
+
+Fetching the working directory itself returned `error.IllegalFileTypeInPackage`.
+The archive follows `build.zig.zon.paths` and excludes local environment and
+cache artifacts. No user environment file was removed to make the fetch pass.
+
+### Current coverage measurement
+
+One instrumented run measured this source. `zig build test quic-test
+-Doptimize=Debug -Dcoverage=true -Dcoverage-rt=<zig-cov-rt.o>` exited 0 at
+22/22 steps and 1159/1159 tests — 599 package tests with their matching
+`ozai-node` children, and 560 in the separately built vendored core, which ran
+again as an instrumented artifact through the out-of-tree consumer harness's
+`coverage-core` step, exit 0, 3/3 steps, 560/560. This is not a repository step.
+Forty-one fresh raw counter files from 15 binaries merged into 15 normalized
+PC tables with saturating counts. The six instrumented consumers are included.
+`zig-cov report --format=json` exited 0 and wrote the report.
+
+The report combines **instrumented block counters and inferred source-line
+attribution**. It expands executed block addresses through DWARF line tables,
+then applies a conservative source-conditional filter. Line hits count retained
+attributions, not statement executions. Zero can mean withheld attribution,
+even when a separate runtime observation proves that the body ran.
+
+The report spans 79 entries: 76 repository files and 3 libc startup assembly
+files. It reports **20 142 / 36 814 attributed source lines (54.71 %)** and
+**30 502 / 75 108 instrumented blocks (40.61 %)**. The repository-only line
+figure is 20 130 / 36 789 (54.72 %). Function counters are absent.
+These are not branch or path measurements.
+
+For added or replaced nonblank, non-comment lines in 74 changed Zig files,
+1 946 have positive attribution, 2 338 have zero attribution, and 1 827 have
+no report row. An absent row does not prove that the compiler emitted no code.
+The pinned compiler's AST places 2 084 zero rows inside test declarations.
+The remaining 254 contain 111 private test-helper rows and 143 production rows.
+This classification separates fixtures from code. It does not turn zero rows
+into branch coverage. Raw counters, exact AST spans and logs remain outside
+the repository.
+
+All 143 production zero rows have a per-function disposition in the retained
+measurement evidence. Runtime checks independently confirm drain retry, gossip
+quit/shuffle, registry churn, empty loss ownership, unidirectional send, close
+coalescing, preferred-address decoding and ticket resumption. Zero attribution
+is accepted for their field stores, continuations and reporter-filtered bodies;
+the exact compiler/filter cause is not inferred.
+
+Unforced combinations remain explicit: successful Retry ODCID installation;
+duplicate peer reset tokens; HelloRetryRequest certificate-policy reinstall;
+late constructor/stream cleanup and individual packet-mode error catches;
+scratch control-frame encoding failures and alternate quota/no-room exits;
+and the connection-level refusal of a peer CID limit below two. The codec
+consumer's ability to encode one is not proof of that last TLS-driven refusal.
+These are accepted coverage limits, not unresolved scoped API defects.
+Reopen a listed combination when its state, validator, cleanup or packet mode
+changes. Unsupported fuzz-runner ABI calls and actual kernel segmentation
+refusal were not forced; injected socket refusals are not kernel evidence.
+
+
+### What this record does not cover
+
+The cross-platform survey and its toolchain limits are reported by
+`cross-test` below and by
+[`0004`](docs/DECISIONS/0004-vendored-core-contracts.md). No iroh
+interoperability, no performance number and no node-level authenticated
+0-RTT is claimed.
+
+### Earlier records, kept as dated history
+
+Before the matrix expansion the direct nine-section gate passed over the
 56-file non-vendored Zig tree, with zero lint/static-analysis findings.
 Native Debug, ReleaseSafe, GNU and musl each passed 543/543 tests. All seven
 decoder fuzz targets completed another 10 000 mutations without a crash.
@@ -28,14 +217,30 @@ The actual CLI delivered exact payloads over IPv4 and IPv6. Under one-CPU
 load, all 30 process scenarios and 30 immediate-banner SIGTERM runs passed.
 The wider cross-platform survey and its limits are recorded below.
 
+An earlier full native run on the cutover tree passed in Debug and
+ReleaseSafe: **1102/1102 tests** over 22 build steps (**577 package, 525
+vendored core**), `zig fmt --check .` at exit 0, 72 changed Zig files at exit
+0, 0 lint errors with 23 vendored advisories, zwanzig over 41 non-vendored
+changed files, and the same 15/15-step, 7/7-target fuzz bound. Out-of-tree
+consumers exercised allocation refusal and retry, copied `Join` storage, real
+TLS resumption and version fallback, and concurrent cancellation. Those
+figures are reproducible history, not a statement about the source as it now
+stands; the record above replaces them.
+
 That instrumented baseline passed 543/543 with its matching node children.
-Progress measured 35/35 source lines; the CLI measured 172/310. These are PC
-line counts, not branch coverage. Accepted cold regions: unsupported-session
-ABI panics (0/16), exceptional kernel interruptions/refusals not forced by
-these runs, and compile-time/elided or fixture rows without owning counters.
-CLI refusal guards were separately smoke-tested; no duplicate tests were
-added to inflate counters. The two pre-existing map allocation-fault gaps
-are recorded with their trigger in [`TODO.md`](TODO.md).
+Progress reported 35/35 source lines; the CLI reported 172/310. These are
+source-line attribution counts, not statement-execution counts. They do not
+measure branches or paths.
+
+Zero attribution alone does not show that a body was untested. Inlining,
+elision, fixture rows and the reporter's conditional filter can affect it.
+That run accepted unsupported-session ABI panics (0/16), kernel interruptions
+and refusals it did not force, and compile-time or fixture attribution gaps.
+CLI refusal guards were separately smoke-tested; no duplicate tests were added
+to inflate counters. Two pre-existing map allocation-fault gaps and their
+triggers are in [`TODO.md`](TODO.md). These historical lists apply only to
+their named runs. The current measurement is under
+[*Current coverage measurement*](#current-coverage-measurement).
 
 After the portability fixes, `zig-gate --no-cross --cov` passed all nine local
 sections with zero lint/static findings. Native Debug and ReleaseSafe passed
@@ -67,15 +272,6 @@ canonical IPv6 bytes. Every FIFO implementation PC was hit. Accepted new-file
 PC-line gaps are inlined byte-copy, endian and switch attribution and constant
 fixture rows. These counters are not exhaustive QUIC branch coverage, and no
 duplicate permanent tests were added to raise them.
-
-All seven existing decoder fuzz targets also passed a fresh run bounded with
-`zig build fuzz --fuzz=10000`: 15/15 build steps, 7/7 fuzz tests, no crash.
-The reported cumulative runs include the retained corpus and prior runs;
-they are not a count of new mutations in this invocation.
-
-The local `devenv` launcher still cannot enter its missing shared sandbox at
-`/tmp/devenv-sbox`. The direct gate command below passed; no
-global temporary storage or launcher was repaired.
 
 | Module | What it is |
 |---|---|
@@ -161,20 +357,94 @@ and pays that back through `zig build quic-test`; the cache roots are there
 because a lint section reports whatever the file list hands it, and build
 output is not a defect.
 
+### Consume as a package
+
+The package registers two modules: `ozai` and `quic`. `ozai` imports the same
+QUIC core internally. It does not export an `ozai.quic` alias.
+
+Add an `ozai` dependency to `build.zig.zon`. Use its registered modules in
+your build:
+
+```zig
+const dep = b.dependency("ozai", .{
+    .target = target,
+    .optimize = optimize,
+});
+const app = b.addExecutable(.{
+    .name = "app",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }),
+});
+app.root_module.addImport("ozai", dep.module("ozai"));
+app.root_module.addImport("quic", dep.module("quic"));
+```
+
+The Linux socket and node drivers require libc. Pure codecs and state machines
+do not. Import `quic` when your source names the core's types.
+Fetched packages include the module sources, vendored license, README and
+architecture and decision documents. Build checks resolve paths from the package
+root, not the consuming application's working directory.
+
+Runtime owners (`Socket`, `Bridge`, `Dialer` and `Node`) need serialized access
+and exactly-once teardown as documented on their types. Zig does not make their
+reachable fields private or prevent shallow copies. Inspect those fields only
+while their owner is alive; direct construction or mutation outside a documented
+API can violate the invariants. Borrowed views do not keep an owner alive.
+
+The Linux socket driver uses libc syscalls and raw `poll`; passing `std.Io`
+provides cancellation checks, not a substitute network backend. Runtime
+cancellation alone does not wake that poll. Use the documented stop operation
+or a finite timeout. `Stop.request` requests exit but does not join or dispose;
+wait for `Node.run` before releasing its stop value. A backend-routed driver
+would win when consumers need alternate networking or immediate cancellation;
+that requires a separate adapter for GSO/GRO/ECN, not a claim about this driver.
+
+### Contract changes
+
+An API audit on 2026-10-03 repaired nine reproduced defects and settled the
+ownership, default, callback and range contracts of the published surface.
+[`DECISIONS/0003`](docs/DECISIONS/0003-api-contract-cutover.md) records each
+change, what a consumer pays for it, and the alternative that was rejected.
+The ones that change a call site:
+
+| Change | What a consumer does |
+|---|---|
+| `BlobTicket.new` takes the address list | drop `address.deinit` and call `ticket.deinit` |
+| `discovery.Published` carries an allocator | add `.alloc` to every literal |
+| `PkarrPublisher.init()` | pass no allocator |
+| `DnsAddressLookup.init` | pass answers and cancellation only |
+| `holepunch.decide` takes `Candidates`; `holepunch.settle` takes no local set | pass the set at the gate, not at settlement |
+| `pkarr` encoders answer `EncodeError` | `try` where a `[]const u8` was returned |
+| `Conn.drain` can return a short prefix | loop until the answer is empty |
+| `Bridge.create` can answer `error.Canceled` | handle it apart from `error.EntropyUnavailable` |
+
+The contracts that settle behaviour without changing a signature are recorded
+as decisions rather than in that table: which of two equal discovery items wins
+a merge, what `Bridge.recv`'s `error.OutOfMemory` does and does not permit, what
+a segmentation refusal or a dropped ECN codepoint reports, what a socket stop
+leaves behind, and what a gossip snapshot has to do with a timer the caller has
+already fired. Each states the constraint, the consumer cost and the setting in
+which the rejected alternative would win.
+
 ### Cross-platform tests
 
-`cross-test.profile.sh` runs the full 543-test Linux socket/process suite,
-including the node artifact built for each target. Its default matrix is
+`cross-test.profile.sh` runs the full Linux socket/process suite, including the
+node artifact built for each target. Its default matrix is
 **16 little-endian musl rows plus native x86_64 GNU**, not every Linux ABI.
 Foreign GNU runs require compatible guest runtimes and are separate from
 that self-contained gate. `cross-test.portable.profile.sh` surveys all 108
 libc ABI targets listed by the pinned Zig 0.16 compiler. It uses
-`src/portable_test.zig`: **32 pure modules, 463 existing tests**, including
+`src/portable_test.zig`: **32 pure modules**, including
 the socket-free endpoint and the socket-free `discovery/dial_source.zig`,
 `transport/quic_bridge.zig` and `transport/dial.zig`. It does **not** claim a
 non-Linux node backend.
 
-The current tree executed **543/543 on all 26 live Linux ABI targets** in one
+The tree as it stood before the 2026-10-03 contract cutover executed
+**543/543 on all 26 live Linux ABI targets** in one
 complete invocation: the 17 default rows plus nine foreign GNU rows.
 The extra GNU rows are AArch64, ARM soft/hard-float, LoongArch64, MIPS32
 hard-float, MIPS64 n64, PPC64LE, RISC-V64 and x86. The invocation exited 0,
@@ -290,7 +560,7 @@ closed output pipes are removed from polling, and premature EOF fails the wait.
 
 ```
 src/root.zig            public surface
-src/base/               identity and addressing — pure, no I/O
+src/base/               identity, addressing and an explicit entropy edge
 src/examples/           runnable proofs
 test/                   integration tests, outside src/ so they are reachable
 docs/                   plan, architecture, decision records
@@ -298,7 +568,10 @@ docs/                   plan, architecture, decision records
 
 `src/base` never touches a socket, a clock, or an allocator it was not handed.
 That is not a style preference: it is what lets a state machine be driven by a
-test instead of by a network.
+test instead of by a network. The one seam is `SecretKey.generate`, which takes
+the caller's `std.Io` for entropy, never stores it and never reaches for a
+global source; every other value in the module is a plain value with an `Io`
+parameter at most on the call that needs one.
 
 ## Reference material
 

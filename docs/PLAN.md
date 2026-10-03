@@ -134,8 +134,8 @@ In tree: `PkarrPublisher`, `PkarrResolver`, `DnsAddressLookup`. mDNS and the
 Mainline DHT are external crates upstream, and in ozai they are simply more
 implementations of the same interface.
 
-Ordering: timestamps first, encoded-packet bytes as the tiebreak. A total order
-or zones flap.
+Ordering: timestamp, node id, address value via `TransportAddr.order`, then
+provenance. A total order prevents arrival-dependent results.
 
 ### M6 — net report and NAT classification
 

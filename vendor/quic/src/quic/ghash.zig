@@ -420,4 +420,3 @@ fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
         }
     };
 }
-

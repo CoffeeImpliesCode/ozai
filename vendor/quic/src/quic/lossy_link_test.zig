@@ -278,7 +278,7 @@ fn runBulk(total: usize, c2s_loss: Link.Loss, s2c_loss: Link.Loss, one_way_ns: i
         var delivered_any = false;
         while (c2s.popDue(now)) |d| {
             delivered_any = true;
-            switch (mgr.recvDatagram(d.bytes[0..d.len], c_addr, s_addr, 0, &resp, now, random)) {
+            switch (try mgr.recvDatagram(d.bytes[0..d.len], c_addr, s_addr, 0, &resp, now, random)) {
                 .send_response => |r| try s2c.push(now, r),
                 else => {},
             }
@@ -400,7 +400,7 @@ const Pair = struct {
         self.client.paths[0].local_addr = self.c_addr;
 
         var i: usize = 0;
-        while (i < 50 and self.exchange()) : (i += 1) {}
+        while (i < 50 and (try self.exchange())) : (i += 1) {}
         try testing.expect(self.client.handshake_confirmed);
         try testing.expectEqual(@as(usize, 1), self.mgr.entries.items.len);
     }
@@ -412,7 +412,7 @@ const Pair = struct {
     }
 
     /// One round of both sides sending what they have; false once quiet.
-    fn exchange(self: *Pair) bool {
+    fn exchange(self: *Pair) error{OutOfMemory}!bool {
         var buf: [MAX_DGRAM]u8 = undefined;
         var resp: [MAX_DGRAM]u8 = undefined;
         var any = false;
@@ -420,7 +420,7 @@ const Pair = struct {
             const n = self.client.sendAt(&buf, self.now, self.random) catch break;
             if (n == 0) break;
             any = true;
-            _ = self.mgr.recvDatagram(buf[0..n], self.c_addr, self.s_addr, 0, &resp, self.now, self.random);
+            _ = try self.mgr.recvDatagram(buf[0..n], self.c_addr, self.s_addr, 0, &resp, self.now, self.random);
         }
         for (self.mgr.entries.items) |e| while (true) {
             const n = e.conn.sendAt(&buf, self.now, self.random) catch break;
@@ -444,7 +444,7 @@ test "stateless reset: a client whose server lost the connection drains" {
     var buf: [MAX_DGRAM]u8 = undefined;
     var resp: [MAX_DGRAM]u8 = undefined;
     const n = try p.client.sendAt(&buf, p.now, p.random);
-    const reset = switch (p.mgr.recvDatagram(buf[0..n], p.c_addr, p.s_addr, 0, &resp, p.now, p.random)) {
+    const reset = switch (try p.mgr.recvDatagram(buf[0..n], p.c_addr, p.s_addr, 0, &resp, p.now, p.random)) {
         .send_response => |r| r,
         else => return error.TestUnexpectedResult,
     };
@@ -470,7 +470,8 @@ test "stateless reset: the server drains a connection its client reset" {
 
     var resp: [MAX_DGRAM]u8 = undefined;
     const sconn = p.mgr.entries.items[0].conn;
-    try testing.expect(p.mgr.recvDatagram(&reset, p.c_addr, p.s_addr, 0, &resp, p.now, p.random) == .processed);
+    const action = try p.mgr.recvDatagram(&reset, p.c_addr, p.s_addr, 0, &resp, p.now, p.random);
+    try testing.expect(action == .processed);
     try testing.expect(sconn.isDraining());
     try testing.expect(sconn.received_stateless_reset);
 }

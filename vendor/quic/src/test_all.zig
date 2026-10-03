@@ -1,19 +1,13 @@
-// The test root for the vendored core.
-//
-// Upstream built its tests from a file like this one, and this file was not
-// vendored — it imported three of the deleted socket-layer files, so it could
-// not come across as-is. Rebuilding it is not optional: Zig analyses a test
-// block only if the compilation reaches it, and `lib.zig` is nothing but
-// re-exports. Under lazy analysis a re-exported file's tests are never looked
-// at, so a root that only re-exports discovers ZERO tests and exits 0. That is
-// a green step proving nothing, and it is the failure mode this file exists to
-// prevent.
-//
-// Every vendored file that carries test blocks is named here explicitly. A new
-// file with tests is not run until it is added below, which is deliberate: a
-// test that nobody references is not a test.
+// Reach every supported module through refAllDecls, then explicitly include
+// internal and test-only modules. A new exported module is covered by the
+// declaration sweep; an internal module needs a reachable import.
 
 test {
+    const root = @import("lib.zig");
+    @import("std").testing.refAllDecls(root);
+    inline for (@typeInfo(root).@"struct".decls) |decl| {
+        @import("std").testing.refAllDecls(@field(root, decl.name));
+    }
     _ = @import("address.zig");
     _ = @import("quic/ack_handler.zig");
     _ = @import("quic/aes_gcm.zig");

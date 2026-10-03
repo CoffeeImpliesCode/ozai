@@ -1,33 +1,88 @@
-// QUIC-LB: Connection ID encoding/decoding for load balancers
-// Implements draft-ietf-quic-load-balancers CID generation with
-// plaintext and encrypted (4-pass Feistel / single-pass AES-ECB) modes.
+//! QUIC-LB: connection-id encoding and decoding for load balancers
+//! (draft-ietf-quic-load-balancers). A cid here is a first octet, this
+//! server's id and a nonce — in the clear, or encrypted with one shared key
+//! by a single AES pass when the two together are 16 bytes and by a four-pass
+//! Feistel otherwise. The nonce and any greased bits come from the caller's
+//! `std.Random`; nothing here reads a clock or allocates.
 
 const std = @import("std");
 const crypto = std.crypto;
 const Aes128 = crypto.core.aes.Aes128;
 
 /// QUIC-LB configuration for CID encoding.
+///
+/// **The two lengths are one obligation, not two.** A CID this module makes
+/// is a first octet followed by `server_id_len` bytes of server id and
+/// `nonce_len` bytes of nonce, so `cidLength` is the whole of it and QUIC's
+/// own 20-byte limit on a connection id (RFC 9000 §17.2) is the bound:
+/// `server_id_len + nonce_len` must be at most 19. Each field's own range —
+/// 1 to 15 and 4 to 18 — is necessary and not sufficient, and the sum is what
+/// decides whether the result is a CID at all.
+///
+/// Nothing checks the sum. A config is written down once, by whoever wrote
+/// it, and checking it on the accept path would be a runtime cost to catch a
+/// value that is wrong on every packet; so it is a programmer obligation, and
+/// a config outside it is a bug — `generateCid` will write more bytes into
+/// `buf` than a connection id may hold, and `extractServerId` will decode
+/// past the end of its own buffer.
 pub const Config = struct {
-    config_id: u3, // 0-6, identifies which config
+    /// Which load balancer this is, in bits 7-5 of the first octet and never
+    /// encrypted: a peer has to be able to tell which config encoded an id
+    /// before it can decode one.
+    config_id: u3,
+    /// This server's own id, carried at the front of every CID it hands out
+    /// and recovered by `extractServerId`. Only the first `server_id_len`
+    /// bytes are ever read; the rest are padding, and a config that leaves
+    /// them set is not wrong because nothing looks at them.
     server_id: [15]u8 = .{0} ** 15,
-    server_id_len: u4, // 1-15
-    nonce_len: u5, // 4-18
-    key: ?[16]u8 = null, // null = plaintext, set = encrypted
-    encode_length: bool = true, // first octet encodes CID length
+    /// Bytes of this server's id a CID carries. 1 to 15; see the combined
+    /// rule on the type.
+    server_id_len: u4,
+    /// Bytes of unguessable nonce after the server id: what stops one peer
+    /// from naming another's CID. 4 to 18; see the combined rule on the
+    /// type.
+    nonce_len: u5,
+    /// The key the server id and nonce are encrypted under, or null to send
+    /// them in the clear. Plaintext keeps routing working while handing the
+    /// server list to anyone who reads an id off the wire.
+    key: ?[16]u8 = null,
+    /// Whether the first octet's low five bits carry the CID length. A
+    /// deployment that can take the length from the config spends them on
+    /// nothing instead, and a greased value there is what a protocol that
+    /// wants no fingerprint spends them on.
+    encode_length: bool = true,
 };
 
 /// Total CID length: 1 (first octet) + server_id_len + nonce_len.
+///
+/// At most 20 for any config in range, because the combined rule on `Config`
+/// is what keeps the result a connection id at all; a config outside that
+/// range returns a length no peer may be given. Nothing is checked here, and
+/// nothing is read but the two lengths.
 pub fn cidLength(config: *const Config) u8 {
     return 1 + @as(u8, config.server_id_len) + @as(u8, config.nonce_len);
 }
 
 /// Generate a QUIC-LB encoded CID into buf.
-/// buf must be at least cidLength(config) bytes.
-/// The nonce, and the low bits of the first octet when the length is not
-/// encoded, come from `random`, which the caller owns. The reset token
-/// issued beside a CID is drawn from that same generator, so a CID drawn
-/// from a process CSPRNG next to an injected token would be the one thing
-/// a test cannot pin.
+///
+/// Writes exactly `cidLength(config)` bytes — the first octet, then
+/// `server_id_len` bytes of server id, then `nonce_len` bytes of nonce — and
+/// leaves the rest of `buf` untouched. `buf.len >= cidLength(config)` is
+/// asserted rather than returned, so it is unchecked in ReleaseFast and
+/// ReleaseSmall.
+///
+/// The nonce, and the low five bits of the first octet when `encode_length`
+/// is false, are drawn from `random`. The bytes drawn are copied into `buf`,
+/// not borrowed, so the caller keeps the only reference to them; the engine
+/// is the caller's and this call advances it, which is what makes two CIDs
+/// from one engine differ. The reset token issued beside a CID is drawn from
+/// that same generator, so a CID drawn from a process CSPRNG next to an
+/// injected token would be the one thing a test cannot pin.
+///
+/// With `config.key` set, everything after the first octet is encrypted and
+/// the octet itself is not — a peer has to read the config id before it can
+/// decode anything. Without it, the id and nonce go on the wire as they are.
+/// Nothing is allocated and nothing is retained.
 pub fn generateCid(config: *const Config, buf: []u8, random: std.Random) void {
     const total = cidLength(config);
     std.debug.assert(buf.len >= total);
@@ -64,8 +119,18 @@ pub fn generateCid(config: *const Config, buf: []u8, random: std.Random) void {
 }
 
 /// Extract server_id from a QUIC-LB encoded CID.
-/// Writes server_id into out[0..config.server_id_len].
-/// Returns false if CID is too short.
+///
+/// Writes `config.server_id_len` bytes to `out[0..config.server_id_len]` and
+/// leaves the rest of `out` alone. Returns false, having written nothing, in
+/// two cases: `cid` is shorter than `cidLength(config)`, or `out` is shorter
+/// than `config.server_id_len`.
+///
+/// `cid` is borrowed for the call and never modified — with a key the payload
+/// is decoded into a local buffer — and the id is in `out` when this returns
+/// true, not only after the caller checks. The decode is parameterised by the
+/// config alone: nothing here compares the first octet's config id, so a
+/// caller matching several configs has to do that itself. Nothing is
+/// allocated.
 pub fn extractServerId(config: *const Config, cid: []const u8, out: []u8) bool {
     const total = cidLength(config);
     if (cid.len < total) return false;
@@ -96,6 +161,9 @@ pub fn extractServerId(config: *const Config, cid: []const u8, out: []u8) bool {
 }
 
 /// Extract the config_id (bits 7-5) from the first octet of a CID.
+///
+/// Every octet has an answer, so this cannot fail; telling whether that
+/// answer names this deployment is the caller's comparison.
 pub fn extractConfigId(first_octet: u8) u3 {
     return @intCast(first_octet >> 5);
 }
@@ -120,6 +188,12 @@ fn singlePassDecrypt(key: [16]u8, data: *[16]u8) void {
 
 /// 4-pass Feistel encrypt in place.
 /// data[0..total_len] contains server_id ++ nonce.
+///
+/// `data` must hold at least `total_len` bytes, which is the width of the
+/// payload being encoded and the largest a connection id can carry; only the
+/// first `total_len` bytes are read and written. `key` is passed by value.
+/// Each round is a XOR, which is why `feistelDecrypt` runs the same rounds in
+/// the opposite order. Nothing is allocated and nothing is retained.
 pub fn feistelEncrypt(key: [16]u8, data: []u8, total_len: u8) void {
     const half_len: u8 = (total_len + 1) / 2; // ceil(N/2)
     const right_len: u8 = total_len - half_len;
@@ -163,6 +237,11 @@ pub fn feistelEncrypt(key: [16]u8, data: []u8, total_len: u8) void {
 
 /// 4-pass Feistel decrypt in place.
 /// data[0..total_len] contains encrypted server_id ++ nonce.
+///
+/// `total_len` is the payload width the matching `feistelEncrypt` was given,
+/// not `data.len`: a longer buffer comes back with only its first
+/// `total_len` bytes decoded, and a shorter one is a caller error. `key` is
+/// passed by value. Nothing is allocated and nothing is retained.
 pub fn feistelDecrypt(key: [16]u8, data: []u8, total_len: u8) void {
     const half_len: u8 = (total_len + 1) / 2; // ceil(N/2)
     const right_len: u8 = total_len - half_len;
@@ -426,4 +505,76 @@ test "quic_lb encrypted no length encoding" {
     var extracted_sid: [15]u8 = undefined;
     try std.testing.expect(extractServerId(&config, &cid, &extracted_sid));
     try std.testing.expectEqualSlices(u8, &.{ 0x11, 0x22, 0x33 }, extracted_sid[0..3]);
+}
+
+test "quic_lb: the longest connection id the lengths may combine into round-trips" {
+    // The two lengths are combined into one payload, and the payload plus the
+    // first octet is a connection id, so the sum is what QUIC's 20-byte limit
+    // bounds. 15 bytes of server id and 4 of nonce is that maximum: the
+    // longest id a peer may be given, and the one the decoder's fixed buffer
+    // is sized for.
+    const key = [16]u8{ 0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0 };
+    var config = Config{
+        .config_id = 6,
+        .server_id_len = 15,
+        .nonce_len = 4,
+        .key = key,
+    };
+    @memset(&config.server_id, 0xa5);
+    try std.testing.expectEqual(@as(u8, 20), cidLength(&config));
+
+    var prng = std.Random.DefaultPrng.init(0x6c6f6e67);
+    var cid: [20]u8 = undefined;
+    generateCid(&config, &cid, prng.random());
+
+    var extracted: [15]u8 = undefined;
+    try std.testing.expect(extractServerId(&config, &cid, &extracted));
+    try std.testing.expectEqualSlices(u8, &config.server_id, &extracted);
+}
+
+test "quic_lb: the longest connection id also round-trips without a key" {
+    var config = Config{
+        .config_id = 0,
+        .server_id_len = 15,
+        .nonce_len = 4,
+    };
+    @memset(&config.server_id, 0x5a);
+    try std.testing.expectEqual(@as(u8, 20), cidLength(&config));
+
+    var prng = std.Random.DefaultPrng.init(0x706c6169);
+    var cid: [20]u8 = undefined;
+    generateCid(&config, &cid, prng.random());
+
+    var extracted: [15]u8 = undefined;
+    try std.testing.expect(extractServerId(&config, &cid, &extracted));
+    try std.testing.expectEqualSlices(u8, &config.server_id, &extracted);
+}
+
+test "quic_lb: a shorter connection id leaves the decoder's buffer half empty" {
+    // The buffer is sized for the longest id QUIC allows, not for the one this
+    // config produces, so the decode of a short id must not depend on the
+    // bytes behind it: anything left over from an earlier packet must not
+    // reach the server id.
+    const key = [16]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00 };
+    var config = Config{
+        .config_id = 3,
+        .server_id_len = 2,
+        .nonce_len = 4,
+        .key = key,
+    };
+    config.server_id[0] = 0xde;
+    config.server_id[1] = 0xad;
+
+    var prng = std.Random.DefaultPrng.init(0x62756666);
+    // A whole 20-byte buffer with a 7-byte connection id at its front and the
+    // rest left as another packet's bytes.
+    var buffer = [_]u8{0xff} ** 20;
+    var cid: [7]u8 = undefined;
+    generateCid(&config, &cid, prng.random());
+    @memcpy(buffer[0..cid.len], &cid);
+
+    var extracted = [_]u8{0xaa} ** 15;
+    try std.testing.expect(extractServerId(&config, buffer[0..], &extracted));
+    try std.testing.expectEqualSlices(u8, config.server_id[0..2], extracted[0..2]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0xaa} ** 13, extracted[2..]);
 }

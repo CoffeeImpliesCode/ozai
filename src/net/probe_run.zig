@@ -82,9 +82,9 @@
 //! sleep, no thread, no allocator and no global — including the RNG upstream
 //! draws the captive-portal relay from (`reportgen.rs:597`), which is why
 //! `Request.check_relay` is the caller's to name. `InFlight` is the caller's
-//! storage for the reason `probe.Results` is: a `report.ProbeResult` carries a
-//! 258-byte `RelayUrl`, so returning the open set by value would copy it on
-//! every turn to say nothing had changed.
+//! storage for the reason `probe.Results` is: a `report.ProbeResult` owns its
+//! `RelayUrl` by value, so returning the open set by value would copy a relay
+//! per entry on every turn to say nothing had changed.
 //!
 //! # The seam, and what is still not on it
 //!
@@ -195,10 +195,24 @@ pub const SendError = error{
 /// result that reaches `probe.Runner` is a `report.ProbeResult`, built by
 /// `resultFor`, and there is no second way of saying what a probe measured.
 pub const Observation = union(enum) {
-    /// A latency, and nothing else.
+    /// A latency in `Nanos` — nanoseconds on the round's own monotonic
+    /// timeline — and nothing else. It is the transport's figure, measured
+    /// from `Open.at` to the `now` it polls at, which is what lets a
+    /// transport measure without a clock of its own; see the module doc's
+    /// last divergence.
     https: Nanos,
     /// A latency, and the public address the relay saw us come from.
     qad: struct {
+        /// The round trip in `Nanos`, nanoseconds on the round's own monotonic
+        /// timeline and the very same figure the `https` arm carries alone.
+        ///
+        /// The transport's, not the clock's: `Open.at` hands over the send
+        /// instant so a transport can measure without one of its own, and a
+        /// test substitutes a relay that always takes the same time. Nothing
+        /// in this file compares it against anything, and nothing here is
+        /// checked against a deadline — `resultFor` files it as
+        /// `report.QadProbe.latency` and `report.HttpsProbe.latency`, which is
+        /// where its units are defined.
         latency: Nanos,
         /// The address as the relay reported it: unconverted, and carrying no
         /// family of its own. The family in the result is the family of the
@@ -237,9 +251,11 @@ pub const Why = enum {
 pub const Open = struct {
     /// What to run, against which relay, at which rung.
     task: probe.Task,
-    /// Which relay, resolved. `Task.relay` is an index into the plan's relays
-    /// because the URL is 258 bytes; the transport is the one thing that needs
-    /// the URL itself.
+    /// Which relay, resolved: `Task.relay` names the plan's relay by index
+    /// because the plan holds each URL once, and the transport is the one
+    /// thing that needs the URL itself. `Open` owns this copy by value and
+    /// borrows nothing, so the plan a caller may rewrite afterwards cannot
+    /// change which relay a transport has already been handed.
     relay: RelayUrl,
     /// The instant it went out. A transport measures `latency` from here to the
     /// `now` it polls at, so it needs no clock of its own to be told when the
@@ -273,26 +289,32 @@ pub const Check = struct {
 /// answer with null when nothing is ready — because a round's instants are the
 /// caller's and this file has no way to wait for one.
 ///
-/// Every `open` is matched by exactly one `close`, and every `beginCheck` by
-/// exactly one `endCheck`, on every path out of `drive`.
+/// A successful `open` is matched by one `close`, and a successful
+/// `beginCheck` by one `endCheck`, when answered, expired or cancelled.
+/// Unfinished probes survive a successful turn in `InFlight`.
 pub const Transport = struct {
+    /// Borrowed with `ctx` until all probes and the check are retired.
     vtable: *const VTable,
+    /// Backend state; its address must remain stable until cleanup finishes.
     ctx: *anyopaque,
 
+    /// All callbacks run synchronously on the caller's thread. Arguments are
+    /// borrowed for the callback; callbacks must not reenter `drive` or `cancel`
+    /// for this round. An acquisition error leaves no resource to retire.
     pub const VTable = struct {
-        /// Start one probe. Called once per entry in a `Step`'s `sends`.
+        /// Start one probe. On error, no matching `close` will be called.
         open: *const fn (ctx: *anyopaque, at: Open) SendError!void,
         /// Take one answer, or null when none is ready. Never waits.
         poll: *const fn (ctx: *anyopaque, now: Nanos) ?Reply,
-        /// One probe is finished with, whether it answered or not.
+        /// Retire one successfully opened probe exactly once.
         close: *const fn (ctx: *anyopaque, task: probe.Task, why: Why) void,
-        /// Start the captive-portal check against the relay `drive` names.
+        /// Start the relay check. On error, no matching `endCheck` is owed.
         beginCheck: *const fn (ctx: *anyopaque, at: Check) SendError!void,
         /// Whether the check has decided, or null while it has not. Never
         /// waits. `false` is an answer — no portal — and is not the same as
         /// null, which is the three states `probe.Runner.captive` covers.
         pollCheck: *const fn (ctx: *anyopaque, now: Nanos) ?bool,
-        /// The check is finished with, whether it decided or not.
+        /// Retire the successfully begun check exactly once.
         endCheck: *const fn (ctx: *anyopaque, why: Why) void,
     };
 };
@@ -362,10 +384,10 @@ pub const Turn = struct {
 /// Run one turn of a round: send what the step named, take what came back,
 /// give up what did not.
 ///
-/// `in_flight` is the round's own bookkeeping and must be the same value every
-/// turn. On success every probe the round had open is closed, including the
-/// ones opened on this turn; on an error `cancel` has already done the same,
-/// and the round is the caller's to abandon.
+/// `in_flight` must be the same value every turn. Answered and expired probes
+/// are closed; pending probes remain open for the next `drive` or `cancel`.
+/// A completed round closes all remaining resources. On error, `cancel`
+/// has already closed them and the caller must abandon the round.
 ///
 /// A turn is a function of `request.now` and nothing else. It never waits, so
 /// the caller drives the round by handing it the next instant in `wake_at`.
@@ -376,11 +398,7 @@ pub fn drive(
     request: Request,
 ) Error!Turn {
     const now = request.now;
-    // Every probe this turn opens is closed on every path out of here,
-    // `discovery/dial_source.zig`'s rule at this layer. The probes earlier
-    // turns opened go with them, because upstream drops the whole set when the
-    // actor goes away and nothing here decides that a failed turn is a round
-    // worth continuing.
+    // A failed turn abandons the whole round, including earlier acquisitions.
     errdefer cancel(transport, in_flight);
 
     const step = try probe.step(runner, now);

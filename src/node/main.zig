@@ -658,12 +658,8 @@ pub fn main(init: std.process.Init) !void {
 
     try drive(io, node, options.send, if (options.progress) text else null);
     // Read here, before the close that will empty both of these: see `Holding`.
-    // A serving relay's registry is the count of its clients, and a client has
-    // none — `Node.initRelay` builds one for a relay that serves and for
-    // nothing else — so that count is read only where one exists rather than
-    // out of storage nobody initialised.
     const holding: Holding = .{
-        .node_ids = if (role == .serve) node.clientCount() else 0,
+        .node_ids = node.clientCount(),
         .connections = node.establishedCount(),
     };
     // And what the close wrote, measured across that call rather than read

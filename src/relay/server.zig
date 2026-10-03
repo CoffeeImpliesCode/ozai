@@ -34,27 +34,59 @@ const NodeId = key.NodeId;
 /// would hand two relays in one process the same id, which is the one thing
 /// upstream says the id must not do — it exists so an access-control
 /// implementation can pair `on_connect` with `on_disconnect`.
+///
+/// **Uniqueness is the caller's, and that is why the value is an argument rather
+/// than a counter in here.** Two live connections of one process must not share
+/// one, because `OnDisconnectGuard.deinit` tells a departure from a displacement
+/// by comparing it against the entry's active connection
+/// (`server/clients.rs:110-121`), and a clash turns one of them into a silent
+/// double report. The value is copied into the entry and into the handle, so
+/// nothing borrows it and a number may be reused once `deinit` has answered.
 pub const ConnectionId = u64;
 
 /// A connection's departure, as access control is told of it. Upstream
 /// `AccessControl::on_disconnect(endpoint_id, connection_id)`
 /// (`server.rs:302`).
+///
+/// **It is reported at most once per connection, and only by the registry.** It
+/// comes back from `OnDisconnectGuard.deinit` in exactly the arms that mean the
+/// connection really ended — `Unregister.disconnected`, `.duplicate` and
+/// `.promoted` — and never from `.already_gone`. It is the one value access
+/// control is told about, so a relay running none counts it instead of dropping
+/// it; nothing in this module reads it.
 pub const Disconnection = struct {
+    /// The node id the connection proved, and the first thing access control is
+    /// told: it is the entry's key, so one node id's connections are told apart by
+    /// `connection_id` and not by this.
     node_id: NodeId,
+    /// Which connection it was, which is the whole of what told a departure from
+    /// a displacement when the entry was left with another connection in it.
     connection_id: ConnectionId,
 };
 
 /// The reason a relay sends when access control denies without giving one.
 /// Upstream `handshake.rs:543`.
+///
+/// Fourteen bytes, so it is always inside `frame.max_text_length` and a denial
+/// carrying it can always be encoded: the default reason is the one answer that
+/// cannot be too long. A comptime literal, so it has static lifetime.
 pub const default_denial = "not authorized";
 
 /// The reason a relay sends when a client signed a challenge wrongly. Upstream
 /// `handshake.rs:461`, and the only reason the challenge path can produce: a
 /// signature either verifies or it does not.
+///
+/// Seventeen bytes, inside `frame.max_text_length` for the same reason
+/// `default_denial` is. A comptime literal, so it has static lifetime and is
+/// never freed.
 pub const invalid_signature_reason = "signature invalid";
 
 /// How a client proved it owns the node id it claimed. Upstream `Mechanism`
 /// (`handshake.rs:399-404`).
+///
+/// **The machine records this and never branches on it.** Which mechanism let a
+/// client in is the access control's business and its logs', and no branch of
+/// `step` decides anything differently because of it.
 pub const Mechanism = enum {
     /// Verified against keying material exported from the TLS session. The
     /// credential rode on the upgrade request, so nothing was written before
@@ -68,6 +100,10 @@ pub const Mechanism = enum {
 /// A client that proved its identity and is waiting to be let in. Upstream's
 /// `SuccessfulAuthentication` (`handshake.rs:388-393`), which is `#[must_use]`
 /// upstream for the same reason the next event exists here.
+///
+/// A value and not a handle: it is copied into `State` and out of it, and nothing
+/// in it borrows. The caller reads it to decide access, and is the one who turns
+/// the `node_id` into a `ConnectionId` at `Registry.admit`.
 pub const Proof = struct {
     /// The authenticated client's node id.
     node_id: NodeId,
@@ -76,6 +112,14 @@ pub const Proof = struct {
 };
 
 /// The client auth header, as the HTTP layer decoded it.
+///
+/// **The three arms are three different answers, and the caller picks between
+/// them where the header is**, which is the HTTP layer and not this file: absent
+/// is `.none` and takes the challenge path, undecodable is `.malformed` and
+/// closes the connection, and decoded is `.key_material` whatever the material
+/// turns out to verify against. `.malformed` must not be softened into `.none` on
+/// the way in — the two differ in whether the client's own bytes were wrong, and
+/// only one of them is a fault the relay can name.
 pub const Credential = union(enum) {
     /// The client sent no such header. A browser, or a client whose TLS stack
     /// has no exporter. Upstream skips the whole block
@@ -93,6 +137,23 @@ pub const Credential = union(enum) {
 };
 
 /// The upgrade request, and everything the relay needs to answer it.
+///
+/// **This is the one struct the caller fills in on the relay's side.** All three
+/// fields are read before `step` returns and only one of them survives it, as a
+/// value:
+///
+/// - `credential` is the header, already decoded or already refused, and it is
+///   what decides which path this connection takes.
+/// - `material` is this end's export, and **null is not "no opinion": it is the
+///   answer `error.NoKeyingMaterial`**, which takes the challenge path even for a
+///   client that sent a sound credential. That is upstream's position and this
+///   machine's — a relay behind a plain HTTP listener has no exporter at all,
+///   and neither has the browser talking to it.
+/// - `challenge` is drawn by the caller **whether or not it will be used**,
+///   because deciding which path is taken is the machine's job and not the
+///   caller's. It is sixteen bytes from a CSPRNG, read only on the challenge
+///   path, and copied into both the state and the frame, so the caller may zero
+///   its own copy on return.
 pub const Offer = struct {
     /// Whatever the client put on the `iroh-relay-key-material-auth` header.
     credential: Credential,
@@ -108,6 +169,28 @@ pub const Offer = struct {
 };
 
 /// Upstream's `Access` (`server.rs:350-357`).
+///
+/// **This is the one decision a consumer supplies, and the one borrow it
+/// creates.** The operator's access control is not called from here: it runs in
+/// the caller's own code, its answer arrives as `Event.access`, and this module
+/// never calls back into anything. Three obligations follow, and all three are
+/// the caller's:
+///
+/// - `.allow` is only an answer from the `.authenticated` state. The same event
+///   anywhere else is `Failure.out_of_order`, so an access decision cannot be
+///   queued ahead of the proof it decides about.
+/// - `.deny` with no reason is a decision to let the relay speak for itself, and
+///   the text the peer reads is then `default_denial`. It is not the same as
+///   choosing those words: nothing distinguishes the two on the wire, and a
+///   caller that wants the difference in a log has to keep it.
+/// - **A reason is borrowed, and the borrow outlives the call.** The `Step` this
+///   event produces holds it twice — in `State.denied.reason` and in
+///   `Action.write.server_denies_auth.reason` — and `encode` reads it after that.
+///   So the text must stay alive and unmutated from the decision until the denial
+///   has been written, a buffer the caller is about to reuse for the next
+///   connection's decision must not be the one this denial names, and a reason
+///   over `frame.max_text_length` is `error.TextTooLong` at that `encode` with
+///   nothing written.
 pub const Access = union(enum) {
     allow,
     /// Deny, with the reason to send back, or null for `default_denial`.
@@ -115,6 +198,10 @@ pub const Access = union(enum) {
 };
 
 /// Why a handshake cannot finish.
+///
+/// Every arm is terminal: `State.failed` keeps it and `step` folds any later event
+/// into itself, so a caller that keeps stepping a failed handshake is told nothing
+/// new rather than handed a second outcome.
 pub const Failure = union(enum) {
     /// A frame arrived that this state cannot accept. Upstream
     /// `Error::UnexpectedFrameType`.
@@ -136,6 +223,11 @@ pub const Failure = union(enum) {
 
 /// A challenge that is on the wire, and why the credential did not carry the
 /// handshake.
+///
+/// Both fields are values, so this state borrows nothing, copying it is free, and
+/// a caller may keep one for a log line for as long as it likes. It is not
+/// terminal: only a `ClientAuth` may come next, and anything else closes the
+/// connection.
 pub const Challenged = struct {
     challenge: frame.ServerChallenge,
     /// The verify failure that sent us down this path, or null when the
@@ -149,6 +241,17 @@ pub const Challenged = struct {
 };
 
 /// The relay half of the handshake.
+///
+/// **Three of the six are terminal**, and a terminal state absorbs whatever
+/// arrives after it: `step` returns the same state with no action, so a caller
+/// that keeps feeding a finished handshake is not an error and gets no second
+/// outcome. `.opened`, `.challenged` and `.authenticated` are the three that can
+/// still move.
+///
+/// A state is a value and safe to copy, with one borrow anywhere inside it:
+/// `denied` names the access-control text or one of the two constants above, and
+/// nothing else in this union points at anything. `step` takes the state by value
+/// and returns a new one, so the caller's copy is its own to keep or drop.
 pub const State = union(enum) {
     /// The upgrade request is in and nothing has been sent.
     opened,
@@ -169,9 +272,18 @@ pub const State = union(enum) {
 
 /// What the caller must do after a step.
 ///
-/// A frame to write, or a close. Every outcome is in the state, so a caller
-/// that wants to know how the handshake went reads the state and a caller
-/// that wants to know what to write reads this.
+/// **One action, and the caller must do it before stepping again.** The machine
+/// holds no queue and remembers nothing, so an action that was not written is not
+/// written later, and the next `step` describes a state that assumed it had been.
+/// `close` means drop the connection writing nothing; it is not a suggestion, and
+/// the state that arrived with it says why.
+///
+/// **The frame is a value with one borrow in it.** `server_challenge` is sixteen
+/// bytes copied out of the offer, and `server_denies_auth` names the text access
+/// control decided, so a `Step` produced by an `access` event borrows that text
+/// until `encode` has written the denial. Both of those frames, and the
+/// confirmation, are emittable in either protocol version, so the version a relay
+/// answers with never refuses one of them.
 pub const Action = union(enum) {
     /// Write this frame. Upstream `write_frame`.
     write: frame.Message,
@@ -181,12 +293,31 @@ pub const Action = union(enum) {
 };
 
 /// One step: the next state, and the one thing to do about it.
+///
+/// The two fields are read separately on purpose: `state` is what to store and
+/// `action` is what to do, and `action == null` means nothing to do *now* — a
+/// handshake waiting for the next frame, not a handshake that has ended. The state
+/// says which of the two it is.
 pub const Step = struct {
     state: State,
     action: ?Action,
 };
 
 /// One step of the relay handshake.
+///
+/// **Pure, and free of every hidden input.** No clock, no allocator, no global,
+/// no I/O, and no call back into the caller: the two things a handshake needs that
+/// are not on the wire — the challenge's randomness and the key material — arrive
+/// in the `Event` as values, so this is a function of its two arguments and
+/// nothing else. It is reentrant and callable from any thread, as long as neither
+/// argument is being written underneath the call: an `Event` borrowed from a
+/// buffer another thread is decoding into must not be stepped.
+///
+/// **No `Step` borrows a frame's payload.** Every frame it writes is a value or
+/// one of the two comptime strings, and every state it returns is a value or one
+/// of those strings, so the borrows a `frame.Message` carries die with the
+/// caller's read buffer rather than with the state. The one borrow a `Step` can
+/// hold is the `Access.deny` reason, which is the caller's own text.
 pub fn step(state: State, event: Event) Step {
     return switch (state) {
         .opened => switch (event) {
@@ -241,6 +372,13 @@ pub fn step(state: State, event: Event) Step {
 }
 
 /// What happened on the relay side between two steps.
+///
+/// **A `frame` event carries the borrow its `Message` carries**, so the buffer it
+/// was decoded from must stay put for as long as the event is used — which is
+/// until the `step` that consumed it returns, and no longer, because no `Step`
+/// keeps a frame's payload. The other three arms hold values: `offered` is filled
+/// in by the caller, `access` is a decision whose one borrow is the caller's text,
+/// and `stream_ended` is nothing at all.
 pub const Event = union(enum) {
     /// The upgrade request completed.
     offered: Offer,
@@ -324,6 +462,21 @@ fn fail(failure: Failure) Step {
 
 /// A datagram queued for one client. Upstream `server::client::Packet`
 /// (`server/client.rs:41-46`).
+///
+/// **The storage contract is the whole of this type.** `src` is a value and
+/// `data` is borrowed from whoever copied the datagram out of its read buffer —
+/// a ring slot of the caller's own in this repo's relay, a `Bytes` upstream's —
+/// and the queue copies nothing:
+///
+/// - the bytes must stay alive and unmutated from the `push` until the item is
+///   popped, which is the whole of "the relay has room for what it forwarded";
+/// - **a popped `Packet` is a copy of the item and not of its bytes, and it owns
+///   nothing.** The `pop` released the ring slot and the queue promises nothing
+///   past that: the bytes are still the caller's own storage, but the ring writes
+///   that slot again `capacity() - len()` pushes later, with `len()` read just
+///   after the `pop` — the very next `push` when the queue was full at it. A
+///   caller that needs a datagram beyond that has to copy it out first;
+/// - `peek` removes nothing, so the bytes it names are still the queue's own.
 pub const Packet = struct {
     /// The node the datagram came from. Upstream `src`.
     src: NodeId,
@@ -341,6 +494,11 @@ pub const Packet = struct {
 /// actions produce, which is what makes the two queues worth having: they are
 /// written to from the same few places and they are drained under different
 /// rules.
+///
+/// **Nothing here borrows**, which is the difference from `Packet` and the reason
+/// one of the two queues can be a bounded table of values: a queued `Control` is
+/// self-contained, outlives whatever buffer the event that produced it was read
+/// from, and needs no ring slot to live in.
 pub const Control = union(enum) {
     /// `FrameType::EndpointGone` (8): a peer this client has sent to is gone.
     /// Upstream `RelayToClientMsg::EndpointGone`.
@@ -359,6 +517,32 @@ pub const Control = union(enum) {
 /// non-blocking on push, so a full queue refuses rather than stalling the
 /// relay behind a client that will never read. Capacity is the length of the
 /// storage, so there is no second number to keep in step with the first.
+///
+/// **The consumer supplies two things and the queue calls out to neither**: the
+/// item type, and the `storage` slice this is instantiated over. Everything it
+/// stores is the item's own value, so the queue is exactly as pure as its items
+/// are — a queue of `Packet` inherits `Packet`'s borrow and a queue of `Control`
+/// inherits nothing.
+///
+/// **The bound is `storage.len`, and reaching it is a refusal and not an
+/// eviction.** A `push` into a full queue is `error.QueueFull`, leaves the queue
+/// exactly as it was, and writes the item nowhere, so nothing the caller still
+/// believes it holds has been overwritten. Zero-length storage is a queue that
+/// refuses every push and is never indexed, which is what makes the arithmetic
+/// below total rather than a division by zero.
+///
+/// **Where an item sits, and when its bytes move.** Item *n* of the queue lives
+/// in `storage[(head + n) % storage.len]` and is not written again until it is
+/// popped, so an item that borrows points at storage that stays put while it is
+/// queued. `pop` releases that slot, and the ring reaches it again only after
+/// every other slot has been filled once. `storage`, `head` and `count` are public
+/// because a caller that places borrowed bytes per queue position has to compute
+/// the same index this will — and that arithmetic is only valid while nothing
+/// pushes between the two steps, which is the caller's discipline to keep.
+///
+/// Nothing here is synchronized, so two threads sharing one queue are a race the
+/// caller has to prevent, and there is no `deinit` because there is nothing to
+/// free: the storage is the caller's from the first instruction to the last.
 pub fn Queue(comptime Item: type) type {
     return struct {
         const Self = @This();
@@ -375,13 +559,31 @@ pub fn Queue(comptime Item: type) type {
             ///
             /// Upstream's `TrySendError::Full`, and the relay drops the
             /// datagram on it (`server/clients.rs:218-224`).
+            ///
+            /// **The queue is unchanged and the item is dropped**, which is the
+            /// caller's cue to count it: the datagram that did not fit is not
+            /// waiting behind the ones that did, so a relay cannot report a
+            /// backlog it is not holding.
             QueueFull,
         };
 
+        /// Takes the caller's storage and borrows it: nothing is read from it,
+        /// nothing is written to it here, and it is not freed here either, so a
+        /// zeroed or otherwise undefined buffer is a valid one to hand over and
+        /// the buffer must outlive this queue.
+        ///
+        /// The length is the capacity, so a queue with no storage is not a
+        /// malformed one — it is the one that refuses everything.
         pub fn init(storage: []Item) Self {
             return .{ .storage = storage, .head = 0, .count = 0 };
         }
 
+        /// Adds an item at the back, or refuses.
+        ///
+        /// The refusal is `error.QueueFull` and it is decided before anything is
+        /// written, so the queue and every item in it are exactly as they were.
+        /// The item is a value: a caller holding the only copy of something the
+        /// item borrows is the one who has to keep it alive until the pop.
         pub fn push(self: *Self, item: Item) PushError!void {
             // This check is also what makes the modulo below safe: a queue
             // with no storage is always full and never indexes.
@@ -390,6 +592,14 @@ pub fn Queue(comptime Item: type) type {
             self.count += 1;
         }
 
+        /// The front item, removed, or null when the queue is empty.
+        ///
+        /// **The item is a copy of what was stored, and not of what that item
+        /// borrows.** For a `Packet` the datagram bytes belong to the caller's
+        /// storage, this queue has released the slot, and the ring overwrites
+        /// those bytes only when it wraps back around to that slot — which is the
+        /// next `push` if the queue was full and `capacity()` pushes later if it
+        /// was not.
         pub fn pop(self: *Self) ?Item {
             if (self.count == 0) return null;
             const item = self.storage[self.head];
@@ -399,20 +609,32 @@ pub fn Queue(comptime Item: type) type {
         }
 
         /// The next item, without removing it.
+        ///
+        /// It removes nothing, so the item stays at the front and the storage an
+        /// item borrows cannot be overwritten until it is popped.
         pub fn peek(self: Self) ?Item {
             if (self.count == 0) return null;
             return self.storage[self.head];
         }
 
+        /// How many items are queued, which is `count` and never the capacity:
+        /// a queue of capacity two holding one is `len() == 1`.
         pub fn len(self: Self) usize {
             return self.count;
         }
 
         /// How many pushes this queue accepts before it refuses.
+        ///
+        /// This is the bound `push` refuses at, and it is the length of the
+        /// caller's storage rather than a number of this file's own, so the two
+        /// cannot disagree.
         pub fn capacity(self: Self) usize {
             return self.storage.len;
         }
 
+        /// Whether the next `push` is a refusal, which is a stronger statement
+        /// than `len() == capacity()` only because it is the answer to the
+        /// question a caller actually asks.
         pub fn isFull(self: Self) bool {
             return self.count == self.storage.len;
         }
@@ -426,6 +648,15 @@ pub fn Queue(comptime Item: type) type {
 /// get it (`server/client.rs:139-140`). The 512 is the number invariant 9 is
 /// about: merged, a `Status` sits behind 512 datagrams for a client that has
 /// stopped reading, which is a client that most needs to be told.
+///
+/// **It is a default, not a limit anything here enforces.** Nothing in this
+/// module sizes a queue — the caller owns the storage — so the depth is the
+/// caller's number and this one is upstream's to start from. A caller that picks
+/// a smaller depth refuses sooner and holds fewer bytes per client; one that
+/// picks a larger one holds more datagrams for as long as a client stops reading.
+/// At whatever depth it picks, reaching it is `error.QueueFull` and the datagram
+/// is dropped (`server/clients.rs:218-224`), which is why the control queue is a
+/// second queue rather than a longer first one.
 pub const per_client_send_queue_depth = 512;
 
 /// The two queues one connection writes from.
@@ -435,11 +666,20 @@ pub const per_client_send_queue_depth = 512;
 /// takes packets first (`server/client.rs:381-423`). Keeping them apart is
 /// what lets a control message be accepted while the datagram queue is full,
 /// which is the whole of `docs/ARCHITECTURE.md` invariant 9.
+///
+/// **The two queues have separate storage and separate bounds, so one of them
+/// being full never refuses the other.** That is invariant 9, and it is what lets
+/// a `Status` reach a client whose datagram backlog is exhausted. Nothing here
+/// allocates and there is no `deinit`; what the caller owns, `init` says.
 pub const Connection = struct {
     data: Queue(Packet),
     control: Queue(Control),
 
-    /// Both buffers are the caller's and their lengths are the capacities.
+    /// Both buffers are the caller's, are borrowed rather than copied, and must
+    /// outlive the `Connection`. Their lengths are the capacities, so a caller
+    /// that wants a smaller depth passes shorter slices rather than setting a
+    /// field — and a caller that passes an empty one has built a connection that
+    /// can be said nothing to.
     pub fn init(data_storage: []Packet, control_storage: []Control) Connection {
         return .{
             .data = Queue(Packet).init(data_storage),
@@ -449,6 +689,10 @@ pub const Connection = struct {
 
     /// Whether both queues are full, which is the state in which a control
     /// message is the only thing that can still be said to this client.
+    ///
+    /// **Both full is the state a control message cannot escape**, and one full is
+    /// a slow client rather than a lost one: `peer_gone` and every `status` still
+    /// fit while the datagram queue refuses.
     pub fn isSaturated(self: Connection) bool {
         return self.data.isFull() and self.control.isFull();
     }
@@ -460,6 +704,14 @@ pub const Connection = struct {
 /// these arms, and the connection id it requires is what tells them apart:
 /// `remove_if_mut` compares it against the entry's active connection, and a
 /// mismatch means this connection is one of the displaced ones.
+///
+/// **This is what `OnDisconnectGuard.deinit` answers, and it is the only source of
+/// a `Disconnection`.** Two arms report and two do not: `.disconnected` and
+/// `.duplicate` are a connection that ended, and `.promoted` is one that ended
+/// *and* handed its node id to another, so the caller reports the `ended` in it
+/// and then tells the connection named by `took_over` that it is healthy — a frame
+/// on that connection's control queue, which is the caller's. `.already_gone` is
+/// the second `deinit`, and it is what keeps that from being a double report.
 pub const Unregister = union(enum) {
     /// No connection with this id is in the table, so there is nothing to
     /// report. This is the arm a second exit reaches, and it is the reason a
@@ -502,12 +754,33 @@ pub const Unregister = union(enum) {
 /// somewhere; the caller is the only one who knows what a relay should shed
 /// first. A connection past the depth is refused rather than silently dropped,
 /// so the caller can log it.
+///
+/// **The caller owns the slots and the registry borrows them**: `init` writes
+/// `.empty` over every one and nothing grows the array afterwards, so the storage
+/// must outlive the registry and the registry needs no `deinit`.
+///
+/// **Two bounds, and both are refusals that leave the table as it was.** The slot
+/// count is the caller's, and a table with no free slot is `error.NoFreeSlot`.
+/// `inactive_depth` is how many displaced connections one node id may hold, and
+/// the next is `error.TooManyDuplicateConnections` — checked before the active id
+/// moves, so the entry keeps its active connection and its displaced list. **A
+/// refused `admit` admits nothing**: that connection has no handle, is not in the
+/// table, and is the caller's to close.
+///
+/// The table rehashes itself at three quarters full, tombstones included, so a
+/// relay that churns connections does not probe through its own history; the
+/// rebuild keeps every entry and clears the tombstones.
+///
+/// **No synchronization.** Every method takes `*Self` over a plain table, so two
+/// threads sharing one registry are a race; the relay's loop is the only writer,
+/// which is the discipline `Connection`'s queues are under too.
 pub fn Registry(comptime inactive_depth: usize) type {
     return struct {
         const Self = @This();
 
         /// One cell of the table. The caller owns the array of them and never
-        /// reads it.
+        /// reads it: `init` writes every one, so nothing here is ever `undefined`
+        /// and a slot the caller never filled is not a slot with no valid tag.
         pub const Slot = union(enum) {
             /// Never used, and never held a neighbour's entry.
             empty,
@@ -533,7 +806,15 @@ pub fn Registry(comptime inactive_depth: usize) type {
                 // ziglint-ignore: Z022
                 const Inactive = @This();
 
+                /// The displaced connections, newest last, up to the depth the
+                /// caller's `Registry(inactive_depth)` bound the list at. Only
+                /// `[0..len]` is ever read — `admit` leaves the rest `undefined`
+                /// — so nothing outside this file may look at them, and a caller
+                /// that kept more displaced connections than this holds has lost
+                /// them to a bound it chose rather than to a write it can see.
                 ids: [inactive_depth]ConnectionId,
+                /// How many of `ids` are in use, and never a capacity: a list of
+                /// depth four holding one is `len == 1`.
                 len: usize,
 
                 fn pop(self: *Inactive) ?ConnectionId {
@@ -585,6 +866,12 @@ pub fn Registry(comptime inactive_depth: usize) type {
             NoFreeSlot,
             /// This node id already has `inactive_depth` displaced
             /// connections.
+            ///
+            /// **The table is unchanged**: the entry keeps its active connection
+            /// and its displaced list, and the connection that was refused has no
+            /// handle and is not in it. Nothing is evicted to make room, so a
+            /// caller sees the refusal rather than a client it did not choose to
+            /// lose.
             TooManyDuplicateConnections,
         };
 
@@ -595,10 +882,26 @@ pub fn Registry(comptime inactive_depth: usize) type {
             /// Another connection owned it. Upstream deactivates that one,
             /// tells it `Status::SameEndpointIdConnected` over its control
             /// queue, and remembers it as inactive.
+            ///
+            /// **The value is the connection that was displaced, not the one
+            /// that was admitted.** It is the id of the connection that lost the
+            /// node id, so it is what the caller still owes a
+            /// `Status::SameEndpointIdConnected` over, on that connection's own
+            /// control queue, which is the caller's queue and not this file's.
+            /// A `fresh` admitted into nothing and owes nothing.
+            ///
+            /// The displaced id is also what the entry remembers, so a departure
+            /// can tell the two apart (`server/clients.rs:110-121`) and the id
+            /// this arm carries is the one the caller may act on.
             replaced: ConnectionId,
         };
 
         /// A connection that has been admitted, and the handle that ends it.
+        ///
+        /// The two fields are read once, together: the handle ends the connection
+        /// and the outcome says what is still owed. Copying it copies the handle,
+        /// which is safe because `deinit` reports once, and the handle points
+        /// into the registry that handed it out.
         pub const Admitted = struct {
             guard: OnDisconnectGuard,
             admit: Admit,
@@ -626,6 +929,13 @@ pub fn Registry(comptime inactive_depth: usize) type {
         /// outlive the guard" a type can carry; the other half is a discipline,
         /// and it is recorded in `docs/ARCHITECTURE.md` rather than pretended
         /// away — Zig has no move semantics, so a struct can always be copied.
+        ///
+        /// **`deinit` reports by returning and calls nothing.** It frees no
+        /// memory, closes no socket, and does not reach the caller's access
+        /// control; the caller receives an `Unregister` and acts on it. It is the
+        /// only exit, so a connection dropped without it stays in the table until
+        /// the registry itself is discarded — which is how a relay that tears its
+        /// table down early loses exactly those connections' reports.
         pub const OnDisconnectGuard = struct {
             registry: *Self,
             node_id: NodeId,
@@ -648,6 +958,12 @@ pub fn Registry(comptime inactive_depth: usize) type {
         /// Builds a registry over storage the caller owns. `slots` is sized
         /// by the caller and is never grown. A power of two is faster to
         /// probe, and any size is correct.
+        ///
+        /// `slots` is marked empty in place and never read otherwise, so it may
+        /// be `undefined` on the way in and must outlive the registry. Zero slots
+        /// is degenerate rather than broken — every `admit` is
+        /// `error.NoFreeSlot` and every lookup is null — and it is why the probing
+        /// and the insertion both answer before dividing by `slots.len`.
         pub fn init(slots: []Slot) Self {
             for (slots) |*slot| slot.* = .empty;
             return .{ .slots = slots, .len = 0, .tombstones = 0 };
@@ -656,6 +972,15 @@ pub fn Registry(comptime inactive_depth: usize) type {
         /// Upstream `Clients::register`, gated on upstream's access check:
         /// nothing is admitted before access control has allowed it, and the
         /// handle comes back with the entry.
+        ///
+        /// **The handle comes back only on success**, so a refused `admit` leaves
+        /// the caller with a connection it has not admitted and must close; that
+        /// error is also the only place a relay learns to log
+        /// `TooManyDuplicateConnections` instead of dropping a client silently.
+        ///
+        /// `connection_id` is the caller's number and is unique across the
+        /// process rather than across this registry, because the table compares it
+        /// against an entry that another registry may also hold.
         pub fn admit(
             self: *Self,
             node_id: NodeId,
@@ -699,6 +1024,11 @@ pub fn Registry(comptime inactive_depth: usize) type {
         }
 
         /// The connection datagrams for this node id are forwarded to.
+        ///
+        /// Null means no entry holds this node id, which is what a relay answers
+        /// with `Control.peer_gone` — this is only the lookup, and the frame is the
+        /// caller's to send. The id is a value, so nothing here borrows and a
+        /// lookup keeps no connection alive.
         pub fn activeConnectionId(self: *const Self, node_id: NodeId) ?ConnectionId {
             const index = self.find(node_id) orelse return null;
             return self.slots[index].occupied.active;
@@ -706,6 +1036,10 @@ pub fn Registry(comptime inactive_depth: usize) type {
 
         /// How many node ids the registry holds, which is the number of
         /// entries and not the number of connections.
+        ///
+        /// One node id is one entry however many of its connections are
+        /// displaced, so this is a count of clients the relay can reach and not
+        /// of connections it is holding.
         pub fn nodeCount(self: *const Self) usize {
             return self.len;
         }
@@ -777,15 +1111,15 @@ pub fn Registry(comptime inactive_depth: usize) type {
             // Three quarters full, tombstones included: a relay that churns
             // connections would otherwise probe through its own history.
             if ((self.len + self.tombstones + 1) * 4 > self.slots.len * 3) {
-                try self.rehash();
+                self.rehash();
             }
             try self.place(entry);
             self.len += 1;
         }
 
         /// Probes for a slot and writes the entry there, with no load
-        /// bookkeeping of its own. `rehash` uses this directly, so a rebuild
-        /// cannot ask for another rebuild.
+        /// bookkeeping of its own: `insert` has already decided whether the
+        /// table needed rebuilding before it got here.
         fn place(self: *Self, entry: Entry) AdmitError!void {
             var probes: usize = 0;
             while (probes < self.slots.len) : (probes += 1) {
@@ -798,33 +1132,61 @@ pub fn Registry(comptime inactive_depth: usize) type {
                 self.slots[index] = .{ .occupied = entry };
                 return;
             }
-            // Not reachable: `insert` and `rehash` both establish that
-            // `len < slots.len` first, which is an `empty` to find. It is
-            // here so the function has no exit that is not accounted for.
+            // Not reachable: `insert` establishes that `len < slots.len`
+            // first, which is an `empty` to find. It is here so the function
+            // has no exit that is not accounted for.
             return error.NoFreeSlot;
         }
 
         /// Puts every entry back, clearing the tombstones.
-        fn rehash(self: *Self) AdmitError!void {
-            var index: usize = 0;
-            while (index < self.slots.len) : (index += 1) {
-                const entry = switch (self.slots[index]) {
-                    .occupied => |entry| entry,
-                    else => continue,
-                };
-                // The slot is emptied before the entry goes back in, so no
-                // entry is ever in two places. The entry may land at or after
-                // `index`, in which case this loop meets it again and moves
-                // it once more; one copy survives either way.
-                self.slots[index] = .tombstone;
-                self.tombstones += 1;
-                try self.place(entry);
+        ///
+        /// A tombstone cannot simply become an `empty` slot: probing stops at
+        /// one, so every entry whose path crosses it has to move first, and
+        /// where it moves to is the first free slot on its own path. Each hole
+        /// is therefore closed by taking the entries that depend on it, one
+        /// after the other, with the hole walking on to the slot each of them
+        /// stood in; the hole it reaches last is one that nothing depends on,
+        /// and that is the `empty` the table then measures against.
+        ///
+        /// The walk goes round the whole table rather than forward from the
+        /// hole, because an entry whose probe wrapped past the end of the
+        /// array depends on slots on both sides of it. Nothing is written
+        /// outside the caller's slots, and a move only ever shortens the path
+        /// its entry was probed along, so no entry is lost and none is left
+        /// unreachable.
+        fn rehash(self: *Self) void {
+            var scan: usize = 0;
+            while (scan < self.slots.len) : (scan += 1) {
+                switch (self.slots[scan]) {
+                    .occupied, .empty => continue,
+                    .tombstone => {},
+                }
+                var hole = scan;
+                var probe = scan;
+                var walked: usize = 0;
+                while (walked + 1 < self.slots.len) : (walked += 1) {
+                    probe = (probe + 1) % self.slots.len;
+                    switch (self.slots[probe]) {
+                        // Nothing is probed past an `empty` slot, so nothing
+                        // beyond this one can depend on the hole.
+                        .empty => break,
+                        .occupied => |entry| {
+                            // The hole is on this entry's path when it is no
+                            // further from the home than its own slot is.
+                            const home = self.start(entry.node_id);
+                            const to_hole = (hole + self.slots.len - home) % self.slots.len;
+                            const to_entry = (probe + self.slots.len - home) % self.slots.len;
+                            if (to_hole > to_entry) continue;
+                            self.slots[hole] = .{ .occupied = entry };
+                            self.slots[probe] = .empty;
+                            hole = probe;
+                        },
+                        .tombstone => {},
+                    }
+                }
+                self.slots[hole] = .empty;
             }
-            var remaining: usize = 0;
-            for (self.slots) |slot| {
-                if (std.meta.activeTag(slot) == .tombstone) remaining += 1;
-            }
-            self.tombstones = remaining;
+            self.tombstones = 0;
         }
     };
 }
@@ -1475,6 +1837,110 @@ test "a removed entry does not hide the one behind it" {
     // is for.
     try t.expect((try registry.admit(first_node, 3)).admit == .fresh);
     try t.expectEqual(@as(?ConnectionId, 3), registry.activeConnectionId(first_node));
+}
+
+test "a rebuild keeps every connection and hands the table its empty slots back" {
+    // Churn, with a collision the hash decides: seeds 4, 5 and 6 all probe
+    // from the same slot in an eight-slot table, so two of them wrap past the
+    // end of it and the rebuild has to move entries whose probe path crosses
+    // the tombstones rather than the ones that only pass them.
+    // `Registry` is a generic factory: the binding holds the struct type it
+    // returns, and a type binding is PascalCase rather than a value.
+    // zwanzig-disable-next-line: identifier-style
+    const Reg = Registry(4);
+    var slots: [8]Reg.Slot = undefined;
+    var registry = Reg.init(&slots);
+
+    const wrapped_a = try testNodeId(4);
+    const wrapped_b = try testNodeId(5);
+    const wrapped_c = try testNodeId(6);
+    const churned = try testNodeId(9);
+    const churned_too = try testNodeId(16);
+    const held = try testNodeId(14);
+
+    // Six node ids, one per slot, and then a second connection that takes one
+    // of them away from the first: the table holds a displaced connection as
+    // well as the live ones, and the rebuild has to keep both.
+    var first = try registry.admit(wrapped_a, 1);
+    var displaced = try registry.admit(wrapped_b, 2);
+    try t.expect((try registry.admit(wrapped_c, 3)).admit == .fresh);
+    var gone = try registry.admit(churned, 4);
+    var also_gone = try registry.admit(churned_too, 5);
+    var kept = try registry.admit(held, 6);
+    var newest = try registry.admit(wrapped_b, 7);
+    // The displaced connection is the one that lost the node id, not the one
+    // that took it.
+    try t.expectEqual(Reg.Admit{ .replaced = 2 }, newest.admit);
+    try t.expectEqual(@as(usize, 6), registry.nodeCount());
+
+    // Three of them leave, which spends six of the eight slots, so the next
+    // admission is over three quarters full and rebuilds.
+    try t.expect(gone.guard.deinit() == .disconnected);
+    try t.expect(also_gone.guard.deinit() == .disconnected);
+    try t.expect(first.guard.deinit() == .disconnected);
+    try t.expectEqual(@as(usize, 3), registry.nodeCount());
+    try t.expectEqual(@as(usize, 3), registry.tombstones);
+
+    var rebuilt = try registry.admit(try testNodeId(24), 8);
+    try t.expectEqual(Reg.Admit.fresh, rebuilt.admit);
+
+    // Every entry survived the rebuild: the three that stayed, the node id the
+    // newest connection owns, and the ones that left, which stay gone.
+    try t.expectEqual(@as(?ConnectionId, 7), registry.activeConnectionId(wrapped_b));
+    try t.expectEqual(@as(?ConnectionId, 3), registry.activeConnectionId(wrapped_c));
+    try t.expectEqual(@as(?ConnectionId, 6), registry.activeConnectionId(held));
+    try t.expectEqual(@as(?ConnectionId, 8), registry.activeConnectionId(try testNodeId(24)));
+    try t.expectEqual(@as(?ConnectionId, null), registry.activeConnectionId(wrapped_a));
+    try t.expectEqual(@as(?ConnectionId, null), registry.activeConnectionId(churned));
+    try t.expectEqual(@as(?ConnectionId, null), registry.activeConnectionId(churned_too));
+    try t.expectEqual(@as(usize, 4), registry.nodeCount());
+
+    // The rebuild cleared the tombstones, in the caller's slots and not only
+    // in the count: what the table measures afterwards is its entries, so the
+    // next rebuild is that many admissions away rather than one admission away.
+    try t.expectEqual(@as(usize, 0), registry.tombstones);
+    for (registry.slots) |slot| try t.expect(std.meta.activeTag(slot) != .tombstone);
+
+    // The displaced connection is still remembered, and still the one the node
+    // id goes back to.
+    switch (newest.guard.deinit()) {
+        .promoted => |promotion| try t.expectEqual(@as(ConnectionId, 2), promotion.took_over),
+        else => return error.TestUnexpectedResult,
+    }
+    try t.expectEqual(@as(?ConnectionId, 2), registry.activeConnectionId(wrapped_b));
+    try t.expect(displaced.guard.deinit() == .disconnected);
+    try t.expectEqual(@as(?ConnectionId, null), registry.activeConnectionId(wrapped_b));
+
+    // A connection displaced after the rebuild is the duplicate when it goes,
+    // and leaves the live one holding the node id.
+    var replaces = try registry.admit(held, 9);
+    try t.expectEqual(Reg.Admit{ .replaced = 6 }, replaces.admit);
+    try t.expect(kept.guard.deinit() == .duplicate);
+    try t.expectEqual(@as(?ConnectionId, 9), registry.activeConnectionId(held));
+    try t.expect(replaces.guard.deinit() == .disconnected);
+
+    // And the table keeps taking connections afterwards, right up to a second
+    // rebuild, which leaves every one of them where the caller put it.
+    try t.expect((try registry.admit(try testNodeId(1), 10)).admit == .fresh);
+    try t.expect((try registry.admit(try testNodeId(2), 11)).admit == .fresh);
+    try t.expect((try registry.admit(try testNodeId(3), 12)).admit == .fresh);
+    try t.expect((try registry.admit(try testNodeId(7), 13)).admit == .fresh);
+    try t.expect((try registry.admit(try testNodeId(10), 14)).admit == .fresh);
+    var again = try registry.admit(try testNodeId(11), 15);
+    try t.expectEqual(Reg.Admit.fresh, again.admit);
+    try t.expectEqual(@as(usize, 8), registry.nodeCount());
+    try t.expectEqual(@as(usize, 0), registry.tombstones);
+    for (registry.slots) |slot| try t.expect(std.meta.activeTag(slot) != .tombstone);
+    try t.expectEqual(@as(?ConnectionId, 3), registry.activeConnectionId(wrapped_c));
+    try t.expectEqual(@as(?ConnectionId, 8), registry.activeConnectionId(try testNodeId(24)));
+    try t.expectEqual(@as(?ConnectionId, 10), registry.activeConnectionId(try testNodeId(1)));
+    try t.expectEqual(@as(?ConnectionId, 11), registry.activeConnectionId(try testNodeId(2)));
+    try t.expectEqual(@as(?ConnectionId, 12), registry.activeConnectionId(try testNodeId(3)));
+    try t.expectEqual(@as(?ConnectionId, 13), registry.activeConnectionId(try testNodeId(7)));
+    try t.expectEqual(@as(?ConnectionId, 14), registry.activeConnectionId(try testNodeId(10)));
+    try t.expectEqual(@as(?ConnectionId, 15), registry.activeConnectionId(try testNodeId(11)));
+    try t.expect(rebuilt.guard.deinit() == .disconnected);
+    try t.expect(again.guard.deinit() == .disconnected);
 }
 
 test "a status is not refused by a full datagram backlog" {

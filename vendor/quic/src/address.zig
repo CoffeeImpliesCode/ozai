@@ -6,12 +6,22 @@
 const std = @import("std");
 const mem = std.mem;
 
+/// An IPv4 endpoint. A value: copying one copies the address, and nothing
+/// here owns memory.
+///
+/// `bytes` is in network order and `port` in host order, which is the seam's
+/// problem and not the caller's; see the module doc.
 pub const Ipv4Address = struct {
     bytes: [4]u8,
     /// The socket seam converts host byte order to kernel byte order.
     port: u16,
 };
 
+/// An IPv6 endpoint. A value, and like `Ipv4Address` a copy is independent.
+///
+/// `scope_id` is the RFC 4007 interface zone, which is part of path identity
+/// for a link-local address and zero for everything else — including a
+/// synthetic address, which has no interface to name.
 pub const Ipv6Address = struct {
     bytes: [16]u8,
     port: u16,
@@ -19,20 +29,42 @@ pub const Ipv6Address = struct {
     scope_id: u32 = 0,
 };
 
+/// A path's address: one of the two families, or `unset`.
+///
+/// `unset` is not a wildcard or an error; no endpoint has been assigned.
+/// It does not prevent the core from producing output. Callers must supply
+/// named local and peer addresses for traffic. Two unset paths compare equal
+/// and do not trigger migration.
+///
+/// Equality is byte-for-byte over the family, the address, the port and the
+/// scope; a caller that wants to compare only the addresses asks
+/// `sameIp`, which ignores the port the way a routing table does.
 pub const Address = union(enum) {
     unset,
     ipv4: Ipv4Address,
     ipv6: Ipv6Address,
 
+    /// Build an IPv4 path from its two fields: `bytes` in network order,
+    /// `port` in host order — see the module doc for why the seam, not the
+    /// caller, carries that difference. Nothing is validated and nothing is
+    /// borrowed, so the result is a value that owns no memory.
     pub fn initIpv4(bytes: [4]u8, port: u16) Address {
         return .{ .ipv4 = .{ .bytes = bytes, .port = port } };
     }
 
+    /// Build an IPv6 path. `bytes` is network order and `port` host order as
+    /// for IPv4, and `scope_id` is the RFC 4007 interface zone, for which the
+    /// field's own default is the right argument for an address with no zone.
+    /// Nothing checks that the zone is the interface the address belongs to:
+    /// a link-local address paired with zone 0 is accepted here and means
+    /// something different to the transport.
     pub fn initIpv6(bytes: [16]u8, port: u16, scope_id: u32) Address {
         return .{ .ipv6 = .{ .bytes = bytes, .port = port, .scope_id = scope_id } };
     }
 
-    /// Path identity includes the port and IPv6 scope.
+    /// Path identity includes the port and IPv6 scope. Two addresses of
+    /// different families never compare equal, and `unset` equals only
+    /// `unset`. Static, and a function of its two arguments alone.
     pub fn eql(a: Address, b: Address) bool {
         return switch (a) {
             .unset => switch (b) {
@@ -91,9 +123,16 @@ pub const Address = union(enum) {
         };
     }
 
-    /// Canonical token binding includes the complete IP, port and scope.
-    /// A family tag distinguishes otherwise identical zero IPv4/IPv6 values.
-    /// The old kernel byte window omitted the IPv6 tail.
+    /// The canonical bytes this address is bound by, in one zero-filled
+    /// `identity_length` array: the union tag, the port in network order, the
+    /// address bytes, then the IPv6 scope in network order. The tag is why an
+    /// all-zero IPv4 and an all-zero IPv6 address never bind the same bytes,
+    /// and the tail of the shorter family stays zero, so the width is the same
+    /// whatever the family.
+    ///
+    /// A value, and a pure function of one: it borrows nothing, keeps no state
+    /// and reads no host beyond the byte order it converts out of, so the same
+    /// address binds the same bytes on every host.
     pub fn identity(self: Address) [identity_length]u8 {
         var out = [_]u8{0} ** identity_length;
         out[0] = @intFromEnum(std.meta.activeTag(self));

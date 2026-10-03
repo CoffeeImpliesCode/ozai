@@ -565,11 +565,19 @@ pub const SendError = batch.Error || ControlError || error{
     /// answer, so this is the kernel disagreeing about where the datagram
     /// ends, and the caller has to know that it did.
     PartialDatagram,
-    /// A bound on this call ran out: `EINTR` on every attempt the send had, or
-    /// a stop whose queue or wake counter a send could not empty within
-    /// `max_discarded` and `max_wakes_spent`. Nothing went out, and a stop this
-    /// send did not deal with leaves the socket stopped, so asking again is
-    /// what drains the rest and makes progress.
+    /// A bound on this call ran out: `EINTR` on every attempt the refused run
+    /// had, or a stop whose queue or wake counter a send could not empty within
+    /// `max_discarded` and `max_wakes_spent`.
+    ///
+    /// The bound is on the call and not on the batch. A batch is one
+    /// `sendmsg` per run, and every run that finished before this one left the
+    /// socket: nothing the refused run carried went out, while datagrams ahead
+    /// of it may have. Which is why `Socket.send` returns no sent-prefix count
+    /// and why the caller is the one that decides about duplicates — the same
+    /// residue every other error here leaves, and this one is no exception.
+    ///
+    /// A stop this send did not deal with leaves the socket stopped, so asking
+    /// again is what drains the rest and makes progress.
     Interrupted,
     /// Anything else.
     Unexpected,
@@ -622,6 +630,8 @@ pub const Options = struct {
 
 /// One datagram, or a list coalesced into one buffer.
 pub const Received = struct {
+    /// `bytes` borrows the caller's receive buffer. Reusing or releasing that
+    /// buffer invalidates it. The other fields are independent values.
     /// The bytes the kernel wrote.
     bytes: []const u8,
     /// Who sent them.
@@ -645,6 +655,12 @@ pub const Received = struct {
 /// is what lets a stack pool them and what lets a test hand over a stack
 /// array. Two descriptors and one flag, and every one of the three is about
 /// being stopped rather than about carrying a datagram; see `stop`.
+///
+/// A successful `create` owns both descriptors. Close them exactly once after
+/// all operations and stop callers finish. Copies share those descriptors.
+/// Keep the value at a stable address while a lookup or stop caller borrows it.
+/// Serialize sends and receives. Only `stop` may run concurrently with them.
+/// An operation borrows `io` and its backend only until the operation returns.
 pub const Socket = struct {
     /// The descriptor. `O_NONBLOCK` from the moment it exists, which is what
     /// makes `EAGAIN` a fact a caller can act on instead of a stall.
@@ -659,9 +675,8 @@ pub const Socket = struct {
     stopped: std.atomic.Value(bool),
     /// Which control message carries the codepoint here.
     family: batch.Family,
-    /// What the socket answered when it was asked, and the only field that
-    /// changes afterwards. A driver that cannot segment is found by sending,
-    /// and the cap is never raised again.
+    /// Capabilities observed at creation and downgraded after refused sends.
+    /// A driver that cannot segment is found by sending; a cap is never raised.
     caps: batch.Capability,
     /// Where it is bound, with the ephemeral port the kernel chose written in.
     address: base_addr.SocketAddr,
@@ -710,6 +725,7 @@ pub const Socket = struct {
 
     /// Close both descriptors. Nothing is buffered on this side: a send that
     /// returned has left the socket, and a read that returned has been taken.
+    /// Do not close a copy or call this twice. Neither descriptor is reset.
     pub fn close(self: *Socket) void {
         _ = c.close(self.wake);
         _ = c.close(self.handle);
@@ -731,6 +747,8 @@ pub const Socket = struct {
     /// store and one `write`, both on POSIX's list of calls such a handler is
     /// allowed to make. The queue is emptied by the wait this wakes and by the
     /// next send, because `recvmsg` is not on that list.
+    ///
+    /// Keep the socket alive and open until every concurrent stop returns.
     pub fn stop(self: *Socket) void {
         self.stopped.store(true, .release);
         var one: u64 = 1;
@@ -753,6 +771,18 @@ pub const Socket = struct {
     /// carries no segment size whatever the batch was, which is the fallback
     /// `DECISIONS/0002` promised and which `Report.degraded` makes visible
     /// instead of silent.
+    ///
+    /// **Every datagram this call sends reaches the wire once.** A run refused
+    /// for segmentation lowers the socket's capability for good and is
+    /// answered by sending that run and the runs behind it, one datagram per
+    /// `sendmsg`; the runs before it are already on the wire and are not sent
+    /// again. A codepoint the retried tail lost is reported as lost, because
+    /// the datagram carrying it has gone and no retry can put it back.
+    ///
+    /// The call is nonblocking and borrows `payload.contents` only for the
+    /// call. `error.Canceled` is forwarded. On error, earlier runs may already
+    /// have left the socket. No sent-prefix count is returned. Do not replay a
+    /// batch unless the protocol tolerates duplicates.
     pub fn send(
         self: *Socket,
         io: std.Io,
@@ -760,38 +790,10 @@ pub const Socket = struct {
         payload: batch.Send,
     ) SendError!batch.Report {
         try io.checkCancel();
-        // A stop means nothing arriving on this descriptor is wanted, so
-        // whatever is queued goes with it rather than being left for whoever
-        // reads next. This is the one place a stopped socket becomes a socket
-        // again, and the only place the wake is spent: a counter left standing
-        // would wake every wait that followed, for a stop already dealt with.
-        if (self.stopped.load(.acquire)) {
-            // Cleared only once the queue is empty, in that order: a drain a
-            // cancellation cut short leaves the socket stopped rather than
-            // clean with a straggler still in it, and the next send drains
-            // again. Two sends racing here is harmless — one of them finds
-            // nothing to take.
-            try self.discard(io);
-            self.stopped.store(false, .release);
-            // The flag goes before the counter so a stop raised between the two
-            // is not spent by this drain and still leaves the socket stopped,
-            // and it goes back if the counter could not be spent: a socket that
-            // says it is running with a unit still standing on it ends the next
-            // wait the way a real stop would, and nothing else would take that
-            // unit off.
-            errdefer self.stopped.store(true, .release);
-            try self.clearWake();
-        }
-        var refused = try self.sendBatch(io, dest, payload);
-        if (refused == .segmentation) {
-            // Found by sending, not by asking, and permanent: noq lowers the
-            // cap and never raises it (`noq-udp/src/unix.rs:436-445`),
-            // because a driver that could segment on the next send would
-            // fail it again on the one after.
-            self.caps = self.caps.withoutSegmentation();
-            refused = try self.sendBatch(io, dest, payload);
-        }
-        return batch.report(payload, batch.Family.of(dest.ip), refused);
+        // What a stop leaves behind is dealt with first, and it is a whole of
+        // its own: `restart` drains the queue and spends the wake.
+        try restart(self, io);
+        return sendBatch(self, io, dest, payload, &self.caps);
     }
 
     /// Take whatever is queued, or answer that nothing is.
@@ -799,6 +801,10 @@ pub const Socket = struct {
     /// `error.WouldBlock` is a value and not a failure: the socket has been
     /// non-blocking since it was opened, and a caller with nothing else to do
     /// is the one that decides what an empty queue means.
+    ///
+    /// The returned bytes borrow `buffer`, not `control`. Both buffers may be
+    /// overwritten even on error. A truncation error consumes the datagram.
+    /// `error.Canceled` is forwarded. This call does not wait for readiness.
     pub fn tryReceive(
         self: *const Socket,
         io: std.Io,
@@ -810,6 +816,12 @@ pub const Socket = struct {
 
     /// Wait for a datagram and take it. A `timeout_ms` of null waits as long
     /// as the caller means, and time stays the caller's: this reads no clock.
+    ///
+    /// Zero polls once. Negative values, like `null`, wait without a deadline.
+    /// A timeout returns `error.WouldBlock`. `stop` wakes a blocked poll with
+    /// `error.Canceled`. An `io` cancellation is checked around the syscalls,
+    /// but does not itself wake the poll. Result and error residue follow
+    /// `tryReceive`.
     pub fn receive(
         self: *const Socket,
         io: std.Io,
@@ -821,20 +833,9 @@ pub const Socket = struct {
         return self.recvmsg(io, buffer, control);
     }
 
-    /// One `sendmsg` per run of `payload`, and the refusal worth reporting.
-    fn sendBatch(
-        self: *Socket,
-        io: std.Io,
-        dest: base_addr.SocketAddr,
-        payload: batch.Send,
-    ) SendError!batch.Refused {
-        var runs = try batch.Runs.init(payload, self.caps);
-        var refused: batch.Refused = .none;
-        while (runs.next()) |run| {
-            refused = strongest(refused, try self.sendRun(io, dest, run));
-        }
-        return refused;
-    }
+    // One `sendmsg` per run of `payload` is `walkRuns`, and the two passes
+    // deciding what a refused batch costs is `sendBatch`; both are functions
+    // of their writer rather than methods, and this is where the batch ends.
 
     /// One run, and what it cost.
     fn sendRun(
@@ -1121,16 +1122,145 @@ pub const Socket = struct {
     }
 };
 
-/// The refusal a caller is told about when a batch took more than one run. A
-/// lost codepoint outranks a lost segmentation, because nothing downstream can
-/// get it back, and a lost segmentation is a slower path rather than a wrong
-/// one.
-fn strongest(current: batch.Refused, next: batch.Refused) batch.Refused {
-    return switch (next) {
-        .segmentation => .segmentation,
-        .unknown_control_message => if (current == .segmentation) current else next,
-        .none => current,
-    };
+/// End the stopped state this socket is in: take the queue, then spend the
+/// wake the stop left behind.
+///
+/// A stop means nothing arriving on this descriptor is wanted, so whatever is
+/// queued goes with it rather than being left for whoever reads next. This is
+/// the one place a stopped socket becomes a socket again, and the only place
+/// the wake is spent: a counter left standing would wake every wait that
+/// followed, for a stop already dealt with.
+///
+/// `context` is what the recovery runs on and not a `*Socket`, so a test can
+/// raise a real `Socket.stop` between the drain and the flag. Another task's
+/// stop is the only thing that happens there in production, and whether this
+/// erases one is the whole of what the order below has to get right.
+fn restart(context: anytype, io: std.Io) error{ Canceled, Interrupted, Unexpected }!void {
+    // The old stop is spent *first*, and the order is the whole of this
+    // function: a stop raised while the queue is being taken, or while the
+    // counter is being emptied, has set the flag again, and a flag cleared
+    // after either of those erases that stop outright — nothing queued after it
+    // would ever be drained and nothing would end the next wait.
+    if (!context.stopped.swap(false, .acq_rel)) return;
+    // And it goes back on the paths that leave the socket as they found it: a
+    // drain or a counter spend that could not finish leaves the stop standing,
+    // so the next send drains again rather than sending over a queue nobody has
+    // emptied. Two sends racing here is harmless — one of them finds nothing
+    // to take.
+    errdefer context.stopped.store(true, .release);
+    try context.discard(io);
+    // The units this stop left, which are on the counter whatever has arrived
+    // since: a unit spent here is a wake for a stop this socket has dealt with,
+    // and spending one is what ends the wait after it on the descriptor.
+    try context.clearWake();
+    // A stop that arrived during the drain or during that read is still
+    // outstanding, and the read may have taken the unit it raised. The socket
+    // is stopped, so it owes a waiter a wake; `stop` is the socket's own way of
+    // raising one, and a stop that arrives after this line writes its own unit
+    // instead of finding one to take.
+    if (context.stopped.load(.acquire)) context.stop();
+}
+
+/// What one pass over a batch left behind.
+///
+/// The refusal is the codepoint one when there was one, because a codepoint
+/// dropped from a run is not on the next one either; a refused segmentation is
+/// not a refusal of the codepoint at all and is reported by `tail` being there
+/// rather than by being ranked against a loss.
+const Pass = struct {
+    /// What the runs drew. `.none` when every one of them went out.
+    refused: batch.Refused = .none,
+    /// The payload from the refused run onwards, and null when there is none:
+    /// a run that went out took its datagrams with it, so a pass that refused
+    /// nothing has nothing to send again, and a pass that refused one leaves
+    /// the tail starting on that run rather than behind it.
+    tail: ?batch.Send = null,
+};
+
+/// Send `payload` to `dest`, and say what it carried.
+///
+/// One pass over the runs, and a second over the runs that did not go out when
+/// one of them was refused for segmentation. Every datagram reaches the wire
+/// once: the runs before the refused one are already there, so the tail starts
+/// on the refused run itself and the retry cannot put a second copy of
+/// anything on it.
+///
+/// `context` is the writer the runs go out on, and not the socket type: the
+/// refusals below come from the driver, and a driver that refuses a segmented
+/// run is a node a test may not be running on. Monomorphised rather than
+/// erased, so the production call is `Socket.sendRun` and saying it costs
+/// nothing at run time.
+fn sendBatch(
+    context: anytype,
+    io: std.Io,
+    dest: base_addr.SocketAddr,
+    payload: batch.Send,
+    caps: *batch.Capability,
+) SendError!batch.Report {
+    const family = batch.Family.of(dest.ip);
+    const first = try walkRuns(context, io, dest, payload, caps.*);
+    const tail = first.tail orelse return batch.report(payload, family, first.refused);
+    // Found by sending, not by asking, and permanent: noq lowers the cap and
+    // never raises it (`noq-udp/src/unix.rs:436-445`), because a driver that
+    // could segment on the next send would fail it again on the one after.
+    caps.* = caps.*.withoutSegmentation();
+    // Nothing behind that refusal was segmented, so the retry draws no second
+    // segmentation and cannot leave a tail of its own.
+    const second = try walkRuns(context, io, dest, tail, caps.*);
+
+    // `batch.report` is given the refusal no retry can undo: a codepoint either
+    // pass dropped is on the wire without it, and nothing downstream can get it
+    // back. A refused segmentation is answered by the retry above and is not a
+    // report about the codepoint at all — that fact is `degraded`, below.
+    const unrecoverable = if (first.refused == .unknown_control_message)
+        first.refused
+    else
+        second.refused;
+    var report = batch.report(payload, family, unrecoverable);
+    // The degradation is the other fact and the retry does not undo it: it is
+    // the reason there was a retry, and a batch that went out one datagram per
+    // `sendmsg` went out that way whatever the retry found. Same rule
+    // `batch.report` uses — one datagram is one `sendmsg` either way.
+    report.degraded = payload.datagramCount() > 1;
+    return report;
+}
+
+/// One `context.sendRun` per run of `payload`, and what the pass left behind.
+///
+/// Stops at the first run refused for segmentation: that run carried nothing,
+/// and every run behind it is one this socket will refuse the same way — the
+/// cap is lowered by the caller, not argued with here.
+fn walkRuns(
+    context: anytype,
+    io: std.Io,
+    dest: base_addr.SocketAddr,
+    payload: batch.Send,
+    caps: batch.Capability,
+) SendError!Pass {
+    var runs = try batch.Runs.init(payload, caps);
+    var pass: Pass = .{};
+    // The bytes already sent, which is where a refused run starts: the runs
+    // before it left the socket, so the tail is everything behind them.
+    var on_wire: usize = 0;
+    while (runs.next()) |run| {
+        const refused = try context.sendRun(io, dest, run);
+        if (refused == .segmentation) {
+            // The tail starts on the refused run and not behind it: that run
+            // carried nothing, so a tail measured from its end drops it.
+            pass.tail = .{
+                .ecn = payload.ecn,
+                .contents = payload.contents[on_wire..],
+                .segment_size = payload.segment_size,
+            };
+            return pass;
+        }
+        // Both answers that are not a refused segmentation left the socket.
+        on_wire += run.contents.len;
+        // Sticky: the run went out, and it went out without the codepoint. The
+        // runs behind it carry their own, so nothing here clears this.
+        if (refused == .unknown_control_message) pass.refused = refused;
+    }
+    return pass;
 }
 
 fn createSocket(family: batch.Family) OpenError!c.fd_t {
@@ -1682,6 +1812,241 @@ test "a lost codepoint is reported, and only on IPv4" {
     try t.expectEqual(@as(?batch.Ecn, null), nothing.carried);
 }
 
+/// A writer that answers what a socket answers, and refuses where a test says
+/// to.
+///
+/// `Socket.sendRun` reads a refusal out of the driver, and a driver that
+/// refuses a segmented run is a node this suite may not be running on: the one
+/// measured here refuses every count of every segment size that is a multiple
+/// of 256, which refuses the first run of a batch and leaves nothing on the
+/// wire that a replay could send twice. So the answer is scripted, and what
+/// the tests assert is what the policy did with it — the runs it handed here,
+/// and the `Report` it gave its caller.
+///
+/// Two ledgers and not one, because an offer is not a datagram: a run refused
+/// for segmentation was handed over and never left the socket, and a test
+/// that counted it among the runs that went out would add its datagrams a
+/// second time and call the batch whole.
+const Scripted = struct {
+    /// One answer per run offered, in the order the runs are offered, `.none`
+    /// for a run that goes out. A shorter list leaves every run past its end
+    /// going out.
+    answers: []const batch.Refused,
+    /// Every run handed over, in the order it was handed over, a refused run
+    /// included.
+    offered: [16]batch.Send = undefined,
+    /// How many there have been.
+    offers: usize = 0,
+    /// The runs that reached the wire, in the order they reached it.
+    sent: [16]batch.Send = undefined,
+    /// How many there have been.
+    sends: usize = 0,
+
+    fn sendRun(
+        self: *Scripted,
+        io: std.Io,
+        dest: base_addr.SocketAddr,
+        run: batch.Send,
+    ) SendError!batch.Refused {
+        // The two parameters `walkRuns` calls with that this writer has no use
+        // for: it is not a socket, so there is no descriptor to be cancelled
+        // on and no address of its own to compare `dest` against.
+        _ = io;
+        _ = dest;
+        std.debug.assert(self.offers < self.offered.len);
+        const answer = if (self.offers < self.answers.len) self.answers[self.offers] else .none;
+        self.offered[self.offers] = run;
+        self.offers += 1;
+        // What `Socket.sendRun` does with each answer: a refused segmentation
+        // comes back before the kernel was asked to segment anything, so that
+        // run is an offer and nothing else. An unknown control message is on
+        // the wire — that run went out on the retry which dropped the message
+        // — and so is every run that drew no refusal at all.
+        if (answer != .segmentation) {
+            std.debug.assert(self.sends < self.sent.len);
+            self.sent[self.sends] = run;
+            self.sends += 1;
+        }
+        return answer;
+    }
+};
+
+/// The batch every test below shares: eight datagrams of ten bytes on a socket
+/// whose cap takes three per run, which is three runs, with the refusal
+/// landing on the middle one.
+const RefusedMiddle = struct {
+    send: batch.Send,
+    caps: batch.Capability,
+};
+
+fn refusedMiddleRun(payload: []const u8) batch.Error!RefusedMiddle {
+    return .{
+        .send = try batch.Send.batch(payload, 10, .ect0),
+        .caps = .{ .max_send_segments = 3, .max_recv_segments = 1 },
+    };
+}
+
+test "a refused segmentation is answered with the runs that did not leave" {
+    // The first run is on the wire and the last was never reached, so the
+    // answer is the tail from the refused run onwards. The batch again would
+    // put the first run's three datagrams on the wire a second time.
+    var payload: [8 * 10]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @truncate(index);
+    var fixture = try refusedMiddleRun(&payload);
+    var writer: Scripted = .{ .answers = &.{ .none, .segmentation } };
+
+    _ = try sendBatch(&writer, t.io, loopback, fixture.send, &fixture.caps);
+
+    // Every datagram on the wire exactly once, in order: the runs that were
+    // sent, concatenated, are the payload — no run repeated and none missing.
+    // The refused run is not among them, because it never reached the wire;
+    // a ledger that counted it would charge its three datagrams twice and
+    // still call the batch whole.
+    var at: usize = 0;
+    for (writer.sent[0..writer.sends]) |run| {
+        // The run's own claim on the payload, checked before it reads out of
+        // it: a repeat steps `at` off the end, and a test that traps on the
+        // defect is a test that cannot say what the defect was.
+        try t.expect(run.contents.len <= payload.len - at);
+        try t.expectEqualSlices(u8, payload[at..][0..run.contents.len], run.contents);
+        at += run.contents.len;
+    }
+    try t.expectEqual(payload.len, at);
+
+    // Seven runs offered and six sent. The middle one was offered, refused,
+    // and is what the retry carried again: three datagrams that were not on
+    // the wire at any point before it.
+    try t.expectEqual(@as(usize, 7), writer.offers);
+    try t.expectEqual(@as(usize, 6), writer.sends);
+    try t.expectEqual(@as(usize, 3), writer.offered[1].datagramCount());
+
+    // The first run went out as the socket offered to send it; the tail went
+    // out one datagram per `sendmsg`, which is what the lowered cap is for.
+    try t.expectEqual(@as(usize, 3), writer.sent[0].datagramCount());
+    for (writer.sent[1..writer.sends]) |run| {
+        try t.expectEqual(@as(usize, 1), run.datagramCount());
+    }
+
+    // And the cap is never raised again, so the next send finds out the same
+    // way rather than paying for this discovery twice.
+    try t.expectEqual(@as(u16, 1), fixture.caps.max_send_segments);
+}
+
+test "a batch that took the fallback says it was degraded" {
+    var payload: [8 * 10]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @truncate(index);
+    var fixture = try refusedMiddleRun(&payload);
+    var writer: Scripted = .{ .answers = &.{ .none, .segmentation } };
+
+    const report = try sendBatch(&writer, t.io, loopback, fixture.send, &fixture.caps);
+
+    // The fallback `DECISIONS/0002` promised, made visible rather than a
+    // slower wire to notice: the run this socket could take went out as one
+    // `sendmsg` and the five datagrams of the tail it refused went out one
+    // each, and the caller is told the batch was degraded rather than left to
+    // measure it.
+    try t.expect(report.degraded);
+
+    // Nothing about the codepoint, because every run this module wrote carried
+    // it — the retried tail included.
+    try t.expect(report.ecnSurvived());
+    try t.expectEqual(@as(?batch.Ecn, .ect0), report.carried);
+}
+
+test "a codepoint lost on the retried tail is reported with the degradation" {
+    // Both refusals one send can draw: a driver that will not segment, and an
+    // IPv4 kernel that does not know `IP_TOS` on the datagram it retries with.
+    // The datagram that lost its codepoint is on the wire anyway, so the batch
+    // went out slower than it was asked to *and* lost the one thing nothing
+    // downstream can get back — which is two facts and not one.
+    var payload: [8 * 10]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @truncate(index);
+    var fixture = try refusedMiddleRun(&payload);
+    var writer: Scripted = .{ .answers = &.{ .none, .segmentation, .unknown_control_message } };
+
+    const report = try sendBatch(&writer, t.io, loopback, fixture.send, &fixture.caps);
+
+    try t.expect(report.degraded);
+    try t.expect(!report.ecnSurvived());
+    try t.expectEqual(@as(?batch.Ecn, null), report.carried);
+    try t.expectEqual(@as(?batch.Ecn, .ect0), report.wanted);
+
+    // The tail went out anyway: a dropped control message is a datagram with
+    // no codepoint on it, not a datagram missing, and the refused run that
+    // opened the tail is not counted here either.
+    var at: usize = 0;
+    for (writer.sent[0..writer.sends]) |run| {
+        try t.expect(run.contents.len <= payload.len - at);
+        at += run.contents.len;
+    }
+    try t.expectEqual(payload.len, at);
+}
+
+test "a codepoint lost before a refused segmentation is reported too" {
+    // The two refusals in the order that hides one: a run that goes out
+    // without its codepoint, and then a later run this socket will not segment
+    // at all. The retry carries that run and every run behind it and none of
+    // them is refused, so a report built from the retry alone says a codepoint
+    // survived a send that demonstrably dropped it — which is the one loss a
+    // caller cannot work out for itself afterwards.
+    var payload: [8 * 10]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @truncate(index);
+    var fixture = try refusedMiddleRun(&payload);
+    var writer: Scripted = .{ .answers = &.{ .unknown_control_message, .segmentation } };
+
+    const report = try sendBatch(&writer, t.io, loopback, fixture.send, &fixture.caps);
+
+    try t.expect(!report.ecnSurvived());
+    try t.expectEqual(@as(?batch.Ecn, null), report.carried);
+    try t.expectEqual(@as(?batch.Ecn, .ect0), report.wanted);
+    // Both facts: the batch went out one datagram at a time after the refused
+    // run whatever the retry found, so it was degraded and it lost the
+    // codepoint, and a report that can only name one of them is wrong.
+    try t.expect(report.degraded);
+
+    // And the tail still went out once, which is what keeps this a report about
+    // a codepoint rather than about a datagram: the one that lost it is on the
+    // wire, and nothing behind the refused run is sent twice.
+    var at: usize = 0;
+    for (writer.sent[0..writer.sends]) |run| {
+        try t.expect(run.contents.len <= payload.len - at);
+        at += run.contents.len;
+    }
+    try t.expectEqual(payload.len, at);
+}
+
+test "a codepoint lost by one datagram is not put back by the next" {
+    // A socket with no segmentation offers every datagram on its own, which is
+    // the only shape in which a run can lose its codepoint and be followed by
+    // another run: the one behind it carried the message the kernel refused
+    // here. The batch lost it, and a later run going out with it does not make
+    // the batch whole again — the caller decides what one datagram without a
+    // codepoint means, and it can only do that if it is told.
+    var payload: [8 * 10]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @truncate(index);
+    const send = try batch.Send.batch(&payload, 10, .ect0);
+    var caps: batch.Capability = .{ .max_send_segments = 1, .max_recv_segments = 1 };
+    var writer: Scripted = .{ .answers = &.{.unknown_control_message} };
+
+    const report = try sendBatch(&writer, t.io, loopback, send, &caps);
+
+    // No segmentation was ever refused here, so nothing about the batch is
+    // degraded: one `sendmsg` per datagram is how this socket sends every
+    // batch, not a fallback it took.
+    try t.expect(!report.degraded);
+    try t.expect(!report.ecnSurvived());
+    try t.expectEqual(@as(?batch.Ecn, null), report.carried);
+
+    // Every datagram went out anyway, all eight of them, none of them twice.
+    // Every offer here was a send as well, which is what makes this the shape
+    // where no run is ever refused and the two ledgers cannot differ.
+    try t.expectEqual(@as(usize, 8), writer.sends);
+    try t.expectEqual(@as(usize, 8), writer.offers);
+    var at: usize = 0;
+    for (writer.sent[0..writer.sends]) |run| at += run.contents.len;
+    try t.expectEqual(payload.len, at);
+}
+
 test "a kernel GRO integer defines datagram boundaries, and a short value does not" {
     var message = kernelGro(14);
     const read = readCmsg(std.mem.asBytes(&message)[0..message.length]);
@@ -1900,4 +2265,175 @@ test "a queue or a counter past its bound is refused, and the next send takes it
     const read = try client.receive(t.io, &buffer, &control, 50);
     try t.expectEqualStrings(answer, read.bytes);
     try t.expectEqual(server.address, read.from);
+}
+
+/// A recovery with a real stop raised inside it.
+///
+/// The windows are the two moments between taking the queue and the send being
+/// a send again, and the only thing that happens in either of them in
+/// production is another task's `Socket.stop`. So the test raises one there —
+/// on a real socket, with a real drain and a real counter — rather than
+/// describing one and asserting the description back.
+const StopWindow = enum {
+    /// After the drain and before the flag is cleared: the stop has set the
+    /// flag again and the line that clears it is next.
+    drain,
+    /// After the flag is cleared and before the counter is emptied: the check
+    /// that decides whether to empty it has answered, and this stop's unit is
+    /// the one the read about to take.
+    wake,
+};
+
+const StopDuringRecovery = struct {
+    /// The real socket, so every call below is the real one.
+    socket: *Socket,
+    /// The real flag, borrowed rather than copied: an atomic copied out of the
+    /// socket it belongs to is a second flag, and the whole question here is
+    /// what the socket's own flag says.
+    stopped: *std.atomic.Value(bool),
+    /// Which of the two windows this run raises its stop in.
+    window: StopWindow,
+
+    fn discard(
+        self: *StopDuringRecovery,
+        io: std.Io,
+    ) error{ Canceled, Interrupted, Unexpected }!void {
+        try self.socket.discard(io);
+        if (self.window == .drain) self.socket.stop();
+    }
+
+    fn clearWake(self: *StopDuringRecovery) error{Interrupted}!void {
+        if (self.window == .wake) self.socket.stop();
+        return self.socket.clearWake();
+    }
+
+    /// The socket's own way of raising a wake, which a recovery that owes a
+    /// waiter one has to use rather than write its own.
+    fn stop(self: *StopDuringRecovery) void {
+        self.socket.stop();
+    }
+};
+
+/// What a stop raised inside the recovery must leave behind, in either window:
+/// the flag up, and a wake unit standing for it.
+///
+/// Both halves are needed and neither is enough. A flag that went down loses
+/// the stop outright — nothing queued after it would ever be drained again. A
+/// unit spent for it leaves a wait that nothing ends, because `awaitReadable`
+/// reads the wake descriptor and nothing else.
+fn expectStopSurviving(window: StopWindow) !void {
+    var speaker = try Socket.create(loopback, .{});
+    defer speaker.close();
+    var socket = try Socket.create(loopback, .{});
+    defer socket.close();
+    var buffer: [64]u8 = undefined;
+    var control: ControlBuffer = undefined;
+    const straggler = "the answer to a query nobody is waiting for";
+
+    // A stopped socket with something queued is the state the recovery exists
+    // for: the queue goes with the stop, and the wake that stop left is spent
+    // so the wait after this send is not woken for a stop already dealt with.
+    _ = try speaker.send(t.io, socket.address, batch.Send.single(straggler, null));
+    socket.stop();
+    var recovery: StopDuringRecovery = .{
+        .socket = &socket,
+        .stopped = &socket.stopped,
+        .window = window,
+    };
+
+    try restart(&recovery, t.io);
+
+    try t.expect(socket.stopped.load(.acquire));
+
+    // Claiming the flag the way a send would leaves exactly what a live stop
+    // leaves: an empty queue and one unit for it. The quarter of a second is
+    // only there so that a unit which is *not* standing fails in a quarter of
+    // a second rather than in five — a unit that is standing ends the wait on
+    // the descriptor, with no clock involved at all.
+    _ = socket.stopped.swap(false, .acq_rel);
+    try t.expectError(error.Canceled, socket.receive(t.io, &buffer, &control, 250));
+    try t.expectError(error.WouldBlock, socket.tryReceive(t.io, &buffer, &control));
+}
+
+// Two tests and not one with two cases: a case that fails stops the test
+// before the next one runs, and these two fail for different reasons — one
+// loses the flag, the other loses only the wake — so a single test would
+// report the first and hide the second.
+test "a stop raised after the drain survives the recovery" {
+    try expectStopSurviving(.drain);
+}
+
+test "a stop raised as the counter is emptied survives the recovery" {
+    try expectStopSurviving(.wake);
+}
+
+// 79 display columns; the rule counts UTF-8 bytes, three per box character.
+// ziglint-ignore: Z024
+// ──────────────────────────────────────────────────────── a batch, on loopback
+//
+// A duplicate datagram is a fact about the wire and not about a return value:
+// a policy that re-sends a run the kernel already took reports the same batch
+// and hands its caller the same `Report`, and the only place a second copy of
+// a datagram exists is the socket at the other end of it. So this one sends
+// for real and reads back what arrived, which is the one claim the scripted
+// policy tests cannot make on their own.
+
+/// The most bytes one read may hand back: `UDP_GRO_CNT_MAX` coalesced
+/// datagrams of the kilobyte this section sends.
+///
+/// The count is promoted before the product rather than after it, because it
+/// is a `u16` of segments and 64 of them at 1024 bytes is 65536 — one past
+/// the largest value the count it came from can hold.
+const max_read_bytes: usize = @as(usize, batch.max_gro_segments_linux) * 1024;
+
+test "a batch reaches the wire as its datagrams, once each" {
+    var sender = try Socket.create(loopback, .{});
+    defer sender.close();
+    var receiver = try Socket.create(loopback, .{});
+    defer receiver.close();
+    // A read this socket hands back may be coalesced: `UDP_GRO` puts as many
+    // equal datagrams in one buffer as it is willing to coalesce, each as long
+    // as the datagram it took, and a buffer shorter than that gets a read
+    // truncated — which `recvmsg` reports as `MSG_TRUNC` and this module as
+    // `MessageTooLarge`. Sized for the largest coalesced read rather than for
+    // what the sender happened to write.
+    var buffer: [max_read_bytes]u8 = undefined;
+    var control: ControlBuffer = undefined;
+
+    // Seventy datagrams of a kilobyte: more than one run's worth at this
+    // segment size, so the socket has to take the fallback or answer with
+    // several `sendmsg`s, and every datagram is filled with its own index so
+    // that one which arrives twice is visible in the bytes and not only in
+    // the count.
+    const datagrams = 70;
+    var payload: [datagrams * 1024]u8 = undefined;
+    for (&payload, 0..) |*byte, index| byte.* = @truncate(index / 1024);
+
+    const sent = try batch.Send.batch(&payload, 1024, .ect0);
+    const report = try sender.send(t.io, receiver.address, sent);
+    // The codepoint is on every run this module writes, including a fallback's,
+    // so a send that reports it lost lost it to a kernel that refused the
+    // message rather than to the degradation below.
+    try t.expect(report.ecnSurvived());
+    try t.expectEqual(@as(?batch.Ecn, .ect0), report.carried);
+
+    // Everything the kernel has, and no more: a datagram sent twice is twice
+    // on this wire, and a receiver that stopped at the expected count would
+    // step over the second copy rather than see it. The queue is empty when
+    // the reads end, and it was filled before `send` returned.
+    var seen: usize = 0;
+    while (true) {
+        const read = receiver.tryReceive(t.io, &buffer, &control) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        const coalesced = try read.toRecv();
+        for (0..coalesced.datagramCount()) |index| {
+            const datagram = coalesced.datagram(index) orelse return error.TestUnexpectedResult;
+            try t.expect(seen < datagrams);
+            try t.expectEqualSlices(u8, payload[seen * 1024 ..][0..datagram.len], datagram);
+            seen += 1;
+        }
+    }
+    try t.expectEqual(@as(usize, datagrams), seen);
 }

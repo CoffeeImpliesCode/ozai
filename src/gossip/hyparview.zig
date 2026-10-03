@@ -234,6 +234,14 @@ const PeerDataMap = struct {
         return self.len;
     }
 
+    /// Forget every peer's contact data. The `PeerData` values in the slots
+    /// past `len` are copies this table took, and `get` reads only the live
+    /// prefix, so forgetting the entry is what stops this state from offering
+    /// that data again.
+    fn clear(self: *PeerDataMap) void {
+        self.len = 0;
+    }
+
     fn get(self: *const PeerDataMap, peer: NodeId) ?*const PeerData {
         for (self.entries[0..self.len]) |*entry| {
             if (sameNode(entry.peer, peer)) return &entry.data;
@@ -500,6 +508,12 @@ pub fn IndexSet(comptime capacity: usize) type {
             return self.items[0..self.len];
         }
 
+        /// Forget every peer. Slots past `len` keep their ids and are never
+        /// read again.
+        pub fn clear(self: *Self) void {
+            self.len = 0;
+        }
+
         pub fn contains(self: *const Self, peer: NodeId) bool {
             for (self.slice()) |item| {
                 if (sameNode(item, peer)) return true;
@@ -675,12 +689,32 @@ const RemovalReason = union(enum) {
 /// code: not a symmetric data structure, but two nodes that reach the same
 /// view by each asking the other and waiting.
 pub const State = struct {
+    /// This node's identity, fixed by `init`. A `Join` naming it is refused and
+    /// an active view holding it is impossible, so writing it after `init`
+    /// changes which peers this node will connect to. Zig fields are not
+    /// private — this one is fixed by convention and by `init`, not by the
+    /// language.
     me: NodeId,
+    /// This node's own contact data, fixed by `init`; `null` and an empty
+    /// `PeerData` both mean *advertise nothing*, and `myData` sends no slice
+    /// either way. The bytes are stored by value in this `PeerData` — a
+    /// `PeerData.fromBytes` copied them on the way in — so the caller keeps no
+    /// claim on them and need not keep its own copy alive.
+    ///
+    /// A `Neighbor`, `Join` or `Shuffle` this state sends borrows these bytes,
+    /// so the one call that invalidates an `out` entry holding such a slice is
+    /// the next `.update_peer_data` event: it writes this record in place. No
+    /// other event touches it, and `left` keeps it.
     me_data: ?PeerData,
     /// Peers we are connected to. Insertion-ordered, as upstream's.
     active_view: IndexSet(max_active) = .{},
     /// Peers we know about and are not connected to.
     passive_view: IndexSet(max_passive) = .{},
+    /// View capacities, shuffle and walk sizes and every timeout, fixed by
+    /// `init`, which validates them once and does not validate them again. It
+    /// is read per event — every view insertion, every timer arming and every
+    /// shuffle — so writing it after `init` changes the behaviour of views
+    /// that were already built under the old values; nothing rewrites them.
     config: Config,
     /// Whether the shuffle timer is outstanding. Latched on the first call.
     shuffle_scheduled: bool = false,
@@ -696,6 +730,17 @@ pub const State = struct {
     /// Peers that disconnected while saying they were still alive, and so must
     /// survive the connection closing.
     alive_disconnect_peers: IndexSet(max_active) = .{},
+
+    /// Whether this state has left the topic. Upstream drops the whole
+    /// per-peer state on `Quit` and then ignores every later event for it, so
+    /// a state that has quit answers nothing and produces nothing.
+    ///
+    /// Terminal, and there is no way back from here: rejoining means a new
+    /// `State` from `init`. A join offered to a state that has quit would be
+    /// answered by machinery whose passive view, claims and contact data no
+    /// longer describe anything, which is the situation upstream avoids by
+    /// dropping the actor rather than emptying it.
+    left: bool = false,
 
     pub fn init(me: NodeId, me_data: ?PeerData, config: Config, rng: Rng) Error!State {
         try config.validate();
@@ -717,16 +762,73 @@ pub const State = struct {
 
     /// Handle one event.
     ///
+    /// **A state that has quit is inert.** Upstream drops the per-peer state on
+    /// `Quit` and ignores every later event for it; the `left` flag is how that
+    /// is expressed here. An inert `handle` succeeds, appends nothing and
+    /// changes nothing, so a driver that keeps feeding a node it has stopped
+    /// driving gets silence rather than an error it cannot act on.
+    ///
     /// The shuffle timer is armed on the first call whatever that call was,
     /// which is upstream's `handle`: the tail of the function, after the
     /// dispatch, not a constructor side effect. It matters because a node that
     /// only ever received messages still has to shuffle, and one that armed the
     /// timer in its constructor would arm it at a different moment in the run.
+    /// It is *queued before the latch is set*, because a latch set first is a
+    /// claim that a timer exists which the caller never received: an allocator
+    /// refusing that one append would leave the node believing it had a shuffle
+    /// scheduled, and no shuffle would ever happen again. The same rule runs
+    /// the other way: a `.do_shuffle` event is delivered because the caller
+    /// took that timer out of its queue, so `handleShuffleTimer` releases the
+    /// latch before its fallible work and this tail re-arms on any later turn.
+    /// Neither half alone would do — a latch that is only ever set survives a
+    /// refusal to publish, and a timer queued with the latch already set is a
+    /// claim the caller never received.
+    ///
+    /// **Not transactional, and the residue is named rather than hidden.** An
+    /// event advances `self` and appends to `out` as it goes, so an
+    /// `error.OutOfMemory` out of an append leaves the state advanced as far as
+    /// that event got and leaves the appends that succeeded in `out`. The state
+    /// is still a valid `State` — every mutation here is checked, so nothing is
+    /// left half-written — but it is not the state the caller handed in.
+    ///
+    /// The recovery is the caller's, and `plumtree.State.handle` states it in
+    /// full because it is the same recovery: snapshot the value before the call
+    /// and restore it on error, which works because `State` is a plain value
+    /// holding no slice of its own storage. The copy is `@sizeOf(State)` and no
+    /// allocation. The bounds stated there apply here. It restores `self` and
+    /// nothing else, so a caller that acts on `out` as it drains it has already
+    /// sent what it read; it restores `out` only when `out` was empty when the
+    /// call started, because `Actions` cannot truncate to a saved length; and it
+    /// does not restore the caller's timers — a `.do_shuffle` event is
+    /// delivered because the caller removed that timer to fire it, so a restored
+    /// copy carries `shuffle_scheduled` with no timer behind it and the caller
+    /// must re-queue the shuffle itself. A caller that accumulates output across
+    /// events, or that cannot keep a copy, must abandon instead: treat the
+    /// failed `handle` as the end of this peer's run. Replaying the event is not
+    /// promised to be idempotent.
+    ///
+    /// **What the entries in `out` borrow.** `Actions` owns the list and not the
+    /// bytes its entries name, and those bytes live in three places. An emitted
+    /// `peer_data` entry names the slice the event carried, which is the
+    /// caller's own buffer. A `Shuffle` or `ShuffleReply` node list names a
+    /// `peer_data` slot, and a `Join`'s, a `Neighbor`'s and a `Shuffle`'s own
+    /// data names a `me_data` slot. Both of those are stored inline by value —
+    /// `PeerDataMap.put` and `PeerData.fromBytes` each copied on the way in —
+    /// so nothing is borrowed from the message that filled them. Appending
+    /// copies the event value and no bytes, so an entry lives exactly as long
+    /// as those places.
+    ///
+    /// Two calls end the claim on a `peer_data` slot: the next `handle` that
+    /// writes one, and a quit, whose `peer_data.clear()` forgets them all. One
+    /// call ends the claim on a `me_data` slot: a `.update_peer_data` event,
+    /// which is the only thing that writes the field. A caller that keeps an
+    /// output list across any of them must copy.
     pub fn handle(
         self: *State,
         event: SwarmInEvent,
         out: *Actions(SwarmOutEvent),
     ) (Error || Allocator.Error)!void {
+        if (self.left) return;
         switch (event) {
             .recv_message => |recv| try self.handleMessage(recv.from, recv.message, out),
             .timer_expired => |timer| switch (timer) {
@@ -738,12 +840,15 @@ pub const State = struct {
             .update_peer_data => |data| self.me_data = data,
             .quit => try self.handleQuit(out),
         }
-        if (self.shuffle_scheduled) return;
-        self.shuffle_scheduled = true;
+        // A node that has just quit does not shuffle: there is no view left to
+        // shuffle, and a timer armed after the quit is exactly the stale timer
+        // the drop exists to prevent.
+        if (self.left or self.shuffle_scheduled) return;
         try out.push(.{ .schedule_timer = .{
             .after = self.config.shuffle_interval,
             .timer = .do_shuffle,
         } });
+        self.shuffle_scheduled = true;
     }
 
     /// Upstream `handle_message`.
@@ -815,18 +920,72 @@ pub const State = struct {
         }
     }
 
-    /// Upstream `handle_quit`.
+    /// Upstream `handle_quit`, and all of what a quit drops.
+    ///
+    /// The active view goes first and noisily: every peer in it owes a
+    /// `ShuffleReply` and a `Disconnect` so it is not left holding a half-open
+    /// belief about a neighbour that has gone. That output is the one part of
+    /// leaving a caller can observe, and it is why the loop drains the view
+    /// rather than clearing it.
+    ///
+    /// Everything else is dropped in silence, and all of it is state about the
+    /// topic rather than about this node: the passive view, the unanswered
+    /// neighbour requests, the peers that said they were still alive as they
+    /// disconnected, and the contact data. `peer_data` is the one that matters
+    /// beyond tidiness: those are the bytes this node would offer those peers
+    /// to somebody else, and clearing the table is what stops it.
+    ///
+    /// `me_data` survives, because it is this node's own contact data and not
+    /// the topic's; so does `stats`, which reports what the node did while it
+    /// was here. `shuffle_scheduled` goes, because `left` has taken over the
+    /// question of whether any timer is still wanted.
+    ///
+    /// **A failure part way leaves a partial drain, not a partial quit.** A peer
+    /// leaves the active view only once its whole `sendDisconnect` has been
+    /// appended, so at every refusal the peer being told is still in the view
+    /// and `left` is not yet set — a caller that retries gets the same peer
+    /// again, and the drain can finish.
+    /// That is deliberate: a peer forgotten without a `Disconnect` leaves the
+    /// other side holding a neighbour belief nothing will correct, and no
+    /// retry can reach it.
+    ///
+    /// What a refusal does leave is a published prefix. `sendDisconnect`
+    /// appends a `ShuffleReply`, then the `Disconnect`, then the
+    /// `disconnect_peer`, so a refusal at the second or third append leaves the
+    /// reply on the wire with the peer still in the view, and the retry sends a
+    /// second one before the `Disconnect`. That is the residue; no retry is
+    /// promised to be free of it, and the price is a duplicate node list rather
+    /// than anything the other node has to reconcile. Nothing else has moved:
+    /// the tables dropped below are untouched until the drain finishes.
     fn handleQuit(self: *State, out: *Actions(SwarmOutEvent)) (Error || Allocator.Error)!void {
         while (self.active_view.count() > 0) {
             const peer = self.active_view.at(0);
-            _ = self.active_view.removeAt(0);
+            // Told first, forgotten second, for the reason the failure paragraph
+            // gives: a peer taken out of the view before its `Disconnect` was
+            // published is one no retry can reach. `sendDisconnect` reads the
+            // views and the contact table and writes none of them, so the peer
+            // is still in the view while its farewell is built — which is why
+            // the farewell excludes it by name.
             try self.sendDisconnect(peer, false, out);
+            _ = self.active_view.removeAt(0);
         }
+        self.passive_view.clear();
+        self.pending_neighbor_requests.clear();
+        self.alive_disconnect_peers.clear();
+        self.peer_data.clear();
+        self.shuffle_scheduled = false;
+        self.left = true;
     }
 
     /// Upstream `send_disconnect`. A `ShuffleReply` goes out first, with
     /// enough of our view to keep the other node connected: it is about to
     /// lose us, and if it has just joined the swarm it may have nobody else.
+    /// How much of the view is still standing is the caller's business, not
+    /// this one's: on the quit path the drain empties it as it goes, so the
+    /// peer told last is offered whatever is left, which is nothing once it is
+    /// alone. The peer is excluded from whatever that list turned out to be,
+    /// so it is never recommended to itself, which is what keeps the quit path
+    /// honest while the peer is still in the active view when this runs.
     fn sendDisconnect(
         self: *State,
         peer: NodeId,
@@ -835,7 +994,7 @@ pub const State = struct {
     ) (Error || Allocator.Error)!void {
         const offered =
             self.config.shuffle_active_view_count + self.config.shuffle_passive_view_count;
-        try self.sendShuffleReply(peer, offered, out);
+        try self.sendShuffleReply(peer, &.{peer}, offered, out);
         try out.push(.{ .send_message = .{
             .to = peer,
             .message = .{ .disconnect = .{ .alive = alive } },
@@ -991,7 +1150,7 @@ pub const State = struct {
         if (message.ttl.expired() or self.active_view.count() <= 1) {
             const len = message.nodes.count;
             for (message.nodes.slice()) |node| try self.addPassive(node.id, node.data, out);
-            try self.sendShuffleReply(message.origin, len, out);
+            try self.sendShuffleReply(message.origin, &.{}, len, out);
             return;
         }
         const excluded = [_]NodeId{ message.origin, from };
@@ -1001,7 +1160,7 @@ pub const State = struct {
             // the end of the function and losing the message.
             const len = message.nodes.count;
             for (message.nodes.slice()) |node| try self.addPassive(node.id, node.data, out);
-            try self.sendShuffleReply(message.origin, len, out);
+            try self.sendShuffleReply(message.origin, &.{}, len, out);
             return;
         };
         try out.push(.{ .send_message = .{
@@ -1016,18 +1175,20 @@ pub const State = struct {
 
     /// Upstream `send_shuffle_reply`: a random slice of the passive view,
     /// topped up from the active view if the passive one is too short.
+    /// `without` names the peers neither half may offer.
     fn sendShuffleReply(
         self: *State,
         to: NodeId,
+        without: []const NodeId,
         len: usize,
         out: *Actions(SwarmOutEvent),
     ) (Error || Allocator.Error)!void {
         var chosen: [max_shuffle_nodes]NodeId = undefined;
         const wanted = @min(len, max_shuffle_nodes);
-        var count = self.passive_view.shuffledWithoutAndCapped(&.{}, wanted, &self.rng, &chosen);
+        var count = self.passive_view.shuffledWithoutAndCapped(without, wanted, &self.rng, &chosen);
         if (count < wanted) {
             count += self.active_view.shuffledWithoutAndCapped(
-                &.{},
+                without,
                 wanted - count,
                 &self.rng,
                 chosen[count..],
@@ -1053,11 +1214,18 @@ pub const State = struct {
     }
 
     /// Upstream `handle_shuffle_timer`: start a walk from a random active
-    /// peer, carrying part of both views and ourselves.
+    /// peer, carrying part of both views and ourselves. The walk after this one
+    /// is armed by the tail of `handle`, which is the only thing that arms one.
     fn handleShuffleTimer(
         self: *State,
         out: *Actions(SwarmOutEvent),
     ) (Error || Allocator.Error)!void {
+        // The timer this call answers has already left the caller's queue, so
+        // the latch is released before any append below can be refused. Held
+        // across them it would be a claim that a timer exists which nothing
+        // will ever fire: `handle` arms the next one only while this is clear,
+        // so releasing it here is what lets the next event arm one.
+        self.shuffle_scheduled = false;
         if (self.active_view.pickRandom(&self.rng)) |node| {
             var chosen: [max_shuffle_nodes]NodeId = undefined;
             var count = self.active_view.shuffledWithoutAndCapped(
@@ -1084,10 +1252,6 @@ pub const State = struct {
                 } },
             } });
         }
-        try out.push(.{ .schedule_timer = .{
-            .after = self.config.shuffle_interval,
-            .timer = .do_shuffle,
-        } });
     }
 
     fn passiveIsFull(self: *const State) bool {
@@ -1272,7 +1436,9 @@ pub const State = struct {
         }
     }
 
-    /// Upstream `send_neighbor`: one `Neighbor` per request, no more.
+    /// Upstream `send_neighbor`: one `Neighbor` per request, no more. The
+    /// pending entry is the claim that the request was made, so it is withdrawn
+    /// with the request rather than left standing on a refused append.
     fn sendNeighbor(
         self: *State,
         peer: NodeId,
@@ -1280,6 +1446,11 @@ pub const State = struct {
         out: *Actions(SwarmOutEvent),
     ) (Error || Allocator.Error)!void {
         if (!try self.pending_neighbor_requests.insert(peer)) return;
+        // The timer that clears this entry is queued by the caller after this
+        // returns, so a claim left behind by a refused append is one nothing
+        // owns: every later refill skips the peer and counts it against the
+        // active-view capacity, and nothing ever times it out.
+        errdefer std.debug.assert(self.pending_neighbor_requests.remove(peer));
         try out.push(.{ .send_message = .{
             .to = peer,
             .message = .{ .neighbor = .{ .priority = priority, .data = self.myData() } },
@@ -1388,10 +1559,51 @@ pub const Stats = struct {
 /// One node's state for one topic: membership plus broadcast tree. Upstream
 /// `proto::topic::State`.
 pub const TopicState = struct {
+    /// This node's identity, fixed by `init`. `handle` never reads it: both
+    /// layers were built with their own copy, in `swarm.me` and `gossip.me`,
+    /// so writing this field after `init` changes nothing about what the node
+    /// does. Zig fields are not private — those two are the live identities.
     me: NodeId,
+    /// The membership layer. `handle` drives it and `hasActivePeers` reads it
+    /// back, and those are the supported ways in. Writing it is neither refused
+    /// nor repaired: this layer's `left` and the topic's `left` are separate
+    /// flags, so replacing it under a live `gossip` can leave the two out of
+    /// step.
     swarm: State,
+    /// The broadcast layer, and the door a caller reaches the tree through
+    /// directly: `topic.gossip.broadcast(...)` needs no `handle`, which is why
+    /// `Command.quit` calls `plumtree.State.leave` and that call sets this
+    /// layer's own `left`. After a quit the layer is inert — `broadcast` and
+    /// `handle` both return without touching a cache, a queue or a latch — so
+    /// a caller that reaches in after leaving gets silence rather than a fresh
+    /// tree. Writing it is neither refused nor repaired, and a layer written
+    /// with `left == false` will answer for a topic that has left.
     gossip: plumtree.State,
+    /// Per-topic counters, zeroed by `init` and moved only by `handle`: one
+    /// `messages_received` per received frame of either layer, and one
+    /// `messages_sent` per `send_message` this call appends to `out`. They
+    /// count what crossed the topic's boundary, not what each layer did —
+    /// `swarm.stats` and `gossip.stats` are the per-layer counts — and they
+    /// survive `Command.quit`, as do the layers' own.
     stats: Stats,
+
+    /// Whether this node has left the topic. Set by `Command.quit` and checked
+    /// before every dispatch, so a topic that has been left is inert: it
+    /// succeeds, appends nothing and changes nothing.
+    ///
+    /// This is the topic's flag and not the membership layer's `State.left`,
+    /// and both are needed because they answer for different machines. A
+    /// membership-only driver that quits gets a membership state that is inert;
+    /// this one has to be inert too, because `Command.broadcast` and a
+    /// `.gossip` message reach the broadcast layer directly. `plumtree.State`
+    /// carries its own `left`, and `leave` sets it: a broadcast layer that was
+    /// emptied without a latch would answer the next broadcast with a fresh
+    /// cache entry.
+    ///
+    /// Terminal: a node rejoins by building a new `TopicState`, as upstream
+    /// rejoins by building a new topic actor. `init` never returns one with
+    /// this set.
+    left: bool = false,
 
     pub fn init(
         me: NodeId,
@@ -1412,7 +1624,57 @@ pub const TopicState = struct {
         return self.swarm.active_view.count() > 0;
     }
 
-    /// Handle one event.
+    /// Handle one event. `now` is the caller's clock; neither layer reads one.
+    ///
+    /// **A topic that has been left is inert.** `Command.quit` drops the
+    /// broadcast layer, tells the membership layer to disconnect and forget, and
+    /// sets `left`; every later event is accepted and produces nothing. That is
+    /// upstream's behaviour — the topic actor is dropped and every later event
+    /// for it ignored — expressed as a fact about this value rather than as
+    /// bookkeeping in the driver.
+    ///
+    /// **Not transactional, and the residue is named rather than hidden.** The
+    /// event advances both layers as it goes and the passes at the end copy
+    /// their output into `out` as they go, so an error out of either leaves the
+    /// topic advanced as far as that event got. Nothing is left half-written —
+    /// every mutation in both layers is checked — but the state is not the state
+    /// the caller handed in, and a `plumtree.Error` the broadcast layer refused
+    /// with arrives here unchanged.
+    ///
+    /// The recovery is the caller's and is the one `plumtree.State.handle` states
+    /// in full: snapshot the value before the call and restore it on error, which
+    /// works because `TopicState` is a plain value holding no slice of its own
+    /// storage — both layers are inline in it, caches and all — so the copy is
+    /// `@sizeOf(TopicState)` and no allocation, and it restores the borrowed
+    /// payload bytes a failed call handed to `out` along with the value. Three
+    /// bounds apply. It restores `self` and nothing else, so a caller that acts
+    /// on `out` as it drains it has already sent what it read; it restores `out`
+    /// only when `out` was empty when the call started, because `Actions` cannot
+    /// truncate to a saved length; and it restores neither layer's timers, since
+    /// a topic timer event is delivered because the caller removed that timer to
+    /// fire it. A caller that accumulates output across events, or that cannot
+    /// keep a copy, must abandon instead: treat the failed `handle` as the end of
+    /// this topic's run. Replaying the event is not promised to be idempotent.
+    ///
+    /// One detail of *where* the failure lands, because it changes what a
+    /// caller sees: the two layers fill scratch containers this function owns,
+    /// and only the two passes at the end copy them into the caller's `out`. A
+    /// failure inside a layer therefore leaves `out` untouched and the layers
+    /// advanced; a failure in a pass leaves `out` holding the entries copied
+    /// before it. `out` is never rolled back here in either case.
+    ///
+    /// **What the entries in `out` borrow.** `Actions` owns the list and not the
+    /// bytes its entries name, and it keeps neither layer's claim on them. A
+    /// `swarm` entry names one of the three places `State.handle` names: the
+    /// decoded frame the caller brought, a `peer_data` slot or a `me_data`
+    /// slot, the last two stored inline in this value. A `gossip` message and
+    /// an `emit_event.received` borrow either the caller's broadcast buffer or
+    /// the broadcast layer's cache, which is inline in `gossip`. What advances
+    /// each is what those two `handle` docs name: the next `handle` on this
+    /// state, `Command.quit`, and — for a `me_data` slice alone — a
+    /// `.update_peer_data` event. A caller that keeps an output list across any
+    /// of them must copy. See `plumtree.Actions` for the container's own
+    /// rules.
     ///
     /// **The order of the two passes below is the contract, and it is not
     /// tidy.** Upstream `proto/topic.rs` dispatches the event to one layer,
@@ -1437,6 +1699,10 @@ pub const TopicState = struct {
         now: Nanos,
         out: *Actions(OutEvent),
     ) (Error || plumtree.Error || Allocator.Error)!void {
+        // Before the scratch containers, so an inert call allocates nothing at
+        // all: three `Actions` over one allocator is three chances to fail on a
+        // topic that has nothing left to say.
+        if (self.left) return;
         var membership: Actions(SwarmOutEvent) = .init(out.gpa);
         defer membership.deinit();
         var payload: plumtree.Actions(plumtree.OutEvent) = .init(out.gpa);
@@ -1452,7 +1718,14 @@ pub const TopicState = struct {
                 .broadcast => |b| try self.gossip.handle(.{
                     .broadcast = .{ .content = b.content, .scope = b.scope },
                 }, now, &payload),
-                .quit => try self.swarm.handle(.quit, &membership),
+                .quit => {
+                    // Membership first: it is the layer that owes output a
+                    // caller can observe, and that output is lifted into `out`
+                    // by the passes below like everything else this call makes.
+                    try self.swarm.handle(.quit, &membership);
+                    self.gossip.leave();
+                    self.left = true;
+                },
             },
             .recv_message => |recv| {
                 self.stats.messages_received += 1;
@@ -2887,6 +3160,403 @@ test "a quit disconnects every neighbour" {
         else => {},
     };
     try t.expectEqual(@as(usize, 2), disconnects);
+}
+
+// A `Quit` is a drop of the whole topic, not a disconnect of the active view.
+// Every other table goes with it, and the state stops answering.
+test "a quit drops the rest of the topic and leaves the state inert" {
+    const first = try sim.nodeIdFor(2);
+    const second = try sim.nodeIdFor(3);
+    var state: State = try newMembership(1, .{}, 41);
+    var out: Actions(SwarmOutEvent) = .init(t.allocator);
+    defer out.deinit();
+    try prime(&state, &out);
+
+    // One neighbour, carrying contact data: the path into `peer_data` for an
+    // active peer.
+    const data = [_]u8{ 9, 8, 7 };
+    try state.handle(.{ .recv_message = .{ .from = first, .message = .{ .neighbor = .{
+        .priority = .high,
+        .data = &data,
+    } } } }, &out);
+    // A shuffle reply files its nodes in the passive view and then asks one of
+    // them to be our neighbour, which is the path into the pending set.
+    try state.handle(.{ .recv_message = .{ .from = first, .message = .{ .shuffle_reply = .{
+        .nodes = try PeerInfos.init(&.{.{ .id = second, .data = null }}),
+    } } } }, &out);
+    // And a peer that says it is still alive as it goes, which is what the
+    // alive-disconnect set exists for.
+    try state.handle(.{ .recv_message = .{ .from = second, .message = .{ .disconnect = .{
+        .alive = true,
+    } } } }, &out);
+
+    // Every table is loaded, or the rest of this test proves nothing.
+    try t.expectEqual(@as(usize, 1), state.activeView().len);
+    try t.expectEqual(@as(usize, 1), state.passiveView().len);
+    try t.expectEqual(@as(usize, 1), state.pending_neighbor_requests.count());
+    try t.expectEqual(@as(usize, 1), state.alive_disconnect_peers.count());
+    try t.expectEqual(@as(usize, 1), state.peer_data.count());
+
+    out.clear();
+    try state.handle(.quit, &out);
+
+    try t.expectEqual(@as(usize, 0), state.activeView().len);
+    try t.expectEqual(@as(usize, 0), state.passiveView().len);
+    try t.expectEqual(@as(usize, 0), state.pending_neighbor_requests.count());
+    try t.expectEqual(@as(usize, 0), state.alive_disconnect_peers.count());
+    try t.expectEqual(@as(usize, 0), state.peer_data.count());
+    try t.expect(state.left);
+
+    // The disconnects are the one part of leaving a caller gets to see, and a
+    // shuffle timer is not among them: there is no view left to shuffle, and a
+    // timer armed after the quit would outlive the topic it was keeping.
+    var disconnects: usize = 0;
+    var timers: usize = 0;
+    for (out.slice()) |produced| switch (produced) {
+        .send_message => |send| disconnects += @intFromBool(send.message == .disconnect),
+        .schedule_timer => timers += 1,
+        else => {},
+    };
+    try t.expectEqual(@as(usize, 1), disconnects);
+    try t.expectEqual(@as(usize, 0), timers);
+
+    // And the state is inert: a `Neighbor` that would have inserted a peer
+    // inserts nothing, a second quit owes nothing, and a shuffle timer that
+    // fires anyway changes nothing. All three succeed, because a driver that
+    // keeps feeding a node it has stopped driving has no error to act on.
+    out.clear();
+    try state.handle(.{ .recv_message = .{ .from = first, .message = .{ .neighbor = .{
+        .priority = .high,
+        .data = &data,
+    } } } }, &out);
+    try state.handle(.quit, &out);
+    try state.handle(.{ .timer_expired = .do_shuffle }, &out);
+    try t.expectEqual(@as(usize, 0), out.count());
+    try t.expectEqual(@as(usize, 0), state.activeView().len);
+}
+
+// The drain a quit does is the one place a leaving node writes to the wire for
+// every peer it had, so it is the one place a refused append can forget a peer
+// outright. A peer taken out of the active view before its `Disconnect` was
+// published is unreachable by the retry the doc offers, and the caller is left
+// holding a neighbour it never told, which is exactly the belief
+// `handleQuit`'s rationale says must not survive.
+test "a disconnect that could not be published leaves the peer in the active view" {
+    const first = try sim.nodeIdFor(2);
+    const second = try sim.nodeIdFor(3);
+    var state: State = try newMembership(1, .{}, 43);
+    var out: Actions(SwarmOutEvent) = .init(t.allocator);
+    defer out.deinit();
+    try prime(&state, &out);
+
+    try state.handle(.{ .recv_message = .{ .from = first, .message = .{ .neighbor = .{
+        .priority = .high,
+        .data = null,
+    } } } }, &out);
+    try state.handle(.{ .recv_message = .{ .from = second, .message = .{ .neighbor = .{
+        .priority = .high,
+        .data = null,
+    } } } }, &out);
+    try t.expectEqual(@as(usize, 2), state.activeView().len);
+
+    // A fresh container, because `clear` keeps its capacity and a container
+    // that already has room would not allocate at all. The first append a quit
+    // makes is the shuffle reply that opens the first peer's farewell, so this
+    // refusal lands on the first peer of the drain.
+    var failing = std.testing.FailingAllocator.init(t.allocator, .{});
+    var refusing: Actions(SwarmOutEvent) = .init(failing.allocator());
+    defer refusing.deinit();
+    failing.fail_index = failing.alloc_index;
+    try t.expectError(error.OutOfMemory, state.handle(.quit, &refusing));
+
+    // Nothing was told and nothing forgotten, so the quit committed no part of
+    // itself: both peers are still neighbours to retry from.
+    try t.expectEqual(@as(usize, 0), refusing.count());
+    try t.expectEqual(@as(usize, 2), state.activeView().len);
+    try t.expect(!state.left);
+
+    // So the retry reaches both of them, and only then is the node gone.
+    failing.fail_index = std.math.maxInt(usize);
+    try state.handle(.quit, &refusing);
+    try t.expect(state.left);
+    try t.expectEqual(@as(usize, 0), state.activeView().len);
+    var disconnects: usize = 0;
+    for (refusing.slice()) |produced| switch (produced) {
+        .send_message => |send| disconnects += @intFromBool(send.message == .disconnect),
+        else => {},
+    };
+    try t.expectEqual(@as(usize, 2), disconnects);
+}
+
+// The wire payload a committed quit produced before the peer was told it was
+// leaving, and the one the order change had to keep producing after. The peer
+// is still in the active view while its farewell is built, and the farewell is
+// a list of nodes worth knowing — the node asking to be remembered is not one
+// of them. What the two peers are given is not the same length, and not
+// because the exclusion is weaker for one of them: every farewell is read
+// from the view the drain is already emptying. Told first, a peer still has
+// the other one standing beside it and is offered it; told last, every other
+// neighbour is already forgotten and there is nothing left to name. Both are
+// told either way — a list that thins to nothing is the drain finishing.
+
+test "a farewell shuffle reply does not offer the peer it is for" {
+    const me = try sim.nodeIdFor(1);
+    const first = try sim.nodeIdFor(2);
+    const second = try sim.nodeIdFor(3);
+    var state: State = try newMembership(1, .{}, 47);
+    var out: Actions(SwarmOutEvent) = .init(t.allocator);
+    defer out.deinit();
+    try prime(&state, &out);
+
+    try state.handle(.{ .recv_message = .{ .from = first, .message = .{ .neighbor = .{
+        .priority = .high,
+        .data = null,
+    } } } }, &out);
+    try state.handle(.{ .recv_message = .{ .from = second, .message = .{ .neighbor = .{
+        .priority = .high,
+        .data = null,
+    } } } }, &out);
+    try t.expectEqual(@as(usize, 2), state.activeView().len);
+    // The passive view is empty, so every farewell here is topped up from the
+    // active view — which holds the peer it is for, and is the only place
+    // there is anything to offer from.
+    try t.expectEqual(@as(usize, 0), state.passiveView().len);
+
+    out.clear();
+    try state.handle(.quit, &out);
+
+    var replies: usize = 0;
+    // Only the prongs below write these, so a third farewell is caught by the
+    // count rather than by an out-of-bounds write.
+    var told: [2]NodeId = undefined;
+    for (out.slice()) |produced| switch (produced) {
+        .send_message => |send| switch (send.message) {
+            .shuffle_reply => |reply| {
+                switch (replies) {
+                    0 => {
+                        told[0] = send.to;
+                        try t.expectEqual(@as(usize, 1), reply.nodes.count);
+                        // The other neighbour, which is what makes the
+                        // exclusion a choice rather than an accident of an
+                        // empty view.
+                        const offered = reply.nodes.slice()[0].id;
+                        const other = if (sameNode(send.to, first)) second else first;
+                        try t.expect(sameNode(offered, other));
+                        try t.expect(!sameNode(offered, send.to));
+                        try t.expect(!sameNode(offered, me));
+                    },
+                    // Its only other neighbour left the view when the loop
+                    // told it, so the list it is offered is empty — and it is
+                    // still told, which is the part that matters.
+                    1 => {
+                        told[1] = send.to;
+                        try t.expectEqual(@as(usize, 0), reply.nodes.count);
+                    },
+                    else => {},
+                }
+                replies += 1;
+            },
+            else => {},
+        },
+        else => {},
+    };
+    // Both peers were told, and neither twice: every send in this drain goes
+    // to a peer the loop has not forgotten, and there were only two of them.
+    try t.expectEqual(@as(usize, 2), replies);
+    try t.expect(!sameNode(told[0], told[1]));
+}
+
+// The latch on the shuffle timer is a claim that a timer exists. Setting it
+// before the append that publishes the timer makes that claim true when the
+// caller never received one, and an allocator that refuses that single append
+// costs the node its shuffle for good.
+test "a shuffle timer that could not be queued is armed again on the next turn" {
+    var state: State = try newMembership(1, .{}, 41);
+    var failing = std.testing.FailingAllocator.init(t.allocator, .{});
+    var out: Actions(SwarmOutEvent) = .init(failing.allocator());
+    defer out.deinit();
+
+    // Nothing this event does appends before the shuffle timer, so the very
+    // next allocation is that timer's.
+    failing.fail_index = failing.alloc_index;
+    try t.expectError(
+        error.OutOfMemory,
+        state.handle(.{ .update_peer_data = PeerData{} }, &out),
+    );
+    try t.expect(!state.shuffle_scheduled);
+    try t.expectEqual(@as(usize, 0), out.count());
+
+    // The claim was never made, so the next turn makes it and the timer is
+    // queued. With the latch set first it survived the failure, the second turn
+    // produced nothing, and the node never shuffled again.
+    failing.fail_index = std.math.maxInt(usize);
+    try state.handle(.{ .update_peer_data = PeerData{} }, &out);
+    try t.expect(state.shuffle_scheduled);
+    try t.expectEqual(@as(usize, 1), out.count());
+    try t.expectEqual(SwarmTimer.do_shuffle, out.at(0).schedule_timer.timer);
+}
+
+// The same latch, read from the other end. The tail of `handle` owns every
+// re-arming and queues before it sets, so a refusal there costs one turn. A
+// *consumed* timer is the case the tail cannot reach: the caller has already
+// taken that timer out of its queue to hand it to this call, so a latch still
+// set when the shuffle is refused is a claim about a timer that will never
+// fire again, and nothing else in the state ever clears it.
+test "a consumed shuffle that could not be published leaves no phantom timer" {
+    const peer = try sim.nodeIdFor(2);
+    var state: State = try newMembership(1, .{}, 41);
+    var warm: Actions(SwarmOutEvent) = .init(t.allocator);
+    defer warm.deinit();
+    try prime(&state, &warm);
+
+    // A neighbour, so the shuffle timer has something to publish and the
+    // refusal lands on the `Shuffle` itself rather than on the re-arm.
+    try state.handle(.{ .recv_message = .{ .from = peer, .message = .{ .neighbor = .{
+        .priority = .high,
+        .data = null,
+    } } } }, &warm);
+    try t.expectEqual(@as(usize, 1), state.activeView().len);
+    try t.expect(state.shuffle_scheduled);
+
+    var failing = std.testing.FailingAllocator.init(t.allocator, .{});
+    var out: Actions(SwarmOutEvent) = .init(failing.allocator());
+    defer out.deinit();
+    failing.fail_index = failing.alloc_index;
+    try t.expectError(
+        error.OutOfMemory,
+        state.handle(.{ .timer_expired = .do_shuffle }, &out),
+    );
+
+    // The timer the caller handed us is gone and nothing replaced it.
+    try t.expect(!state.shuffle_scheduled);
+    try t.expectEqual(@as(usize, 0), out.count());
+
+    // So the next turn re-arms it. With the latch left set, that turn produced
+    // nothing and the node never shuffled again.
+    failing.fail_index = std.math.maxInt(usize);
+    try state.handle(.{ .update_peer_data = PeerData{} }, &out);
+    try t.expect(state.shuffle_scheduled);
+    try t.expectEqual(@as(usize, 1), out.count());
+    try t.expectEqual(SwarmTimer.do_shuffle, out.at(0).schedule_timer.timer);
+}
+
+// The same rule on the other latch in this module. `pending_neighbor_requests`
+// is the claim that we asked a peer to be our neighbour, and it is what
+// `handlePendingNeighborTimer` clears — but only if the timer that clears it
+// was ever queued, and `refillActiveFromPassive` queues it *after* the
+// `sendNeighbor` that publishes the request. A refusal in between therefore
+// leaves a claim nothing owns: a refill skips a pending peer and counts it
+// against the active-view capacity, so one refusal spends the slot for good.
+test "a neighbor request that could not be published spends no slot" {
+    const candidate = try sim.nodeIdFor(2);
+    var state: State = try newMembership(1, .{}, 41);
+    var warm: Actions(SwarmOutEvent) = .init(t.allocator);
+    defer warm.deinit();
+    try prime(&state, &warm);
+
+    // One passive peer and an empty active view, so a refill has exactly one
+    // peer it could ask and the test cannot pass by asking somebody else.
+    try state.handle(.{ .recv_message = .{ .from = candidate, .message = .{ .shuffle = .{
+        .origin = candidate,
+        .nodes = try PeerInfos.init(&.{.{ .id = candidate, .data = null }}),
+        .ttl = .{ .value = 0 },
+    } } } }, &warm);
+    try t.expectEqual(@as(usize, 1), state.passiveView().len);
+    try t.expectEqual(@as(usize, 0), state.activeView().len);
+    try t.expectEqual(@as(usize, 0), state.pending_neighbor_requests.count());
+
+    // A `shuffle_reply` carrying no nodes: the only thing it does is refill, so
+    // the very next allocation is the `Neighbor` the refill publishes.
+    const ask: SwarmInEvent = .{ .recv_message = .{ .from = candidate, .message = .{
+        .shuffle_reply = .{ .nodes = try PeerInfos.init(&.{}) },
+    } } };
+    var failing = std.testing.FailingAllocator.init(t.allocator, .{});
+    var out: Actions(SwarmOutEvent) = .init(failing.allocator());
+    defer out.deinit();
+    failing.fail_index = failing.alloc_index;
+    try t.expectError(error.OutOfMemory, state.handle(ask, &out));
+
+    // No request went out, so none is pending: a claim nobody owns is exactly
+    // what the pending timer exists to be able to clear.
+    try t.expectEqual(@as(usize, 0), out.count());
+    try t.expectEqual(@as(usize, 0), state.pending_neighbor_requests.count());
+
+    // And the node can still ask its only passive peer, with the timer that
+    // would give the request up if it went unanswered. Left pending, every
+    // later refill skips this peer, and nothing ever queues that timer.
+    failing.fail_index = std.math.maxInt(usize);
+    try state.handle(ask, &out);
+    var asked: usize = 0;
+    var timers: usize = 0;
+    for (out.slice()) |produced| switch (produced) {
+        .send_message => |send| switch (send.message) {
+            .neighbor => asked += 1,
+            else => {},
+        },
+        .schedule_timer => |schedule| switch (schedule.timer) {
+            .pending_neighbor_request => timers += 1,
+            else => {},
+        },
+        else => {},
+    };
+    try t.expectEqual(@as(usize, 1), asked);
+    try t.expectEqual(@as(usize, 1), timers);
+}
+
+// The topic's promise is "leave the topic and drop its state", and the
+// broadcast layer is state. A quit that empties the active view and leaves the
+// iTree, the lazy queue and both caches standing is not a drop.
+test "a quit through the topic empties the broadcast layer and the topic goes quiet" {
+    const me = try sim.nodeIdFor(1);
+    const peer = try sim.nodeIdFor(2);
+    var state: TopicState = try TopicState.init(me, null, .{}, .init(9));
+    var out: Actions(OutEvent) = .init(t.allocator);
+    defer out.deinit();
+
+    // A neighbour, which puts a peer in the active view and then in the tree's
+    // eager set, and a broadcast, which fills both caches and the id table.
+    try state.handle(.{ .recv_message = .{ .from = peer, .message = .{ .swarm = .{
+        .neighbor = .{ .priority = .high, .data = null },
+    } } } }, 0, &out);
+    try state.handle(.{ .command = .{ .broadcast = .{
+        .content = "hello",
+        .scope = .swarm,
+    } } }, 0, &out);
+
+    // Both layers hold something before the quit, or the rest proves nothing.
+    // What is inside the broadcast layer is asserted in `plumtree.zig`, which
+    // owns those tables; what the topic owns is that both layers answered the
+    // event and that the quit reaches both.
+    try t.expectEqual(@as(usize, 1), state.swarm.activeView().len);
+    try t.expectEqual(@as(usize, 1), state.gossip.eagerPeers().len);
+
+    out.clear();
+    try state.handle(.{ .command = .quit }, 0, &out);
+
+    try t.expect(state.left);
+    try t.expect(state.swarm.left);
+    try t.expectEqual(@as(usize, 0), state.swarm.activeView().len);
+    try t.expectEqual(@as(usize, 0), state.gossip.eagerPeers().len);
+    try t.expectEqual(@as(usize, 0), state.gossip.lazyPeers().len);
+
+    // Inert afterwards: a broadcast, a membership message, a peer that drops
+    // and an application asking for its contact data all produce nothing, and
+    // all four succeed. Before the fix the broadcast still went out to a tree
+    // whose neighbours had been dropped, and the membership message still
+    // answered a `Neighbor` for a topic this node had left.
+    out.clear();
+    try state.handle(.{ .command = .{ .broadcast = .{
+        .content = "after",
+        .scope = .swarm,
+    } } }, 1, &out);
+    try state.handle(.{ .recv_message = .{ .from = peer, .message = .{ .swarm = .{
+        .neighbor = .{ .priority = .high, .data = null },
+    } } } }, 1, &out);
+    try state.handle(.{ .peer_disconnected = peer }, 1, &out);
+    try state.handle(.{ .update_peer_data = PeerData{} }, 1, &out);
+    try t.expectEqual(@as(usize, 0), out.count());
+    try t.expectEqual(@as(usize, 0), state.gossip.eagerPeers().len);
+    try t.expectEqual(@as(usize, 0), state.swarm.activeView().len);
 }
 
 // A `TopicId` is 32 bytes the application chose. There is no derivation and no

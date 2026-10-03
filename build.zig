@@ -48,16 +48,21 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // Declared on the library so an importer of `ozai` can reach the transport
-    // stack as `ozai.quic` without this repository depending on it at build
-    // time. Zig modules are lazy, so naming it here costs nothing until
-    // something imports it.
+    // Both modules are registered consumer routes. The bridge imports the
+    // same core module, while consumers add "quic" explicitly when naming
+    // the core's types in their own module.
     lib_mod.addImport("quic", quic_mod);
 
     // The test root is `test_all.zig`, not `lib.zig`. A root that only
     // re-exports discovers zero tests and still exits 0, which is a green step
-    // proving nothing; `test_all.zig` names every file carrying test blocks so
-    // the vendored suite actually runs.
+    // proving nothing. Two mechanisms there find them and it needs both: an
+    // explicit `_ = @import` for every module `lib.zig` does not export — the
+    // internal ones and the test-only ones — and a `refAllDecls` sweep over the
+    // declarations `lib.zig` does export, which is what reaches a module the
+    // list does not name. So not every test-bearing file is a direct import,
+    // and none has to be while `lib.zig` exports it. The sweep is declaration
+    // reachability, not proof that a test ran: the executed count is the build
+    // summary `zig build quic-test` prints.
     const quic_test_mod = b.createModule(.{
         .root_source_file = b.path("vendor/quic/src/test_all.zig"),
         .target = target,
@@ -81,7 +86,10 @@ pub fn build(b: *std.Build) void {
     // `@embedFile` cannot glob, so the gate names every vendored file in a
     // list. Comparing that list against the directory is the only way an
     // addition can be noticed: a file the list omits is a file the gate never
-    // reads, and it would go on looking exactly like coverage.
+    // reads, and it would go on looking exactly like coverage. That list is
+    // the scanner's coverage and nothing more: it says nothing about which
+    // files carry test blocks or whether `quic-test` discovers them, which is
+    // what the root above is for.
     checkVendoredFileList(b);
 
     // Examples are separate executables, never part of the library: an example
@@ -507,7 +515,7 @@ fn checkVendoredFileList(b: *std.Build) void {
 
     var found: std.ArrayList([]const u8) = .empty;
     defer found.deinit(gpa);
-    var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| {
+    var dir = b.build_root.handle.openDir(io, root, .{ .iterate = true }) catch |err| {
         std.debug.panic("cannot read {s}: {s}", .{ root, @errorName(err) });
     };
     defer dir.close(io);

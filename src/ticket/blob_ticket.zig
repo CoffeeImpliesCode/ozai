@@ -36,11 +36,13 @@
 //!
 //! # Ownership
 //!
-//! A decoded ticket's address list is the only thing it owns, and variant 0
-//! cannot put a custom payload in it, so `deinit` is `NodeAddr.deinit` and
-//! nothing more. That is why this kind returns a bare `BlobTicket` where
-//! `EndpointTicket` returns a `Decoded` wrapper: the wrapper exists for the
-//! custom payload copy, and there is no such copy here.
+//! A ticket's address list is the only thing it owns, and `new` takes that
+//! list over from the caller's `NodeAddr` while variant 0 cannot put a custom
+//! payload in it, so `deinit` is `NodeAddr.deinit` and nothing more. That is
+//! why this kind returns a bare `BlobTicket` where `EndpointTicket` returns a
+//! `Decoded` wrapper: the wrapper exists for the custom payload copy, and
+//! there is no such copy here. It is also why `new` transfers rather than
+//! borrows — a type that frees its address list cannot also be lent one.
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
@@ -75,8 +77,9 @@ pub const DecodeError = shared.DecodeError;
 /// then a ticket carries the bytes and nothing claims to know what they are.
 pub const Hash = [32]u8;
 
+/// Bytes in a hash. A value, not an array the caller sizes.
 pub const hash_length = 32;
-
+/// Characters in the hex form `hashToHex` writes and `parseHashHex` reads.
 pub const hash_hex_length = hash_length * 2;
 
 /// Lowercase hex, the form a ticket's hash is printed and pasted in.
@@ -84,6 +87,8 @@ pub fn hashToHex(hash: Hash) [hash_hex_length]u8 {
     return std.fmt.bytesToHex(&hash, .lower);
 }
 
+/// Everything a hash's hex form is refused for, checked in that order: the
+/// length first, then the digits.
 pub const HashParseError = error{
     /// Not `hash_hex_length` characters.
     BadLength,
@@ -91,6 +96,13 @@ pub const HashParseError = error{
     NotHex,
 };
 
+/// `text` as a hash: exactly `hash_hex_length` hex digits, either case.
+///
+/// The two failures are separate so a caller can tell a truncated paste
+/// from a corrupted one. Nothing else is checked: these 32 bytes are a
+/// name, and whether one names a blob is the transfer's question.
+///
+/// Returns the bytes by value; `text` is borrowed for the call only.
 pub fn parseHashHex(text: []const u8) HashParseError!Hash {
     if (text.len != hash_hex_length) return error.BadLength;
     var hash: Hash = undefined;
@@ -133,6 +145,12 @@ pub const Loss = struct {
     /// called the home relay.
     relays: usize = 0,
 
+    /// Whether the round trip loses nothing, which is the precondition for
+    /// treating a ticket's bytes as a stand-in for the address that produced
+    /// them.
+    ///
+    /// A ticket that came off the wire is always empty: nothing was dropped to
+    /// decode it.
     pub fn isEmpty(self: Loss) bool {
         return self.custom == 0 and self.relays == 0;
     }
@@ -141,6 +159,12 @@ pub const Loss = struct {
 /// What one `encode` produced: the bytes, and what they could not carry.
 pub const Encoded = struct {
     /// postcard variant 0. Byte for byte what upstream writes.
+    ///
+    /// These are the caller's `out` and not a copy of it. The slice is the
+    /// prefix the writer filled, so `out` must stay alive and unwritten for as
+    /// long as the bytes are read, and writing `out` again — a second `encode`
+    /// into it included — invalidates the slice and every slice taken from it.
+    /// `BlobTicket.encode` says the same where the buffer is named.
     bytes: []const u8,
     /// What the projection dropped. Read it; an `encode` that lost nothing
     /// and one that lost a custom transport return the same `bytes` type and
@@ -154,23 +178,46 @@ pub const Encoded = struct {
 /// of direct addresses, because that is all variant 0 has room for. A ticket
 /// built here can carry more, and `loss` is how a caller finds out before it
 /// relies on the round trip.
+///
+/// A `BlobTicket` owns `addr.addrs`: `new` takes the list over from the
+/// caller's `NodeAddr` and `decodeBytes` builds one, and `deinit` releases it
+/// either way. One `deinit` per ticket frees it exactly once.
+///
+/// The custom payloads inside the list are *not* owned by the ticket. They
+/// are the same borrows `NodeAddr` carries, so they have to outlive the
+/// ticket; see `NodeAddr` and `Decoded` for the other side of that borrow.
 pub const BlobTicket = struct {
     /// The kind prefix, and the only spelling `decodeString` accepts.
     pub const kind = "blob";
 
+    /// The provider's address. Its list is this ticket's to release; its
+    /// custom payloads, if any, are still the caller's borrow.
     addr: NodeAddr,
+    /// One blob at this hash, or a sequence of them.
     format: BlobFormat,
+    /// The blob's BLAKE3 hash, or the first hash of a sequence.
     hash: Hash,
 
+    /// A ticket for `hash` on `address`, taking over `address.addrs`.
+    ///
+    /// The list is moved, not copied, so nothing is allocated here and
+    /// `address` is spent: the caller must not free it, keep reading through
+    /// it, or hand it to a second owner, and releases it through
+    /// `ticket.deinit(alloc)` instead. Custom payloads inside the list stay
+    /// borrows and must outlive the ticket.
     pub fn new(address: NodeAddr, hash: Hash, format: BlobFormat) BlobTicket {
         return .{ .addr = address, .hash = hash, .format = format };
     }
 
-    /// Free the address list, which is the only thing a decoded ticket owns.
+    /// Free the address list, which is the only thing a ticket owns.
     ///
-    /// There is no custom payload to free, because variant 0 has nowhere to
-    /// put one. `EndpointTicket` needs a wrapper for exactly that copy; this
-    /// does not, and saying so is why the two differ.
+    /// Whether the ticket came from `new` or from `decodeBytes`, this is the
+    /// one release for that list and it runs once. Nothing else is freed: a
+    /// custom payload in the list is a borrow, and variant 0 has nowhere to
+    /// put one anyway. `EndpointTicket` needs a wrapper for its payload copy;
+    /// this does not, and saying so is why the two differ.
+    ///
+    /// The ticket and every copy of it are invalid afterward.
     pub fn deinit(self: BlobTicket, alloc: Allocator) void {
         self.addr.deinit(alloc);
     }
@@ -204,6 +251,15 @@ pub const BlobTicket = struct {
     /// `SocketAddr.order` order and duplicate-free, and that is the order
     /// upstream's `BTreeSet<SocketAddr>` iterates. A custom transport and
     /// every relay past the first are not written at all; `loss` says so.
+    ///
+    /// The result borrows `out`: `Encoded.bytes` is the prefix the writer
+    /// filled, not a copy of it, so `out` must stay alive and unwritten for as
+    /// long as those bytes are read, and a later write through `out`
+    /// invalidates them. A buffer too short for the ticket is
+    /// `error.BufferFull`, and `out` then holds the prefix the writer
+    /// committed before it ran out of room — a partial encoding rather than a
+    /// ticket, which is why nothing is returned for it and it must not reach
+    /// `decodeBytes`.
     pub fn encode(self: BlobTicket, out: []u8) postcard.Error!Encoded {
         var writer = postcard.Writer.init(out);
         try writer.writeVariant(WireVariant.variant0);
@@ -245,6 +301,11 @@ pub const BlobTicket = struct {
 
     /// The canonical text form of `encoded.bytes`, which must be what `encode`
     /// produced. `shared.textLength(kind, …)` sizes `out`.
+    ///
+    /// The text returned is the prefix of `out` that was filled and not a copy
+    /// of it, so `out` must stay alive and unwritten for as long as it is read,
+    /// and a later write through `out` invalidates it. An `out` shorter than
+    /// that length is `error.BufferFull`, and it writes nothing.
     pub fn encodeString(
         self: BlobTicket,
         encoded: Encoded,
@@ -409,8 +470,9 @@ test "golden: the blob ticket text form" {
 test "the text form is a fixed point" {
     const alloc = t.allocator;
     const address = try providerAddr(alloc);
-    defer address.deinit(alloc);
     const ticket = BlobTicket.new(address, try parseHashHex(golden_hash_hex), .hash_seq);
+    // `new` took the list over, so the ticket releases it.
+    defer ticket.deinit(alloc);
 
     var body: [256]u8 = undefined;
     const encoded = try ticket.encode(&body);
@@ -440,10 +502,10 @@ test "a ticket with no custom transport round trips through variant 0 unchanged"
         return error.TestUnexpectedResult;
     address = (try address.insert(alloc, .{ .ip = v6 })) orelse
         return error.TestUnexpectedResult;
-    defer address.deinit(alloc);
 
     const hash = try parseHashHex(golden_hash_hex);
     const ticket = BlobTicket.new(address, hash, .hash_seq);
+    defer ticket.deinit(alloc);
     // Nothing to report is the precondition for trusting the round trip, so
     // it is checked before the round trip rather than inferred from it.
     try t.expect(ticket.loss().isEmpty());
@@ -494,10 +556,10 @@ test "variant 0 drops a custom transport, and the ticket says so" {
     const custom = try addr.CustomAddr.parse("2a_abab", &storage);
     address = (try address.insert(alloc, .{ .custom = custom })) orelse
         return error.TestUnexpectedResult;
-    defer address.deinit(alloc);
 
     const hash = try parseHashHex(golden_hash_hex);
     const ticket = BlobTicket.new(address, hash, .raw);
+    defer ticket.deinit(alloc);
 
     // The question can be asked before anything is written.
     try t.expectEqual(@as(usize, 1), ticket.loss().custom);
@@ -537,9 +599,9 @@ test "variant 0 keeps one relay out of several, and the ticket says which" {
         return error.TestUnexpectedResult;
     address = (try address.insert(alloc, third)) orelse
         return error.TestUnexpectedResult;
-    defer address.deinit(alloc);
 
     const ticket = BlobTicket.new(address, try parseHashHex(golden_hash_hex), .raw);
+    defer ticket.deinit(alloc);
     try t.expectEqual(@as(usize, 2), ticket.loss().relays);
     try t.expectEqual(@as(usize, 0), ticket.loss().custom);
 
@@ -684,11 +746,18 @@ test "a direct address sent twice is one address" {
     try t.expectEqual(@as(usize, 1), decoded.addr.addrs.len);
 
     const address = try providerAddr(alloc);
-    defer address.deinit(alloc);
     const ticket = BlobTicket.new(address, try parseHashHex(golden_hash_hex), .raw);
-    var canonical: [128]u8 = undefined;
-    const ticket_bytes = (try ticket.encode(&canonical)).bytes;
-    const decoded_bytes = (try decoded.encode(&canonical)).bytes;
+    defer ticket.deinit(alloc);
+    // Two buffers, because one would compare a slice with itself: encoding
+    // the decoded ticket into the storage the first encoding borrowed
+    // overwrites those bytes, and `expectEqualSlices` would then be reading
+    // the second answer twice. Written this way, a `canonicalizeAddrs` that
+    // dropped, duplicated or reordered an address fails the comparison
+    // instead of passing it.
+    var built: [128]u8 = undefined;
+    var from_wire: [128]u8 = undefined;
+    const ticket_bytes = (try ticket.encode(&built)).bytes;
+    const decoded_bytes = (try decoded.encode(&from_wire)).bytes;
     try t.expectEqualSlices(u8, ticket_bytes, decoded_bytes);
 }
 

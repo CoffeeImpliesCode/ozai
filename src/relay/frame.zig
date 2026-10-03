@@ -63,11 +63,22 @@
 //! never shortened, because a reason missing its end is a sentence the relay
 //! did not choose and the peer cannot tell it from one it did.
 //!
-//! # Purity
+//! One thing the length bound does not cover is whether the text is text, and
+//! it is checked here rather than left to the caller. Upstream's reason is a
+//! `String` (`handshake.rs:106`) and cannot be anything else; here it is
+//! `[]const u8`, so `encode` validates it with
+//! `std.unicode.utf8ValidateSlice` and refuses `error.InvalidUtf8` — the name
+//! `decode` already answers with, because postcard validates on the way in. A
+//! codec that refuses a value on the way in and writes it on the way out is not
+//! a codec, and the relay side of this protocol writes denials and health
+//! problems that a peer reads as text.
 //!
 //! Nothing here reads a clock, the environment, or a global, and nothing
-//! allocates: `encode` appends into a buffer the caller owns and `decode` borrows
-//! the caller's bytes for the two payloads that are variable-length. `Restarting`
+//! allocates: `encode` appends into a buffer the caller owns, and `decode` borrows
+//! the caller's bytes for the three kinds of payload it does not copy out — a
+//! denial's reason, a health problem, and the contents of the four datagram
+//! frames. Everything else it hands back is a value it copied first, so a
+//! `Message` is as independent of its buffer as its tag allows. `Restarting`
 //! stores milliseconds as the `u32` the wire truncates them to rather than as a
 //! duration, so a value that will not fit on the wire cannot be held in a struct
 //! that claims to be a frame. See `docs/ARCHITECTURE.md`, "Wire codecs are pure
@@ -140,10 +151,26 @@ pub const Error = error{
 ///
 /// This counts only the bytes a socket sees, not the frame's own overhead, and it
 /// is upstream's `MAX_PACKET_SIZE` (`relay.rs:23`).
+///
+/// **It is the ceiling of the whole codec, not only of the datagram arms.**
+/// `decode` measures the payload alone and refuses over it whatever the frame
+/// type is, so the largest frame this module reads is `max_packet_size + 1` bytes
+/// — one header byte over 64 KiB. On the way out it binds the four datagram arms
+/// and nothing else, and it binds the payload rather than the contents, which is
+/// why those four are not bounded alike: 65503 bytes of contents in a single
+/// datagram and 65501 in a batch, which spends two of the bound on its segment
+/// size.
 pub const max_packet_size: usize = 64 * 1024;
 
-/// The largest frame the relay will accept, and therefore the smallest burst a
-/// rate limiter has to let through. Upstream's `MAX_FRAME_SIZE` (`relay.rs:29`).
+/// Upstream's `MAX_FRAME_SIZE` (`relay.rs:29`).
+///
+/// **Nothing in this module reads it, and this codec refuses sixteen times
+/// less.** Upstream needs it where a frame is framed — the WebSocket read — and
+/// `decode` here measures the payload alone against `max_packet_size`, so a
+/// message a peer was willing to send as a megabyte arrives as
+/// `error.FrameTooLarge`. A caller sizing a read buffer sizes it with this one; a
+/// caller deciding how wide a message to admit decides it at the socket, and the
+/// width that actually survives this decoder is `max_packet_size + 1`.
 pub const max_frame_size: usize = 1024 * 1024;
 
 /// The most bytes of text a relay writes into one frame: a `server_denies_auth`
@@ -168,6 +195,12 @@ pub const max_frame_size: usize = 1024 * 1024;
 /// shorten it. Truncation is the one answer worse than silence: a denial
 /// missing the end of its reason is a different sentence from the one the relay
 /// chose, and the peer reading it cannot tell.
+///
+/// **It bounds what `encode` writes, and nothing else.** `decode` applies only
+/// `max_packet_size` to a whole payload, so a peer may send a denial reason or a
+/// health problem of up to 65533 bytes: both are read, and a value that long
+/// re-encodes as `error.TextTooLong`. Upstream is in the same position and has no
+/// bound at all, so bounding the way in would refuse frames upstream emits.
 pub const max_text_length: usize = 255;
 
 /// The relay protocol version, as the `Sec-Websocket-Protocol` sub-protocol spells
@@ -184,6 +217,10 @@ pub const ProtocolVersion = enum(u8) {
     v2 = 2,
 
     /// The sub-protocol name a client sends and a server answers with.
+    ///
+    /// A comptime literal with static lifetime, so it is never borrowed from the
+    /// version and never freed. A caller that sends it must send it unchanged:
+    /// `parse` is exact, so a peer that lower-cases this name is on no version.
     pub fn name(version: ProtocolVersion) []const u8 {
         return switch (version) {
             .v1 => "iroh-relay-v1",
@@ -193,6 +230,11 @@ pub const ProtocolVersion = enum(u8) {
 
     /// The version a sub-protocol name names, or null for a name this build does
     /// not speak.
+    ///
+    /// Exact and case-sensitive, as a sub-protocol token is: nothing is trimmed
+    /// and no case is folded here, because this answers a name and `negotiate` is
+    /// the half that handles a header field. Empty is not a name, and returns
+    /// null.
     pub fn parse(text: []const u8) ?ProtocolVersion {
         if (std.mem.eql(u8, text, "iroh-relay-v1")) return .v1;
         if (std.mem.eql(u8, text, "iroh-relay-v2")) return .v2;
@@ -213,6 +255,15 @@ pub const ProtocolVersion = enum(u8) {
 /// `header_value` is the whole header field, a comma-separated list of tokens. It
 /// is bytes rather than a parsed header map because this is the part of an HTTP
 /// server that has to be right without one.
+///
+/// The result is the largest version named by any token, or null when the field
+/// names none — an empty field and a field of nothing but unknown tokens are the
+/// same answer, and the caller closes the connection rather than choosing. The
+/// field is borrowed for the call and nothing in the result refers to it, so the
+/// header buffer may be reused the moment this returns. **One connection
+/// negotiates once**: the version it returns is the one every `decode` and every
+/// `encode` on that connection is given, because a frame legal in one is not
+/// legal in the other.
 pub fn negotiate(header_value: []const u8) ?ProtocolVersion {
     var best: ?ProtocolVersion = null;
     var rest = header_value;
@@ -228,6 +279,11 @@ pub fn negotiate(header_value: []const u8) ?ProtocolVersion {
 }
 
 /// Which end of a relay connection a frame belongs to.
+///
+/// Neither value is on the wire — the frame type already carries the direction,
+/// and its four datagram arms are numbered by it. This names it locally so
+/// `Datagrams.frameType` and a `Message`'s tag cannot disagree about which end a
+/// datagram is going to.
 pub const Direction = enum {
     /// A client to the relay. Upstream `ClientToRelayMsg`.
     client_to_relay,
@@ -273,6 +329,11 @@ pub const FrameType = enum(u8) {
     status = 13,
 
     /// The frame type for a number, or null when the number is not one.
+    ///
+    /// `u32` and not `u8` because the header is read as a `u64` varint: `decode`
+    /// narrows it before asking, so a peer spelling a frame type wider than `u32`
+    /// is `error.UnknownFrameType` rather than a truncation. A number this build
+    /// has no name for is a number it must not guess at.
     pub fn fromInt(value: u32) ?FrameType {
         return std.enums.fromInt(FrameType, value);
     }
@@ -325,6 +386,10 @@ pub const Ecn = enum(u8) {
     ce = 0b11,
 
     /// The codepoint a byte reduces to, or null when it reduces to none.
+    ///
+    /// Only the low two bits are read, so `0x00` and `0x04` both reduce to none:
+    /// upstream masks with `0b11` (`shared.rs:193`), and a byte above the field is
+    /// not a fourth codepoint.
     pub fn fromBits(bits: u8) ?Ecn {
         return switch (bits & 0b11) {
             0b01 => .ect1,
@@ -334,6 +399,13 @@ pub const Ecn = enum(u8) {
         };
     }
 
+    /// The two-bit value, which is never zero: absence is a null
+    /// `Datagrams.ecn`, and the codec spells that `0x00`.
+    ///
+    /// **So a decoded frame is not always a byte fixed point.** An ECN byte above
+    /// `0b11` decodes to null here and re-encodes as `0x00`, and the canonical
+    /// spelling of what it meant is the second decode's, which is the one a
+    /// metamorphic check compares.
     pub fn toBits(self: Ecn) u8 {
         return @intFromEnum(self);
     }
@@ -347,14 +419,30 @@ pub const Ecn = enum(u8) {
 /// than one datagram, and its absence is what says it is one datagram.
 pub const Datagrams = struct {
     /// Explicit congestion notification for the datagrams, or null for none.
+    ///
+    /// Null is not a codepoint and cannot be spelled as one: the wire has two
+    /// bits and `0b00` is what no codepoint reduces to, so a frame whose byte was
+    /// `0x00` and a frame whose byte was `0x04` both read as null and both
+    /// re-encode as `0x00`.
     ecn: ?Ecn,
     /// The size of one datagram, or null when `contents` is one datagram.
     ///
-    /// Never zero when it is set: zero names no datagram, and `decode` refuses a
-    /// frame claiming one rather than reading it as a single datagram.
+    /// Set means several datagrams of this size; null means one datagram.
+    /// A single-datagram frame tag with a set size is `error.InvalidFrame`,
+    /// decided before encoding writes anything.
+    ///
+    /// A batch size of zero is `error.ZeroSegmentSize` on encode and decode.
+    /// Encoding discovers it after writing the frame header, so that refusal
+    /// leaves a partial frame in the caller's buffer.
     segment_size: ?u16,
-    /// The datagram bytes. In a batch, every `segment_size` bytes but the last
-    /// datagram is one datagram.
+    /// The datagram bytes, borrowed from whoever decoded or received them. In a
+    /// batch, every `segment_size` bytes but the last datagram is one datagram.
+    ///
+    /// **Nothing here copies and nothing here frees.** `encode` writes these bytes
+    /// into the caller's buffer and keeps no reference to them, so a payload
+    /// buffer may be reused the instant `encode` returns; `decode` hands the same
+    /// bytes on as a borrow of the message buffer, so they must stay put and
+    /// unmutated until the frame built from them is done with.
     contents: []const u8,
 
     /// The ECN byte every datagram payload starts with.
@@ -362,6 +450,9 @@ pub const Datagrams = struct {
     /// The big-endian segment size a batch payload carries after the ECN byte.
     pub const segment_size_length = 2;
     /// The number of bytes in a node id, which every datagram payload starts with.
+    ///
+    /// It is `key.NodeId.byte_length` and is written down rather than referred to
+    /// so a caller can size a datagram payload from this file alone.
     pub const node_id_length = 32;
 
     /// Whether these are a batch. This is the left half of the invariant
@@ -396,13 +487,25 @@ pub const Datagrams = struct {
     /// second is the one that corrupts the GSO path when it is missed: the batch
     /// handed back keeps a segment size only if it really holds more than one
     /// segment, and this loses its segment size the moment one segment or less is
-    /// left in it. A `Datagrams` holding one datagram and a segment size is a value
-    /// the decoder refuses to build, so leaving one here is not a smaller loss
-    /// than it looks.
+    /// left in it. **That is what keeps `isBatch` and `frameType` in step:** a
+    /// value holding one datagram is carried as `*_datagram`, so a segment size
+    /// left on one would make `frameType` pick the batch tag for a frame whose
+    /// payload is a single datagram. Nothing else forbids that shape — a batch
+    /// frame whose payload is narrower than its segment size decodes to exactly
+    /// it, `readDatagrams` refusing only a zero segment size — so a caller
+    /// draining a batch one segment at a time must expect the tail to come back
+    /// as a non-batch.
     ///
-    /// A `num_segments` of zero or one returns everything as a non-batch and
-    /// leaves nothing here, which is upstream's behaviour and the reason a
-    /// single-datagram frame is a frame and not a batch of one.
+    /// With a segment size, zero takes no bytes and one takes at most one
+    /// segment; either result is a non-batch. Without a segment size, the whole
+    /// payload is returned regardless of `num_segments`.
+    ///
+    /// The two values share one backing array: the batch handed back and the
+    /// receiver both borrow the same bytes, the split moves no memory, and
+    /// neither value frees anything. What the call changes is which bytes each
+    /// one names — the receiver's `contents` is shortened and may lose its
+    /// segment size — so a caller still holding the old slice sees the old
+    /// datagrams while `self` no longer includes them.
     pub fn takeSegments(self: *Datagrams, num_segments: usize) Datagrams {
         const segment_size = self.segment_size orelse {
             const contents = self.contents;
@@ -433,8 +536,17 @@ pub const Datagrams = struct {
 ///
 /// Upstream `Status` (`relay.rs:122`). The three named conditions are the ones a
 /// relay can report. `unknown` is upstream's forward-compatibility arm: a
-/// discriminant this build has no name for is kept rather than rejected, so a
+/// condition this build has no name for is kept rather than rejected, so a
 /// relay that grows a fourth one does not break a client that is only reading.
+///
+/// **This module carries the value and decides nothing from it.** A status frame
+/// arriving before admission is refused as an out-of-order frame by the client
+/// handshake machine in `relay/client.zig`, because no handshake state names
+/// it. A node past admission counts `.same_endpoint_id_connected` and drops
+/// `.healthy`, `.rate_limited` and `.unknown` (`node.zig`, `converseMessage`),
+/// so a relay that rate-limits a node is invisible to that node's counters and
+/// its logs. That is a fact about the consumers, not about the wire, and a
+/// consumer that wants to act on an arm has to write the arm for itself.
 pub const Status = union(enum) {
     /// The connection is healthy, and has recovered from earlier trouble.
     healthy,
@@ -442,9 +554,14 @@ pub const Status = union(enum) {
     same_endpoint_id_connected,
     /// The relay is rate-limiting what this endpoint sends.
     rate_limited,
-    /// A discriminant this build has no name for.
+    /// A condition this build has no name for, kept as the byte the relay sent.
     unknown: u8,
 
+    /// The condition a byte names, keeping a byte this build has no name for.
+    ///
+    /// The three named arms are 0, 1 and 2 and everything else is `.unknown`, so
+    /// `toBits(fromBits(bits)) == bits` for all 256: the status frame is the one
+    /// frame here whose re-encode is always the same byte.
     pub fn fromBits(bits: u8) Status {
         return switch (bits) {
             0 => .healthy,
@@ -454,6 +571,7 @@ pub const Status = union(enum) {
         };
     }
 
+    /// The byte, which is the discriminant itself and not the arm's index.
     pub fn toBits(self: Status) u8 {
         return switch (self) {
             .healthy => 0,
@@ -471,12 +589,32 @@ pub const Status = union(enum) {
 /// wait longer than `u32.max` milliseconds has a value the wire truncates, and a
 /// struct holding the untruncated one would be describing a frame that cannot
 /// exist.
+///
+/// **Milliseconds, `u32`, big-endian, and nothing about the pair is checked.**
+/// Zero is meaningful for both — no advisory wait, no budget — and this module
+/// stores them and never compares them: `try_for_ms` is not required to exceed
+/// `reconnect_in_ms`, and a relay that means one says so itself. The widest a
+/// peer can be told is `std.math.maxInt(u32)` milliseconds, about 49.7 days, and
+/// a client turning that into nanoseconds multiplies into `u64` without
+/// overflowing.
+///
+/// **Nothing in this tree acts on either number.** They are decoded, sized,
+/// compared for equality and encoded, and that is the whole of their life
+/// here. A restarting frame that arrives before admission is refused as an
+/// out-of-order frame by the client handshake machine in `relay/client.zig`,
+/// because no handshake state names it. A node past admission drops it
+/// (`node.zig`, `converseMessage`), and `Node` dials its relay once and does
+/// not reconnect, so there is no loop here for either figure to govern or
+/// spend. A consumer that wants a reconnect budget has to write one; nothing
+/// in this module enforces it and nothing counts against it.
 pub const Restarting = struct {
-    /// An advisory wait before reconnecting. It may be zero: the relay is allowed
-    /// to use it to smear reconnects out.
+    /// An advisory wait before reconnecting. It may be zero: the relay is
+    /// allowed to use it to smear reconnects out. No consumer in this tree
+    /// waits for it.
     reconnect_in_ms: u32,
-    /// An advisory total budget for reconnecting before the client gives up and
-    /// goes back to its own connection-failure logic.
+    /// An advisory total budget a client may spend reconnecting before it
+    /// gives up and goes back to its own connection-failure logic. No consumer
+    /// in this tree spends it, so nothing here gives up on it either.
     try_for_ms: u32,
 };
 
@@ -485,6 +623,13 @@ pub const Restarting = struct {
 /// Upstream `ServerChallenge` (`handshake.rs:77`). Which sixteen bytes they are
 /// is the server's draw from a cryptographic RNG and not this module's: the codec
 /// carries them, and the signer derives the message to sign from them.
+///
+/// The codec constrains the bytes by nothing but their length, and that is
+/// deliberate: the whole of the challenge's force is that the client signs
+/// something the relay could not have chosen, so the draw is a CSPRNG's and the
+/// rest is `messageToSign`'s. The value is copied into the state and into the
+/// frame that carries it, so nothing borrows it and nothing has to outlive the
+/// caller.
 pub const ServerChallenge = struct {
     /// Bytes of challenge, drawn by the server from a cryptographic RNG.
     pub const challenge_length = 16;
@@ -496,8 +641,20 @@ pub const ServerChallenge = struct {
 /// Upstream `ClientAuth` (`handshake.rs:88`). Upstream's `public_key` is `NodeId`
 /// here for the reason `docs/ARCHITECTURE.md` gives: the value is never used as a
 /// key in this API, it addresses a node.
+///
+/// Self-contained and fixed width: `decode` copies both fields out of the message
+/// buffer, so this is the one handshake payload that outlives the bytes it was
+/// read from. A node id that is not a point at all is `error.InvalidNodeId` on
+/// the way in; a value a caller builds by hand is not checked here, and the only
+/// thing left that can fail with it is `verifyClientAuth`.
 pub const ClientAuth = struct {
+    /// The node id being claimed, and it must be a point on the curve: `decode`
+    /// refuses the 32 bytes of a frame that are not one.
     node_id: NodeId,
+    /// The signature over the derived message of the challenge that was issued
+    /// (`relay/client.zig` is where that message is built). Sixty-four bytes
+    /// rather than a 65-byte `r‖s` pair, because a fixed array is written as raw
+    /// bytes by the one codec in this protocol that postcards anything.
     signature: Signature,
 };
 
@@ -510,8 +667,11 @@ pub const ClientAuth = struct {
 /// codec's to assume. The two numbers below are how a caller that has to build
 /// one is told what it may write.
 pub const ServerDeniesAuth = struct {
-    /// The most bytes of reason a denial may carry. Upstream has no such
-    /// number and needs none; see `max_text_length` for why this one exists.
+    /// The most bytes of reason `encode` will carry. Upstream has no such
+    /// number and needs none; see `max_text_length` for why this one exists, and
+    /// for why it is a bound on the way out only: a peer may send a longer
+    /// reason, `decode` reads it, and a value over this bound re-encodes as
+    /// `error.TextTooLong`.
     pub const max_reason_length: usize = max_text_length;
     /// The most bytes the whole denial frame may occupy: the frame type, the
     /// postcard length prefix over `max_reason_length`, and the reason.
@@ -528,11 +688,26 @@ pub const ServerDeniesAuth = struct {
     /// Why the client did not authenticate. postcard-encoded, so this is a varint
     /// length and then UTF-8.
     ///
+    /// **Borrowed from whoever decided the text — access control, or one of the
+    /// two constants above — and the frame borrows it too.** `encode` copies it
+    /// into the caller's buffer, so a denial that has been written owes nothing
+    /// further; the `Step` that carries it does not, so the text must stay put
+    /// and unmutated from the decision until that write.
+    ///
     /// **Longer than `max_reason_length` is refused by `encode` as
     /// `error.TextTooLong` and never shortened.** The denial is the one frame a
     /// peer is waiting to learn something from, so a truncated reason is worse
     /// than no denial: the peer is told something the relay did not decide to
     /// say, and a closed connection afterwards cannot be read as a correction.
+    ///
+    /// **It must also be UTF-8, and `encode` refuses it if it is not.** Upstream
+    /// types the reason as a `String`, so it cannot be anything else; this port
+    /// types it as bytes, and postcard validates on the way in while `encode`
+    /// writes what it is given. Without the check, a relay could put a reason on
+    /// the wire that this module's own decoder rejects and that no peer can read
+    /// as a `String` either. So `encode` answers `error.InvalidUtf8` — the same
+    /// name `decode` uses — and refuses before its writer exists, so `out` is
+    /// left exactly as the caller handed it over.
     reason: []const u8,
 };
 
@@ -543,6 +718,12 @@ pub const ServerDeniesAuth = struct {
 /// `remote_endpoint_id` on a relay-to-client frame (`relay.rs:80`) and
 /// `dst_endpoint_id` on a client-to-relay one (`relay.rs:189`), and that
 /// difference is the direction the frame type already carries.
+///
+/// The borrow is the datagram's, not the struct's: `node_id` is a value and
+/// `datagrams.contents` is borrowed from the message buffer the frame was decoded
+/// from, so a `DatagramFrame` handed out by `decode` is only as long-lived as that
+/// buffer, while one built by a caller to be encoded is done with its payload as
+/// soon as `encode` returns.
 pub const DatagramFrame = struct {
     /// The node id plus the ECN byte, which every datagram payload starts with.
     pub const header_length = Datagrams.node_id_length + Datagrams.ecn_length;
@@ -563,6 +744,17 @@ pub const DatagramFrame = struct {
 /// Every arm is emittable in the versions `FrameType.allowedIn` says, and `encode`
 /// refuses the other combination rather than putting on the wire a frame the far
 /// end has agreed not to understand.
+///
+/// **Six of the fourteen arms borrow and eight do not**, and the split is the one
+/// `checkEncodable` draws: a denial's reason, a health problem and the four
+/// datagram frames' contents are borrowed, and the other eight are fixed-width
+/// values the codec copied. A `Message` is therefore exactly as long-lived as the
+/// buffer it came from when it came from `decode`, and a caller that builds one
+/// owns the bytes it put into it until `encode` returns.
+///
+/// `health` is the rest of the message rather than a length, so an empty health
+/// frame is a valid frame carrying no text, and that text is bounded by
+/// `max_packet_size` on the way in and by `max_text_length` on the way out.
 pub const Message = union(FrameType) {
     server_challenge: ServerChallenge,
     client_auth: ClientAuth,
@@ -575,6 +767,9 @@ pub const Message = union(FrameType) {
     endpoint_gone: NodeId,
     ping: [8]u8,
     pong: [8]u8,
+    /// UTF-8 problem text, borrowed from the decode buffer or the caller.
+    /// Encoding allows at most `max_text_length` bytes and refuses invalid
+    /// UTF-8 as `error.InvalidUtf8` before writing anything.
     health: []const u8,
     restarting: Restarting,
     status: Status,
@@ -595,8 +790,16 @@ pub const Message = union(FrameType) {
 /// for the frame and not for the contents, and takes
 /// `max_packet_size + FrameType.client_to_relay_datagram_batch.encodedLen()`,
 /// which `ServerDeniesAuth.max_frame_length` does not come near.** The other
-/// eight arms are fixed by their own type, and `checkLengths` is where both
+/// eight arms are fixed by their own type, and `checkEncodable` is where both
 /// halves of that statement are kept.
+///
+/// **It is what a buffer is sized from, and for every message `encode` accepts it
+/// is exactly the byte count.** For one `encode` refuses it is what the frame
+/// would have been: text over `max_text_length` still counts its bytes, and a
+/// batch with no segment size or a zero one still counts the two that would have
+/// carried it. So `encodedLen` never understates a frame that can be written, and
+/// a caller may treat it as a lower bound on a buffer for a message it has not
+/// checked.
 pub fn encodedLen(message: Message) usize {
     const payload: usize = switch (message) {
         .server_challenge => ServerChallenge.challenge_length,
@@ -631,13 +834,25 @@ pub fn encodedLen(message: Message) usize {
 /// both versions emittable without either one sending a frame the far end has
 /// agreed not to understand.
 ///
-/// **A frame carrying more than `max_text_length` of relay-authored text is
-/// `error.TextTooLong`, and no part of it is written.** `out` is untouched on
-/// the refusal, because the check runs before the frame type goes down, so a
-/// caller cannot find a denial's first bytes in its buffer and mistake them for
-/// one. A relay that cannot say why it refused has to say nothing rather than
-/// say something it chose not to: the peer closing the connection is a
-/// different event from the peer being told a truncated reason.
+/// `error.FrameNotAllowedInVersion`, `error.InvalidFrame`,
+/// `error.InvalidUtf8`, `error.TextTooLong` and `error.FrameTooLarge` are
+/// decided before the writer exists and leave `out` unchanged.
+///
+/// The two refusals the writer itself makes are different, and the difference is
+/// what is in the buffer afterwards: **`error.BufferFull` and
+/// `error.ZeroSegmentSize` leave a partial frame** — the frame type, and whatever
+/// of the payload fitted before the writer ran out — because both are found once
+/// bytes are down. Neither hands back a slice, so a caller must discard `out` on
+/// any error rather than send what happens to be in it.
+///
+/// **What it borrows and what it keeps.** `message` is read and nothing in the
+/// result refers to it: every arm is copied into `out`, so the payload buffers a
+/// caller encoded from may be reused the moment this returns. The slice it returns
+/// is `out[0..written]` — the same memory, not a copy of it — so it aliases the
+/// caller's buffer and is invalidated by whatever the caller next writes there.
+/// Nothing is allocated, nothing is read from a global, and no clock or I/O is
+/// touched, so the call is reentrant over distinct buffers and needs no
+/// synchronization beyond the caller's own.
 pub fn encode(message: Message, version: ProtocolVersion, out: []u8) Error![]const u8 {
     const frame_type: FrameType = std.meta.activeTag(message);
     if (!frame_type.allowedIn(version)) return error.FrameNotAllowedInVersion;
@@ -645,7 +860,7 @@ pub fn encode(message: Message, version: ProtocolVersion, out: []u8) Error![]con
     // over the arms whose length the type does not fix, so a refusal leaves
     // `out` exactly as the caller handed it over rather than holding the frame
     // type and no payload.
-    try checkLengths(message);
+    try checkEncodable(message);
     var writer = Writer.init(out);
     try writer.writeVarInt(@intFromEnum(frame_type));
     switch (message) {
@@ -682,7 +897,8 @@ pub fn encode(message: Message, version: ProtocolVersion, out: []u8) Error![]con
         .ping => |data| try writer.write(&data),
         .pong => |data| try writer.write(&data),
         // v1 only, and the other of the two frames whose length no field fixes.
-        // Its bound is `max_text_length` and `checkLengths` has already had it.
+        // Its bound is `max_text_length` and `checkEncodable` has already had it,
+        // together with the check that it is text at all.
         .health => |problem| try writer.write(problem),
         .restarting => |restarting| {
             try writer.writeU32Be(restarting.reconnect_in_ms);
@@ -696,14 +912,28 @@ pub fn encode(message: Message, version: ProtocolVersion, out: []u8) Error![]con
 /// Reads one frame from the start of `bytes`.
 ///
 /// `bytes` is one WebSocket message: a frame type and then that frame's payload to
-/// the end. The two variable-length payloads are borrowed from `bytes`, so they
-/// outlive this call and not the buffer; see `base/addr.zig` on
-/// `RelayUrl.hostSlice` for the same borrow, argued at greater length.
+/// the end. **What comes back is the caller's own storage, borrowed, on six of the
+/// fourteen arms** — a denial's reason, a health problem, and the contents of the
+/// four datagram frames are slices into `bytes`; the other eight arms are
+/// fixed-width values copied out first, and the node ids and signatures among them
+/// are independent of the buffer they were read from.
+///
+/// So the borrow lasts exactly as long as the message buffer, and freeing it is
+/// the caller's: this function allocates nothing and retains nothing after it
+/// returns. Writing any byte of `bytes` changes the frame borrowing it, and
+/// reusing the buffer for the next message invalidates every `Message` still held
+/// from the last one. See `base/addr.zig` on `RelayUrl.hostSlice` for the same
+/// borrow, argued at greater length.
+///
+/// There is nothing to copy, nothing to free, and nothing to do with the message
+/// but read it, so two threads may decode two messages out of two buffers at
+/// once — and neither may decode from a buffer the other is writing.
 ///
 /// `version` is what the connection negotiated, and it is checked before the
 /// payload is read at all: a v2 connection sent a `Health` frame, the answer is
 /// `error.FrameNotAllowedInVersion`, and nothing downstream learns what the
 /// payload said.
+/// Denial and Health text must be UTF-8; invalid text is `error.InvalidUtf8`.
 pub fn decode(bytes: []const u8, version: ProtocolVersion) Error!Message {
     var offset: usize = 0;
     const tag = try readVarInt(bytes, &offset);
@@ -743,7 +973,10 @@ pub fn decode(bytes: []const u8, version: ProtocolVersion) Error!Message {
         .endpoint_gone => .{ .endpoint_gone = try readNodeIdExact(payload) },
         .ping => .{ .ping = try readExact(8, payload) },
         .pong => .{ .pong = try readExact(8, payload) },
-        .health => .{ .health = payload },
+        .health => blk: {
+            if (!std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
+            break :blk .{ .health = payload };
+        },
         .restarting => blk: {
             if (payload.len != 2 * @sizeOf(u32)) return error.InvalidFrame;
             break :blk .{ .restarting = .{
@@ -801,6 +1034,12 @@ pub fn eql(a: Message, b: Message) bool {
     };
 }
 
+test "codec: invalid UTF-8 in a peer health frame is refused" {
+    const wire = [_]u8{ @intFromEnum(FrameType.health), 0xff };
+    try std_testing.expectError(error.InvalidUtf8, decode(&wire, .v1));
+    try std_testing.expectError(error.FrameNotAllowedInVersion, decode(&wire, .v2));
+}
+
 fn datagramFrameEql(a: DatagramFrame, b: DatagramFrame) bool {
     if (!nodeIdEql(a.node_id, b.node_id)) return false;
     if (a.datagrams.ecn != b.datagrams.ecn) return false;
@@ -836,30 +1075,41 @@ fn writeDatagramHeader(writer: *Writer, frame: DatagramFrame) Error!void {
 /// The datagram bound is on the payload `decode` measures — every byte after the
 /// frame type, and not the contents alone — so it is the rule `decode` already
 /// applies to a payload it is handed (`relay.rs:404` and `:544`), now applied on
-/// the way out too, and this module cannot emit a frame its own decoder rejects.
-/// That is `max_packet_size` over a node id, an ECN byte and, on a batch, a
-/// segment size: 65503 bytes of contents in a single datagram, 65501 in a batch.
-/// Upstream checks it on decode only, because its `write_to` writes into a
-/// `BytesMut` that grows (`relay.rs:328`): a frame that is too large there is a
-/// large allocation rather than a fault.
+/// the way out too, and this module cannot emit a frame its own decoder refuses
+/// for being too long. That is `max_packet_size` over a node id, an ECN byte and,
+/// on a batch, a segment size: 65503 bytes of contents in a single datagram, 65501
+/// in a batch. Upstream checks it on decode only, because its `write_to` writes
+/// into a `BytesMut` that grows (`relay.rs:328`): a frame that is too large there
+/// is a large allocation rather than a fault.
+///
+/// What is not a length is out of scope here, with one exception that is a real
+/// hole: relay-authored text is written as it was handed, so a reason or a
+/// problem that is not UTF-8 would be a frame this module emits and will not
+/// read back. So this is the sweep that closes it — the two text arms check
+/// `std.unicode.utf8ValidateSlice` and refuse `error.InvalidUtf8`, the name
+/// `decode` already answers with, because a codec that refuses on the way in
+/// and writes on the way out is not a codec.
 ///
 /// It runs before the writer exists so that a refusal leaves `out` as the caller
 /// handed it over. A caller that kept the frame type and lost the payload would
 /// find a partial frame in its own buffer, and a partial denial is a denial
 /// whose reason stops early.
-fn checkLengths(message: Message) Error!void {
+fn checkEncodable(message: Message) Error!void {
     switch (message) {
         .server_denies_auth => |denial| {
             if (denial.reason.len > ServerDeniesAuth.max_reason_length) {
                 return error.TextTooLong;
             }
+            if (!std.unicode.utf8ValidateSlice(denial.reason)) return error.InvalidUtf8;
         },
         .health => |problem| {
             if (problem.len > max_text_length) return error.TextTooLong;
+            if (!std.unicode.utf8ValidateSlice(problem)) return error.InvalidUtf8;
         },
         .client_to_relay_datagram,
         .relay_to_client_datagram,
         => |frame| {
+            if (frame.datagrams.segment_size != null) return error.InvalidFrame;
             const contents_limit = max_packet_size - DatagramFrame.header_length;
             if (frame.datagrams.contents.len > contents_limit) return error.FrameTooLarge;
         },
@@ -1940,6 +2190,39 @@ test "codec: the health problem is bounded by the same number as the reason" {
     for (refusal) |byte| try std_testing.expectEqual(@as(u8, 0xff), byte);
 }
 
+test "codec: text that is not UTF-8 is refused, because decode refuses it too" {
+    // The one frame this module can write and cannot read back. Upstream's reason
+    // is a `String`, so the bytes cannot be anything but text; here they are
+    // `[]const u8` and `encode` writes what it is handed, while `decode` hands the
+    // same bytes to postcard, which validates them and answers
+    // `error.InvalidUtf8`. A relay that emits one has put a frame on the wire that
+    // its own decoder refuses and that a peer cannot read as a `String` either.
+    //
+    // So `encode` refuses it under the name `decode` already uses, and it refuses
+    // it in the sweep, before the writer exists, so the buffer is untouched the
+    // way an over-long reason leaves it. `0xff` is never a UTF-8 byte, which is
+    // what makes this the smallest input that says it.
+    const not_text = [_]u8{ 0xff, 'n', 'o', ' ' };
+
+    var out: [scratch_len]u8 = undefined;
+    @memset(&out, 0xff);
+    try std_testing.expectError(
+        error.InvalidUtf8,
+        encode(.{ .server_denies_auth = .{ .reason = &not_text } }, .v2, &out),
+    );
+    for (out) |byte| try std_testing.expectEqual(@as(u8, 0xff), byte);
+
+    // v1's answer to the same question, over the same bytes and under the same
+    // rule: both arms are relay-authored text with no field fixing its length.
+    var v1_out: [scratch_len]u8 = undefined;
+    @memset(&v1_out, 0xff);
+    try std_testing.expectError(
+        error.InvalidUtf8,
+        encode(.{ .health = &not_text }, .v1, &v1_out),
+    );
+    for (v1_out) |byte| try std_testing.expectEqual(@as(u8, 0xff), byte);
+}
+
 test "codec: a datagram over max_packet_size is refused on the way out too" {
     // All four datagram arms go through the same check, so both directions and
     // both the batch and single form are covered by one case. These contents are
@@ -2228,4 +2511,27 @@ fn hexdump(bytes: []const u8) [2 * max_dumped_bytes]u8 {
     }
     @memset(out[shown * 2 ..], ' ');
     return out;
+}
+
+test "codec: a single-datagram tag cannot discard a batch boundary" {
+    const datagram_frame: DatagramFrame = .{
+        .node_id = try captureId(),
+        .datagrams = .{
+            .ecn = .ect0,
+            .segment_size = 6,
+            .contents = "abcdefabcdef",
+        },
+    };
+    inline for (.{
+        FrameType.client_to_relay_datagram,
+        FrameType.relay_to_client_datagram,
+    }) |tag| {
+        const message = @unionInit(Message, @tagName(tag), datagram_frame);
+        for ([_]ProtocolVersion{ .v1, .v2 }) |version| {
+            var out: [64]u8 = @splat(0xac);
+            const untouched: [64]u8 = @splat(0xac);
+            try std_testing.expectError(error.InvalidFrame, encode(message, version, &out));
+            try std_testing.expectEqualSlices(u8, &untouched, &out);
+        }
+    }
 }

@@ -113,21 +113,15 @@ pub const vendored_files = [_][]const u8{
     vendored_root ++ "/test_all.zig",
 };
 
-/// The root the vendored suite is built from. Zig analyses a test block only if
-/// the compilation reaches it, so a file whose tests are not named here is a
-/// file whose tests do not run. That is why the test root is a file that
-/// imports its subjects and not a re-export of `lib.zig`.
-const test_root = vendored_root ++ "/test_all.zig";
-
 /// Upstream's syscall seam, deleted by DECISIONS/0001 step 2 once its last
 /// caller went. Named here so the rule that forbids importing it never depends
 /// on remembering the spelling.
 const deleted_seam = "sys.zig";
 
-/// Qualifiers that mean "reached through a system namespace". A method call on
-/// a type is not a syscall — `Connection.accept(` is this project's handshake
-/// entry point — so a socket is only a socket when a namespace stands in front
-/// of it. `posix` is here for the syscalls it names, not for the address types
+/// Qualifiers that mean "reached through a system namespace". A call is read
+/// as one only when the identifier standing directly in front of the callee's
+/// period is in this list — `Scanner.isSyscall` says what that leaves out.
+/// `posix` is here for the syscalls it names, not for the address types
 /// it used to carry: the core's address is its own value
 /// (`vendor/quic/src/address.zig`) and the tree now names no `posix` at all, so
 /// a `posix.` appearing in it from here on is reaching for the system.
@@ -339,22 +333,6 @@ const rule_seam_import: Rule = .{
         "and points at whoever expected it back.",
 };
 
-const rule_unwired_tests: Rule = .{
-    .name = "test blocks that nothing runs",
-    .breaks = "Zig analyses a test block only if the compilation reaches it, " ++
-        "so a file the test root does not name has no tests at all, and a " ++
-        "green step that discovered nothing still exits 0.",
-};
-
-/// What one embedded file contributed to the audit. `quoted` is the path as
-/// the test root spells it, `@import("quic/rsa.zig")`, so checking the wiring
-/// needs no allocation: the testing allocator is watching this function.
-const FileFacts = struct {
-    path: []const u8,
-    quoted: []const u8,
-    tests: u32,
-};
-
 const AuditError = error{ OutOfMemory, VendoredInvariantViolated };
 
 fn has(set: []const []const u8, text: []const u8) bool {
@@ -382,10 +360,9 @@ const Scanner = struct {
     scaffolding: std.ArrayList(bool) = .empty,
 
     /// Function names this file declares, from `fn <name>`. A bare call to one
-    /// of them is this project's own code rather than a syscall:
-    /// `connection.zig` declares `connect` as its client handshake entry point,
-    /// and `Connection.accept` is its server-side one, so the POSIX spellings
-    /// `connect(3)` and `accept(2)` cannot be found by name alone. A file that
+    /// of them is this project's own code rather than a syscall, which is why a
+    /// name shared with libc — `connect(3)` and `accept(2)` are the spellings
+    /// this one meets — cannot be read as a syscall by name alone. A file that
     /// declares a name and also calls that libc entry point bare would be
     /// missed; the qualified spelling is not, and no vendored file does it.
     local_fns: std.ArrayList([]const u8) = .empty,
@@ -579,11 +556,21 @@ const Scanner = struct {
     }
 
     /// True when the token at `i` is the callee of a call that could reach the
-    /// operating system: a bare `socket(`, or one through a system namespace,
-    /// `posix.socket(`. Two shapes are deliberately not that. A declaration,
-    /// `fn accept(`, is not a call at all. And `Connection.accept(` is this
-    /// project's handshake entry point rather than a syscall, which is why the
-    /// qualifier in front has to be a namespace and not merely a period.
+    /// operating system: a bare `socket(`, or one whose immediately preceding
+    /// qualifier is a namespace, `posix.socket(`. Two shapes are deliberately
+    /// not that. A declaration, `fn accept(`, is not a call at all. And a
+    /// qualifier that is not a namespace — a type or a value, `endpoint.accept(`
+    /// — is left alone.
+    ///
+    /// That last one is a lexical boundary, not a fact about the code, so it
+    /// is worth stating plainly. This reads exactly one qualifier: the
+    /// identifier directly in front of the period. A syscall reached through a
+    /// type, `std.Io.net.IpAddress.bind(`, or through a namespace bound to
+    /// another name is not a shape this rule matches, and no method is
+    /// classified as the project's own or as the kernel's. Nothing here
+    /// resolves a declaration or a type, so a run that passes says the tree
+    /// used none of the spellings this file names — not that it cannot take a
+    /// descriptor.
     fn isSyscall(self: *const Scanner, i: usize) bool {
         if (self.tagAfter(i) != .l_paren) return false;
         if (self.tagAt(i, 1) == .keyword_fn) return false;
@@ -849,10 +836,7 @@ fn audit(alloc: std.mem.Allocator) AuditError!void {
     defer scanner.scaffolding.deinit(alloc);
     defer scanner.local_fns.deinit(alloc);
 
-    var facts: std.ArrayList(FileFacts) = .empty;
-    defer facts.deinit(alloc);
-
-    var test_root_src: []const u8 = "";
+    var test_blocks: u32 = 0;
     // Checked before anything is embedded, so a list that is out of order says
     // so rather than failing on a path first.
     if (unsortedAt(&vendored_files)) |pair| {
@@ -870,43 +854,15 @@ fn audit(alloc: std.mem.Allocator) AuditError!void {
     inline for (vendored_files) |embedded| {
         const src: [:0]const u8 = @embedFile("../" ++ embedded);
         const path = embedded;
-        const tests = try scanner.scanFile(alloc, src, path);
-        try facts.append(alloc, .{
-            .path = path,
-            .quoted = "\"" ++ path[vendored_root.len + 1 ..] ++ "\"",
-            .tests = tests,
-        });
-        if (std.mem.eql(u8, path, test_root)) test_root_src = src;
-    }
-
-    // A file carrying a test block has to be named in the test root, or its
-    // tests are never analysed and the suite is green having run none of them.
-    // The root does not name itself.
-    for (facts.items) |fact| {
-        if (fact.tests == 0 or std.mem.eql(u8, fact.path, test_root)) continue;
-        const quoted = fact.quoted;
-        if (std.mem.indexOf(u8, test_root_src, quoted) == null) {
-            std.debug.print(
-                "{s}: {s}: {s}\n    Add `_ = @import({s});` to {s}.\n",
-                .{
-                    fact.path,
-                    rule_unwired_tests.name,
-                    rule_unwired_tests.breaks,
-                    quoted,
-                    test_root,
-                },
-            );
-            scanner.hits += 1;
-        }
+        test_blocks += try scanner.scanFile(alloc, src, path);
     }
 
     if (scanner.hits == 0) return;
     std.debug.print(
-        "\n{d} violation(s) across {d} vendored files. vendor/ is excluded from " ++
-            "fmt, zlint and zbc, so this test is the only thing watching it, and " ++
-            "a failure here means the core cannot be driven in process any " ++
-            "more.\n",
-        .{ scanner.hits, facts.items.len },
+        "\n{d} architectural violation(s) across {d} vendored files " ++
+            "({d} test blocks inspected). These restrictions keep I/O, time " ++
+            "and process entropy at the caller boundary.\n",
+        .{ scanner.hits, vendored_files.len, test_blocks },
     );
     return error.VendoredInvariantViolated;
 }

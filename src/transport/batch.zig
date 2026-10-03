@@ -332,6 +332,9 @@ pub fn capability(send: Probe, recv: Probe) Capability {
 /// the two halves of rule 7 in `docs/ARCHITECTURE.md` are one fact, and a
 /// value that violated it would be handed to a socket as a `UDP_SEGMENT`
 /// control message naming a single datagram.
+///
+/// Payload bytes are borrowed. Keep them alive and unchanged through the send
+/// or iterator that uses them. Copies do not copy the payload.
 pub const Send = struct {
     /// The codepoint every datagram in this payload carries, or null for
     /// none.
@@ -370,16 +373,16 @@ pub const Send = struct {
 
     /// How many datagrams this payload holds.
     ///
-    /// One unless a segment size is set, and then one more than the number of
-    /// whole segments in it: every `segment_size` bytes but the last datagram
-    /// is one datagram, and the last is whatever is left, including nothing.
+    /// An unsegmented payload is one datagram, including an empty payload.
+    /// A segmented payload has `ceil(contents.len / segment_size)` datagrams;
+    /// a short tail counts once and an empty segmented payload counts zero.
     pub fn datagramCount(self: Send) usize {
         const size = self.segment_size orelse return 1;
         return divCeil(self.contents.len, @as(usize, size));
     }
 
-    /// The length of the last datagram, which is the segment size for every
-    /// datagram but a short one.
+    /// The length of the last datagram. For an empty segmented payload there
+    /// is no last datagram; this reports the configured segment size.
     pub fn lastDatagramLen(self: Send) usize {
         const size = self.segment_size orelse return self.contents.len;
         const rest = self.contents.len % @as(usize, size);
@@ -411,6 +414,9 @@ pub const Send = struct {
 /// `&mut` on the value being drained (`relay/frame.zig`'s `takeSegments`,
 /// noq's `max_gso_segments` loop) and a batcher that has to be driven twice
 /// with different capabilities cannot keep the cursor in a global.
+///
+/// The cursor owns no bytes. Returned runs borrow the original payload, which
+/// must remain alive and unchanged until all runs have been sent.
 pub const Runs = struct {
     /// Every datagram in the batch, back to back.
     contents: []const u8,
@@ -463,13 +469,9 @@ pub const Runs = struct {
 
     /// The next run, or null when the batch is exhausted.
     ///
-    /// Three rules, and the first is the one that corrupts the send path when
-    /// it is missed: a run that holds one datagram carries no segment size,
-    /// whatever the batch was segmented for. The second is the fallback — a
-    /// socket that cannot segment gets one datagram per run, and the caller
-    /// can see it because `segment_size` is null on a run that holds more
-    /// than one. The third is that no run is ever cut inside a datagram, so
-    /// the runs concatenate back to the batch they came from.
+    /// A one-datagram run carries no segment size, including the fallback on
+    /// a socket without segmentation. Multi-datagram runs retain the size.
+    /// Runs never split a datagram and concatenate to the original payload.
     pub fn next(self: *Runs) ?Send {
         if (self.index >= self.total) return null;
         const size: usize = self.segment_size orelse 0;
@@ -495,9 +497,8 @@ pub const Runs = struct {
 
     /// How many socket writes this batch takes, without walking it.
     ///
-    /// Equal to the number of `next` calls that are not null, and a caller
-    /// that wants the count before it starts sending does not have to walk
-    /// twice to get it.
+    /// The total run count for the original batch, not the remaining count.
+    /// Advancing the cursor does not change this result.
     pub fn count(self: Runs) usize {
         if (self.total == 0) return 0;
         return divCeil(self.total, self.max_datagrams);
@@ -512,6 +513,8 @@ pub const Runs = struct {
 /// stride is in the value rather than implied by the buffer, and every read
 /// answers `datagramCount` before anything is taken from it.
 pub const Recv = struct {
+    /// Borrowed views into the receive buffer. Reusing or releasing that
+    /// buffer invalidates this value and every returned datagram slice.
     /// The bytes the socket wrote.
     bytes: []const u8,
     /// The size of one datagram in `bytes`. Equal to `bytes.len` unless a
@@ -553,7 +556,7 @@ pub const Recv = struct {
     /// The last datagram of a coalesced list is short rather than absent, so
     /// this is a slice of the tail and not a truncated one.
     pub fn datagram(self: Recv, index: usize) ?[]const u8 {
-        const start = index * self.stride;
+        const start = std.math.mul(usize, index, self.stride) catch return null;
         if (start >= self.bytes.len) return null;
         return self.bytes[start..@min(start + self.stride, self.bytes.len)];
     }
@@ -616,7 +619,7 @@ pub fn tosBits(send: Send) u8 {
 }
 
 /// The control messages one `sendmsg` carries, in the order a platform
-/// encoder writes them, appended to `out` and handed back.
+/// encoder writes them, written from `out[0]` and handed back.
 ///
 /// Traffic class first, then the segmentation size: that is noq's
 /// `prepare_msg` (`noq-udp/src/unix.rs:608-630`), and the order matters to
@@ -729,7 +732,11 @@ pub const Refused = enum {
 pub const Report = struct {
     /// The codepoint the caller asked for, or null for none.
     wanted: ?Ecn,
-    /// The codepoint that went on the wire, or null for none.
+    /// The codepoint every datagram went on the wire with, or null when at
+    /// least one of them went without it. A batch is many datagrams and a
+    /// caller reading this cannot tell which lost it, so one loss is reported
+    /// as the loss of all — which is what `ecnSurvived` answers and what the
+    /// caller acts on.
     carried: ?Ecn,
     /// Whether the run went out as more than one `sendmsg`, which is what a
     /// socket that cannot segment does with a batch.
@@ -1144,6 +1151,14 @@ test "a coalesced read is a list of datagrams" {
     try std_testing.expectEqual(@as(usize, 3), short.datagramCount());
     try std_testing.expectEqual(@as(usize, 6), short.datagram(2).?.len);
     try std_testing.expect(short.datagram(3) == null);
+}
+
+test "a datagram index that overflows the byte offset returns null" {
+    // This index would wrap to the first datagram in unchecked builds.
+    const bytes = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const recv = try Recv.init(&bytes, 4, null);
+    const wrapped_index = std.math.maxInt(usize) / recv.stride + 1;
+    try std_testing.expect(recv.datagram(wrapped_index) == null);
 }
 
 test "a stride that names no datagram, or one past the buffer, is refused" {

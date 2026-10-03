@@ -396,9 +396,9 @@ address *is* abandoning the first. `handleMigration`
 inactive slot at `:3442-3443` and flips `active_path_idx` at `:3452`; the old
 slot keeps its counters, unread, until the next migration overwrites it. At the
 bridge there is literally one destination per connection: `Conn.drain` stamps
-every egress datagram from `conn.peer()` (`src/transport/quic_bridge.zig:702`),
+every egress datagram from `conn.peer()` (`src/transport/quic_bridge.zig`),
 which is `Connection.peerAddress`
-(`vendor/quic/src/quic/connection.zig:4327-4328`) —
+(`vendor/quic/src/quic/connection.zig`) —
 `&self.paths[self.active_path_idx].peer_addr`.
 
 So **a peer reachable two ways is two connections**, not one connection with two
@@ -898,25 +898,30 @@ closed after M8 and is marked below. Item 4 was added on 2026-09-30, when a
 measurement turned item 1 from "untidy" into a trap; item 1's reason was
 corrected in the same pass and its conclusion was not.
 
-**1. 0-RTT, and the verifier identity. Open.** `TlsConfig.session_ticket`
-(`tls13.zig:736`) and `TlsConfig.ticket_key` (`tls13.zig:737`) must be stable
-across every client-config construction, or resumption silently stops matching.
-The certificate patch did **not** discharge this and M8 did not touch it.
-*Closes when* one client-identity acquisition path exists that resumption does
-not skip, one constructor owns both ticket values, and a test resumes against a
-server whose ticket key is held constant across two connections and whose pin
-is enforced on the second. Until then treat early data as unimplemented.
+**1. 0-RTT, and the verifier identity. Open.** The M8 requirement was to keep
+the client's session ticket and the server's sealing key stable across config
+construction. The old `TlsConfig.session_ticket` and `TlsConfig.ticket_key`
+fields are now the `.client` and `.server` cases of `TlsConfig.resumption`;
+each role has one value to retain. That cutover does not acquire a resumed
+client's authenticated identity. *Closes when* one acquisition path exists that
+resumption does not skip, and a test resumes with a stable server key and
+enforces the client pin on the second connection. Until then, treat
+**authenticated client-identity early data** as unimplemented, not the
+standalone unauthenticated PSK/0-RTT path.
 
 **Amended 2026-09-30: the reason this item gave was the wrong one.** It read
 `ClientAuth`'s doc at `tls13.zig:253-259` — "Session tickets are neither issued
 nor accepted while a policy is in force" — as why a pinned client identity and
 resumption are mutually exclusive here. That sentence points at the ticket
 format, and the ticket format is not the obstacle. A ticket carries no client
-identity today and carrying one is mechanical: the plaintext is `[64]u8`
-(`:2152`), laid out `psk(32) || creation_time(8) || alpn_len(1) || alpn`
-(`:2151`); the sealed form is the same plus a 16-byte tag (`:2164`); and
-`serverSendTicket` writes both at `:2152-2175`. Neither size is negotiated with
-anything. Do not read this item as a wire-format change.
+identity. The layout cited here was a `[64]u8` plaintext; those sizes and line
+numbers were the 2026-09-30 measurement, not the current format. The current
+`serverSendTicket` writes `psk(32) || creation_time(8) || quic_version(4) ||
+alpn_len(1) || alpn`, with an ALPN of at most 32 bytes and a 16-byte tag:
+77 plaintext bytes and 93 sealed bytes at most. The ALPN capacity changed in
+the contract cutover so a negotiated protocol is recorded whole. None of these
+fields carries a client identity, so the structural obstacle below remains;
+it is not resolved by that format change.
 
 The block is structural: **TLS 1.3 has one client-identity acquisition path, and
 resumption skips it.** `serverProcessClientCertificate` (`:2066`) is the only

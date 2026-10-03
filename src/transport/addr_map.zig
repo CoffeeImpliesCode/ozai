@@ -129,6 +129,7 @@ pub const GetError = error{
 /// find each other. Only the bytes a relay URL is made of are hashed, and the
 /// integers go in native order because the hash never leaves the process.
 pub const KeyContext = struct {
+    /// Hash the active key bytes. Unused fixed-buffer tails do not contribute.
     pub fn hash(_: KeyContext, key: Key) u64 {
         var hasher = std.hash.Wyhash.init(0);
         // The arm, so two keys whose payloads collide do not share a bucket on
@@ -150,6 +151,7 @@ pub const KeyContext = struct {
         return hasher.final();
     }
 
+    /// Compare key contents, ignoring unused bytes in fixed buffers.
     pub fn eql(_: KeyContext, a: Key, b: Key) bool {
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
@@ -174,6 +176,11 @@ const Reverse = std.HashMapUnmanaged(Ula, Key, std.hash_map.AutoContext(Ula), ma
 /// The bidirectional map between a key and the synthetic address it answers
 /// with. Upstream's `MappedAddrs` holds one `AddrMap` per key arm; with the
 /// arms in one `Key` and the addresses in one `Ula`, one map does that work.
+///
+/// Both tables own allocations from the allocator supplied to `get`.
+/// Use that same allocator for later mutations and `deinit`.
+/// Keys, including custom payloads, are independent copies. Map copies share
+/// table storage, so only one copy may mutate or release it. Serialize access.
 pub const MappedAddrs = struct {
     by_key: Forward,
     by_addr: Reverse,
@@ -214,6 +221,9 @@ pub const MappedAddrs = struct {
     /// guess a live address can address a path it was never given. A caller
     /// that wants a reproducible test passes a seeded engine instead. Nothing
     /// in this file reaches for entropy on its own.
+    ///
+    /// On error, existing mappings remain unchanged. A failed insertion may
+    /// retain table capacity and consume random draws, but records no new key.
     pub fn get(
         self: *MappedAddrs,
         gpa: std.mem.Allocator,

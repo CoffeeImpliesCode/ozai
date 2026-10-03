@@ -694,10 +694,25 @@ pub const SocketError = error{
 /// lookup's socket is the one thing above it that a lookup needs. `io: std.Io`
 /// is a parameter of both calls and is stored nowhere, for the reason
 /// `docs/DECISIONS/0002-async-substrate.md` gives.
+///
+/// Nothing here is owned: `ctx` is the socket's own value and the three
+/// functions are the caller's, so all of it has to outlive every `Retrieval`
+/// begun with it. Each call runs synchronously, on the thread that asked, and
+/// returns before `Retrieval.ask` does — this seam retains neither a datagram
+/// nor a reply — and none of them is reentered from another: a `send` or
+/// `receive` that called back into the retrieval asking it would be reading a
+/// `Request` that call is in the middle of writing.
 pub const Datagram = struct {
+    /// Borrowed backend state. Its address must remain stable until all asks
+    /// and cancellation callbacks return. Synchronize state shared by them.
     ctx: *anyopaque,
     /// Put one datagram on the wire, whole or not at all: a query truncated in
     /// transit is a question nobody can answer.
+    ///
+    /// `bytes` is the framed query, borrowed for the call, and `to` is
+    /// `Retrieval.server` by value. Called synchronously, on the thread that
+    /// asked, with `io` borrowed for the call and stored nowhere. Nothing
+    /// survives it.
     send: *const fn (
         ctx: *anyopaque,
         io: std.Io,
@@ -706,8 +721,13 @@ pub const Datagram = struct {
     ) SocketError!void,
     /// Take one datagram into `into`, waiting at most `deadline_ms`.
     ///
-    /// `into` does not outlive this call, which is why the answer is copied out
-    /// of it rather than handed back pointing into it.
+    /// On success `Reply.bytes` borrows `into` until that buffer is overwritten
+    /// or released. A short receive only overwrites its prefix; an error or
+    /// timeout need not write any bytes. `deadline_ms` is null for no deadline.
+    /// A finite wait with no datagram returns `error.Empty`.
+    ///
+    /// Called synchronously on the asking thread; `io` is borrowed for the
+    /// call. Concurrent `stop` must wake this call without racing its state.
     receive: *const fn (
         ctx: *anyopaque,
         io: std.Io,
@@ -720,13 +740,16 @@ pub const Datagram = struct {
     /// `stop` is here rather than on `Retrieval`: a flag on a struct nobody
     /// reads would satisfy every assertion written about cancellation while the
     /// query sat in the socket's queue, which is the failure invariant 13 names.
+    /// May run on a concurrent thread. Synchronize shared callback state and
+    /// unblock a pending receive. This is a request, not a join or disposal.
     stop: *const fn (ctx: *anyopaque) void,
 
     /// One datagram, and who sent it.
     pub const Reply = struct {
-        /// Borrowed from the buffer the receive was given, and dead as soon as
-        /// that call is.
+        /// Borrows the receive buffer until it is overwritten or released.
         bytes: []const u8,
+        /// Who sent it, by value, and the only thing standing between a lookup
+        /// and a forged answer: a TXT answer carries no signature.
         from: addr.SocketAddr,
     };
 };
@@ -738,7 +761,22 @@ pub const Datagram = struct {
 /// on it — the query and the answer through `ask`, the deadline through
 /// `Request`, the transaction id through `begin`, and the abort through
 /// `cancellation`.
+///
+/// Two of its fields are state rather than configuration. `stopped` is
+/// terminal: `cancellation().fire()` sets it, and every later `ask` answers
+/// `error.Canceled` — a retrieval that was stopped is one that will not ask
+/// again, which is a state rather than a failure to retry. `owner` is scratch,
+/// reused by every ask, and nothing handed out points into it: the records that
+/// leave an ask are copies.
+///
+/// Serialize `ask` calls. After `cancellation`, keep this value at the same
+/// address until all asks and fires return. Cancellation may run concurrently;
+/// its callback must synchronize with send and receive. It does not join them.
+/// Copies have separate latches but share the borrowed datagram context.
 pub const Retrieval = struct {
+    /// The socket to ask, borrowed. It, and everything its `ctx` reaches, has to
+    /// outlive this retrieval and every ask made through it, because an ask
+    /// reads all three of its functions.
     datagram: Datagram,
     /// Who the question goes to, kept so a datagram from anywhere else can be
     /// refused. A TXT answer carries no signature, so the source address is the
@@ -751,7 +789,7 @@ pub const Retrieval = struct {
     /// What the query advertises it can receive. See `max_udp_payload`.
     udp_payload: u16 = max_udp_payload,
     /// Set by `cancellation`, and the reason `ask` refuses rather than waits.
-    stopped: bool = false,
+    stopped: std.atomic.Value(bool) = .init(false),
     /// One decoded owner name, so matching an answer's records against the name
     /// asked about allocates nothing. Fixed-size because RFC 1035 §2.3.4 caps a
     /// name, which makes this a bound rather than a guess.
@@ -790,13 +828,30 @@ pub const Retrieval = struct {
     /// `request.name` is `_iroh.<z32>.<origin>` in presentation form, built by
     /// `discovery/dns.zig`'s `queryName` into storage the caller owns. What
     /// comes back is this call's to free with `Answer.deinit`.
+    ///
+    /// Waits for a datagram, deadline or stop through the supplied seam.
+    /// Stop is checked before I/O and after receive. An observed stop returns
+    /// `error.Canceled`, including when receive reports a concurrent timeout.
+    /// A result can win if cancellation comes after the final check.
+    ///
+    /// Both buffers are caller-owned scratch and may retain old bytes.
+    /// `wire` changes during query encoding; `reply` changes only as the seam
+    /// receives into it. An early cancellation can leave both untouched.
+    /// Errors release any answer allocation, but do not restore scratch,
+    /// undo a sent query, or return a consumed datagram to the socket.
+    ///
+    /// This is not a retry. The transaction id was drawn once by `begin`, so a
+    /// second ask asks the same question and will read the first one's late
+    /// answer if one is still coming. Repeating a query is RFC 1035 §7.2's
+    /// policy and needs an instant this value does not carry, so a caller that
+    /// wants one begins another retrieval with another id.
     pub fn ask(
         self: *Retrieval,
         alloc: std.mem.Allocator,
         io: std.Io,
         request: Request,
     ) Error!Answer {
-        if (self.stopped) return error.Canceled;
+        if (self.stopped.load(.acquire)) return error.Canceled;
         const wire = try writeQuery(request.name, .{
             .id = self.id,
             .udp_payload = self.udp_payload,
@@ -807,16 +862,16 @@ pub const Retrieval = struct {
             io,
             request.reply,
             request.deadline_ms,
-        ) catch |err| switch (err) {
-            // The deadline arrived with nothing. The third answer; see the
-            // module doc for why it is not one of the other two.
-            error.Empty => return .{ .timeout = {} },
-            else => |rest| return rest,
+        ) catch |err| {
+            if (self.stopped.load(.acquire)) return error.Canceled;
+            return switch (err) {
+                error.Empty => .{ .timeout = {} },
+                else => |rest| rest,
+            };
         };
+        // A reply that arrived after stop is not an answer to deliver.
+        if (self.stopped.load(.acquire)) return error.Canceled;
         if (reply.from.order(self.server) != .eq) return error.ForeignSource;
-        // A datagram that landed after the resolve was abandoned is nobody's
-        // answer, and parsing it would make an abandoned resolve produce one.
-        if (self.stopped) return error.Canceled;
         return readAnswer(alloc, reply.bytes, request.name, self.id, self.owner[0..]);
     }
 };
@@ -829,8 +884,7 @@ pub const Retrieval = struct {
 /// told once.
 fn stopRetrieval(ctx: *anyopaque) void {
     const self: *Retrieval = @ptrCast(@alignCast(ctx));
-    if (self.stopped) return;
-    self.stopped = true;
+    if (self.stopped.swap(true, .acq_rel)) return;
     self.datagram.stop(self.datagram.ctx);
 }
 
@@ -840,14 +894,18 @@ fn stopRetrieval(ctx: *anyopaque) void {
 /// list that long is a list nothing distinguishes. The buffers are the
 /// caller's because a read buffer does not outlive the call and a query may be
 /// longer than anything this file could own.
+///
+/// Encoding and receive may overwrite prefixes only. Buffer contents are not
+/// an outcome channel: inspect the returned `Answer`, not unwritten bytes.
 pub const Request = struct {
     /// The name asked about, in presentation form with its trailing dot.
     name: []const u8,
-    /// Where the framed query goes before it is sent: `queryLength(name)`
-    /// bytes.
+    /// Query scratch of at least `queryLength(name)` bytes. Encoding can
+    /// overwrite it; a retrieval stopped before encoding leaves it unchanged.
     wire: []u8,
-    /// Where the datagram is read before it is parsed. `reply_length` bytes is
-    /// what a peer that honours the advertised size can send.
+    /// Receive scratch. `reply_length` bytes fits an answer within the advertised
+    /// limit. A short receive leaves the tail unchanged; timeout and error may
+    /// leave the whole buffer unchanged.
     reply: []u8,
     /// How long one receive waits, in milliseconds, and null for as long as the
     /// caller means. Upstream gives each of its six staggered queries three
@@ -887,6 +945,7 @@ const Scripted = struct {
     /// What the last `receive` was asked to wait for, so a test can read the
     /// deadline that was actually threaded down.
     deadline_ms: ?i32 = null,
+    cancel_during_receive: ?resolve.Cancellation = null,
 
     fn send(
         ctx: *anyopaque,
@@ -918,6 +977,10 @@ const Scripted = struct {
     ) SocketError!Datagram.Reply {
         const self: *Scripted = @ptrCast(@alignCast(ctx));
         self.deadline_ms = deadline_ms;
+        if (self.cancel_during_receive) |cancellation| {
+            cancellation.fire();
+            return error.Empty;
+        }
         const answer = self.reply orelse return error.Empty;
         if (answer.len > into.len) return error.Refused;
         @memcpy(into[0..answer.len], answer);
@@ -1190,7 +1253,7 @@ test "an abandoned resolve stops the query that was in flight" {
     var cancellation = retrieval.cancellation();
     cancellation.fire();
     try t.expectEqual(@as(u32, 1), script.stops);
-    try t.expect(retrieval.stopped);
+    try t.expect(retrieval.stopped.load(.acquire));
 
     // A second fire is free, because `deinit` fires on every path out of a
     // resolve including the ones with nothing in flight.
@@ -1201,6 +1264,22 @@ test "an abandoned resolve stops the query that was in flight" {
     // pending, which is the whole of what `resolve.Cancellation` is for.
     try t.expectError(error.Canceled, retrieval.ask(t.allocator, t.io, request));
     try t.expectEqual(@as(u32, 1), script.sends);
+}
+
+test "a stop during receive takes precedence over its timeout" {
+    var engine: Prng = Prng.init(17);
+    var script: Scripted = .{ .from = nameserver };
+    var retrieval = Retrieval.begin(script.datagram(), nameserver, engine.random());
+    script.cancel_during_receive = retrieval.cancellation();
+    var wire: [asked_bytes]u8 = undefined;
+    var reply: [reply_length]u8 = undefined;
+    try t.expectError(error.Canceled, retrieval.ask(t.allocator, t.io, .{
+        .name = "_iroh.example.",
+        .wire = &wire,
+        .reply = &reply,
+        .deadline_ms = 1,
+    }));
+    try t.expectEqual(@as(u32, 1), script.stops);
 }
 
 test "a lookup that got no answer in time is not a node that published nothing" {

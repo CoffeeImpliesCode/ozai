@@ -136,7 +136,8 @@ The load-bearing part was never the runtime's name. It is *where* a runtime is
 allowed to appear, and that is unchanged:
 
 ```
-  ozai.base            pure. Never sees Io, never sees a runtime.
+  ozai.base            pure values. One explicit entropy edge —
+                       SecretKey.generate(io) — never stored, never ambient.
   wire codecs          pure. Never sees Io, never sees a runtime.
   state machines       pure over state, with time passed in as data.
   ────────────────────────────────────────────────────
@@ -144,45 +145,51 @@ allowed to appear, and that is unchanged:
   ozai.endpoint        tasks, cancellation, shutdown. std.Io + Io.Group.
 ```
 
-Everything above the line is testable with no runtime at all, which is the whole
-point of drawing the line there. A runtime is what the socket and the task
-scheduler need; it is not something the protocol logic is allowed to know
+Everything above the line is drivable without a runtime of its own — the
+entropy edge takes the caller's `Io`, and a test passes a fixed one — which is
+the whole point of drawing the line there. A runtime is what the socket and the
+task scheduler need; it is not something the protocol logic is allowed to know
 about, and which one it is is not the protocol logic's business.
+
+**The first row is the one that needs the qualification, because
+`ozai.base` does name `std.Io`.** `SecretKey.generate` (`src/base/key.zig:204`)
+takes `io: std.Io` and draws the secret from it. That is an entropy *bridge*,
+not an ambient dependency: the source is the caller's argument, it is never
+stored, and it is the only way entropy enters the module. What the row is
+describing is everything else in it — `NodeId`, `Signature`, `RelayUrl`,
+`IpAddress`, `SocketAddr`, `CustomAddr`, `TransportAddr` and `NodeAddr` are
+values, they hold no `Io`, and their operations touch no socket, no clock and no
+entropy of their own. A test can drive every one of those with a fixed `Io`, and
+so can a caller that wants a different entropy source.
 
 No layer moved. `ozai.transport` owned the socket before and owns it now — it
 just owns it in `std.c` rather than through `zio.ev`. `ozai.endpoint` owned
 tasks, cancellation and shutdown before and owns them now. The only thing this
-correction removes is a name, which is why `docs/ARCHITECTURE.md`'s layering
-(`ozai.transport — the QUIC seam. Owns the socket.`, `:20-22`) is still exactly
-what this record says it is.
+correction removes is a name. The transport boundary in
+[`ARCHITECTURE.md`](../ARCHITECTURE.md#layering) still owns the socket.
 
 Consequences worth stating, because they will be argued about later:
 
-- **Tests of protocol logic construct their own time.** A timestamp or a
-  duration is an argument; nothing in this project asks an `Io` what time it
-  is. A test that has to stand up a runtime to check a state transition has
-  found a boundary in the wrong place. This consequence needed no correction,
-  and `0001` spent its largest phase buying it: 60 hidden-input call sites in
-  the vendored core became two parameters.
+- **Tests of protocol logic construct their own time.** A timestamp or duration
+  is an argument; state transitions do not read an `Io` clock. Runtime bridges
+  such as `Node.run` read time and pass it into the protocol logic. A test that
+  needs a runtime just to check a state transition has found a misplaced
+  boundary. `0001` replaced 60 hidden-input sites in the vendored core with
+  explicit time and randomness.
 - **An `Io` is never stored.** It is a parameter to the functions that need it,
   exactly like any other `std.Io`. A struct holding an `Io` cannot be driven
   twice with different clocks, and that is the property the design is for —
   written before it was load-bearing, and the reason the runtime turned out to
-  be a choice rather than a fact. It holds in the tree: `io: std.Io` is a
-  parameter in three places across two files, and `src/base/key.zig:131`,
-  `src/transport/quic_bridge.zig:455` and `:656` are all of it.
-  `src/transport/quic_bridge.zig:415-417` says so of itself. The sharper
-  statement is `src/endpoint/endpoint.zig:27-37`: the two operations that do
-  need a runtime — spawn a task, cancel one — are named as `Action` values and
-  performed by the caller, with the `Io` the caller already holds for the
-  socket.
+  be a choice rather than a fact. `SecretKey.generate`, `Bridge.create`,
+  `Socket.send` and `Socket.tryReceive` take `io` explicitly; the call-site
+  count is not an invariant. The pure endpoint's `Action` values name spawning
+  and cancellation for the caller to perform with its runtime.
 - **The GSO path is ours, and it is written.** `src/transport/batch.zig` is the
   batch seam: a send is bytes, a segment size and ancillary data, and what the
-  socket refuses comes back as a `Report`. `UDP_SEGMENT` and `UDP.GRO` are read
-  from the std tree rather than typed in (`batch.zig:99` and `:102`, off
-  `std.os.linux.UDP.SEGMENT` and `.GRO`), and a platform that refuses them
-  takes the one-datagram path the record promised — which is a value a test can
-  read, not a wire that got slower.
+  socket refuses comes back as a `Report`. The socket layer uses
+  `std.os.linux.UDP.SEGMENT` and `.GRO`; it does not duplicate their values.
+  A segmentation refusal lowers the capability and sends the unsent tail
+  one datagram at a time. The report preserves both degradation and ECN loss.
 - **A test that needs a runtime stands one up over `std.Io`.** `zig build test`
   is the runner and it stays the runner. There is no fourth test runner here.
 
@@ -259,11 +266,13 @@ a runtime was nothing.
 
 Stated again, so a reversal cannot be read as a licence to move the boundary:
 
-- **`ozai.base` and the wire codecs stay pure.** No `Io`, no clock, no
+- **`ozai.base` and the wire codecs stay pure.** No ambient `Io`, no clock, no
   environment, no allocator it was not handed (`AGENTS.md` §2,
-  `docs/ARCHITECTURE.md:36-38`). `src/relay/`, `src/router/`, `src/net/` and
-  `src/blobs/` hold no `Io` instance at all; `src/discovery/` names
-  `std.Io.net.IpAddress`, which is a value type and not a runtime.
+  `docs/ARCHITECTURE.md:36-38`). The one `Io` in `ozai.base` is the explicit
+  entropy parameter of `SecretKey.generate`, which the diagram under *Decision*
+  now carries. `src/relay/`, `src/router/`, `src/net/` and `src/blobs/` hold no
+  `Io` instance at all; `src/discovery/` names `std.Io.net.IpAddress`, which is a
+  value type and not a runtime.
 - **The runtime stays at the edges.** `ozai.transport` owns the socket,
   `ozai.endpoint` owns tasks and shutdown, and neither may expose which runtime
   it is built on. This is why the reversal is cheap: there is no module to
@@ -405,24 +414,20 @@ and worth stating here rather than discovering later.
 ### The caller, named
 
 `Action.spawn` and `Action.shutdown` are values for a caller to perform with
-the `io: std.Io` it already holds (`src/endpoint/endpoint.zig:27-37`).
-**That caller does not exist.** `build.zig`'s only `addExecutable` is the
-examples step (`:89-115`, one file, `src/examples/node_id.zig`), and
-`b.installArtifact` at `:31` installs a library.
+its runtime. At the 2026-09-30 reconsideration that caller had not yet been
+written. The current executable has runtime loops in `Node.run` and
+`src/node/main.zig`'s `drive`; this paragraph is not a current claim that the
+package installs only a library.
 
 Its shape is not free. The tree already fixes it:
 
-- It holds no `Io`. It threads one into `Socket.send` and `Socket.tryReceive`
-  (`src/transport/socket.zig:612`, `:636`) and into `Bridge.create`
-  (`src/transport/quic_bridge.zig:455`) — which is what
-  `test/protocol_loopback_test.zig:630`, `:655` and `:671` already do, on
-  `t.io`.
-- It owns one `Io.Group` and one `Future` per live task, and reports back
-  through the only interface the loop has: `Event.arrived`, `Event.reaped`,
-  `Event.close_requested` into `Loop.step`
-  (`src/endpoint/endpoint.zig:270-310`).
-- It reads no clock. Time is the same argument the test passes today
-  (`test/protocol_loopback_test.zig:967-968`).
+- It threads `io` into `Socket.send`, `Socket.tryReceive` and `Bridge.create`.
+  The loopback consumer does this in `Wire.take` and `Wire.flush` in
+  `test/protocol_loopback_test.zig`.
+- A caller of the pure endpoint loop owns the task handles and reports
+  `Event.arrived`, `Event.reaped` and `Event.close_requested` through `Loop.step`.
+- Protocol time is an argument. Runtime loops such as `Node.run` read the clock
+  at the bridge; the protocol loopback consumer constructs its instants.
 
 Written that way it is a `main` over `Io.Threaded`. Nothing in it needs a third
 runtime, and nothing in it may reach above `ozai.endpoint`.
@@ -458,24 +463,26 @@ A runtime that owned readiness *and* the sends would become right when:
 Restated in substance, because a reconsideration that moved it would be a
 different decision and this one does not:
 
-- **`ozai.base` and the wire codecs stay pure.** No `Io`, no clock, no
-  environment, no allocator it was not handed.
+- **Wire codecs and network state machines stay pure.** They read no clock or
+  environment and use only explicit allocators. `SecretKey.generate` is an
+  entropy edge with an explicit `Io` parameter, not pure key derivation.
 - **The runtime stays at the edges.** `ozai.transport` owns the socket,
   `ozai.endpoint` owns tasks and shutdown, and neither exposes which runtime it
   is built on.
-- **An `Io` is threaded and never stored.** It holds at the one place it is
-  hardest: `Socket` has four fields and one of them is a descriptor
-  (`src/transport/socket.zig:542-553`).
+- **Drivers borrow `Io` per operation.** The backend and its userdata outlive
+  all tasks that use them. `Socket` keeps the descriptor, not a backend.
 - **Tests construct their own time.** The round loop advances a counter and
   reads no clock (`test/protocol_loopback_test.zig:967-968`).
 
-**One count in the Decision section is stale, and it is worth correcting rather
-than leaving.** It says `io: std.Io` is a parameter "in three places across
-two files". That was true on 2026-09-30. There are **13** now:
-`src/base/key.zig` 1, `src/transport/quic_bridge.zig` 3,
-`src/transport/socket.zig` 8, and one inside a doc comment at
-`src/endpoint/endpoint.zig:32`. The rule did not move; the surface it is
-threaded through grew by a socket seam, which is the rule working.
+**One count from the 2026-09-30 wording is superseded, and the correction is kept
+rather than dropped.** That date described `io: std.Io` as a parameter "in three
+places across two files". The Decision section above carries no call-site count
+to update: it names the four functions that take `io` and states that the count
+is not an invariant. The cutover threads `io` through key generation, bridge
+send/drain operations and socket operations. Documentation mentions, private
+helpers and test doubles are not a public-parameter count. The earlier
+13-match lexical survey mixed those categories and is withdrawn; it does not
+measure the published surface. The explicit-runtime rule is unchanged.
 
 ### The trigger to reopen it again
 

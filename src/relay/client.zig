@@ -39,6 +39,14 @@ const Signature = key.Signature;
 /// The relay and the net report both measure time and neither may read a
 /// clock, so the vocabulary is defined once, where the report fold that first
 /// needed it put it.
+///
+/// **Nanoseconds, `u64`, on one timeline the caller owns.** Nothing here reads a
+/// clock, so every instant and duration in this file is a number the caller
+/// measured: zero is the caller's origin rather than 1970, the maximum is about
+/// 584 years rather than never, and two instants are comparable only when they
+/// came from the same timeline. A caller that mixes them gets a saturating
+/// subtraction and a zero round trip, which the deadline rules below turn into
+/// the health-check floor rather than into an expiry.
 pub const Nanos = net_report.Nanos;
 
 /// The number of bytes of an export that are signed; the rest is passed
@@ -47,6 +55,11 @@ pub const Nanos = net_report.Nanos;
 const signed_prefix = 16;
 
 /// The bytes that are only echoed back. Upstream `key_material_suffix`.
+///
+/// The other sixteen bytes are the signed prefix: an export is
+/// `signed_prefix` of signature and `key_material_suffix_length` of echo, and the
+/// two halves add up to the whole `KeyMaterial` or the split is not the split
+/// upstream chose (`handshake.rs:263`).
 pub const key_material_suffix_length = 16;
 
 /// A TLS key-material export for one session, as the exporter produced it.
@@ -55,7 +68,22 @@ pub const key_material_suffix_length = 16;
 /// (`handshake.rs:256-260`). The export itself belongs to the TLS seam; this
 /// is the value that seam hands over, and it is an argument because a
 /// process-global exporter is what `base` forbids.
+///
+/// **A value and not a borrow.** Both `create` and `verify` take it by value and
+/// keep no reference to it, so the exporter's buffer may be reused the moment the
+/// header it fed has been built. An end with no export has no `KeyMaterial` at
+/// all rather than a zeroed one: the absence is `?KeyMaterial` at the two seams
+/// that can lack one.
 pub const KeyMaterial = [32]u8;
+
+comptime {
+    // Both halves of `create` and `verify` index the export by that split, so a
+    // `KeyMaterial` that is not exactly the two halves would make the suffix
+    // comparison a length mismatch rather than a mismatch of content — and the
+    // error it could report would be `MismatchedSuffix`, which reads like a
+    // broken proxy rather than like the bug it would be.
+    std.debug.assert(@sizeOf(KeyMaterial) == signed_prefix + key_material_suffix_length);
+}
 
 /// The label the export must be taken under. Upstream
 /// `DOMAIN_SEP_TLS_EXPORT_LABEL` (`handshake.rs:56`).
@@ -64,6 +92,14 @@ pub const KeyMaterial = [32]u8;
 /// protocol: two ends that export under different labels produce different
 /// key material, verify nothing, and fall back to a challenge for no visible
 /// reason.
+///
+/// A comptime literal with static lifetime. **It is not on the wire either, and it
+/// is published because it is the one part of the handshake that cannot be
+/// checked from the wire**: a caller exporting under a different label produces a
+/// credential that verifies nowhere, and the failure surfaces as
+/// `error.MismatchedSuffix`, which reads like a broken proxy and is a mislabelled
+/// exporter. A caller that exports compares against this string rather than
+/// spelling it again.
 pub const key_material_label = "iroh-relay handshake v1";
 
 /// Domain separation for the challenge signature. Upstream
@@ -73,6 +109,10 @@ pub const key_material_label = "iroh-relay handshake v1";
 /// is what stops a malicious relay collecting arbitrary 16-byte signatures:
 /// it picks the challenge, so without this step it could ask for a signature
 /// over bytes of its own choosing. Upstream says so at `handshake.rs:211-219`.
+///
+/// The context `Blake3.initKdf` is given, and it reaches no peer, so it is
+/// private to this file: a port checks the derivation by comparing
+/// `messageToSign` against the bytes upstream produces, not by reading this.
 const challenge_domain = "iroh-relay handshake v1 challenge signature";
 
 /// Why a credential did not verify.
@@ -81,6 +121,12 @@ const challenge_domain = "iroh-relay handshake v1 challenge signature";
 /// a challenge on all of them (`handshake.rs:441-450`) and the comment there
 /// says the point: a TLS exporter is not required to match across a proxy, and
 /// a failed verify is the protocol working, not failing.
+///
+/// **None of the three is fatal, and none is an error the relay propagates.** All
+/// three send the same client down the challenge path with the error kept in
+/// `Challenged.key_material_failure` so the caller can log which one it was. A
+/// relay that turned any of them into a closed connection would fail exactly the
+/// connection the protocol exists to rescue (`handshake.rs:441-450`).
 pub const VerifyError = error{
     /// This end has no exporter, so it cannot reproduce the client's export.
     NoKeyingMaterial,
@@ -98,6 +144,11 @@ pub const VerifyError = error{
 /// Upstream `ServerChallenge::message_to_sign` (`handshake.rs:210-220`). The
 /// KDF context is the domain string and the key material is the challenge,
 /// which is the argument order `Blake3.initKdf` takes.
+///
+/// The derivation is total and deterministic: the same challenge always derives
+/// the same 32 bytes and nothing about it depends on anything but `challenge` and
+/// `challenge_domain`. The result is a value — a caller may sign over it and drop
+/// it, and the challenge it came from may be freed the moment this returns.
 pub fn messageToSign(challenge: frame.ServerChallenge) [32]u8 {
     var hasher = std.crypto.hash.Blake3.initKdf(challenge_domain, .{});
     hasher.update(&challenge.challenge);
@@ -109,6 +160,12 @@ pub fn messageToSign(challenge: frame.ServerChallenge) [32]u8 {
 /// Upstream `ClientAuth::new` (`handshake.rs:225-230`): the answer to a
 /// challenge, which is a signature of the derived message under the node id
 /// the client claims.
+///
+/// The secret is borrowed for the call and never copied or retained: the node id
+/// and the signature come out by value, so the caller may zero the key as soon as
+/// this returns. The message is derived here rather than taken, so a caller
+/// cannot sign a challenge with the wrong domain by accident — and cannot sign
+/// anything but a `ServerChallenge`, which is all a relay may ask for.
 pub fn signChallenge(
     secret: *const SecretKey,
     challenge: frame.ServerChallenge,
@@ -125,12 +182,23 @@ pub fn signChallenge(
 /// bytes and no exporter is involved, so the other two arms describe a
 /// failure this path cannot have, and an error set that names one is one a
 /// caller can handle without an `else` that decides nothing.
+///
+/// One arm, and there is no retry behind it: the challenge is spent and the relay
+/// has answered, so the connection closes. It is a separate set from
+/// `VerifyError` because a caller that would have fallen back to the challenge
+/// path has nothing left to fall back to.
 pub const ChallengeError = error{
     /// The signature does not verify under the claimed node id.
     SignatureInvalid,
 };
 
 /// Upstream `ClientAuth::verify` (`handshake.rs:234-247`).
+///
+/// The challenge is the only input: no exporter is involved and no key material
+/// is compared, which is what makes this the one verification that can be done by
+/// a relay with no TLS at all. Pure and total — no clock, no allocator, no global,
+/// no I/O, nothing kept — so the same pair may be verified from two threads at
+/// once.
 pub fn verifyClientAuth(
     auth: frame.ClientAuth,
     challenge: frame.ServerChallenge,
@@ -148,6 +216,13 @@ pub fn verifyClientAuth(
 /// missing on purpose is the header encoding itself: it is the HTTP seam's
 /// business, and upstream publishes no captured bytes of one to pin it to, so
 /// an encoder here would be an interop claim with nothing behind it.
+///
+/// **The caller builds this from the HTTP header and this module never sees the
+/// header.** Nothing here checks that the node id is a canonical point — the frame
+/// codec does that for a node id on the wire, and there is no decoder here for one
+/// in a header — so a credential whose node id is not a point fails as
+/// `error.SignatureInvalid` rather than as a separate error. Every field is a
+/// value, so a credential outlives the buffer the header was decoded into.
 pub const KeyMaterialAuth = struct {
     /// The node id being claimed. Upstream `public_key`, which is a
     /// `NodeId` here for the reason `docs/ARCHITECTURE.md` gives.
@@ -165,6 +240,13 @@ pub const KeyMaterialAuth = struct {
     /// and of any client whose TLS stack has no exporter. Upstream returns
     /// `Option` for the same reason and the caller simply omits the header
     /// (`client.rs:328`).
+    ///
+    /// **The null is the answer and not a failure**: a browser has no exporter,
+    /// and neither does any TLS stack that has none. Upstream returns `Option` for
+    /// the same reason (`client.rs:328`). A caller that gets null omits the header
+    /// rather than sending an empty one, which would decode as
+    /// `Credential.malformed` and be refused. The credential owns its bytes, so
+    /// the export may be zeroed on return.
     pub fn create(secret: *const SecretKey, material: ?KeyMaterial) ?KeyMaterialAuth {
         const exported = material orelse return null;
         return .{
@@ -180,6 +262,14 @@ pub const KeyMaterialAuth = struct {
     /// is the diagnostic: a matching suffix with a failing signature is a
     /// client with a broken key, and a mismatched suffix is a broken
     /// transport, which is a very different thing to go looking for.
+    ///
+    /// **Neither argument is borrowed beyond the call and nothing is retained**,
+    /// and no failure says anything about the client that a retry could fix: the
+    /// suffix is compared first for the reason above, and the signature check is
+    /// the last thing that can fail. A null export is `error.NoKeyingMaterial`
+    /// whatever the credential says — the material was never made, so there is
+    /// nothing to compare the suffix against and no way to tell a proxy from a
+    /// client.
     pub fn verify(self: KeyMaterialAuth, material: ?KeyMaterial) VerifyError!void {
         const exported = material orelse return error.NoKeyingMaterial;
         if (!std.mem.eql(u8, &self.key_material_suffix, exported[signed_prefix..])) {
@@ -198,6 +288,12 @@ pub const KeyMaterialAuth = struct {
 /// It is recorded before the first relay frame rather than decided by it,
 /// because whether a credential was attached to the upgrade request is a fact
 /// about what we sent, and only we know it.
+///
+/// **The client's own record of what it offered, and it survives a challenge.** A
+/// relay that challenges a client which offered key material has done nothing
+/// wrong, so `State.awaiting_relay` keeps this value through that challenge
+/// rather than turning it into a fault. It is what makes `Admitted.unauthenticated`
+/// reachable and nameable, and it is not derived from anything the relay said.
 pub const Path = enum {
     /// A `KeyMaterialAuth` went out on the upgrade request, so the relay can
     /// admit the client with no further frame at all.
@@ -208,6 +304,12 @@ pub const Path = enum {
 };
 
 /// How the relay let the client in, as far as the client can tell.
+///
+/// **It is the client's account of what happened, and `.unauthenticated` is
+/// upstream's outcome rather than this machine's judgement**: a relay may confirm
+/// a client that offered nothing (`handshake.rs:344-363`), and a port that
+/// refused that would fork the protocol. It is named so a log line can say it, and
+/// nothing in `step` branches on it.
 pub const Admitted = enum {
     /// The relay confirmed the key material from the upgrade request. Zero
     /// extra round trips.
@@ -226,6 +328,9 @@ pub const Admitted = enum {
 };
 
 /// Why a handshake cannot finish.
+///
+/// Terminal, like every `State.failed`: `step` on a failed state returns it again
+/// with no action, so a caller may keep stepping and will be told nothing new.
 pub const Failure = union(enum) {
     /// A frame arrived that this state does not accept. Upstream
     /// `Error::UnexpectedFrameType`, which carries the whole `FrameType`.
@@ -235,6 +340,12 @@ pub const Failure = union(enum) {
 };
 
 /// What happened between two steps.
+///
+/// A `frame` event borrows the buffer its `Message` was decoded from, so that
+/// buffer has to stay valid across `step` and past it whenever the returned
+/// state is `denied`, whose `reason` is a slice of that same buffer: keep it
+/// alive until the last use of the state, or copy the reason out before
+/// releasing it. The other four returned states retain no frame bytes.
 pub const Event = union(enum) {
     /// A frame arrived, decoded. Upstream `read_frame`.
     frame: frame.Message,
@@ -243,6 +354,15 @@ pub const Event = union(enum) {
 };
 
 /// The client half of the handshake.
+///
+/// **Three of the five are terminal**, and a terminal state absorbs whatever
+/// arrives after it: `step` returns it unchanged with no action, so a caller that
+/// keeps feeding a finished handshake is not an error and gets no second outcome.
+///
+/// One arm borrows. `denied` names the reason inside the frame the relay sent, so
+/// it points into that message's buffer and dies with it; the other four are
+/// values. The state is otherwise free to copy, and `step` takes it by value and
+/// returns a new one.
 pub const State = union(enum) {
     /// The upgrade request is out and the relay has not answered.
     ///
@@ -267,6 +387,16 @@ pub const State = union(enum) {
 /// the state, and nothing is said twice: a caller that wants to know how the
 /// handshake went reads the state, and a caller that wants to know what to
 /// write reads this.
+///
+/// **One action, and the caller must do it before stepping again.** The machine
+/// holds no queue, so a `ClientAuth` that was not written is not written later and
+/// the next `step` describes a state that assumed it had been. `close` means drop
+/// the connection writing nothing, and it is used for a denial as much as for a
+/// protocol error: after either one the client has nothing left to say.
+///
+/// **Nothing in it borrows.** `send_client_auth` carries the node id and the
+/// signature by value, both derived during the step, so the caller may hold it,
+/// queue it, or encode it long after the buffer its frame came from is gone.
 pub const Action = union(enum) {
     /// Write this `ClientAuth`. Upstream `write_frame(io, client_info)`.
     send_client_auth: frame.ClientAuth,
@@ -279,12 +409,20 @@ pub const Action = union(enum) {
 };
 
 /// One step: the next state, and the one thing to do about it.
+///
+/// `state` is what to store and `action` is what to do, and `action == null` means
+/// nothing to do *now* — a handshake waiting for the relay's next frame, not one
+/// that has ended. The state says which of the two it is.
 pub const Step = struct {
     state: State,
     action: ?Action,
 };
 
 /// The machine a client starts in.
+///
+/// The only construction there is: a client begins here with the path it offered
+/// and nothing else. The secret is not part of the state, so the same `State` can
+/// be stepped by a test, replayed, or logged without a signing key in it.
 pub fn start(path: Path) State {
     return .{ .awaiting_relay = path };
 }
@@ -294,6 +432,23 @@ pub fn start(path: Path) State {
 /// `secret` is the signing key, taken as an argument rather than held: the
 /// machine's state is a value that a test can build, and a value that carries
 /// a secret key is a value that gets copied into a trace.
+///
+/// **Reentrant and callable from any thread, as long as nothing it reads is
+/// being written underneath the call.** The three inputs are a value, a message
+/// that borrows a buffer, and a pointer to the signing key, and each has its own
+/// rule. A `State` is a value and may be held by as many threads as like. An
+/// `Event` is read here and written by the caller's reader, so a buffer another
+/// thread is decoding the next frame into must not be stepped. The
+/// `SecretKey` is read by the arm that signs a challenge, so it must not be
+/// zeroed, rotated or overwritten while a step is running.
+///
+/// **The buffer outlives the call whenever the returned state keeps a frame
+/// borrow.** `denied` names the relay's reason inside that buffer, so the
+/// returned `Step` is not free of the frame payload on the one arm that
+/// refuses: the buffer must stay valid until the caller stops reading the
+/// state, or the reason must be copied out first. Every other returned state
+/// is a value and keeps nothing. Nothing in the `Action` borrows — see
+/// `Action`.
 pub fn step(state: State, event: Event, secret: *const SecretKey) Step {
     return switch (state) {
         .awaiting_relay => |path| switch (event) {
@@ -364,17 +519,38 @@ fn fail(failure: Failure) Step {
 /// Upstream `PING_TIMEOUT` (`ping_tracker.rs:5`): the longest a pong may take
 /// before the connection is treated as dead, and `PingTracker::default()`'s
 /// ceiling.
+///
+/// **Nanoseconds, `u64`.** It is a ceiling, so a round trip three times this is
+/// still answered in this; `PingTracker.init` is how a caller asks for a
+/// different one, and it is what refuses a ceiling under
+/// `min_health_check_timeout` rather than letting the first clamp assert.
 pub const default_max_timeout: Nanos = 5 * std.time.ns_per_s;
 
 /// Upstream `MIN_HEALTH_CHECK_TIMEOUT` (`ping_tracker.rs:8`).
 ///
 /// A health check that fires sooner than this measures its own scheduling
 /// jitter rather than the relay's health.
+///
+/// **Nanoseconds, `u64`.** It is a floor, so an instant round trip does not make
+/// the next deadline shorter: below it the tracker is measuring its own
+/// scheduling rather than the relay's health, and this is the smallest value
+/// `pingTimeout` will ever return.
 pub const min_health_check_timeout: Nanos = 500 * std.time.ns_per_ms;
 
 /// Upstream `PING_INTERVAL` (`protos/relay.rs:36`): how often the server
 /// pings an otherwise idle connection. The client answers without tracking
 /// one, which is why the interval is here and not in the client's own state.
+///
+/// **Nanoseconds, `u64`.** How often the *relay* pings an idle connection, which
+/// is why it is here and not in the client's state: the client answers a `Ping`
+/// with a `Pong` and keeps no deadline of its own.
+///
+/// **The three numbers are one loop, and the only relation the code checks is
+/// that the ceiling is above the floor.** Fifteen seconds between pings against a
+/// five-second ceiling is coherent because `newPing` overwrites: at most one ping
+/// is ever outstanding, so the second deadline is never armed before the first
+/// one is due. A caller that pings on a timer *as well as* through this tracker
+/// would break that — `Timeout.expired` would report a ping that was never lost.
 pub const ping_interval: Nanos = 15 * std.time.ns_per_s;
 
 comptime {
@@ -387,6 +563,13 @@ comptime {
 }
 
 /// A ping that is out and not yet answered.
+///
+/// **Written only by `newPing` and read only by the tracker.** `sent_at` is the
+/// round trip's origin and `deadline` is `now +| pingTimeout()` at that moment,
+/// saturating: a `now` close enough to the maximum gives a deadline no caller
+/// will ever reach, which is the same as no timeout rather than a wrapped one.
+/// `data` is the eight bytes the peer echoes and it is compared in full — it is
+/// not a sequence number and there is nothing to reuse it for.
 pub const Pending = struct {
     /// The 8 payload bytes the relay will echo back.
     data: [8]u8,
@@ -403,8 +586,25 @@ pub const Pending = struct {
 /// matters, and the next deadline is three times the last round trip clamped
 /// into a fixed band. Both are testable without a relay, and both are the
 /// kind of thing that is otherwise only ever verified by waiting.
+///
+/// **The fields are public and `init` is the only guarded way to build one.** Zig
+/// has no private field, so a literal with `max_timeout` under
+/// `min_health_check_timeout` is not refused anywhere — and it does not fail until
+/// `pingTimeout` has a round trip to clamp, where `std.math.clamp` asserts that
+/// its bounds are ordered. `init` turns that into `error.MaxTimeoutBelowFloor` up
+/// front, and `withDefaults` is upstream's default.
+///
+/// Nothing here reads a clock or allocates, and every method is handed its
+/// instants, so a caller drives the whole tracker from its own timeline and can
+/// step it without waiting for any of it. There is no `deinit` and nothing to
+/// free: `pending` is null, or eight bytes and two timestamps.
 pub const PingTracker = struct {
+    /// The one ping that is out, or null when none is. `newPing` overwrites it
+    /// rather than queueing behind it, so there is never more than one.
     pending: ?Pending,
+    /// The ceiling `pingTimeout` clamps into, and the leash an untimed
+    /// connection gets. `init` is what refuses one under
+    /// `min_health_check_timeout`.
     max_timeout: Nanos,
     /// The last measured round trip, and the only input to the next deadline.
     last_rtt: ?Nanos,
@@ -436,6 +636,11 @@ pub const PingTracker = struct {
     /// `clamp(3 × last_rtt, 500 ms, max_timeout)`, and `max_timeout` itself
     /// until a round trip has been measured: a connection that has never been
     /// timed gets the longest leash, not the shortest.
+    ///
+    /// The floor can only bite once a round trip has been measured and the
+    /// ceiling can only bite for a slow one; between them it is three round trips.
+    /// `Nanos` is `u64` and three times a round trip can exceed it, which
+    /// saturates to the maximum — and the maximum is the ceiling's answer anyway.
     pub fn pingTimeout(self: PingTracker) Nanos {
         const rtt = self.last_rtt orelse return self.max_timeout;
         const tripled = std.math.mul(Nanos, rtt, 3) catch std.math.maxInt(Nanos);
@@ -451,6 +656,13 @@ pub const PingTracker = struct {
     /// `data` is the 8 payload bytes. Upstream draws them with
     /// `rand::random()`; a process-global RNG is what `base` forbids, so the
     /// caller supplies them and the tracker stays a value.
+    ///
+    /// **It supersedes rather than queues**: the previous ping's `deadline` is
+    /// gone, so a pong arriving for it is ignored and the round trip it would
+    /// have measured — one spanning two pings — is never counted. The eight bytes
+    /// come back because the caller has to write them into the `Ping` frame; the
+    /// return is a copy, so it and the tracker's copy are two values and neither
+    /// borrows the other.
     pub fn newPing(self: *PingTracker, now: Nanos, data: [8]u8) [8]u8 {
         self.pending = .{
             .data = data,
@@ -469,6 +681,13 @@ pub const PingTracker = struct {
     /// harmless to *count* one, because a pong for a superseded ping measures
     /// a round trip that spans two pings, which is the average this rule
     /// exists to refuse.
+    ///
+    /// **A pong arriving after `timeout` reported the expiry measures nothing**,
+    /// because that call cleared `pending`: the connection is already being torn
+    /// down and a round trip from a dead connection is not a measurement. A pong
+    /// with nothing outstanding, or one whose eight bytes are not the outstanding
+    /// eight, is a no-op rather than an error — a peer may send whatever it
+    /// likes, and upstream calls it harmless too.
     pub fn pongReceived(self: *PingTracker, now: Nanos, data: [8]u8) void {
         const pending = self.pending orelse return;
         if (!std.mem.eql(u8, &pending.data, &data)) return;
@@ -480,6 +699,12 @@ pub const PingTracker = struct {
 
     /// What the connection actor should do about the outstanding ping.
     /// Upstream `ping_tracker.rs:96-105`, without the sleep.
+    ///
+    /// **It is an answer and not a wait**: nothing here sleeps, and `timeout`
+    /// is called again to ask again. `.idle` is the state with no ping
+    /// outstanding — upstream's `pending()`, which is to say it never returns
+    /// and is worth naming here — and `.pending` is how much of the deadline
+    /// is left, which is never zero, since the deadline itself is `.expired`.
     pub const Timeout = union(enum) {
         /// Nothing is outstanding. Upstream's `pending()`, which is to say it
         /// never returns.
@@ -495,6 +720,11 @@ pub const PingTracker = struct {
 
     /// Upstream `PingTracker::timeout`. The deadline is compared, never
     /// waited on, so a test can be at it in one step.
+    ///
+    /// **Asking twice at the same instant is safe**: the first call that finds the
+    /// deadline due clears `pending`, so the second answers `.idle` and not a
+    /// second `.expired`. `.expired` carries the eight bytes, so the caller can
+    /// name the ping that was lost.
     pub fn timeout(self: *PingTracker, now: Nanos) Timeout {
         const pending = self.pending orelse return .idle;
         if (now < pending.deadline) return .{ .pending = pending.deadline - now };

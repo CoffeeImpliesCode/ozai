@@ -43,17 +43,41 @@ const Retry = router.Retry;
 /// the builder (`protocol.rs:106-111`, `:478-481`). `ask` then runs the same
 /// default the `if let Some(filter)` upstream runs: no filter, every attempt
 /// accepted.
+///
+/// **The call is synchronous and happens on the thread stepping the loop** —
+/// the endpoint's own pass, or a caller driving `Loop.step` itself. Upstream's
+/// closure is awaited inside the loop body (`protocol.rs:574`) and this is
+/// that await made into an `Action`, so a filter that blocks blocks the pass
+/// and there is no thread here for it to move to.
+///
+/// **`incoming` is borrowed for the call and is not to be stored.** The accept
+/// loop holds one attempt while the filter runs and clears the slot when the
+/// answer arrives, so an attempt is acted on exactly once; a filter that kept
+/// the value would be keeping a copy of a struct that names a connection the
+/// core may already have finished with.
+///
+/// **`ptr` must stay valid from `Loop.init` until the loop is dropped**, for
+/// the same reason a handler's context must outlive its registration: a filter
+/// torn down first leaves a dangling context and nothing here can see it
+/// coming.
+///
+/// **A filter may not step the loop from inside its own call.** It is holding
+/// the one attempt the loop is waiting on, so re-entering is what turns one
+/// verdict into two.
 pub const IncomingFilter = struct {
     /// The filter's own state, handed to every call unchanged and never
     /// dereferenced here. The same field `ProtocolHandler.ptr` is, for the same
     /// reason: upstream's `&self` is a real borrow and this is the thinnest
-    /// honest equivalent.
+    /// honest equivalent. It must stay valid and unchanged from `Loop.init`
+    /// until the loop is dropped — see this struct's note.
     ptr: *anyopaque,
     /// The call. Upstream's closure, and its four answers are `Answer`.
     ///
-    /// The answer is the filter's own: nothing is done to it before the loop
-    /// sees it except `decide`, which attaches what the path says a `retry` is
-    /// worth and refuses one this flow cannot be given.
+    /// Called at most once per attempt, on the thread stepping the loop, with
+    /// the attempt borrowed for the call and not to be stored. The answer is
+    /// the filter's own: nothing is done to it before the loop sees it except
+    /// `decide`, which attaches what the path says a `retry` is worth and
+    /// refuses one this flow cannot be given.
     filter: *const fn (ptr: *anyopaque, incoming: Incoming) Answer,
 };
 
@@ -96,6 +120,11 @@ pub const Answer = enum {
 /// than making it.
 ///
 /// The answer is the filter's own; nothing has been done to it yet.
+///
+/// A null filter is upstream's `if let Some(filter)` (`protocol.rs:573-596`):
+/// no filter, every attempt accepted, and no call made at all. The thread is
+/// the caller's own and the attempt is borrowed, so a filter is a predicate and
+/// not a worker — see `IncomingFilter`'s note for the rest.
 pub fn ask(filter: ?IncomingFilter, incoming: Incoming) Answer {
     const present = filter orelse return .accept;
     return present.filter(present.ptr, incoming);

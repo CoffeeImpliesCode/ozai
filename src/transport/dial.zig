@@ -124,12 +124,10 @@
 //!   `error.NoPeerPin` before it touches the map, so a refused dial allocates
 //!   nothing at all.
 //!
-//! And then the shape removes the remaining case. Both synthetic subnets are
-//! keyed on the peer's id — `addr_map.Key.relay` is a `(relay, node)` pair and
-//! `Key.custom` belongs to one node — so **a dial with no id has no key to
-//! allocate an address from**, and `resolveRoute` returns `error.NoPeerId`. The
-//! only target an unpinned dial can name is a direct `SocketAddr`, and reaching
-//! that takes `require_peer_pin = false` written out by the caller.
+//! Relay routes require a peer id: `Key.relay` is a `(relay, node)` pair.
+//! Custom routes use `CustomKey` alone and do not require that id. Setting
+//! `require_peer_pin = false` therefore permits unpinned direct and custom
+//! dials, but a relay route still returns `error.NoPeerId`.
 //!
 //! One more asymmetry, and the one a caller is most likely to trip on. The pin
 //! is enforced, but the bytes it was compared against are not kept on this
@@ -235,8 +233,7 @@ pub const Error = quic_bridge.Error || base_addr.CustomAddrParseError ||
     /// The caller required a pin and named no peer to pin. Nothing was
     /// allocated: the refusal is the first thing `dial` does.
     NoPeerPin,
-    /// A non-IP target and no peer's id, so there is no map key to allocate
-    /// an address from. See the module doc.
+    /// A relay target without a peer id has no `(relay, node)` map key.
     NoPeerId,
     /// The manager's connection table is full. A dial takes the same slot an
     /// accepted connection would, and a node that is refusing new connections
@@ -275,9 +272,9 @@ pub const Config = struct {
     /// How long a connection may sit idle before the core gives it up, in
     /// milliseconds. The core's unit is milliseconds and so is this one.
     idle_timeout_ms: u64 = 30_000,
-    /// A NEW_TOKEN from an earlier connection to this peer, to be presented in
-    /// the first Initial. `connectInto` copies it into the connection's own
-    /// buffer, so this slice is not retained. Null sends no token.
+    /// A NEW_TOKEN for the first Initial. Null sends no token.
+    /// The dialer retains this slice for later dials. Keep it alive and
+    /// unchanged until `destroy`. Each connection copies the token bytes.
     initial_token: ?[]const u8 = null,
     /// Whether a dial that names no peer is refused.
     ///
@@ -320,12 +317,10 @@ pub const Route = struct {
 /// What a target becomes: one address the core is told, and one key the caller
 /// keeps.
 ///
-/// A direct target comes back whole and is never allocated in the map, for
-/// `base/ula.zig`'s reason. The other two are the arms that need dressing up,
-/// and each is keyed on the peer's id: `Key.relay` is a `(relay, node)` pair
-/// and `Key.custom` belongs to one node. That is why `peer` may be null only
-/// for a direct path, and why the answer to a null id on the others is
-/// `error.NoPeerId` rather than an address nobody could resolve back to a peer.
+/// Direct targets do not allocate. Relay targets require `peer` and return
+/// `error.NoPeerId` when it is null. Custom targets copy their payload into the
+/// key and do not use `peer`. Allocation errors leave existing mappings intact,
+/// but may retain map capacity and consume random draws.
 pub fn resolveRoute(
     gpa: std.mem.Allocator,
     map: *addr_map.MappedAddrs,
@@ -402,11 +397,19 @@ pub fn ownerOf(map: *const addr_map.MappedAddrs, socket: SocketAddr) ?addr_map.K
 /// Heap-allocated rather than returned by value because the TLS configuration
 /// a dial hands the core points at this struct's own `spki` and `alpn_list`, and
 /// a returned struct is moved into the caller's frame.
+///
+/// Keep the heap address stable and release it exactly once with `destroy`.
+/// Copies share resources and are not independent owners. Serialize operations
+/// with this dialer and its bridge. The bridge and allocator must outlive it.
+/// `gpa` must be the bridge's allocator because the bridge frees dialled entries.
 pub const Dialer = struct {
     gpa: std.mem.Allocator,
     /// The bridge whose manager will own the dialled connection. Borrowed: the
     /// connection is freed by `Bridge.sweep` or `Bridge.destroy`, never here.
     bridge: *Bridge,
+    /// Options copied by value, including a secret-key copy erased by `destroy`.
+    /// ALPN and SNI bytes must outlive this dialer and its connections. The
+    /// token bytes must stay unchanged until `destroy`.
     config: Config,
     node_id: NodeId,
     /// The 32 bytes of seed the presented certificate is built from.
@@ -426,6 +429,9 @@ pub const Dialer = struct {
     /// borrowed: the core's configuration holds the slices for as long as the
     /// connection lives, so they must outlive every connection this dialer
     /// opens.
+    ///
+    /// `config.initial_token` is also borrowed, until `destroy`. On error no
+    /// dialer is returned and the bridge is unchanged.
     pub fn create(
         gpa: std.mem.Allocator,
         bridge: *Bridge,
@@ -449,20 +455,22 @@ pub const Dialer = struct {
         return self;
     }
 
-    /// Free the dialer, refusing while a connection it opened is still live.
+    /// Free the dialer, refusing while any client entry remains in the bridge.
     ///
-    /// The seed is zeroed first, for `Bridge.destroy`'s reason: it is a copy of
-    /// a key the caller also holds, and the core's handshakes on this dialer's
-    /// connections point at it, which is why a live connection refuses this.
+    /// Both retained key copies are erased first: `config.secret` and `seed`.
+    /// Handshakes borrow the seed, so a live client entry prevents erasure.
+    ///
+    /// A refusal leaves the dialer usable. Finish and sweep client connections
+    /// before retrying, while the bridge is still alive. A successful call
+    /// invalidates this pointer and every borrowed TLS configuration.
     pub fn destroy(self: *Dialer) DestroyError!void {
-        // A bridge only ever accepts a server connection — `acceptConnection`
-        // passes `is_server = true` as a `comptime` argument — so a client
-        // connection in this table is one this dialer opened, with no
-        // bookkeeping of its own to keep.
+        // TLS configurations borrow dialer storage. Without an owner index,
+        // refusing every client entry prevents release while one may borrow it.
         for (self.bridge.manager.entries.items) |entry| {
             if (!entry.conn.is_server) return error.DialedConnectionsLive;
         }
         std.crypto.secureZero(u8, self.seed[0..]);
+        self.config.secret.deinit();
         self.gpa.destroy(self);
     }
 
@@ -479,8 +487,9 @@ pub const Dialer = struct {
     /// and the handshake keeps that copy: one value per dialer could not say
     /// what a given dial used.
     ///
-    /// The type is the core's own and is spelled in full: an alias for it here
-    /// would be private, and a public signature may not name a private type.
+    /// The result borrows this dialer's identity and configuration storage.
+    /// It is valid only while the dialer and its borrowed inputs remain alive.
+    /// Import the registered `quic` module to name the result type.
     pub fn tlsConfigFor(self: *const Dialer, expect_peer: ?NodeId) quic.tls13.TlsConfig {
         return .{
             // Two required fields the core's struct has no default for, and
@@ -526,6 +535,11 @@ pub const Dialer = struct {
     /// `at` and `random` are the caller's, for the module doc's reason. The
     /// returned `Dial` carries a connection the bridge drives, and the caller
     /// has to have a socket open for `dial.route.socket` before draining it.
+    ///
+    /// On error no new connection remains registered. A resolved synthetic
+    /// mapping and manager capacity may remain, and random draws are consumed.
+    /// The returned handle borrows the bridge and is invalid after its sweep
+    /// frees the connection. No caller teardown is required for the handle.
     pub fn dial(
         self: *Dialer,
         transport: TransportAddr,
@@ -1513,4 +1527,31 @@ test "a dial with a NEW_TOKEN presents it in the first Initial" {
     var egress: [max_egress]Egress = undefined;
     var out: [max_egress * max_datagram]u8 = undefined;
     try t.expect((try dial.conn.drain(egress[0..], out[0..], start, engine.random())).len > 0);
+}
+
+test "destroy wipes every retained secret copy before releasing its storage" {
+    const alignment = @max(@alignOf(Bridge), @alignOf(Dialer));
+    var backing: [@sizeOf(Bridge) + @sizeOf(Dialer) + alignment]u8 align(alignment) = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    const alloc = fixed.allocator();
+    var secret = try SecretKey.fromSeed(client_seed);
+    defer secret.deinit();
+    var engine = Prng.init(81);
+    const bridge = try Bridge.create(alloc, t.io, .{
+        .secret = secret,
+        .alpn = alpn,
+        .retry_token_key = @splat(0x12),
+        .static_reset_key = @splat(0x34),
+    }, engine.random());
+    defer bridge.destroy();
+    const dialer = try Dialer.create(alloc, bridge, .{ .secret = secret, .alpn = alpn });
+    const secret_start = @intFromPtr(&dialer.config.secret) - @intFromPtr(&backing);
+    const seed_start = @intFromPtr(&dialer.seed) - @intFromPtr(&backing);
+    try dialer.destroy();
+
+    // The allocator releases objects, not the caller-owned backing array.
+    const erased_secret: [@sizeOf(SecretKey)]u8 = @splat(0);
+    const erased_seed: [seed_length]u8 = @splat(0);
+    try t.expectEqualSlices(u8, &erased_secret, backing[secret_start..][0..erased_secret.len]);
+    try t.expectEqualSlices(u8, &erased_seed, backing[seed_start..][0..erased_seed.len]);
 }

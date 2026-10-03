@@ -18,15 +18,21 @@
 //! subtraction is done by masking.
 
 const std = @import("std");
-const assert = std.debug.assert;
 
 /// Widest modulus, in bits. RSA-4096's CRT halves are 2048 bits.
 pub const max_bits = 2048;
+/// `max_bits` expressed in 64-bit limbs: the width of every fixed buffer in
+/// this module, and the size at which a modulus wider than `max_bits` stops
+/// being representable rather than merely rejected.
 pub const max_limbs = max_bits / 64;
 
 const window_bits = 4;
 const table_len = 1 << window_bits;
 
+/// The one failure `Modulus` raises. Every operation that can see a
+/// non-Montgomery input reports it, so a caller can treat the one tag as "this
+/// number was not usable here" rather than reading a body to find out which
+/// precondition failed.
 pub const Error = error{
     /// Not an odd modulus of 1 to `max_limbs` limbs, or an operand wider than it.
     InvalidModulus,
@@ -36,7 +42,14 @@ pub const Error = error{
 const Limbs = [max_limbs]u64;
 
 /// An odd modulus, prepared once: Montgomery needs -m^-1 mod 2^64.
+///
+/// `fromBytes` rejects zero, even and oversized magnitudes. Manual field writes
+/// must preserve a nonzero odd modulus, `1 <= len <= max_limbs`, zero unused
+/// limbs and the matching `n0inv`; Zig does not enforce those invariants.
+/// All storage is inline. Copies are independent and need no release.
 pub const Modulus = struct {
+    /// Little-endian modulus limbs. Arithmetic uses `len`; modulus size is
+    /// not hidden. Exponent-dependent table selection is constant-time.
     limbs: Limbs,
     /// Limbs in use; the rest are zero.
     len: usize,
@@ -44,6 +57,11 @@ pub const Modulus = struct {
     n0inv: u64,
 
     /// `bytes` is a big-endian magnitude. Leading zeros are allowed.
+    ///
+    /// The bytes are read once into fixed limbs and the result borrows
+    /// nothing, so `bytes` need not outlive the call. `error.InvalidModulus`
+    /// leaves no value: zero, an even number, or anything wider than
+    /// `max_bits` after leading zeros.
     pub fn fromBytes(bytes: []const u8) Error!Modulus {
         var self: Modulus = .{ .limbs = @splat(0), .len = 0, .n0inv = 0 };
         try bytesToLimbs(&self.limbs, bytes);
@@ -57,6 +75,16 @@ pub const Modulus = struct {
     /// right-aligned and zero-padded, so its length fixes the encoding. The
     /// exponent's encoded length sets the work done, so pad it to hide the
     /// exponent's own size.
+    ///
+    /// `base` must already be reduced below the modulus — `error.InvalidModulus`
+    /// when it is not, or when it is wider than `max_bits`. On either error
+    /// `out` is left exactly as the caller passed it, so a retry after reducing
+    /// the base rewrites all of it. On success all of `out` is written: the
+    /// result right-aligned and zero-padded to `out.len`, which the caller
+    /// sizes to the modulus length.
+    ///
+    /// Allocates nothing and retains no arguments. The base, table, accumulator
+    /// and selected table entries are wiped; not every intermediate is erased.
     pub fn pow(self: *const Modulus, base: []const u8, exp: []const u8, out: []u8) Error!void {
         var b: Limbs = @splat(0);
         try bytesToLimbs(&b, base);

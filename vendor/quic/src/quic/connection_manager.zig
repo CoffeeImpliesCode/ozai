@@ -1,3 +1,10 @@
+//! Server-side CID routing, connection ownership and bounded stateless replies.
+//! `recvDatagram` processes caller-owned bytes; the caller sends any response
+//! and supplies time and entropy. No socket or clock is owned here.
+//! Entries and their connections are borrowed until deferred destruction.
+//! Serialize calls, finish each event pass before `freeDeadEntries`, and release
+//! the manager exactly once with `deinit`.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const address = @import("../address.zig");
@@ -22,9 +29,12 @@ const frame_mod = @import("frame.zig");
 
 /// Fixed-size CID key for use in HashMap lookups.
 pub const CidKey = struct {
+    /// Inline CID bytes; only the prefix selected by `len` participates in routing.
     buf: [20]u8 = .{0} ** 20,
+    /// Initialized prefix length in bytes, in 0..20.
     len: u8 = 0,
 
+    /// Copy up to 20 bytes; a longer input is truncated rather than rejected.
     pub fn fromSlice(s: []const u8) CidKey {
         var key = CidKey{};
         key.len = @intCast(@min(s.len, 20));
@@ -32,6 +42,7 @@ pub const CidKey = struct {
         return key;
     }
 
+    /// Borrow the initialized prefix until this key is changed or released.
     pub fn getSlice(self: *const CidKey) []const u8 {
         return self.buf[0..self.len];
     }
@@ -43,10 +54,12 @@ pub const ResetKey = [16]u8;
 
 /// Hash/equality context for CidKey in HashMap.
 pub const CidKeyContext = struct {
+    /// Hash only the initialized prefix; requires `key.len <= 20`.
     pub fn hash(_: CidKeyContext, key: CidKey) u64 {
         return std.hash.Wyhash.hash(0, key.buf[0..key.len]);
     }
 
+    /// Compare lengths and initialized prefixes; both lengths must be at most 20.
     pub fn eql(_: CidKeyContext, a: CidKey, b: CidKey) bool {
         if (a.len != b.len) return false;
         return std.mem.eql(u8, a.buf[0..a.len], b.buf[0..b.len]);
@@ -58,34 +71,42 @@ pub const CidKeyContext = struct {
 /// Heap-allocated, so its address is stable from `acceptConnection` until
 /// `freeDeadEntries` releases it.
 pub const ConnEntry = struct {
+    /// Manager-owned connection; invalid after this entry is freed.
     conn: *connection.Connection,
     /// Unique per manager, never reused.
     id: u64 = 0,
 
-    /// Type-erased handler pointer for zero-copy datagram callback.
+    /// Borrowed application context. The manager neither calls nor releases it.
     datagram_handler_ctx: ?*anyopaque = null,
 
-    /// Called when something queued data on this connection, so the owner can
-    /// send it without waiting for its next I/O event.
+    /// Synchronous notification on the thread calling `wake`; no call when
+    /// this or `wake_ctx` is null. Retain callback code and context until cleared
+    /// or the entry is freed; this method queues no work and adds no synchronization.
     wake_fn: ?*const fn (ctx: *anyopaque) void = null,
+    /// Borrowed context shared by `wake_fn` and `repoll_fn`.
     wake_ctx: ?*anyopaque = null,
 
-    /// Called when data already received became deliverable (a resumed
-    /// request body), so the owner polls again with nothing new on the
-    /// wire. Takes `wake_ctx`.
+    /// Synchronous notification on the thread calling `repoll`, using
+    /// `wake_ctx`. Either null suppresses the call. Keep code and context alive
+    /// until cleared or the entry is freed; the caller performs the next poll.
     repoll_fn: ?*const fn (ctx: *anyopaque) void = null,
 
-    // For raw QUIC protocol: track streams whose fin has been delivered to handler
+    /// Stream IDs whose FIN the application has received; owned map.
     finished_streams: std.AutoArrayHashMapUnmanaged(u64, void) = .empty,
 
-    // Track which CIDs are registered in the routing map for this connection.
-    // Max 8 from LocalCidPool + 1 initial client DCID = 9.
+    /// Routing keys registered for this entry; only the counted prefix is valid.
     registered_cids: [9]CidKey = .{CidKey{}} ** 9,
+    /// Initialized routing keys, at most the nine inline slots.
     registered_cid_count: u8 = 0,
+    /// Client's current Initial DCID, retained for retransmission routing.
+    /// `acceptConnection` copies it; null on a manually constructed entry.
+    initial_dcid: ?CidKey = null,
 
-    // Keys this connection holds in `reset_token_map`, one per peer CID.
+    /// Reset-map keys for peer CIDs; only `reset_key_count` slots are initialized.
     reset_keys: [8]ResetKey = undefined,
+    /// Initialized reset keys, in 0..8.
     reset_key_count: u8 = 0,
+    /// Last synchronized peer-CID generation; null before the first synchronization.
     reset_pool_gen: ?u32 = null,
 
     /// Tell the owner there is data to send; see `wake_fn`.
@@ -99,35 +120,58 @@ pub const ConnEntry = struct {
     }
 
     fn addRegisteredCid(self: *ConnEntry, key: CidKey) void {
-        if (self.registered_cid_count < 9) {
-            self.registered_cids[self.registered_cid_count] = key;
-            self.registered_cid_count += 1;
-        }
+        std.debug.assert(self.registered_cid_count < self.registered_cids.len);
+        std.debug.assert(!self.hasRegisteredCid(key));
+        self.registered_cids[self.registered_cid_count] = key;
+        self.registered_cid_count += 1;
     }
 
     fn hasRegisteredCid(self: *const ConnEntry, key: CidKey) bool {
-        for (self.registered_cids[0..self.registered_cid_count]) |registered| {
-            if (CidKeyContext.eql(.{}, registered, key)) return true;
-        }
-        return false;
+        return containsCid(self.registered_cids[0..self.registered_cid_count], key);
     }
 
-    fn removeRegisteredCid(self: *ConnEntry, key: CidKey) void {
-        var i: usize = 0;
-        while (i < self.registered_cid_count) {
-            if (CidKeyContext.eql(.{}, self.registered_cids[i], key)) {
-                // Swap-remove
-                self.registered_cid_count -= 1;
-                if (i < self.registered_cid_count) {
-                    self.registered_cids[i] = self.registered_cids[self.registered_cid_count];
-                }
-                self.registered_cids[self.registered_cid_count] = CidKey{};
-                return;
-            }
-            i += 1;
-        }
+    fn removeRegisteredCid(self: *ConnEntry, index: usize) void {
+        std.debug.assert(index < self.registered_cid_count);
+        self.registered_cid_count -= 1;
+        self.registered_cids[index] = self.registered_cids[self.registered_cid_count];
+        self.registered_cids[self.registered_cid_count] = .{};
     }
 };
+
+fn containsCid(keys: []const CidKey, key: CidKey) bool {
+    std.debug.assert(keys.len <= 9);
+    for (keys) |registered| {
+        if (CidKeyContext.eql(.{}, registered, key)) return true;
+    }
+    return false;
+}
+
+fn activeCid(pool: *const connection.LocalCidPool, key: CidKey) bool {
+    for (&pool.entries) |*entry| {
+        if (!entry.occupied or entry.retired or entry.cid_len != key.len) continue;
+        if (std.mem.eql(u8, entry.getCid(), key.getSlice())) return true;
+    }
+    return false;
+}
+
+fn unregisteredCids(entry: *const ConnEntry, keys: *[9]CidKey) u8 {
+    var count: u8 = 0;
+    if (entry.initial_dcid) |key| {
+        if (!entry.hasRegisteredCid(key)) {
+            keys[count] = key;
+            count += 1;
+        }
+    }
+    for (&entry.conn.local_cid_pool.entries) |*cid_entry| {
+        if (!cid_entry.occupied or cid_entry.retired or cid_entry.cid_len == 0) continue;
+        const key = CidKey.fromSlice(cid_entry.getCid());
+        if (entry.hasRegisteredCid(key) or containsCid(keys[0..count], key)) continue;
+        std.debug.assert(count < keys.len);
+        keys[count] = key;
+        count += 1;
+    }
+    return count;
+}
 
 /// Smallest datagram that may open a connection or earn a Version
 /// Negotiation reply (RFC 9000 14.1, 6).
@@ -148,9 +192,14 @@ pub const ReplyLimiter = struct {
     /// Replies allowed per second, and the burst held in reserve. Zero
     /// disables stateless replies altogether.
     per_second: u32 = 200,
+    /// Available reply credits, in 0..per_second for a consistently configured bucket.
     tokens: u32 = 200,
+    /// Last refill time in nanoseconds, using the same epoch as `allow`.
     last_refill_ns: i64 = 0,
 
+    /// Spend one reply credit, or return false without sending anything.
+    /// `now` is nanoseconds in the bucket's epoch. A backward time step resets
+    /// the refill origin without granting credits; zero rate always refuses.
     pub fn allow(self: *ReplyLimiter, now: i64) bool {
         if (self.per_second == 0) return false;
         const elapsed = now - self.last_refill_ns;
@@ -173,8 +222,11 @@ pub const ReplyLimiter = struct {
 /// kind — spoofed short headers soliciting resets, say — cannot spend the
 /// budget that CONNECTION_REFUSED or Version Negotiation owe real clients.
 pub const ReplyLimits = struct {
+    /// Independent Version Negotiation reply budget.
     version_negotiation: ReplyLimiter = .{},
+    /// Independent stateless reset reply budget.
     stateless_reset: ReplyLimiter = .{},
+    /// Independent CONNECTION_REFUSED reply budget.
     refusal: ReplyLimiter = .{},
 
     /// Each kind gets `per_second`, with a burst of the same size.
@@ -185,31 +237,46 @@ pub const ReplyLimits = struct {
 };
 
 /// Manages multiple QUIC connections, routing packets by DCID.
+///
+/// Owns connections, entries and routing tables through the retained allocator.
+/// Copies share those resources; release one owner exactly once with `deinit`.
+/// Serialize calls and use of borrowed entries. The allocator and TLS
+/// configuration's borrowed slices must outlive the manager and its connections.
 pub const ConnectionManager = struct {
+    /// Initial live-connection limit; callers may change `max_connections`.
     pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
+    /// Retained allocator for maps, entries and connections; borrowed until teardown.
     allocator: Allocator,
 
     /// New connections past this many live ones are refused.
     max_connections: usize = DEFAULT_MAX_CONNECTIONS,
+    /// Next entry identity, starting at one. Acceptance increments it; must not wrap.
     next_entry_id: u64 = 1,
+    /// Owned routing map; values borrow entries also held in `entries`.
     cid_map: std.HashMap(CidKey, *ConnEntry, CidKeyContext, 80),
+    /// Owned live-entry list; entries and their connections are owned allocations.
     entries: std.ArrayList(*ConnEntry),
 
     /// Peer-issued stateless reset tokens, so a reset from a client that
     /// lost state finds its connection even though its DCID is random.
     reset_token_map: std.AutoHashMapUnmanaged(ResetKey, *ConnEntry) = .empty,
+    /// Per-manager copied key for keyed reset-token lookup; drawn by `init`.
     reset_lookup_key: [16]u8,
     /// Removals from the two maps above since their tombstones were cleared.
     /// std's HashMap never clears them itself, and every connection ID a
     /// server hands out is inserted and later removed: see `noteRemovals`.
     removed_since_rehash: usize = 0,
 
-    // Server-wide shared config
+    /// Copied server TLS settings; nested slices and pointers retain their borrows.
     tls_config: tls13.TlsConfig,
+    /// Copied settings applied when a connection is accepted.
     conn_config: connection.ConnectionConfig,
+    /// Copied key for sealing and validating address-validation Retry tokens.
     retry_token_key: [16]u8,
+    /// Copied key shared by connection-issued tokens and stateless reset replies.
     static_reset_key: [16]u8,
+    /// Short-header CID length in bytes, in 0..20. Derived from QUIC-LB, or eight.
     local_cid_len: u8 = 8,
 
     /// When true, Initial packets without a valid token get a Retry response.
@@ -232,14 +299,18 @@ pub const ConnectionManager = struct {
     /// config_id, to a server id other than ours belongs to a sibling server
     /// — typically another worker thread on the same port.
     steer_foreign: bool = false,
+    /// Scratch for `RecvAction.foreign`; only the returned prefix is valid,
+    /// and the next foreign-ID extraction overwrites it.
     foreign_id: [15]u8 = undefined,
 
-    // Deferred free queue: entries invalidated by removeConnection are held
-    // here until freeDeadEntries() is called after all event processing.
-    // acceptConnection reserves a slot for every entry it creates, so
-    // removeConnection can never fail to queue one.
+    /// Removed entries awaiting `freeDeadEntries`; still owned, not live-routable.
+    /// Acceptance reserves these slots before publishing an entry.
     dead_entries: std.ArrayList(*ConnEntry) = .empty,
 
+    /// Create an empty manager retaining both configurations by value.
+    /// TLS certificate, ALPN and resumption-ticket slices are borrowed, not
+    /// copied. Keep them alive and unchanged until all users are released.
+    /// Draws one lookup key from `random`; performs no allocation or I/O.
     pub fn init(
         allocator: Allocator,
         tls_config: tls13.TlsConfig,
@@ -269,6 +340,10 @@ pub const ConnectionManager = struct {
         };
     }
 
+    /// Release every live and deferred entry and connection, then routing state.
+    /// Invalidates every borrowed entry, connection and stream. This does not
+    /// release the caller's allocator or borrowed configuration slices.
+    /// Call exactly once; copies and a repeated call are not protected.
     pub fn deinit(self: *ConnectionManager) void {
         // Free deferred-dead entries first
         self.freeDeadEntries();
@@ -321,19 +396,24 @@ pub const ConnectionManager = struct {
         if (self.reset_token_map.capacity() > 0) self.reset_token_map.rehash(std.hash_map.AutoContext(ResetKey){});
     }
 
-    /// Mirror the peer CID pool's reset tokens into `reset_token_map`.
-    fn syncResetTokens(self: *ConnectionManager, entry: *ConnEntry) void {
-        const pool = &entry.conn.peer_cid_pool;
-        if (entry.reset_pool_gen == pool.generation) return;
-        entry.reset_pool_gen = pool.generation;
-        self.dropResetKeys(entry);
-        for (&pool.entries) |*e| {
-            if (!e.occupied) continue;
-            const key = self.resetKey(&e.stateless_reset_token);
-            self.reset_token_map.put(self.allocator, key, entry) catch continue;
-            entry.reset_keys[entry.reset_key_count] = key;
-            entry.reset_key_count += 1;
+    fn resetKeys(self: *const ConnectionManager, entry: *const ConnEntry, keys: *[8]ResetKey) u8 {
+        var count: u8 = 0;
+        for (&entry.conn.peer_cid_pool.entries) |*cid_entry| {
+            if (!cid_entry.occupied) continue;
+            const key = self.resetKey(&cid_entry.stateless_reset_token);
+            var duplicate = false;
+            for (keys[0..count]) |existing| {
+                if (std.mem.eql(u8, &existing, &key)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            std.debug.assert(count < keys.len);
+            keys[count] = key;
+            count += 1;
         }
+        return count;
     }
 
     /// Look up a connection entry by destination CID.
@@ -364,8 +444,7 @@ pub const ConnectionManager = struct {
             self.entries.items.len + self.dead_entries.items.len + 1,
         );
 
-        // Heap-allocate Connection, then build it in place: the by-value
-        // accept() would stage all ~185 KB on the stack first.
+        // Allocate at the final address: transport parameters borrow inline CIDs.
         const conn = try self.allocator.create(connection.Connection);
         errdefer self.allocator.destroy(conn);
         try connection.Connection.acceptInto(
@@ -387,7 +466,12 @@ pub const ConnectionManager = struct {
         errdefer conn.deinit();
         const entry = try self.allocator.create(ConnEntry);
         errdefer self.allocator.destroy(entry);
-        entry.* = .{ .conn = conn, .id = self.next_entry_id };
+        const client_dcid_key = CidKey.fromSlice(header.dcid);
+        entry.* = .{
+            .conn = conn,
+            .id = self.next_entry_id,
+            .initial_dcid = client_dcid_key,
+        };
         self.next_entry_id += 1;
 
         // Register server's SCID in the routing map
@@ -397,40 +481,64 @@ pub const ConnectionManager = struct {
         errdefer _ = self.cid_map.remove(scid_key);
 
         // Also register the client's initial DCID so retransmitted Initials route correctly
-        const client_dcid_key = CidKey.fromSlice(header.dcid);
         try self.cid_map.put(client_dcid_key, entry);
-        entry.addRegisteredCid(client_dcid_key);
+        if (!entry.hasRegisteredCid(client_dcid_key)) entry.addRegisteredCid(client_dcid_key);
 
         self.entries.appendAssumeCapacity(entry);
 
         return entry;
     }
 
-    /// Synchronize the CID routing map with the connection's LocalCidPool.
-    /// Registers new CIDs and unregisters retired ones.
-    pub fn syncCids(self: *ConnectionManager, entry: *ConnEntry) void {
-        const pool = &entry.conn.local_cid_pool;
-
-        for (&pool.entries) |*cid_entry| {
-            const key = CidKey.fromSlice(cid_entry.cid_buf[0..cid_entry.cid_len]);
-            if (key.len == 0) continue;
-
-            if (cid_entry.occupied and !cid_entry.retired) {
-                // Active CID — register if not already present
-                if (!entry.hasRegisteredCid(key)) {
-                    self.cid_map.put(key, entry) catch {};
-                    entry.addRegisteredCid(key);
-                }
-            } else if (cid_entry.retired) {
-                // Retired CID — unregister if present
-                if (entry.hasRegisteredCid(key)) {
-                    _ = self.cid_map.remove(key);
-                    entry.removeRegisteredCid(key);
-                    self.noteRemovals(1);
-                }
-            }
+    /// Synchronize local CID routes and peer reset tokens, retaining Initial routing.
+    /// Retirement is reconciled against the current pool, even after slot reuse.
+    /// `error.OutOfMemory` leaves indexed keys, registration counts and the
+    /// synchronized generation unchanged; map capacity may grow. Retry before
+    /// sending newly issued CIDs. Requires a live entry owned by this manager.
+    pub fn syncCids(self: *ConnectionManager, entry: *ConnEntry) error{OutOfMemory}!void {
+        var new_cids: [9]CidKey = undefined;
+        const new_cid_count = unregisteredCids(entry, &new_cids);
+        var cid_growth: u32 = 0;
+        for (new_cids[0..new_cid_count]) |key| {
+            if (!self.cid_map.contains(key)) cid_growth += 1;
         }
-        self.syncResetTokens(entry);
+
+        const peer_pool = &entry.conn.peer_cid_pool;
+        const update_resets = entry.reset_pool_gen != peer_pool.generation;
+        var reset_keys: [8]ResetKey = undefined;
+        const reset_count = if (update_resets) self.resetKeys(entry, &reset_keys) else 0;
+        var reset_growth: u32 = 0;
+        for (reset_keys[0..reset_count]) |key| {
+            if (!self.reset_token_map.contains(key)) reset_growth += 1;
+        }
+        try self.cid_map.ensureUnusedCapacity(cid_growth);
+        try self.reset_token_map.ensureUnusedCapacity(self.allocator, reset_growth);
+
+        var removed: usize = 0;
+        var index: usize = 0;
+        while (index < entry.registered_cid_count) {
+            const key = entry.registered_cids[index];
+            const initial = if (entry.initial_dcid) |cid| CidKeyContext.eql(.{}, cid, key) else false;
+            if (initial or activeCid(&entry.conn.local_cid_pool, key)) {
+                index += 1;
+                continue;
+            }
+            if (self.cid_map.remove(key)) removed += 1;
+            entry.removeRegisteredCid(index);
+        }
+        for (new_cids[0..new_cid_count]) |key| {
+            self.cid_map.putAssumeCapacity(key, entry);
+            entry.addRegisteredCid(key);
+        }
+        self.noteRemovals(removed);
+        if (update_resets) {
+            self.dropResetKeys(entry);
+            for (reset_keys[0..reset_count]) |key| {
+                self.reset_token_map.putAssumeCapacity(key, entry);
+            }
+            @memcpy(entry.reset_keys[0..reset_count], reset_keys[0..reset_count]);
+            entry.reset_key_count = reset_count;
+            entry.reset_pool_gen = peer_pool.generation;
+        }
     }
 
     /// Remove a terminated connection. It leaves the routing map at once, but
@@ -476,9 +584,11 @@ pub const ConnectionManager = struct {
     /// Result of processing a received UDP datagram.
     pub const RecvAction = union(enum) {
         /// Datagram was delivered to an existing or newly accepted connection.
+        /// Borrowed until the entry is freed by `freeDeadEntries` or `deinit`.
         processed: *ConnEntry,
         /// A response packet (VN, Retry, or Stateless Reset) was written to
         /// out_buf and should be sent back to the source address.
+        /// Borrows `out_buf` until that buffer is overwritten or released.
         send_response: []const u8,
         /// Datagram was unroutable or invalid; no action needed.
         dropped: void,
@@ -493,6 +603,14 @@ pub const ConnectionManager = struct {
     /// coalesced packets (RFC 9000 §12.2).
     ///
     /// The application should send `send_response` data back to the source.
+    /// `bytes` is borrowed for this call and may be decrypted in place.
+    /// Response bytes borrow `out_buf`; consume them before reusing that buffer.
+    /// A dropped datagram gives no valid output prefix.
+    /// `error.OutOfMemory` from index synchronization may follow committed packet
+    /// processing. Do not replay the decrypted bytes; retry `syncCids` on live
+    /// entries before sending newly issued CIDs. Index keys remain valid on refusal.
+    /// `now` is nanoseconds in the connections' clock epoch; `ecn_val` is the
+    /// received IP ECN field. Entropy is drawn only from the supplied generator.
     pub fn recvDatagram(
         self: *ConnectionManager,
         bytes: []u8,
@@ -502,13 +620,14 @@ pub const ConnectionManager = struct {
         out_buf: []u8,
         now: i64,
         random: std.Random,
-    ) RecvAction {
+    ) error{OutOfMemory}!RecvAction {
         return self.route(bytes, from, local, ecn_val, out_buf, now, random, self.steer_foreign);
     }
 
     /// `recvDatagram` for a datagram another server already reported as
     /// `foreign` and handed to us: never reported as foreign again, so a
     /// DCID nobody owns cannot bounce between servers.
+    /// Has the same input borrows and allocation-failure residue as `recvDatagram`.
     pub fn recvHandedOver(
         self: *ConnectionManager,
         bytes: []u8,
@@ -518,7 +637,7 @@ pub const ConnectionManager = struct {
         out_buf: []u8,
         now: i64,
         random: std.Random,
-    ) RecvAction {
+    ) error{OutOfMemory}!RecvAction {
         return self.route(bytes, from, local, ecn_val, out_buf, now, random, false);
     }
 
@@ -532,7 +651,7 @@ pub const ConnectionManager = struct {
         now: i64,
         random: std.Random,
         steer: bool,
-    ) RecvAction {
+    ) error{OutOfMemory}!RecvAction {
         var fbs = io.fixedBufferStream(bytes);
         var current_entry: ?*ConnEntry = null;
         // Out here: the new connection's transport parameters point into it
@@ -545,7 +664,6 @@ pub const ConnectionManager = struct {
 
             const pkt_start = fbs.seek;
             var header = packet.Header.parse(&fbs, self.local_cid_len) catch break;
-            const full_size = fbs.seek - pkt_start + header.remainder_len;
 
             // Version negotiation (RFC 9000 §6). Only for a datagram as large
             // as a real Initial, so it cannot amplify a spoofed small one.
@@ -556,6 +674,10 @@ pub const ConnectionManager = struct {
                 packet.negotiateVersion(header, &vn_fbs, random) catch return .{ .dropped = {} };
                 return .{ .send_response = vn_fbs.buffered() };
             }
+            // Read after the Version Negotiation branch, because that is the
+            // one packet type with no Length field: a packet length this loop
+            // steps by has to come from the packet.
+            const full_size = fbs.seek - pkt_start + header.remainder_len;
 
             // Route to existing connection by DCID
             var entry = current_entry orelse self.findByDcid(header.dcid);
@@ -683,7 +805,7 @@ pub const ConnectionManager = struct {
                 }
                 break;
             };
-            self.syncCids(e);
+            try self.syncCids(e);
 
             const next_pos = pkt_start + full_size;
             if (fbs.seek < next_pos) fbs.seek = next_pos;
@@ -803,24 +925,6 @@ test "CidKey different lengths" {
     try std.testing.expect(!CidKeyContext.eql(.{}, a, b));
 }
 
-test "ConnEntry registered CIDs" {
-    var entry = ConnEntry{ .conn = undefined };
-
-    const key1 = CidKey.fromSlice(&[_]u8{ 0x01, 0x02 });
-    const key2 = CidKey.fromSlice(&[_]u8{ 0x03, 0x04 });
-
-    entry.addRegisteredCid(key1);
-    entry.addRegisteredCid(key2);
-    try std.testing.expectEqual(@as(u8, 2), entry.registered_cid_count);
-    try std.testing.expect(entry.hasRegisteredCid(key1));
-    try std.testing.expect(entry.hasRegisteredCid(key2));
-
-    entry.removeRegisteredCid(key1);
-    try std.testing.expectEqual(@as(u8, 1), entry.registered_cid_count);
-    try std.testing.expect(!entry.hasRegisteredCid(key1));
-    try std.testing.expect(entry.hasRegisteredCid(key2));
-}
-
 test "max_connections is configurable past 256, and every removed entry is freed" {
     const alloc = std.testing.allocator;
     const tls_config: tls13.TlsConfig = .{
@@ -902,6 +1006,15 @@ fn testManager(alloc: Allocator, random: std.Random) ConnectionManager {
     return ConnectionManager.init(alloc, tls_config, .{}, .{0} ** 16, .{0} ** 16, random);
 }
 
+fn testAcceptedEntry(manager: *ConnectionManager, random: std.Random) !*ConnEntry {
+    return manager.acceptConnection(.{
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .packet_type = .initial,
+        .dcid = &([_]u8{0xbb} ** 8),
+        .scid = &([_]u8{0xaa} ** 8),
+    }, .unset, .unset, null, null, test_now, random);
+}
+
 /// A real client's first datagram, padded to 1200 bytes as RFC 9000 14.1 asks.
 fn clientInitial(
     alloc: Allocator,
@@ -942,7 +1055,7 @@ test "an Initial in a datagram under 1200 bytes opens no connection" {
     var buf = [_]u8{0} ** 1500;
     var out: [1500]u8 = undefined;
     const n = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &([_]u8{0x11} ** 8));
-    const action = mgr.recvDatagram(buf[0..n], addr, addr, 0, &out, now, random);
+    const action = try mgr.recvDatagram(buf[0..n], addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .dropped);
     try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
 }
@@ -959,7 +1072,7 @@ test "an Initial with a DCID under 8 bytes opens no connection" {
     var buf = [_]u8{0} ** 1200;
     var out: [1500]u8 = undefined;
     _ = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &([_]u8{0x11} ** 7));
-    const action = mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random);
+    const action = try mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .dropped);
     try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
 }
@@ -978,12 +1091,12 @@ test "Version Negotiation only answers full-size datagrams, and is rate limited"
     var buf = [_]u8{0} ** 1200;
     var out: [1500]u8 = undefined;
     const n = fakeLongHeader(&buf, unknown, &([_]u8{0x11} ** 8));
-    var action = mgr.recvDatagram(buf[0..n], addr, addr, 0, &out, now, random);
+    var action = try mgr.recvDatagram(buf[0..n], addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .dropped);
-    action = mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random);
+    action = try mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .send_response);
     // The bucket is spent; the refill needs a second to pass.
-    action = mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random);
+    action = try mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .dropped);
 }
 
@@ -999,15 +1112,15 @@ test "stateless reset answers only packets long enough not to be one" {
     var buf = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
     var out: [1500]u8 = undefined;
     const short = buf[0 .. MIN_RESET_TRIGGER - 1];
-    var action = mgr.recvDatagram(short, addr, addr, 0, &out, now, random);
+    var action = try mgr.recvDatagram(short, addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .dropped);
-    switch (mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random)) {
+    switch (try mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random)) {
         .send_response => |r| try std.testing.expect(r.len < buf.len),
         else => return error.TestUnexpectedResult,
     }
 
     mgr.reply_limits = .init(0);
-    action = mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random);
+    action = try mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .dropped);
 }
 
@@ -1038,9 +1151,9 @@ test "spoofed reset triggers do not spend the CONNECTION_REFUSED budget" {
     var out: [1500]u8 = undefined;
 
     var junk = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
-    var action = mgr.recvDatagram(&junk, addr, addr, 0, &out, now, random);
+    var action = try mgr.recvDatagram(&junk, addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .send_response);
-    action = mgr.recvDatagram(&junk, addr, addr, 0, &out, now, random);
+    action = try mgr.recvDatagram(&junk, addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .dropped);
 
     var buf: [1500]u8 = undefined;
@@ -1049,7 +1162,7 @@ test "spoofed reset triggers do not spend the CONNECTION_REFUSED budget" {
         client.conn.deinit();
         alloc.destroy(client.conn);
     }
-    action = mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out, now, random);
+    action = try mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .send_response);
 }
 
@@ -1072,7 +1185,7 @@ test "a server at capacity refuses a new client with CONNECTION_REFUSED" {
     try std.testing.expect(client.len >= MIN_INITIAL_DATAGRAM);
 
     var out: [1500]u8 = undefined;
-    const reply = switch (mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out, now, random)) {
+    const reply = switch (try mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out, now, random)) {
         .send_response => |r| r,
         else => return error.TestUnexpectedResult,
     };
@@ -1111,7 +1224,7 @@ test "refuse_new turns away new connections while existing ones keep routing" {
         alloc.destroy(client.conn);
     }
     var out: [1500]u8 = undefined;
-    const action = mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out, now, random);
+    const action = try mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .send_response);
     try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
 }
@@ -1155,23 +1268,23 @@ test "a 1-RTT packet for another QUIC-LB server id is reported, not reset" {
 
     var cid: [8]u8 = undefined;
     quic_lb.generateCid(&lbConfig(2), &cid, random);
-    switch (mgr.recvDatagram(shortPacket(&buf, &cid), addr, addr, 0, &out, now, random)) {
+    switch (try mgr.recvDatagram(shortPacket(&buf, &cid), addr, addr, 0, &out, now, random)) {
         .foreign => |id| try std.testing.expectEqualSlices(u8, &.{2}, id),
         else => return error.TestUnexpectedResult,
     }
 
     // Handed over and still unknown: reset, never passed on again.
-    var action = mgr.recvHandedOver(shortPacket(&buf, &cid), addr, addr, 0, &out, now, random);
+    var action = try mgr.recvHandedOver(shortPacket(&buf, &cid), addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .send_response);
 
     // Our own id with no connection behind it is simply gone.
     quic_lb.generateCid(&lbConfig(1), &cid, random);
-    action = mgr.recvDatagram(shortPacket(&buf, &cid), addr, addr, 0, &out, now, random);
+    action = try mgr.recvDatagram(shortPacket(&buf, &cid), addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .send_response);
 
     mgr.steer_foreign = false;
     quic_lb.generateCid(&lbConfig(2), &cid, random);
-    action = mgr.recvDatagram(shortPacket(&buf, &cid), addr, addr, 0, &out, now, random);
+    action = try mgr.recvDatagram(shortPacket(&buf, &cid), addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .send_response);
 }
 
@@ -1189,7 +1302,7 @@ test "an Initial is accepted locally even when its DCID decodes to another serve
     quic_lb.generateCid(&lbConfig(2), &cid, random);
     var buf = [_]u8{0} ** 1200;
     _ = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &cid);
-    const action = mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random);
+    const action = try mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .processed);
     try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
     // And the connection's own CID carries our id.
@@ -1217,7 +1330,7 @@ test "past retry_threshold a new client gets Retry, and is served once it echoes
         first.conn.deinit();
         alloc.destroy(first.conn);
     }
-    var action = mgr.recvDatagram(buf[0..first.len], addr, addr, 0, &out, now, random);
+    var action = try mgr.recvDatagram(buf[0..first.len], addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .processed);
 
     // At it: Retry, and no state kept.
@@ -1226,7 +1339,7 @@ test "past retry_threshold a new client gets Retry, and is served once it echoes
         second.conn.deinit();
         alloc.destroy(second.conn);
     }
-    const retry = switch (mgr.recvDatagram(buf[0..second.len], addr, addr, 0, &out, now, random)) {
+    const retry = switch (try mgr.recvDatagram(buf[0..second.len], addr, addr, 0, &out, now, random)) {
         .send_response => |r| r,
         else => return error.TestUnexpectedResult,
     };
@@ -1243,8 +1356,158 @@ test "past retry_threshold a new client gets Retry, and is served once it echoes
     // the connection is set up as a retried one.
     mgr.removeConnection(mgr.entries.items[0]);
     const n = try second.conn.sendAt(&buf, now, random);
-    action = mgr.recvDatagram(buf[0..n], addr, addr, 0, &out, now, random);
+    action = try mgr.recvDatagram(buf[0..n], addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .processed);
     try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
     try std.testing.expect(mgr.entries.items[0].conn.paths[0].is_validated);
+}
+
+test "an accept that runs out of memory leaves no connection and no entry behind" {
+    const local: address.Address = .unset;
+    const scid = [_]u8{0xaa} ** 8;
+    const dcid = [_]u8{0xbb} ** 8;
+    const header: packet.Header = .{
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .packet_type = .initial,
+        .dcid = &dcid,
+        .scid = &scid,
+    };
+    var entropy = TestRandom.init(7);
+
+    // Every allocation an accept makes, one at a time, so the refusal lands
+    // at each step in turn: the two reservations, the connection, and the
+    // handshake and queues built inside it.
+    var fail_at: usize = 0;
+    while (fail_at < 8) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_at });
+        var mgr = testManager(failing.allocator(), entropy.random());
+        defer mgr.deinit();
+
+        if (mgr.acceptConnection(header, local, local, null, null, test_now, entropy.random())) |entry| {
+            // This step fitted: drop the connection the way a server does
+            // and let the next refusal be measured on a clean table.
+            mgr.removeConnection(entry);
+            mgr.freeDeadEntries();
+            continue;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            // A refused accept is not a connection: nothing in the table to
+            // remove, nothing in the routing map to route to, and nothing the
+            // testing allocator still holds an account of.
+            try std.testing.expectEqual(@as(usize, 0), mgr.entries.items.len);
+            try std.testing.expectEqual(@as(usize, 0), mgr.cid_map.count());
+            try std.testing.expectEqual(@as(usize, 0), mgr.dead_entries.items.len);
+        }
+    }
+}
+
+test "CID index allocation refusal leaves registration pending for retry" {
+    const alloc = std.testing.allocator;
+    var entropy = TestRandom.init(17);
+    const random = entropy.random();
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    var mgr = testManager(failing.allocator(), random);
+    defer mgr.deinit();
+    const entry = try testAcceptedEntry(&mgr, random);
+    const previous_count = entry.registered_cid_count;
+    const previous_key = entry.registered_cids[0];
+    var key: CidKey = undefined;
+    for (0..7) |index| {
+        const issued = entry.conn.local_cid_pool.issueNewCid(8, null, random) orelse
+            return error.TestUnexpectedResult;
+        if (index == 0) key = CidKey.fromSlice(issued.getCid());
+    }
+    failing.fail_index = failing.alloc_index;
+
+    try std.testing.expectError(error.OutOfMemory, mgr.syncCids(entry));
+    try std.testing.expectEqual(previous_count, entry.registered_cid_count);
+    try std.testing.expect(mgr.findByDcid(previous_key.getSlice()) == entry);
+    try std.testing.expect(mgr.findByDcid(key.getSlice()) == null);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try mgr.syncCids(entry);
+    try std.testing.expect(mgr.findByDcid(key.getSlice()) == entry);
+    try std.testing.expectEqual(@as(u8, 9), entry.registered_cid_count);
+}
+
+test "CID slot reuse removes retired routes and preserves Initial routing" {
+    const alloc = std.testing.allocator;
+    var entropy = TestRandom.init(19);
+    const random = entropy.random();
+    var mgr = testManager(alloc, random);
+    defer mgr.deinit();
+    const initial_dcid = [_]u8{0xbb} ** 8;
+    const client_scid = [_]u8{0xaa} ** 8;
+    const header: packet.Header = .{
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .packet_type = .initial,
+        .dcid = &initial_dcid,
+        .scid = &client_scid,
+    };
+    const entry = try mgr.acceptConnection(
+        header,
+        .unset,
+        .unset,
+        null,
+        null,
+        test_now,
+        random,
+    );
+    try mgr.syncCids(entry);
+
+    for (0..12) |_| {
+        const previous = CidKey.fromSlice(entry.conn.local_cid_pool.entries[0].getCid());
+        entry.conn.local_cid_pool.retireBySeq(entry.conn.local_cid_pool.entries[0].seq_num);
+        const next = entry.conn.local_cid_pool.issueNewCid(8, null, random) orelse
+            return error.TestUnexpectedResult;
+        const current = CidKey.fromSlice(next.getCid());
+        try mgr.syncCids(entry);
+        try std.testing.expect(mgr.findByDcid(previous.getSlice()) == null);
+        try std.testing.expect(mgr.findByDcid(current.getSlice()) == entry);
+        try std.testing.expect(mgr.findByDcid(&initial_dcid) == entry);
+        try std.testing.expectEqual(@as(u8, 2), entry.registered_cid_count);
+    }
+
+    mgr.removeConnection(entry);
+    mgr.freeDeadEntries();
+    try std.testing.expectEqual(@as(u32, 0), mgr.cid_map.count());
+}
+
+test "reset index allocation refusal preserves old tokens and retries the new generation" {
+    const alloc = std.testing.allocator;
+    var entropy = TestRandom.init(23);
+    const random = entropy.random();
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    var mgr = testManager(failing.allocator(), random);
+    defer mgr.deinit();
+    const entry = try testAcceptedEntry(&mgr, random);
+    const old_token: [16]u8 = @splat(0xe0);
+    entry.conn.peer_cid_pool.addPeerCid(0, &.{0xe0}, old_token);
+    try mgr.syncCids(entry);
+    const previous_generation = entry.reset_pool_gen;
+    var reset: [stateless_reset.MIN_PACKET_LEN]u8 = @splat(0x41);
+    @memcpy(reset[reset.len - old_token.len ..], &old_token);
+    try std.testing.expect(mgr.findByResetToken(&reset) == entry);
+
+    entry.conn.peer_cid_pool.removeBySeq(0);
+    for (1..9) |i| {
+        const byte: u8 = @intCast(i);
+        entry.conn.peer_cid_pool.addPeerCid(i, &.{byte}, @splat(byte));
+    }
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, mgr.syncCids(entry));
+    try std.testing.expectEqual(previous_generation, entry.reset_pool_gen);
+    try std.testing.expect(mgr.findByResetToken(&reset) == entry);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try mgr.syncCids(entry);
+    try std.testing.expect(mgr.findByResetToken(&reset) == null);
+    for (1..9) |i| {
+        @memset(reset[reset.len - 16 ..], @intCast(i));
+        try std.testing.expect(mgr.findByResetToken(&reset) == entry);
+    }
+    try std.testing.expectEqual(
+        entry.conn.peer_cid_pool.generation,
+        entry.reset_pool_gen,
+    );
 }

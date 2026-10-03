@@ -67,7 +67,9 @@ pub const Error = error{
     BadBool,
     /// An `Option` tag other than 0 or 1.
     BadOptionTag,
-    /// An enum discriminant this build has no arm for.
+    /// An enum discriminant no declared arm names. Only an exhaustive enum
+    /// can produce it; a non-exhaustive one accepts every tag its tag type
+    /// represents. See `Reader.readVariant`.
     UnknownVariant,
     /// Bytes where a string was expected that are not UTF-8.
     InvalidUtf8,
@@ -107,8 +109,21 @@ pub fn varintMaxLastByte(comptime Int: type) u8 {
 /// buffer too small is `error.BufferFull`, never a resize behind the caller's
 /// back. `finish` returns the written prefix and leaves the rest of the buffer
 /// alone, so one scratch buffer serves every encode in a scope.
+///
+/// A writer is a cursor into a buffer it does not own. Two writers over the
+/// same buffer are two cursors and both write; a `Writer` that outlives the
+/// buffer, or one that is copied and used after the original has moved on,
+/// writes through a pointer the caller no longer holds.
+///
+/// `error.BufferFull` may leave a committed prefix and an advanced cursor,
+/// including part of a varint or a byte string's length without its payload.
+/// Do not retry a field from that cursor. Restart the message with `init`.
 pub const Writer = struct {
+    /// The caller's buffer, borrowed for as long as the writer is used and
+    /// never resized: an encode that does not fit is `error.BufferFull`.
     buffer: []u8,
+    /// How much of `buffer` has been written. Every method advances it, and
+    /// `init` sets it to zero.
     length: usize,
 
     /// Encode into `buffer`, overwriting from its first byte.
@@ -143,26 +158,34 @@ pub const Writer = struct {
         try self.writeU8(@bitCast(value));
     }
 
+    /// `varint(u16)`: one to three bytes, low bits first.
+    /// Needs the encoded width, at most `varintMax(u16)`. `BufferFull` may leave
+    /// a partial varint; follow the writer's restart rule.
     pub fn writeU16(self: *Writer, value: u16) Error!void {
         try self.writeVarint(u16, value);
     }
 
+    /// `varint(u16)` over the zigzag encoding, so -1 is the single byte 0x01.
     pub fn writeI16(self: *Writer, value: i16) Error!void {
         try self.writeVarint(u16, zigZag(value));
     }
 
+    /// `varint(u32)`: one to five bytes, at most `varintMax(u32)` of buffer.
     pub fn writeU32(self: *Writer, value: u32) Error!void {
         try self.writeVarint(u32, value);
     }
 
+    /// `varint(u32)` over the zigzag encoding.
     pub fn writeI32(self: *Writer, value: i32) Error!void {
         try self.writeVarint(u32, zigZag(value));
     }
 
+    /// `varint(u64)`: one to ten bytes, at most `varintMax(u64)` of buffer.
     pub fn writeU64(self: *Writer, value: u64) Error!void {
         try self.writeVarint(u64, value);
     }
 
+    /// `varint(u64)` over the zigzag encoding.
     pub fn writeI64(self: *Writer, value: i64) Error!void {
         try self.writeVarint(u64, zigZag(value));
     }
@@ -257,8 +280,19 @@ pub const Writer = struct {
 /// value, and nothing else. There is no `unreachable` on any decode path,
 /// because the only input to this module that is not chosen by us is a peer's
 /// bytes.
+///
+/// A reader is a cursor into a buffer it does not own, and copying one copies
+/// the cursor: two readers over the same buffer are independent positions,
+/// each advancing its own `offset`. A slice a read handed out points into
+/// `buffer`, so it stays valid for as long as the caller's buffer does and is
+/// not affected by where the reader has since moved.
 pub const Reader = struct {
+    /// The caller's bytes, borrowed for as long as the reader is used. Any
+    /// slice a read returns points into this buffer.
     buffer: []const u8,
+    /// How far into `buffer` the next read starts. Every method advances it,
+    /// and `init` sets it to zero; it is public because a framed protocol has
+    /// to record where the frame ended.
     offset: usize,
 
     /// Decode from `bytes`, starting at its first byte.
@@ -281,6 +315,8 @@ pub const Reader = struct {
         if (self.remaining() != 0) return error.TrailingBytes;
     }
 
+    /// One byte: 0 or 1, and `error.BadBool` for anything else. An empty
+    /// input is `error.UnexpectedEnd` rather than `BadBool`.
     pub fn readBool(self: *Reader) Error!bool {
         return switch (try self.readU8()) {
             0 => false,
@@ -289,34 +325,47 @@ pub const Reader = struct {
         };
     }
 
+    /// One raw byte, not a varint: postcard does not varint the widths that
+    /// fit in a byte. `0xff` is 255.
     pub fn readU8(self: *Reader) Error!u8 {
         return (try self.take(1))[0];
     }
 
+    /// One raw byte read as two's complement, so `0xff` is -1.
     pub fn readI8(self: *Reader) Error!i8 {
         return @bitCast(try self.readU8());
     }
 
+    /// `varint(u16)`: one to three bytes. An encoding longer than that is
+    /// `error.BadVarint`; one that terminates inside three bytes but carries
+    /// more than a `u16` holds is `error.ValueOutOfRange`.
     pub fn readU16(self: *Reader) Error!u16 {
         return self.readVarint(u16);
     }
 
+    /// `varint(u16)` read back through the zigzag decoding.
     pub fn readI16(self: *Reader) Error!i16 {
         return unZigZag(try self.readVarint(u16));
     }
 
+    /// `varint(u32)`: one to five bytes, with the same two refusals as
+    /// `readU16`.
     pub fn readU32(self: *Reader) Error!u32 {
         return self.readVarint(u32);
     }
 
+    /// `varint(u32)` read back through the zigzag decoding.
     pub fn readI32(self: *Reader) Error!i32 {
         return unZigZag(try self.readVarint(u32));
     }
 
+    /// `varint(u64)`: one to ten bytes, with the same two refusals as
+    /// `readU16`.
     pub fn readU64(self: *Reader) Error!u64 {
         return self.readVarint(u64);
     }
 
+    /// `varint(u64)` read back through the zigzag decoding.
     pub fn readI64(self: *Reader) Error!i64 {
         return unZigZag(try self.readVarint(u64));
     }
@@ -362,9 +411,21 @@ pub const Reader = struct {
         };
     }
 
-    /// An enum discriminant. A discriminant this build has no arm for is
-    /// `error.UnknownVariant`: a decoder that invented a default arm would
-    /// read a peer it does not understand as a value it does.
+    /// An enum discriminant, read as `varint(u32)` whatever the Zig tag type
+    /// is.
+    ///
+    /// The two kinds of `Variant` read differently, and the difference is in
+    /// the type rather than in this function. A **non-exhaustive** enum —
+    /// one declared with a `_` field — has an unnamed arm for every tag its
+    /// tag type can represent, so a discriminant this build has no *named*
+    /// arm for decodes successfully into that unnamed value; only a number the
+    /// tag type cannot hold is `error.UnknownVariant`. An **exhaustive** enum
+    /// has no such arm, so a discriminant with no declared arm is
+    /// `error.UnknownVariant`.
+    ///
+    /// A caller decoding into a non-exhaustive enum therefore gets values it
+    /// cannot switch exhaustively on: `switch` on the result needs an `else`,
+    /// and `std.enums.tagName` returns null for a tag it does not name.
     pub fn readVariant(self: *Reader, comptime Variant: type) Error!Variant {
         comptime {
             if (@typeInfo(Variant) != .@"enum") {
@@ -962,7 +1023,7 @@ test "a bool byte other than 0 or 1 is rejected" {
     }
 }
 
-test "an unknown enum discriminant is rejected" {
+test "an unknown enum discriminant is rejected by an exhaustive enum" {
     // Three, the first past the last BasicEnum; a u16-wide value, which is one
     // legal `varint(u16)` and one legal `varint(u32)`; and a full u32, which is
     // a well-formed discriminant of a type this build has no arm for.
@@ -974,6 +1035,45 @@ test "an unknown enum discriminant is rejected" {
         var reader = Reader.init(bytes);
         try testing.expectError(error.UnknownVariant, reader.readVariant(BasicEnum));
     }
+}
+
+test "a non-exhaustive enum accepts a tag it has no named arm for" {
+    // The `_` field is an unnamed arm for every tag the tag type can hold, so
+    // a peer may name one this build has never heard of and the read still
+    // succeeds. The caller is left holding a value no name matches, which is
+    // what the `switch`/`tagName` sentence in `readVariant` is about.
+    const Open = enum(u32) { known, _ };
+    const cases = [_]struct { bytes: []const u8, value: u32, named: bool }{
+        // The named arm, the first tag past it, and a full u32.
+        .{ .bytes = &.{0x00}, .value = 0, .named = true },
+        .{ .bytes = &.{0x07}, .value = 7, .named = false },
+        .{ .bytes = &.{ 0xff, 0xff, 0xff, 0xff, 0x0f }, .value = std.math.maxInt(u32), .named = false },
+    };
+    for (cases) |case| {
+        var reader = Reader.init(case.bytes);
+        const tag = try reader.readVariant(Open);
+        try testing.expectEqual(case.value, @intFromEnum(tag));
+        try testing.expectEqual(case.named, std.enums.tagName(Open, tag) != null);
+        try reader.finish();
+    }
+
+    // The tag type is the boundary: an `enum(u8)` cannot represent 300, so
+    // that one is still `UnknownVariant` even though the enum is open.
+    const Narrow = enum(u8) { known, _ };
+    var narrow_reader = Reader.init(&.{ 0xac, 0x02 }); // 300
+    try testing.expectError(error.UnknownVariant, narrow_reader.readVariant(Narrow));
+}
+
+test "an open enum's unknown tag survives a write and a read" {
+    const Open = enum(u32) { known, _ };
+    var buffer: [16]u8 = undefined;
+    var writer = Writer.init(&buffer);
+    try writer.writeVariant(@as(Open, @enumFromInt(7)));
+    try testing.expectEqualSlices(u8, &.{0x07}, writer.finish());
+
+    var reader = Reader.init(writer.finish());
+    try testing.expectEqual(@as(u32, 7), @intFromEnum(try reader.readVariant(Open)));
+    try reader.finish();
 }
 
 test "an invalid utf-8 string is rejected" {

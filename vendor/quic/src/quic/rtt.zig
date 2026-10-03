@@ -1,3 +1,11 @@
+//! Round-trip-time estimation and the timers derived from it (RFC 9002 §5,
+//! §6.2).
+//!
+//! Pure arithmetic over durations in nanoseconds: no clock is read here, every
+//! caller supplies the measurement, and a `RttStats` owns nothing and borrows
+//! nothing. Every value is an `i64` nanosecond duration on the caller's own
+//! monotonic clock — these are differences, never epoch instants.
+
 const std = @import("std");
 const testing = std.testing;
 
@@ -11,6 +19,10 @@ const DEFAULT_INITIAL_RTT: i64 = 100_000_000;
 ///
 /// Maintains smoothed RTT, RTT variance, minimum RTT, and latest RTT.
 /// Used by loss detection and congestion control.
+///
+/// `RttStats{}` has zero sample fields and no measurement; accessors use the
+/// RFC initial RTT. The peer-delay ceiling starts at 25 ms, not zero.
+/// All durations must remain nonnegative. Copies own no resources.
 pub const RttStats = struct {
     /// The most recent RTT measurement (nanoseconds).
     latest_rtt: i64 = 0,
@@ -24,10 +36,18 @@ pub const RttStats = struct {
     /// Minimum RTT observed over the connection lifetime (nanoseconds).
     min_rtt: i64 = 0,
 
-    /// Maximum ACK delay indicated by the peer's transport parameters (nanoseconds).
+    /// Maximum ACK delay indicated by the peer's transport parameters
+    /// (nanoseconds). 25 ms until the peer's transport parameters arrive, and
+    /// `Connection` then overwrites it with `TransportParams.max_ack_delay`
+    /// scaled by 1e6 — the wire carries milliseconds, this field does not, and
+    /// the scaling happens at that assignment rather than here.
+    ///
+    /// It is a ceiling, not a measurement: `updateRtt` clamps the peer's
+    /// reported delay to it and `pto` adds it to the timer.
     max_ack_delay: i64 = 25_000_000, // 25ms default
 
-    /// Whether we have taken the first RTT sample.
+    /// Selects measured statistics rather than RFC initial-RTT fallbacks.
+    /// Manual field writes must keep this flag consistent with the sample fields.
     has_measurement: bool = false,
 
     /// Update RTT statistics with a new measurement.
@@ -35,6 +55,16 @@ pub const RttStats = struct {
     /// `send_delta` is the time between sending the packet and receiving the ACK (nanoseconds).
     /// `ack_delay` is the peer's reported ACK delay (nanoseconds).
     /// `handshake_confirmed` indicates if the handshake is confirmed (affects ack_delay usage).
+    ///
+    /// `ack_delay` is only subtracted once the handshake is confirmed and only
+    /// down to `min_rtt`, and it is clamped to `max_ack_delay` first, so a peer
+    /// that over-reports its delay cannot push the estimate below the floor.
+    ///
+    /// A `send_delta` of zero or less is not a measurement: the call returns
+    /// having changed nothing, so a caller with no sample may pass 0 rather
+    /// than branch. The first accepted sample seeds `min_rtt` and
+    /// `smoothed_rtt` to `send_delta` and `rtt_var` to half of it, and does
+    /// not apply the ACK-delay adjustment.
     pub fn updateRtt(self: *RttStats, send_delta: i64, ack_delay: i64, handshake_confirmed: bool) void {
         if (send_delta <= 0) return;
 
@@ -72,7 +102,13 @@ pub const RttStats = struct {
         self.smoothed_rtt = @divTrunc(7 * self.smoothed_rtt, 8) + @divTrunc(adjusted_rtt, 8);
     }
 
-    /// Calculate the Probe Timeout (PTO) value per RFC 9002 Section 6.2.1.
+    /// Calculate the Probe Timeout (PTO) value per RFC 9002 Section 6.2.1, in
+    /// nanoseconds.
+    ///
+    /// `smoothed_rtt + max(4 * rtt_var, 1ms) + max_ack_delay`, and twice the
+    /// RFC initial RTT before any sample exists. Callers multiply this by
+    /// their own backoff; this is the un-backed-off timer. `ptoNoAckDelay` is
+    /// the same value for the spaces that carry no ACK delay.
     pub fn pto(self: *const RttStats) i64 {
         if (!self.has_measurement) {
             return 2 * DEFAULT_INITIAL_RTT;
@@ -80,7 +116,12 @@ pub const RttStats = struct {
         return self.smoothed_rtt + @max(4 * self.rtt_var, TIMER_GRANULARITY) + self.max_ack_delay;
     }
 
-    /// Calculate the PTO without ACK delay (for Initial/Handshake spaces).
+    /// Calculate the PTO without ACK delay (for Initial/Handshake spaces), in
+    /// nanoseconds.
+    ///
+    /// `pto` without its `max_ack_delay` term, and the same
+    /// twice-initial-RTT fallback before any sample exists. The two agree
+    /// exactly while `max_ack_delay` is 0.
     pub fn ptoNoAckDelay(self: *const RttStats) i64 {
         if (!self.has_measurement) {
             return 2 * DEFAULT_INITIAL_RTT;
@@ -90,6 +131,10 @@ pub const RttStats = struct {
 
     /// Return the loss delay threshold (9/8 * max(smoothed_rtt, latest_rtt)).
     /// Minimum is timer granularity.
+    ///
+    /// Nanoseconds. Before any sample both inputs are 0, so this returns the
+    /// 1 ms granularity rather than 0 — the floor is what makes the threshold
+    /// usable before the first RTT sample arrives.
     pub fn lossDelay(self: *const RttStats) i64 {
         const rtt = @max(self.smoothed_rtt, self.latest_rtt);
         const delay = @divTrunc(rtt * 9, 8);
@@ -97,14 +142,23 @@ pub const RttStats = struct {
     }
 
     /// Get the smoothed RTT, or the default initial RTT if no measurement yet.
+    ///
+    /// Nanoseconds, and the one accessor that substitutes the RFC initial RTT
+    /// instead of a per-accessor fallback of its own. It exists so callers that
+    /// size a window or a bandwidth estimate have a non-zero value to divide
+    /// by on a fresh tracker.
     pub fn smoothedRttOrDefault(self: *const RttStats) i64 {
         if (!self.has_measurement) return DEFAULT_INITIAL_RTT;
         return self.smoothed_rtt;
     }
 
-    // Persistent congestion threshold (RFC 9002 §7.6.1).
-    // Duration = 3 * (smoothed_rtt + max(4*rttvar, granularity) + max_ack_delay)
-    // This equals 3 * PTO (without backoff).
+    /// Persistent congestion threshold (RFC 9002 §7.6.1), in nanoseconds.
+    /// Duration = 3 * (smoothed_rtt + max(4*rttvar, granularity) + max_ack_delay)
+    /// This equals 3 * PTO (without backoff).
+    ///
+    /// A loss burst spanning at least this long is persistent congestion; the
+    /// caller compares its own oldest-to-newest lost span against it, so the
+    /// threshold is read and never set by this call.
     pub fn persistentCongestionThreshold(self: *const RttStats) i64 {
         if (!self.has_measurement) {
             return 3 * 2 * DEFAULT_INITIAL_RTT;

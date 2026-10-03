@@ -158,28 +158,51 @@ fn containsAddr(set: []const SocketAddr, needle: SocketAddr) bool {
     return false;
 }
 
-/// One round the stack accepted: what it was started with, and when.
+/// One round the stack accepted: when it started, and what the stack found.
 ///
-/// Upstream's `HolepunchAttempt`. The two sets are borrowed rather than owned,
-/// and the caller keeps that storage alive for as long as the state names it —
-/// the reason `CustomAddr.parse` takes the caller's storage.
+/// Upstream's `HolepunchAttempt`, minus its `local` field. Upstream can keep
+/// that field as a borrowed slice because its state lives in an `Arc` behind
+/// the machine that started the round; here `PunchState` is a plain value that
+/// callers copy — `Step.next` is one, `Join` is one — and a field that borrows
+/// storage *inside the value being copied* is silently wrong the moment it is:
+/// the copy reads the original's bytes and nobody can tell. The local set a
+/// round started with is therefore an argument to `decide` rather than a field
+/// of the state, and it is read exactly once, on the turn that compares it.
+///
+/// What is left borrows from the caller and nothing else: `remote` names the
+/// candidates the stack returned, which arrive in `Outcome.accepted` and stay
+/// the caller's to keep alive. Copying a state copies that pointer, and both
+/// copies name the same caller buffer, which is what makes the copy safe. A
+/// state holding a slice into itself would not have that property.
 pub const Attempt = struct {
+    /// When the accepted round started, on the caller's timeline.
     when: Nanos,
-    local: []const SocketAddr,
+    /// The candidates the stack reported for it. Borrowed from whoever decoded
+    /// them, as `Outcome.accepted` is: keep that storage alive for as long as
+    /// this state names it.
     remote: []const SocketAddr,
 };
 
-/// One remote's NAT-traversal state. Every field is a value the caller owns.
+/// One remote's NAT-traversal state. A plain value with no borrow of its own
+/// storage: copying it copies values and caller-owned pointers, never a
+/// pointer into itself, so a copy reads what the original reads and the two
+/// cannot drift apart. The one slice it carries, `last.remote`, belongs to the
+/// caller and both copies name the same buffer.
 pub const PunchState = struct {
     /// The connection a round runs on, or null while the gate holds for want of
     /// one. See `selectPunchConnection`.
     punch: ?ConnId = null,
-    /// The last round the stack accepted.
+    /// The last round the stack accepted, or null when none has been.
     ///
     /// Upstream writes this only on `Ok`, and that is load-bearing rather than
     /// incidental: a round that failed moved no candidate, so the next wakeup
     /// has to see the same candidates as new and try again rather than sit out
     /// the interval.
+    ///
+    /// This holds *when* that round started and what the stack found, not what
+    /// it was started with: the local set it started with is the caller's, and
+    /// `decide` takes it as `Candidates.previous_local`. See `Attempt` for why
+    /// it is not a field here.
     last: ?Attempt = null,
     /// The path the connection is currently selected onto.
     ///
@@ -223,16 +246,45 @@ pub const Step = struct {
     action: ?Action = null,
 };
 
+/// The three candidate sets one turn of the gate reads.
+///
+/// Three slices of the same type, so they travel together: named positions in a
+/// parameter list are three ways to transpose the same address and the gate
+/// would answer about one peer while the caller asked about another. All three
+/// are borrowed from the caller for the length of the `decide` call and none
+/// of them is retained: `decide` returns a `PunchState` and an `Action`, and
+/// neither names any of them. What the state keeps from a round is in
+/// `Attempt`, and that keeps only what the caller already owns.
+pub const Candidates = struct {
+    /// What this node may be punched at, as it stands now.
+    local: []const SocketAddr,
+    /// What the peer may be punched at, as it stands now.
+    remote: []const SocketAddr,
+    /// What this node was punched at when the last accepted round started — the
+    /// caller's own copy of that set, kept wherever the caller keeps it. Empty
+    /// when there is no accepted round on record. Read only when
+    /// `PunchState.last` is not null; then an empty set affects the comparison.
+    ///
+    /// **Not `Attempt.local`.** A round's starting set is compared exactly once,
+    /// on the turn after it, and a state that held it would have to borrow it
+    /// from somewhere: from the state that owns it, which is a copy that reads
+    /// the wrong bytes. See `Attempt`.
+    previous_local: []const SocketAddr,
+};
+
 /// The gate. One wakeup in, one decision out.
 ///
 /// `now` is the current instant on the caller's own timeline. Upstream reads
 /// `Instant::now()` at three points inside this function; passing it in is what
 /// makes "too soon" and "due" two answers a test can tell apart.
+///
+/// Pure, and it stays that way: nothing it is handed is stored anywhere it
+/// returns. `next` is `state` itself on every arm, so the answer is the state
+/// the caller already had plus at most one instruction.
 pub fn decide(
     state: PunchState,
     now: Nanos,
-    local: []const SocketAddr,
-    remote: []const SocketAddr,
+    candidates: Candidates,
 ) Step {
     if (state.stopped != null) return .{ .next = state };
     const conn = state.punch orelse return .{ .next = state };
@@ -242,8 +294,8 @@ pub fn decide(
     // address event becomes a round, which floods the relay; drop the second
     // and a peer whose NAT mapping simply aged out is never tried again.
     if (last) |previous| {
-        const appeared = hasNewAddress(local, previous.local) or
-            hasNewAddress(remote, previous.remote);
+        const appeared = hasNewAddress(candidates.local, candidates.previous_local) or
+            hasNewAddress(candidates.remote, previous.remote);
         if (!appeared) {
             // Saturating, so a timeline within five seconds of its ceiling waits
             // rather than wrapping into a round that is always due.
@@ -264,16 +316,23 @@ pub const Outcome = union(enum) {
 };
 
 /// Fold a round's answer back into the state. Pure, like `decide`.
+///
+/// Takes no candidate set, because there is nothing left of one to keep: the
+/// accepted arm records when the round started and what the stack found, and
+/// the caller already holds the set it started the round with — it is the same
+/// `Candidates.local` it will hand to the next `decide` as
+/// `previous_local`. Recording a slice of it here instead would be the one
+/// thing in this file that survives a copy of the state pointing at bytes that
+/// are no longer the state being read.
 pub fn settle(
     state: PunchState,
     now: Nanos,
-    local: []const SocketAddr,
     outcome: Outcome,
 ) Step {
     return switch (outcome) {
         .accepted => |remote| .{ .next = .{
             .punch = state.punch,
-            .last = .{ .when = now, .local = local, .remote = remote },
+            .last = .{ .when = now, .remote = remote },
             .selected = state.selected,
             .stopped = state.stopped,
         } },
@@ -606,14 +665,18 @@ test "the punch connection is the lowest client connection" {
 
 test "a peer with no client connection is not punched" {
     const state: PunchState = .{};
-    const step = decide(state, 0, &.{ip(1)}, &.{ip(2)});
+    const step = decide(state, 0, .{
+        .local = &.{ip(1)},
+        .remote = &.{ip(2)},
+        .previous_local = &.{},
+    });
     try t.expect(step.action == null);
 }
 
 test "the first round runs whatever else is true" {
     // No attempt on record, so there is no interval and no comparison set.
     const state: PunchState = .{ .punch = 3 };
-    const step = decide(state, 0, &.{}, &.{});
+    const step = decide(state, 0, .{ .local = &.{}, .remote = &.{}, .previous_local = &.{} });
     try t.expect(std.meta.eql(Action{ .initiateNatTraversalRound = 3 }, try onlyAction(step)));
 }
 
@@ -622,11 +685,15 @@ test "a new address before the interval is still a punch" {
     const remote = [_]SocketAddr{ip(2000)};
     const state: PunchState = .{
         .punch = 3,
-        .last = .{ .when = 1_000, .local = &local, .remote = &.{} },
+        .last = .{ .when = 1_000, .remote = &.{} },
     };
     // A millisecond after the last round, with a remote candidate that was not
     // there then. The interval has not elapsed and the round happens anyway.
-    const step = decide(state, 1_000 + std.time.ns_per_ms, &local, &remote);
+    const step = decide(state, 1_000 + std.time.ns_per_ms, .{
+        .local = &local,
+        .remote = &remote,
+        .previous_local = &local,
+    });
     try t.expect(std.meta.eql(Action{ .initiateNatTraversalRound = 3 }, try onlyAction(step)));
 }
 
@@ -634,14 +701,13 @@ test "a new local address before the interval is still a punch" {
     const remote = [_]SocketAddr{ip(2000)};
     const state: PunchState = .{
         .punch = 3,
-        .last = .{ .when = 1_000, .local = &.{}, .remote = &remote },
+        .last = .{ .when = 1_000, .remote = &remote },
     };
-    const step = decide(
-        state,
-        1_000 + std.time.ns_per_ms,
-        &.{ip(1000)},
-        &remote,
-    );
+    const step = decide(state, 1_000 + std.time.ns_per_ms, .{
+        .local = &.{ip(1000)},
+        .remote = &remote,
+        .previous_local = &.{},
+    });
     try t.expect(std.meta.eql(Action{ .initiateNatTraversalRound = 3 }, try onlyAction(step)));
 }
 
@@ -650,9 +716,13 @@ test "an expired interval with nothing new is still a punch" {
     const remote = [_]SocketAddr{ip(2000)};
     const state: PunchState = .{
         .punch = 3,
-        .last = .{ .when = 1_000, .local = &local, .remote = &remote },
+        .last = .{ .when = 1_000, .remote = &remote },
     };
-    const step = decide(state, 1_000 + punch_interval, &local, &remote);
+    const step = decide(state, 1_000 + punch_interval, .{
+        .local = &local,
+        .remote = &remote,
+        .previous_local = &local,
+    });
     try t.expect(std.meta.eql(Action{ .initiateNatTraversalRound = 3 }, try onlyAction(step)));
 }
 
@@ -661,9 +731,13 @@ test "neither a new address nor an expired interval is not a punch" {
     const remote = [_]SocketAddr{ip(2000)};
     const state: PunchState = .{
         .punch = 3,
-        .last = .{ .when = 1_000, .local = &local, .remote = &remote },
+        .last = .{ .when = 1_000, .remote = &remote },
     };
-    const step = decide(state, 1_000 + punch_interval - 1, &local, &remote);
+    const step = decide(state, 1_000 + punch_interval - 1, .{
+        .local = &local,
+        .remote = &remote,
+        .previous_local = &local,
+    });
     const wanted: Action = .{ .wakeAt = 1_000 + punch_interval };
     try t.expect(std.meta.eql(wanted, try onlyAction(step)));
 }
@@ -679,7 +753,7 @@ test "an address disappearing is not news" {
 test "every retryable error asks again in 100 ms" {
     const state: PunchState = .{ .punch = 3 };
     for ([_]NatTraversalError{ .multipath, .not_enough_addresses }) |err| {
-        const step = settle(state, 50_000, &.{}, .{ .refused = err });
+        const step = settle(state, 50_000, .{ .refused = err });
         try t.expect(std.meta.eql(
             Action{ .wakeAt = 50_000 + retry_interval },
             try onlyAction(step),
@@ -698,11 +772,15 @@ test "every fatal error stops punching" {
         .extension_not_negotiated,
     };
     for (fatal) |err| {
-        const step = settle(state, 50_000, &.{}, .{ .refused = err });
+        const step = settle(state, 50_000, .{ .refused = err });
         try t.expect(std.meta.eql(Action.stopPunching, try onlyAction(step)));
         try t.expectEqual(err, step.next.stopped.?);
         // A stopped state does not punch again, whatever the wakeup says.
-        const again = decide(step.next, 50_000 + punch_interval, &.{}, &.{ip(1)});
+        const again = decide(step.next, 50_000 + punch_interval, .{
+            .local = &.{},
+            .remote = &.{ip(1)},
+            .previous_local = &.{},
+        });
         try t.expect(again.action == null);
     }
 }
@@ -726,19 +804,21 @@ test "every error variant is classified, and none is left over" {
     for (fatal) |err| try expectVerdict(err, .fatal);
 }
 
-test "an accepted round records the candidates it was started with" {
-    const local = [_]SocketAddr{ip(1000)};
+test "an accepted round records when it ran and what the stack found" {
     const discovered = [_]SocketAddr{ ip(2000), ip(2001) };
     const state: PunchState = .{ .punch = 3, .selected = .{ .ip = ip(1000) } };
-    const step = settle(state, 7_000, &local, .{ .accepted = &discovered });
+    const step = settle(state, 7_000, .{ .accepted = &discovered });
     // Upstream schedules nothing on `Ok`: the next trigger is an address
     // change, the scheduled wakeup it may already hold, or the periodic
     // connection check.
     try t.expect(step.action == null);
     const last = step.next.last orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(Nanos, 7_000), last.when);
-    try expectSameAddrs(&local, last.local);
     try expectSameAddrs(&discovered, last.remote);
+    // The set the round *started* with is not recorded here: it is the caller's,
+    // and the caller hands it back as `Candidates.previous_local`. A state that
+    // kept a slice of it would be borrowing the storage its own owner holds,
+    // and a copy of the state would read the original's bytes.
     try t.expectEqual(@as(?ConnId, 3), step.next.punch);
 }
 
@@ -748,9 +828,13 @@ test "a refused round does not move the interval" {
     // out five seconds. This is what makes the 100 ms retry reachable at all.
     const local = [_]SocketAddr{ip(1000)};
     const state: PunchState = .{ .punch = 3 };
-    const step = settle(state, 1_000, &local, .{ .refused = .not_enough_addresses });
+    const step = settle(state, 1_000, .{ .refused = .not_enough_addresses });
     try t.expect(step.next.last == null);
-    const again = decide(step.next, 1_000 + retry_interval, &local, &local);
+    const again = decide(step.next, 1_000 + retry_interval, .{
+        .local = &local,
+        .remote = &local,
+        .previous_local = &.{},
+    });
     try t.expect(std.meta.eql(Action{ .initiateNatTraversalRound = 3 }, try onlyAction(again)));
 }
 
@@ -758,23 +842,26 @@ test "a selected relay path does not suppress a punch" {
     const relay_url = try addr.RelayUrl.parse("https://use1-1.relay.iroh.network./");
     const local = [_]SocketAddr{ip(1000)};
     const remote = [_]SocketAddr{ip(2000)};
-    const last: Attempt = .{ .when = 1_000, .local = &local, .remote = &.{} };
+    const last: Attempt = .{ .when = 1_000, .remote = &.{} };
     // A millisecond after the last round: inside the interval, with a remote
     // candidate that was not there then.
     const now = 1_000 + std.time.ns_per_ms;
     const wanted: Action = .{ .initiateNatTraversalRound = 3 };
 
+    const candidates: Candidates = .{
+        .local = &local,
+        .remote = &remote,
+        .previous_local = &local,
+    };
     const on_relay = decide(
         .{ .punch = 3, .last = last, .selected = .{ .relay = relay_url } },
         now,
-        &local,
-        &remote,
+        candidates,
     );
     const on_direct = decide(
         .{ .punch = 3, .last = last, .selected = .{ .ip = ip(1000) } },
         now,
-        &local,
-        &remote,
+        candidates,
     );
     try t.expect(std.meta.eql(wanted, try onlyAction(on_relay)));
     try t.expect(std.meta.eql(try onlyAction(on_direct), try onlyAction(on_relay)));
@@ -783,19 +870,22 @@ test "a selected relay path does not suppress a punch" {
     // only in what the connection is currently sending on, and both wait for
     // the same instant. Selecting a relay is not a reason to stop trying to
     // leave it.
-    const held: Attempt = .{ .when = 1_000, .local = &local, .remote = &remote };
+    const held: Attempt = .{ .when = 1_000, .remote = &remote };
     const waited: Action = .{ .wakeAt = 1_000 + punch_interval };
+    const held_candidates: Candidates = .{
+        .local = &local,
+        .remote = &remote,
+        .previous_local = &local,
+    };
     const relay_wait = decide(
         .{ .punch = 3, .last = held, .selected = .{ .relay = relay_url } },
         now,
-        &local,
-        &remote,
+        held_candidates,
     );
     const direct_wait = decide(
         .{ .punch = 3, .last = held, .selected = .{ .ip = ip(1000) } },
         now,
-        &local,
-        &remote,
+        held_candidates,
     );
     try t.expect(std.meta.eql(waited, try onlyAction(relay_wait)));
     try t.expect(std.meta.eql(try onlyAction(direct_wait), try onlyAction(relay_wait)));

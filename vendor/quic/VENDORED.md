@@ -273,7 +273,7 @@ state.
 
 ### 5. `FrameSorter.pop` hands the caller an allocation, and now says so
 
-`FrameSorter.pop` (`stream.zig:366`) returns a slice the caller owns. It is not
+`FrameSorter.pop` returns a slice the caller owns. It is not
 a view into the sorter: the chunk leaves `chunks`, the headroom a grown chunk
 carries is shrunk away or copied out, and the result is a whole allocation. Once
 it has been returned, `FrameSorter.deinit` cannot free it, because it walks
@@ -283,11 +283,11 @@ it has been returned, `FrameSorter.deinit` cannot free it, because it walks
 if there's no data available at the current read position" and stopped there.
 Every in-tree caller freed the result — `connection.zig:2404` and `:2443` both
 `defer self.allocator.free(data)`, and so does every test that pops — but the
-contract lived only in that convention. `ReceiveStream.read` (`:513`) forwarded
-the same owning pointer under "Returns the data slice or null if no data is
-available", and `CryptoStream.read` (`crypto_stream.zig:64`) forwarded it again
-under "Returns null if no complete data is available". A reader of any of the
-three could reasonably conclude the slice is borrowed.
+contract lived only in that convention. `ReceiveStream.read`, in the same file,
+forwarded the same owning pointer under "Returns the data slice or null if no
+data is available", and `CryptoStream.read`, in `crypto_stream.zig`, forwarded
+it again under "Returns null if no complete data is available". A reader of any
+of the three could reasonably conclude the slice is borrowed.
 
 **This is inherited, not introduced.** `diff` against the pinned commit's
 `src/quic/stream.zig` is empty at the three hunks' preimages: 3,767 lines, byte
@@ -297,6 +297,11 @@ signature is what invites it.
 **The patch is +42 / −0 across three hunks, all additive**, and it is
 documentation plus one test. No signature changed, no caller changed, and no
 behaviour changed:
+
+The three hunks below are quoted by the line numbers they occupied at this
+patch; later patches moved all three. The declarations they name are
+`FrameSorter.pop` and `ReceiveStream.read`, and the test is
+`FrameSorter: what pop returns is the caller's, not the sorter's`.
 
 - `stream.zig:359-365` — `pop`'s doc comment now states that the caller owns
   the result and must free it with `self.allocator`, and why `deinit` will not
@@ -310,13 +315,10 @@ behaviour changed:
   result — so the leak checker is what enforces the second half. 457 tests
   now, from 456.
 
-**`CryptoStream.read` is still undocumented, and deliberately so.** It forwards
-the identical owning pointer and the identical unstated contract, and it is the
-same defect. It is recorded here rather than patched: this patch is scoped to
-the file the leak trace named, and `crypto_stream.zig` is a second file. Every
-caller of it frees correctly — `connection.zig`'s handshake feeds are the only
-two, and both `defer`-free. Fixing it is a four-line doc comment and belongs
-with whoever next touches that file.
+`CryptoStream.read` now publishes the same ownership transfer and null residue.
+The caller frees a returned chunk with the stream's allocator. A refused
+copy-out allocation leaves the bytes pending; null alone does not establish EOF.
+This closes the documentation gap recorded by the earlier leak audit.
 
 **The leak this was found through, and where it is fixed.** ozai's
 `test/protocol_loopback_test.zig` leaked 23 `dupe` blocks across the two tests
@@ -468,14 +470,277 @@ and it is why no Safe fallback is offered for the rows that fail here.
 Neither result stands in for the other: a Debug pass is not a Safe
 result, and the Hexagon key result says nothing about the FIFO.
 
-The corrected rerun of the vendored 108-row ABI survey over this section's
-address and fixture fixes is not recorded yet.
+**The survey this section leans on is cross-platform, and it is not part of
+this acceptance.** The one survey result recorded here — 18 executed, 20
+build-only, 70 failed, exit 1 — describes the pre-address, pre-fixture tree.
+It is a failed run, not a partial pass, and it is kept as the dated observation
+it is rather than as a baseline to improve on. The corrected rerun over the
+fixes named above has not been executed, so this file states no corrected row
+counts and claims no cross-platform coverage from it. This acceptance is native,
+and a native result says nothing about a row that only builds elsewhere.
 
-<!-- NUMERIC-PENDING (parent, corrected 467 survey): insert the observed
-executed / build-only / failed row counts, the passing test count and the exit
-status of the completed corrected survey. Nothing until that run finishes. The
-earlier 18 executed / 20 build-only / 70 failed / exit 1 result describes the
-pre-address, pre-fixture survey and is not this one's outcome. -->
+### 8. Repairs to contracts the audit found, named by what each one stops
+
+None of these is a protocol change. They are places where the core took a
+decision it could not take back — consumed a frame, spent a packet number,
+filled a buffer with a key it did not have — and where the API around it did
+not say so before the caller had already paid.
+
+**A refused read keeps the bytes (`src/quic/stream.zig`).** `FrameSorter.pop`
+removed a chunk and then discovered it could not copy it, freed the
+allocation and returned null: a run the peer had already been credited for,
+and which it will never retransmit because from its side it was delivered. The
+chunk goes back at the head of the list with its hole count undone, and the
+list has the slot it just vacated, so the restore cannot fail. `peekLen` is the
+new way to ask how much a read holds without taking it, which is what lets a
+caller make room *before* the read rather than after it.
+
+**`ReceiveStream.read` and `CryptoStream.read` say what a caller owns
+(`src/quic/stream.zig`, `src/quic/crypto_stream.zig`).** The slice either
+returns is an allocation the caller frees with the stream's allocator, and the
+read position, `bytes_read` and the connection credit have all moved by the
+time it is handed over.
+
+**Version Negotiation packets have a length, and are recognised before one is
+read (`src/quic/packet.zig`, `src/quic/connection.zig`,
+`src/quic/connection_manager.zig`).** A VN header carries no Length field, so
+`parse` left `remainder_len` undefined — and both datagram walkers stepped by
+it before `recv` had decided to ignore the packet. The whole remainder of the
+datagram is the packet, as it already was for Retry and 1-RTT, and a VN packet
+now ends the walk instead of stepping by a length it never had.
+
+**A server with no token key issues no NEW_TOKEN (`src/quic/connection.zig`).**
+`token_key` defaulted to sixteen zero bytes, so a token sealed under it was
+sealed under a key every reader of the wire has, and it outlived the connection
+that issued it. The key is now optional and its absence means no token rather
+than a predictable one.
+
+**A refused construction frees what it built (`src/quic/connection.zig`).**
+`acceptInto` initialises a connection and then allocates — the TLS handshake,
+the resized datagram queues — with no `errdefer` between, so a failure after
+the handshake leaked it. One `errdefer conn.deinit()` right after the literal
+closes every path, because the literal initialises every member `deinit`
+touches.
+
+**A client's transport parameters borrow its own connection ids
+(`src/quic/connection.zig`).** `connectInto` built them pointing at the stack
+locals it drew the ids from, and then copied those ids into the connection —
+so the parameters of a client's first Initial pointed at a dead frame. They
+are bound to `conn.scid` after the copy instead. `acceptInto` also owns the
+original-DCID and Retry-SCID bytes. The unsafe
+by-value `accept` and `connect` wrappers are removed and all callers use the
+in-place constructors. The constructed connection must retain its address.
+
+**A close packet waits for a buffer that can hold it
+(`src/quic/connection.zig`).** `sendAt` copied `close_pkt_len` bytes into
+`out_buf` and cleared the retransmit trigger with no check that the buffer was
+that long. A caller with a smaller buffer now gets zero and keeps the trigger.
+
+**QUIC-LB states the combined length its fixed buffer assumes
+(`src/quic/quic_lb.zig`).** `extractServerId` decodes into a 20-byte stack
+buffer because the longest payload a connection id may carry is 19 bytes —
+`server_id_len + nonce_len`, plus the first octet, and QUIC's own 20-byte
+limit. The rule is now on `Config`, where the two lengths are written down,
+with the per-field ranges marked as necessary and not sufficient. Nothing
+validates it at runtime: a config is written once and packed on every packet,
+so a check would buy a per-packet cost to catch a constant.
+
+**`decryptPayload` cannot be out of memory (`src/quic/crypto.zig`).** It
+declared `error.OutOfMemory` and could only ever produce
+`error.AuthenticationFailed`; no allocation happens on that path. The set is
+now what the code can return, so `packet.decrypt` propagates a smaller set as a
+consequence, and `Connection.recv`'s bare `catch` can no longer swallow an
+allocator error that was never there.
+
+**The wrapper states what its room costs (`src/transport/quic_bridge.zig`).**
+`Connection.sendAt` consumes what it packs, so `Conn.drain` asks the core for a
+datagram only where it can finish the job: an empty `out`, a buffer under one
+padded Initial, or a path with no address is refused with nothing built, and
+room running out between datagrams is a short answer rather than a refusal, so
+every datagram built is inside a run that is handed back. `Stream.drain` takes
+the room in its caller's sink before the read that would hand over the bytes.
+`Bridge.create` keeps `error.Canceled` apart from `error.EntropyUnavailable`,
+because one is the caller's own cancellation and the other is an `std.Io` that
+cannot key the bridge. And a peer pin now forces a certificate: the pin is
+read out of the same block `require_peer_certificate` decides whether to ask
+for, so a caller that named a peer and cleared that flag had its pin dropped.
+
+**The module root states the four rules (`src/lib.zig`).** Time, randomness,
+the allocator and ownership are parameters and per-declaration contracts, and
+none of them was written down at the one place a consumer starts reading. Each
+re-export now says what that module is and what it borrows.
+
+**The API-contract repairs, as landed (`src/quic/transport_params.zig`,
+`src/quic/tls13.zig`, `src/quic/connection.zig`, `src/quic/connection_manager.zig`,
+`src/quic/ack_handler.zig`, `src/quic/congestion.zig`, `src/quic/packet.zig`,
+`src/quic/packet_packer.zig`, `src/quic/rsa.zig`, `src/quic/stream.zig`).** One
+more pass over the registered `quic` surface found the same class of defect
+below, in the places where a length a peer declares, a room a caller offers or a
+figure an arithmetic derivation reaches for was taken on trust. Each is closed
+rather than described. `docs/DECISIONS/0004-vendored-core-contracts.md` is the
+full record; the exercised counts, including the executed test count, live there
+and are not restated here.
+
+- **A peer's declared length is checked, not reinterpreted.**
+  `TransportParams.decode` requires every known parameter to consume exactly its
+  declared length, a preferred address to be `41 + cid_len` bytes with a
+  connection id of 1..20, and a migration-disable flag to be empty. A
+  ClientHello cipher-suite or compression list that does not fit its message, a
+  ServerHello extension block or inner extension that runs past it, and a
+  PKCS#8 structure whose lengths the walk cannot honour are refused where they
+  used to index past the message — the first two are reachable by anyone who
+  can send one CRYPTO frame.
+- **A zero is not a version (`version_information`, parameter `0x11`).** A zero
+  chosen version is a parsing failure and `decode` refuses it; a zero anywhere
+  in the available list is refused too, including one behind the eighth entry
+  the value keeps, so the whole declared list is checked on the way past rather
+  than truncated unread. The membership of Chosen Version is recorded over that
+  whole list, so the RFC 9368 §3 test is made against the list the peer sent and
+  not against a retained prefix that may not hold the answer. That answer is one
+  `bool` beside the decoded fields — `version_info_chosen_in_available` — rather
+  than a second list and rather than an encoding of the retained one, so it costs
+  no allocation whatever length the peer declared; the first eight entries are
+  still what the array holds and what `hasAvailableVersion` reads. An empty
+  available list is not a contradiction: RFC 9368 §3 lets a server send one.
+- **Client-sent Version Information must name Chosen Version** (RFC 9368 §3).
+  The rule is the client's, and a server's list may be empty, so the check no
+  longer refuses a list RFC 9368 permits.
+- **Peer delay arithmetic saturates instead of trapping.** An encoded ACK delay
+  is capped at the peer's `max_ack_delay` before it is scaled, and an
+  ACK_FREQUENCY delay or an ACK deadline beyond the signed duration limit
+  saturates at that limit rather than shifting into a wrapped value.
+- **The CUBIC curve stays inside its own types (`src/quic/congestion.zig`).**
+  `k_ns` is the cube root of the epoch's `w_max` in MSS units times
+  `ns_per_s`, and that cube root answers at most `cbrt(maxInt(u64))`, so the
+  multiplication cannot overflow; `now - epoch_start - k_ns` is evaluated in
+  `i128`, because two `i64` instants and a `k_ns` of either sign do not fit an
+  `i64`. Inside the stated domain — `max_datagram_size` non-zero and small
+  enough that `MAX_WINDOW_PACKETS * 17` times it fits a `u64`, `now` at or after
+  `epoch_start` — the curve, `k_ns`, `w_est` and the growth an acknowledgement
+  asks for are exact or saturating and none of them reaches past a type.
+- **A zero-length RSA public exponent is `error.InvalidKey`**, not an index
+  past the end of the integer.
+- **A caller's buffer bounds what is packed, and it bounds the datagram rather
+  than each packet in it.** `max_packet_size` is a whole-UDP-payload number —
+  `Connection` writes it from the path MTU — and `packCoalesced` spends it once,
+  as `min(max_packet_size, out_buf.len)`, offering every level what is left of
+  that one budget instead of a copy of it each
+  (`packet_packer.zig:198-221`, `:380-388`). An ack-eliciting Initial pads
+  toward RFC 9000 §14.1's 1200; a budget that cannot reach it does not emit a
+  shorter packet but refuses the flight whole, before a packet number is taken
+  and before a frame leaves its queue (`:416-426`, `:548-555`). The Handshake
+  level shares that floor when it has CRYPTO data or a CONNECTION_CLOSE is
+  queued, and the room that level needs is held back from the Initial so the
+  padding has somewhere to land around it: an Initial that spent the whole floor
+  alone would defer that closing flight on every pass, and a deferral that
+  repeats forever is not a close that goes out later (`:392-428`). Later levels
+  are held only while the datagram is short of the floor **and** an Initial is
+  still owed, so a later flight cannot overtake an Initial the budget refused.
+  Initial data still queued at a budget that reaches the floor holds nothing
+  (`:445-454`). One pass is not a promise to drain: a level writes what fits the
+  room it was offered and the rest stays queued. An oversized Retry token spends
+  no packet number and consumes no queued frames however large the caller's
+  buffer is, and `PacketPacker.init` no longer takes an allocator it never used.
+- **A datagram that cannot be assembled closes the connection, and the peer
+  hears the first close (`src/quic/connection.zig`).** `packSinglePacket`
+  documents both of its errors as losing the frames the pass had already taken,
+  so a bare propagation would leave an open connection believing it sent a
+  flight it swallowed. Four call paths run it and each closes with a transport
+  `internal_error` first. A connection already closing, draining or terminated
+  keeps the close it has, so the new one is not sent over the old one.
+- **A Retry this connection cannot act on is refused whole
+  (`src/quic/connection.zig`).** Three shapes are turned away before anything
+  moves: a token longer than the buffer tokens are kept in, no token at all,
+  and a token that is present and zero bytes long — the one shape the parser
+  does not produce but a `Header` can hold. Any of them would leave the next
+  Initial carrying the token it already had while every later Retry was turned
+  away, so one such packet costs the handshake its address validation for good.
+- **A refused allocation consumes only committed state.** `openBidiStream` and
+  `openUniStream` free the stream they created and burn no stream id; a
+  peer-initiated stream that cannot be created leaves the creation watermark at
+  the last stream that exists, so a retry resumes rather than replaces; a
+  bidirectional stream the peer reset is reclaimed once its send side has
+  settled and never while pinned; and packet tracking hands back a
+  `SentPacketList` whose room the caller reserves before anything is removed,
+  so a refused reservation leaves every tracked packet available for retry.
+- **A ticket is sized once and says what it is.** The sealed plaintext is
+  `psk(32) || creation_time(8) || quic_version(4) || alpn_len(1)` — a fixed
+  45 bytes — followed by the protocol name and a 16-byte tag, so a sealed
+  ticket runs to 93 and both ends are given the one number. The recorded
+  protocol is bounded by what a selection can hold, so
+  `negotiated_alpn_len_max` is 32 and not RFC 7301's 255: RFC 8446 needs the
+  whole name to compare two connections by it, and the handshake's own
+  selection is the same width (`tls13.zig:774`, `:885`, `:1783`). What that
+  costs is storage rather than code: 32 bytes of selection per handshake and
+  32 in every `SessionTicket`, 16 bytes more than the 16-byte record it
+  replaced, and a `Connection` retains two of those tickets — the one the peer
+  issued and the remembered transport parameters (`connection.zig:1339`, `:1343`)
+  — so 32 added bytes per connection before whatever the struct's padding does
+  with them. A server refuses to select a name it cannot record rather than
+  recording a prefix of it as if the prefix were the protocol, and the client's
+  first flight is built into a bounded 4 KiB staging buffer
+  (`tls13.zig:2347`), so a proposal list that will not encode whole fails that
+  `step` with the `error.InternalError` the constructor already reports, before
+  a byte is written — nothing is trimmed, because a peer cannot tell a short
+  ClientHello from a whole one.
+- **The protocol a ticket records is enforced in both directions.** Both writers
+  copy the connection's selection verbatim and keep `alpn_len` at or below
+  `alpn.len`, so a ticket names a whole protocol or none. A client offers a
+  ticket only while its own proposal still holds that protocol
+  (`resumableTicket`, `tls13.zig:1882-1887`), and a server that opens the ticket
+  compares the sealed name against the protocol it just selected and accepts no
+  early data when the two differ (`tls13.zig:3498-3567`). A zero-length name is
+  a ticket from a connection that negotiated no protocol, which matches a
+  proposal of no protocols and nothing else.
+- **A ticket's version is compared against the first flight, not the negotiated
+  one.** A ticket records the version the *issuing* connection negotiated, and
+  a resuming client compares it with `original_version`: the version its own
+  first flight was built with, copied at construction and never changed. A
+  mismatch is not a failure — the client resumes nothing, offers no PSK, no
+  `early_data` extension and no 0-RTT, and the server authenticates it the
+  ordinary way, so the handshake is an ordinary one. Compatible version
+  negotiation may still move `config.quic_version` to the negotiated version
+  afterwards; the 0-RTT keys and the long headers keep the first-flight version
+  regardless (RFC 9369 §4.1), and a new ticket is written in the negotiated
+  version (RFC 9369 §5). `transport_params.encode_len_max` is a derived 324-byte
+  bound for legal local values — a programmer precondition, not a writer error.
+
+**The same pass closed the contracts on this side of the seam
+(`src/transport/socket.zig`, `src/node/node.zig`, `src/gossip/hyparview.zig`).**
+They are named here because they are the other half of the repairs above, and a
+reader auditing this file should not have to look twice for either half.
+
+- **Every datagram a batch sends reaches the wire once
+  (`src/transport/socket.zig`).** A run refused for segmentation lowers the
+  socket's capability for good and is answered by sending the runs behind it,
+  one datagram per `sendmsg`; the runs before it are already on the wire and
+  are not sent again. A refused segmentation is not a refusal of the codepoint, so
+  the retried tail keeps it; a tail that loses the codepoint to its own retry
+  is reported as lost *together with* the degradation, which is two facts and
+  not one — a datagram carrying no codepoint is not a missing datagram, and
+  nothing downstream can get either one back.
+- **A frame walk compacts the inbox once (`src/node/node.zig`).** `peekFrame`
+  copies the frame into caller-owned scratch, because its variable-length
+  payloads borrow the bytes they were decoded from and taking a message off the
+  inbox's front moves everything behind it — a borrow into a buffer compacted
+  under it is a borrow of nothing. It hands back an end offset instead of
+  shrinking the inbox per message, and `dropInbox` moves what is left exactly
+  once: on the way out of the walk and on the fault that ends it alike, because
+  the two are one decision taken twice rather than two decisions.
+- **The gossip shuffle timer is published before it is latched
+  (`src/gossip/hyparview.zig`).** A latch set first is a claim that a timer
+  exists which the caller never received: an allocator refusing that one append
+  would leave the node believing it had a shuffle scheduled, and no shuffle
+  would ever happen again. The tail of `handle` queues the timer and only then
+  sets the latch; `handleShuffleTimer` releases the latch before its fallible
+  work, so that tail re-arms on any later turn. Neither half alone would do.
+- **A quit tells a peer before it forgets it (`src/gossip/hyparview.zig`).** At
+  every refusal the peer being told is still in the active view and `left` is
+  not yet set, so a retry gets the same peer again. A peer taken out of the view
+  before its `Disconnect` was published is one no retry can reach — the other
+  side keeps a neighbour belief nothing will correct. What a refusal does leave
+  is a published prefix: a duplicate node list, which is the price of not
+  dropping the peer.
 
 ## Measured cost
 
@@ -496,7 +761,10 @@ split — the split would have left the walk present, dead on one path and live 
 the others, and every one of those paths a way for `realtimeSeconds` to come back
 through.
 
-Per file, against the pinned commit:
+Per file, the **initial** patch against the pinned commit. These are that pass's
+deltas and not the current ones: every later patch moved several of these files
+again, so a row records what the first pass did to a file rather than what the
+tree now differs by.
 
 | File | +/− | What |
 |---|---:|---|
@@ -505,7 +773,7 @@ Per file, against the pinned commit:
 | `src/quic/connection_manager.zig` | +199 / −197 | the protocol layers out, time and entropy in |
 | `src/quic/rsa.zig` | +198 / −45 | `signPss` takes the caller's salt; the RSA fixture moves here |
 | `src/quic/lossy_link_test.zig` | +102 / −53 | upstream's harness, adapted to the new signatures |
-| `src/quic/packet.zig` | +76 / −28 | entropy into packet numbering |
+| `src/quic/packet.zig` | +76 / −28 | the caller's generator: the Version Negotiation grease draw, and the Retry and NEW_TOKEN nonces |
 | `src/quic/ack_handler.zig` | +70 / −8 | entropy into the challenge |
 | `src/quic/packet_packer.zig` | +55 / −9 | time and entropy |
 | `src/quic/transport_params.zig` | +48 / −14 | `encode` takes the generator, for the grease draw |
@@ -546,19 +814,26 @@ this project's rules would report findings nobody intends to fix.
 
 "Not gated" must never mean "unchecked". Three things stand in for it:
 
-1. **The vendored suite runs.** `zig build quic-test` (`build.zig:56-58`)
-   compiles `vendor/quic/src/test_all.zig` and runs the 456 `test` blocks spread
-   across 26 of the 29 vendored files. The module is declared and then compiled
-   (`build.zig:36-40`) because a vendored tree nothing references is a vendored
-   tree nobody has proved still builds.
+1. **The vendored suite runs.** `zig build quic-test` compiles
+   `vendor/quic/src/test_all.zig`, which reaches the tests two ways: an explicit
+   `_ = @import` for each module `lib.zig` does not export, and a `refAllDecls`
+   sweep over the declarations it does. The build summary is the current
+   executed count; the smaller counts in earlier patch sections describe their
+   historical runs, and a declaration sweep is not an executed test.
+   Registering a module alone does not exercise its tests.
 2. **The no-socket / no-clock / no-global-RNG invariant is enforced by a test**,
-   `test/vendor_invariant_test.zig`. It reads every `.zig` under
-   `vendor/quic/src/` and fails on the constructs this directory must not
-   contain: `std.posix.socket`, `std.c.`, the socket syscalls, `std.fs`,
-   `std.process`, `getenv`, `std.time.nanoTimestamp`, `std.time.timestamp`,
-   `std.crypto.random.*`, and the `test_clock` global. The sweep is clean today:
+   `test/vendored_invariants.zig`, run as part of every `zig build test`. It
+   reads every `.zig` under `vendor/quic/src/` and fails on the constructs this
+   directory must not contain: `std.posix.socket`, `std.c.`, the socket
+   syscalls, `std.fs`, `std.process`, `getenv`, `std.time.nanoTimestamp`,
+   `std.time.timestamp`, `std.crypto.random.*`, and the `test_clock` global.
+   `vendored_files` in that file is what makes the read exhaustive:
+   `@embedFile` cannot glob, so `build.zig` walks `vendor/quic/src` on every
+   configure and fails when the list and the tree disagree in either direction.
+   That list is the scanner's coverage — the set of files the gate embeds — and
+   nothing here claims it records which tests ran. The sweep is clean today:
    zero hits for every one of them. Note what it does not forbid — mutability.
-   `src/quic/ecdsa_p256.zig:34-35` keeps two file-scope `var`s, a precomputed
+   `src/quic/ecdsa_p256.zig:37-38` keeps two file-scope `var`s, a precomputed
    Montgomery table and the flag that builds it once. They are a constant, not
    input, and they are upstream's. The rule is about hidden input, and a rule
    that forbade every `var` would have had to reject those.
@@ -580,12 +855,11 @@ format is the block. It is not — the plaintext is `[64]u8` and the sealed form
 `[80]u8`, both sized in the file, and growing them is mechanical. The block is
 that TLS has one client-identity acquisition path and resumption skipped it.
 
-**Still open, and now named.** A client that offers a ticket the server
-declines cannot fall back: this stack has one handshake schedule rather than
-two, so the client verifies the server's Finished against the schedule it
-committed to and refuses the connection. That is a client-side fix in
-`clientProcessServerHello` and it is not this entry's business. Early data
-remains unimplemented.
+The API contract follow-up repairs resumed cipher-suite agreement, records in
+each ticket the QUIC version its issuing connection ended on, and keeps 0-RTT
+on the first-flight version during compatible negotiation. See
+`docs/DECISIONS/0004-vendored-core-contracts.md`. This is core resumption
+coverage, not a claim that ozai's node exposes 0-RTT.
 
 **2. Interop, and therefore requirement 3. Open.** The matrix this vendoring
 relied on is upstream's, and it is **not reproducible from this repository**:
@@ -639,14 +913,32 @@ the top of this file. The patch is the asset; the SHA is not.
 
 ### The test root is the trap
 
-`vendor/quic/src/test_all.zig` must name **every** file that carries test
-blocks. Zig analyses a test block only if the compilation reaches it, and
-`lib.zig` is nothing but re-exports, so a root that only re-exports discovers
-**zero** tests and exits 0. That is a green step proving nothing, and it is the
-failure mode the file exists to prevent.
+`vendor/quic/src/test_all.zig` discovers tests by two mechanisms, and it needs
+both: an explicit `_ = @import` for every module `lib.zig` does not export —
+the internal ones and the test-only ones — and a `refAllDecls` sweep over the
+declarations `lib.zig` does export. A root that only re-exports reaches nothing
+at all: Zig analyses a test block only if the compilation reaches it, so such a
+root discovers **zero** tests and exits 0. That is a green step proving nothing,
+and it is the failure mode this file exists to prevent.
 
-The cost of getting it wrong is silent: a new file with tests is not run until
-it is named below, and nothing fails when you forget. Three files —
-`aes_gcm_vectors.zig`, `ghash.zig`, `limits.zig` — carry no `test` block and are
-correctly absent; the other 26 are named, and the count is checkable with
-`grep -c '^test '` per file.
+What does not hold is the rule "names every file that carries test blocks".
+`io_compat.zig` carries a test block and is not named, because the sweep reaches
+it through `lib.zig`'s export. Not every test-bearing file is a direct import,
+and none has to be while `lib.zig` exports it.
+
+What has no second mechanism is a module nothing else reaches. Three files
+carry no test blocks and are absent from those explicit imports for that
+reason — `aes_gcm_vectors.zig`, `ghash.zig` and `limits.zig` — and a new
+*internal* or test-only module with tests in it runs only once it is named
+there. The cost of getting that wrong is still silent: a new file with tests is
+not run until it is named, and nothing fails when you forget.
+
+The sweep is declaration reachability. It says a declaration compiles; it does
+not say a test ran. The executed count is the build summary of
+`zig build quic-test`, and no number is asserted here.
+
+That is a different question from the one `build.zig`'s file-list check asks.
+`vendored_files` in `test/vendored_invariants.zig` is the **scanner's**
+coverage — the set of files the invariant gate embeds and reads — kept equal
+to the tree by a configure-time walk in both directions. It is not a record of
+which tests ran, and it is not one.

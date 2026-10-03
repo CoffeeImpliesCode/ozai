@@ -26,10 +26,14 @@
 //! The second has no upstream counterpart at all and wants a bullet of its own
 //! in the same list:
 //!
-//! * The ordering key is ozai's own canonical encoding of the address, not a
-//!   wire format. The wire formats are another module's business and they
-//!   change; an order that moved when a ticket encoding moved would reorder
-//!   zones for a reason nobody could see. Nothing here is ever sent to a peer.
+//! * The tiebreak is `base/addr.zig`'s value order — `TransportAddr.order`,
+//!   the order a `NodeAddr` list is kept in and a ticket canonicalizes its
+//!   addresses by — and not a wire format. The wire formats are another
+//!   module's business and they change; an order that moved when a ticket
+//!   encoding moved would reorder zones for a reason nobody could see, and
+//!   one that read a different order than the address lists would pick a
+//!   different relay than the list it was handed. Nothing here is ever sent
+//!   to a peer.
 //!
 //! The stream plumbing — the `AddressLookup` trait, the resolvers implementing
 //! it, the handle whose drop cancels them — is a later slice. What is here is
@@ -87,8 +91,9 @@ pub const Provenance = enum {
 };
 
 /// Tag byte per `TransportAddr` arm, in the union's declaration order, so the
-/// canonical encoding and `TransportAddr.order` agree on which variant sorts
-/// first.
+/// first byte of a record names its variant in the rank order
+/// `TransportAddr.order` gives the three. It is a name and not a sort
+/// position: nothing here compares records against one another.
 const tag_relay = 0;
 const tag_ip = 1;
 const tag_custom = 2;
@@ -99,6 +104,12 @@ const tag_custom = 2;
 /// so such an arm cannot be added without the compiler pointing at it.
 pub const max_encoded_addr_length = 1 + 1 + 2 + 1 + addr.RelayUrl.max_host_length;
 
+/// Why an item cannot be written in its canonical encoding: the caller's buffer
+/// was too small for it, or one of its addresses is one no record can hold.
+///
+/// Only `canonicalBytes` returns this. `Item.order` compares address values
+/// and never goes through the encoder, which is why an address no record can
+/// hold still has a total order and why this error set is not in `order`'s.
 pub const EncodeError = error{
     /// `out` cannot hold the whole encoding. Size it with `maxEncodedLength`.
     BufferTooSmall,
@@ -109,6 +120,13 @@ pub const EncodeError = error{
 };
 
 /// One discovery result: an address, the service that reported it, and when.
+///
+/// An `Item` is a shallow value over somebody else's address list: it owns the
+/// `NodeAddr` struct, not the `addrs` slice behind it, and a copy of an `Item`
+/// shares that slice with the original rather than duplicating it. So an item
+/// read out of a `resolve.Stream` is valid exactly as long as that stream is,
+/// and an item to keep past it is an item to copy the addresses into. Who
+/// allocated the list, and who releases it, is `base/addr.zig`'s rule.
 pub const Item = struct {
     /// Upstream's `endpoint_info: EndpointInfo`. ozai's `NodeAddr` carries the
     /// node id beside the paths, so the whole upstream struct is one field
@@ -122,6 +140,9 @@ pub const Item = struct {
     /// from the network it queried; nothing in this module reads a clock.
     last_updated: ?u64,
 
+    /// An item over `endpoint`, storing its address list rather than taking it.
+    /// The caller still owns that list and still releases it, and the returned
+    /// item is valid for as long as the list is.
     pub fn init(
         endpoint: addr.NodeAddr,
         provenance: Provenance,
@@ -131,8 +152,7 @@ pub const Item = struct {
     }
 
     /// The total order of `docs/ARCHITECTURE.md` invariant 12: timestamp
-    /// first, the canonical encoding of the address as the tiebreak, the
-    /// source last.
+    /// first, the discovered address as the tiebreak, the source last.
     ///
     /// Three components, compared in that order, each one total and each one
     /// injective on its own field, so `.eq` comes back for two items only when
@@ -145,8 +165,11 @@ pub const Item = struct {
     ///   stamps nothing wins every merge and pins the zone to the stalest
     ///   view anyone holds. Null is therefore infinitely old: not infinitely
     ///   new, and not unordered.
-    /// * The canonical encoding: node id, then one self-delimiting record per
-    ///   address, in order. It determines the address, so it never ties.
+    /// * The address: the node id's own bytes, then its paths one at a time in
+    ///   `TransportAddr.order`, and only then how many there are. It
+    ///   determines the address, so it never ties. Reading the values is what
+    ///   keeps a merge and the `NodeAddr` lists a caller sorts from
+    ///   disagreeing about which of two relays is the greater one.
     /// * `Provenance.rank`, for the pair that differs in nothing else. Same
     ///   address and same stamp is the same fact about the world; the tag only
     ///   says which of them said it, and a fixed order keeps that choice out
@@ -155,20 +178,18 @@ pub const Item = struct {
         const by_time = orderTimestamp(self.last_updated, other.last_updated);
         if (by_time != .eq) return by_time;
 
-        const self_id = self.endpoint.node_id.toBytes();
-        const other_id = other.endpoint.node_id.toBytes();
-        const by_id = std.mem.order(u8, &self_id, &other_id);
+        const by_id = self.endpoint.node_id.order(other.endpoint.node_id);
         if (by_id != .eq) return by_id;
 
-        // Record by record, and only then by how many records there are. A
+        // Address by address, and only then by how many addresses there are. A
         // stream that stops is smaller than one that continues, and the two
-        // are not the same question: a two-address list whose first record
-        // sorts low still loses to a one-address list whose first record
+        // are not the same question: a two-address list whose first address
+        // sorts low still loses to a one-address list whose first address
         // sorts high, so counting first would answer a different one.
         const shared = @min(self.endpoint.addrs.len, other.endpoint.addrs.len);
         for (self.endpoint.addrs[0..shared], other.endpoint.addrs[0..shared]) |left, right| {
-            const by_bytes = compareAddr(left, right) orelse return left.order(right);
-            if (by_bytes != .eq) return by_bytes;
+            const by_value = left.order(right);
+            if (by_value != .eq) return by_value;
         }
         if (self.endpoint.addrs.len != other.endpoint.addrs.len) {
             return std.math.order(self.endpoint.addrs.len, other.endpoint.addrs.len);
@@ -197,8 +218,17 @@ pub const Item = struct {
         return true;
     }
 
-    /// The ordering key: the canonical encoding of the discovered address,
-    /// written into caller storage.
+    /// The canonical encoding of the discovered address, written into caller
+    /// storage: the node id, then one self-delimiting record per address.
+    ///
+    /// **This is not the sort key, and its byte order is not
+    /// `TransportAddr.order`'s.** A relay and a custom record write their
+    /// length before their bytes, so `https://aa.example./` outranks
+    /// `https://b.example./` as records while the value order ranks it below,
+    /// and the same goes for two custom payloads. What the encoding owes a
+    /// caller is the other half of that: two items share bytes exactly when
+    /// they name the same endpoint, whatever their stamp or their provenance
+    /// say. Use it as a map key or a log key, and let `order` do the sorting.
     ///
     /// The result borrows `out`, and how long the borrow lives is the
     /// caller's decision. This is `CustomAddr.parse`'s discipline, invariant
@@ -236,7 +266,7 @@ fn orderTimestamp(a: ?u64, b: ?u64) std.math.Order {
 
 /// One address, canonically encoded and self-delimiting, so the records of
 /// two different addresses can be walked in step without either list's shape
-/// being known in advance.
+/// being known in advance. Nothing compares them; see `canonicalBytes`.
 fn encodeAddr(
     value: addr.TransportAddr,
     out: *[max_encoded_addr_length]u8,
@@ -270,10 +300,10 @@ fn encodeAddr(
             std.mem.writeInt(u16, out[18..20], socket.port, .big);
             break :record out[0..20];
         },
-        // Big-endian id, not the little-endian of `CustomAddr.writeBinary`:
-        // an ordering key's bytes have to sort in the same order as the
-        // values they encode, and little-endian integers do not. Nothing here
-        // is sent, so no wire format is disturbed.
+        // Big-endian id, unlike the little-endian `CustomAddr.writeBinary`
+        // writes for the wire. This record is a local key and is never sent,
+        // so the two spellings are free to differ — and they do, which is how
+        // a reader who confuses one for the other finds out.
         .custom => |custom| record: {
             // Narrow once, where the bound is proved: the cast admits only a
             // length the record's length byte holds, and the comparison is
@@ -291,21 +321,12 @@ fn encodeAddr(
     };
 }
 
-/// The two records in encoding order, or null when one of them is an address
-/// no record can hold. `Item.order` falls back to `TransportAddr.order` then,
-/// which gives the same answer for every address the encoder accepts — a test
-/// holds the two against each other — so the fallback is a total answer to a
-/// question the type says cannot be asked.
-fn compareAddr(a: addr.TransportAddr, b: addr.TransportAddr) ?std.math.Order {
-    var left: [max_encoded_addr_length]u8 = undefined;
-    var right: [max_encoded_addr_length]u8 = undefined;
-    const left_bytes = encodeAddr(a, &left) catch return null;
-    const right_bytes = encodeAddr(b, &right) catch return null;
-    return std.mem.order(u8, left_bytes, right_bytes);
-}
-
-/// The best item, or null when there is none. The one place a merge asks
-/// which of two results wins, so nothing else needs an opinion of its own.
+/// The best item of `items`, or null when there is none. The one place a merge
+/// asks which of two results wins, so nothing else needs an opinion of its own.
+///
+/// Returns a copy of that item, not a reference to it, and the copy is as
+/// shallow as `Item` is: it borrows the winner's address list, so reading it
+/// after the list is released reads freed memory.
 pub fn winner(items: []const Item) ?Item {
     var best: ?Item = null;
     for (items) |item| {
@@ -318,12 +339,23 @@ pub fn winner(items: []const Item) ?Item {
     return best;
 }
 
-/// Every distinct item, best first.
+/// Every distinct item of `items`, best first, in storage this call allocates
+/// from `alloc` and the caller releases with `alloc.free`.
 ///
 /// Not a second precedence rule: this is the input sorted and deduplicated
 /// under `Item.order`, so it is the same answer whatever order the sources
 /// answered in. Two items that compare `.eq` are equal in every field, which
 /// is what makes dropping one of them drop nothing.
+///
+/// Only the array is new. Every `Item` in it is a shallow copy of an input, so
+/// the merged list owns no address and releases none: `alloc.free` hands back
+/// the array alone, and the merged list is dead as soon as the addresses behind
+/// its items are — which for items out of a resolve is when that stream is
+/// closed. A caller that wants the merge to outlive them copies each address
+/// list out first.
+///
+/// `error.OutOfMemory` allocates nothing that survives: the sorted copy is
+/// released before the error leaves, and the output array was never built.
 pub fn merge(alloc: std.mem.Allocator, items: []const Item) std.mem.Allocator.Error![]Item {
     const sorted = try alloc.dupe(Item, items);
     defer alloc.free(sorted);
@@ -419,7 +451,7 @@ fn corpusIds() key.KeyError![3]addr.NodeId {
     return ids;
 }
 
-const pool_length = 11;
+const pool_length = 15;
 
 /// A small pool of addresses, so a generated item can differ from another in
 /// one field and in no other.
@@ -447,6 +479,15 @@ fn pool() addr.RelayUrlParseError![pool_length]addr.TransportAddr {
         // The same relay host over the other scheme and on another port.
         .{ .relay = try addr.RelayUrl.parse("http://use1-1.relay.iroh.network./") },
         .{ .relay = try addr.RelayUrl.parse("https://relay.example.:8443/") },
+        // Two pairs whose length order and lexical order pull in opposite
+        // directions: in each the longer value is the lexically lower one, so
+        // anything that reads a length prefix before the bytes ranks the pair
+        // the other way round from `TransportAddr.order`. Nothing above can
+        // tell the two orders apart.
+        .{ .relay = try addr.RelayUrl.parse("https://aa.example./") },
+        .{ .relay = try addr.RelayUrl.parse("https://b.example./") },
+        .{ .custom = .{ .id = 5, .data = &.{ 0x61, 0x61 } } },
+        .{ .custom = .{ .id = 5, .data = &.{0x62} } },
     };
 }
 
@@ -503,8 +544,8 @@ fn single(
     return .init(endpoint, provenance, last_updated);
 }
 
-/// An ordering key with its length, because two buffers of the same capacity
-/// are not two encodings to compare: only the written bytes are.
+/// The canonical encoding with its length, because two buffers of the same
+/// capacity are not two encodings to compare: only the written bytes are.
 const Encoded = struct {
     bytes: [Item.maxEncodedLength(4)]u8,
     length: usize,
@@ -519,6 +560,17 @@ const Encoded = struct {
         return encoded;
     }
 };
+
+/// The same node and the same paths — what `canonicalBytes` is a function of,
+/// and what `Item.order` falls through to once the stamp has had its say.
+fn sameEndpoint(left: Item, right: Item) bool {
+    if (left.endpoint.node_id.order(right.endpoint.node_id) != .eq) return false;
+    if (left.endpoint.addrs.len != right.endpoint.addrs.len) return false;
+    for (left.endpoint.addrs, right.endpoint.addrs) |one, other| {
+        if (one.order(other) != .eq) return false;
+    }
+    return true;
+}
 
 /// Longer than `addr.max_inline_length`, which `CustomAddr.parse` refuses to
 /// produce. A caller that built one anyway is owed an answer, and a total one:
@@ -556,7 +608,7 @@ test "a missing timestamp loses to a stamped one" {
     try t.expectEqual(std.math.Order.eq, unstamped.order(unstamped));
 }
 
-test "equal timestamps fall through to the encoded bytes" {
+test "equal timestamps fall through to the address" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -564,52 +616,72 @@ test "equal timestamps fall through to the encoded bytes" {
     const id = (try corpusIds())[0];
 
     // Same node, same service, same stamp, and one address differing only in
-    // its host: the tiebreak has to be the bytes, or the zone has nothing to
-    // decide on.
+    // its host: the tiebreak has to be the address, or the zone has nothing to
+    // decide on. These two hosts are the same length, so the pair cannot tell
+    // the value order from a length-prefixed one; the next test is the pair
+    // that can.
     const first = try single(alloc, id, addresses[0], .pkarr, 17);
     const second = try single(alloc, id, addresses[1], .pkarr, 17);
-    var first_key: [Item.maxEncodedLength(1)]u8 = undefined;
-    var second_key: [Item.maxEncodedLength(1)]u8 = undefined;
-    const first_bytes = try first.canonicalBytes(&first_key);
-    const second_bytes = try second.canonicalBytes(&second_key);
-    try t.expect(std.mem.order(u8, first_bytes, second_bytes) == .lt);
-    try t.expectEqual(std.mem.order(u8, first_bytes, second_bytes), first.order(second));
+    try t.expectEqual(std.math.Order.lt, first.order(second));
 
-    // Two addresses are not automatically the larger item. Records are
-    // compared first: `with_two` starts with the lower host, so it loses to a
-    // one-address item that starts with the higher one, and a comparator that
-    // counted first would have got this exactly backwards.
+    // Two addresses are not automatically the larger item. Addresses are
+    // compared one at a time: `with_two` starts with the lower host, so it
+    // loses to a one-address item that starts with the higher one, and a
+    // comparator that counted first would have got this exactly backwards.
     var grown = addr.NodeAddr.init(id);
     if (try grown.insert(alloc, addresses[0])) |next| grown = next;
     if (try grown.insert(alloc, addresses[1])) |next| grown = next;
     const with_two = Item.init(grown, .pkarr, 17);
     try t.expectEqual(std.math.Order.lt, with_two.order(second));
-    // With the first record equal, the extra record is what decides.
+    // With the first address equal, the extra one is what decides.
     try t.expectEqual(std.math.Order.gt, with_two.order(first));
-
-    // And the bytes say the same thing, which is the whole claim.
-    var two_key: [Item.maxEncodedLength(2)]u8 = undefined;
-    var one_key: [Item.maxEncodedLength(1)]u8 = undefined;
-    const two_bytes = try with_two.canonicalBytes(&two_key);
-    const one_bytes = try second.canonicalBytes(&one_key);
-    try t.expectEqual(std.mem.order(u8, two_bytes, one_bytes), with_two.order(second));
 }
 
-test "the encoding order is the value order" {
-    // `Item.order` answers an address the encoder cannot hold by falling back
-    // to `TransportAddr.order`, so the two have to agree on every address the
-    // encoder can. A pair where they disagreed would sort two ways depending
-    // on which of the two items happened to be compared.
+test "the tiebreak is the address value order, not the encoded record" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     const addresses = try pool();
-    var i: usize = 0;
-    while (i < addresses.len) : (i += 1) {
-        var j: usize = 0;
-        while (j < addresses.len) : (j += 1) {
-            const by_bytes = compareAddr(addresses[i], addresses[j]) orelse
-                return error.TestUnexpectedResult;
-            try t.expectEqual(addresses[i].order(addresses[j]), by_bytes);
-            try t.expectEqual(negate(compareAddr(addresses[j], addresses[i]).?), by_bytes);
-        }
+    const id = (try corpusIds())[0];
+
+    // The last four pool entries are two pairs whose length order and
+    // lexical order disagree, one of relays and one of custom addresses: in
+    // each pair the longer value is the lexically lower one. A record writes
+    // the length before the bytes, so a comparator that reads records ranks
+    // each pair the other way round from `TransportAddr.order` — the order
+    // `NodeAddr.insert` sorts a list with and a ticket writes its addresses
+    // in. A merge that picked the other one would hand a caller a relay that
+    // every other sorted list in ozai ranks below its rival.
+    inline for (.{ 11, 13 }) |index| {
+        const lower = addresses[index];
+        const higher = addresses[index + 1];
+        try t.expectEqual(std.math.Order.lt, lower.order(higher));
+
+        const first = try single(alloc, id, lower, .pkarr, 5);
+        const second = try single(alloc, id, higher, .pkarr, 5);
+        try t.expectEqual(std.math.Order.lt, first.order(second));
+        try t.expectEqual(std.math.Order.gt, second.order(first));
+
+        // Both ways round: the two entry points a caller reaches for are
+        // handed the answers in whatever order its services replied, and a
+        // winner that depended on that would be a flap waiting for a retry.
+        try t.expect(second.eql(winner(&.{ first, second }).?));
+        try t.expect(second.eql(winner(&.{ second, first }).?));
+
+        const merged = try merge(alloc, &.{ first, second });
+        defer alloc.free(merged);
+        try t.expectEqual(@as(usize, 2), merged.len);
+        try t.expect(merged[0].eql(second));
+        try t.expectEqual(std.math.Order.gt, merged[0].order(merged[1]));
+
+        // The list a caller sorts with `insert` agrees, because it is the same
+        // order: the address the merge picked is the one that lands last.
+        var both = addr.NodeAddr.init(id);
+        if (try both.insert(alloc, lower)) |next| both = next;
+        if (try both.insert(alloc, higher)) |next| both = next;
+        try t.expectEqual(@as(usize, 2), both.addrs.len);
+        try t.expectEqual(std.math.Order.lt, both.addrs[0].order(both.addrs[1]));
+        try t.expectEqual(std.math.Order.eq, both.addrs[1].order(higher));
     }
 }
 
@@ -628,23 +700,24 @@ test "the order is antisymmetric, transitive and total" {
             // Antisymmetry, which also gives trichotomy: one of the three
             // orders or the comparison is not an order at all.
             try t.expectEqual(negate(items[j].order(items[i])), forward);
+            // The canonical encoding carries the node id and the address list
+            // and nothing else, so two items share bytes exactly when they
+            // name the same endpoint — whatever their stamp or their
+            // provenance say. It is a key and not the sort key: the pool
+            // carries the pairs whose length order and lexical order
+            // disagree, and for those the bytes rank the two the other way
+            // round from `Item.order`.
+            try t.expectEqual(
+                sameEndpoint(items[i], items[j]),
+                std.mem.eql(u8, keys[i].slice(), keys[j].slice()),
+            );
             if (forward == .eq) {
                 // The whole point. Equal means equal in every field, so two
                 // sources that agree on an address are not a tie to break and
                 // cannot become a flap.
                 try t.expect(items[i].eql(items[j]));
-                const equal_keys = std.mem.order(u8, keys[i].slice(), keys[j].slice());
-                try t.expectEqual(std.math.Order.eq, equal_keys);
             } else {
                 try t.expect(!items[i].eql(items[j]));
-                // And the comparator is the encoded bytes, not a second
-                // notion of precedence read off the fields — once the
-                // timestamp has had its say, which is the one part of the
-                // answer the key does not carry.
-                if (items[i].last_updated == items[j].last_updated) {
-                    const key_order = std.mem.order(u8, keys[i].slice(), keys[j].slice());
-                    try t.expectEqual(key_order, forward);
-                }
             }
             // Transitivity, over every triple. 24 items make this 13 824
             // comparisons, which costs nothing and is the only way the
@@ -772,6 +845,10 @@ test "an address the encoder cannot hold still has a total order" {
         .pkarr,
         3,
     );
+    // The order compares values and never asks whether a record can spell
+    // them, so it is total for this address for the same reason it is for
+    // every other one. Only `canonicalBytes` refuses it, and it refuses it
+    // rather than writing a short record.
     var buffer: [Item.maxEncodedLength(1)]u8 = undefined;
     try t.expectError(error.CustomAddrTooLong, item.canonicalBytes(&buffer));
 

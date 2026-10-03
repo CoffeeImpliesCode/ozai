@@ -1,12 +1,13 @@
 //! ozai — dial a node by its id, not its address.
 //!
-//! This is the library root. It re-exports the pure value layer and is the only
-//! module an importer needs to name.
+//! Import the registered `ozai` module for values, codecs, state machines,
+//! discovery and endpoint drivers. Import the registered `quic` module
+//! separately when naming the vendored core's types.
 //!
-//! Scope, as of the first milestone: identity and addressing only. Everything
-//! that touches a socket is deliberately absent until the transport substrate
-//! is settled — see `docs/PLAN.md`. `ula` maps a path onto the fake address a
-//! QUIC stack would take it on; that is a value, not a socket.
+//! Pure logic uses caller-supplied bytes, state, time and entropy. The Linux
+//! socket and node drivers require libc and take `std.Io` per operation.
+//! Allocating results name their release operation at the owning declaration.
+//! Address lists and runtime handles are shallow copies, not independent owners.
 
 const std = @import("std");
 
