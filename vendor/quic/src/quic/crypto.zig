@@ -19,10 +19,21 @@ const INITIAL_SALT_V1 = [_]u8{ 0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0
 // RFC 9369 §3.1: QUIC v2 initial salt
 const INITIAL_SALT_V2 = [_]u8{ 0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9 };
 
-// Header protection sample length
+/// Bytes of a protected packet the header-protection mask is computed over
+/// (RFC 9001 §5.4.2). The sample starts four bytes after the packet number
+/// offset, which is why a packet shorter than that plus this cannot be
+/// protected at all.
+///
 pub const SAMPLE_LEN = 16;
+/// Bytes of header protection a mask carries: one for the first byte and four
+/// for a packet number that is always encoded at its longest.
+///
 pub const MASK_LEN = 5;
 
+/// The AEAD every key schedule in this tree produces: AES-128-GCM, chosen by
+/// QUIC for the Initial keys and named by every cipher suite in TLS 1.3 that
+/// this core implements.
+///
 pub const Aead = Aes128Gcm;
 const Hmac = HmacSha256;
 
@@ -30,12 +41,27 @@ const Hmac = HmacSha256;
 /// Seal/Open from the (immutable) hp_key, then reused on every packet.
 pub const Aes128HpCtx = @TypeOf(Aes128.initEnc(@as([16]u8, undefined)));
 
-// AES-128-GCM key length (used for initial keys which are always AES)
+/// AES-128-GCM key length, which is also the length of the Initial keys
+/// because those are always AES.
+///
 pub const key_len = 16;
+/// AEAD nonce length: the IV every key is derived with, and the width the
+/// packet number is XORed into (RFC 9001 §5.3).
+///
 pub const nonce_len = 12;
-// Max key length across all cipher suites (ChaCha20 = 32 bytes)
+/// The widest key any cipher suite here uses (ChaCha20-Poly1305), and so the
+/// width the fixed-size key arrays are. The bytes past the suite's own key
+/// length are zero and are never read.
+///
 pub const max_key_len = 32;
 
+/// A TLS 1.3 cipher suite, by its IANA code point.
+///
+/// The suite chooses three things at once — the AEAD, the key length and the
+/// header-protection function — and this core keeps all three together
+/// because the derivation is per suite. A suite whose key length is not
+/// `keyLen` cannot be used with the fixed-size key arrays above.
+///
 pub const CipherSuite = enum(u16) {
     aes_128_gcm_sha256 = 0x1301,
     chacha20_poly1305_sha256 = 0x1303,
@@ -64,9 +90,14 @@ pub const CipherSuite = enum(u16) {
     }
 };
 
-// Note: similar to packet.Epoch (4 values, maps to packet types) and
-// ack_handler.EncLevel (3 values, maps to PN spaces — no 0-RTT space).
-// Kept separate because the value mappings and cardinalities differ.
+/// The four levels QUIC protects separately, as a stable numbering.
+///
+/// Distinct from `packet.Epoch` (four values, keyed by packet type) and from
+/// `ack_handler.EncLevel` (three values, keyed by packet-number space — there
+/// is no 0-RTT space). Kept separate because the mappings and the
+/// cardinalities differ, and a caller that conflates them gets a key for the
+/// wrong level.
+///
 pub const EncryptionLevel = enum(u8) {
     initial = 0,
     early_data,
@@ -74,6 +105,20 @@ pub const EncryptionLevel = enum(u8) {
     application,
 };
 
+/// The keys one encryption level is opened with: an AEAD key, a
+/// header-protection key, and the static IV they are used with.
+///
+/// A value. It owns no allocation, it holds no reference to anything, and
+/// copying one is cheap and safe — which is what a key update does with the
+/// previous generation while reordered packets are still arriving. The bytes
+/// beyond the suite's own key length are zero padding, never read.
+///
+/// `prepareCtx` fills the two cached contexts. It is an optimisation and not
+/// a requirement: without it every packet falls back to std's one-shot
+/// primitive, and with it the key schedule and GHASH powers are computed
+/// once per key. Nothing here is invalidated by a later key change, because
+/// a key change is a different `Open`.
+///
 pub const Open = struct {
     key: [max_key_len]u8 = .{0} ** max_key_len,
     hp_key: [max_key_len]u8 = .{0} ** max_key_len,
@@ -106,12 +151,27 @@ pub const Open = struct {
         return computeHpMask(sample, self.hp_key, self.cipher_suite);
     }
 
+    /// Open a protected payload in place and return the plaintext it carried.
+    ///
+    /// The bytes come out where they went in: the result is
+    /// `payload[0 .. payload.len - 16]`, the tag is consumed, and nothing is
+    /// allocated — a caller keeps the buffer it had and owns no new memory.
+    /// `associated_data` is the unprotected header (RFC 9001 §5.2):
+    /// authenticated, never encrypted.
+    ///
+    /// `AuthenticationFailed` is every way the tag does not verify, and they
+    /// are deliberately not told apart: a payload shorter than its own tag, a
+    /// wrong key, a key from another encryption level, a packet number past
+    /// the nonce, a tampered header, or a peer that sent something it did not
+    /// sign. Nothing here can be out of memory — no allocation happens on
+    /// this path — so there is no allocator error in this set that a caller
+    /// could mistake for a forgery.
     pub fn decryptPayload(
         self: *const Open,
         packet_number: u64,
         associated_data: []const u8,
         payload: []u8,
-    ) error{ AuthenticationFailed, OutOfMemory }![]u8 {
+    ) error{AuthenticationFailed}![]u8 {
         const tag_len = 16; // Same for both AES-128-GCM and ChaCha20-Poly1305
         const payload_len = payload.len;
 
@@ -151,6 +211,14 @@ pub const Open = struct {
     }
 };
 
+/// The keys one encryption level is sealed with: the mirror of `Open`, for
+/// the packets this side sends.
+///
+/// A value, with the same ownership and copying rules as `Open`. The two are
+/// deliberately separate types rather than one with a direction flag: a
+/// connection holds both for a level and neither can be used as the other by
+/// accident, which is the mistake header protection makes expensive.
+///
 pub const Seal = struct {
     key: [max_key_len]u8 = .{0} ** max_key_len,
     hp_key: [max_key_len]u8 = .{0} ** max_key_len,
@@ -375,6 +443,18 @@ pub fn encodePacketNumber(pn: u64, largest_acked: ?u64, out: *[4]u8) usize {
     return pn_len;
 }
 
+/// The Initial keys for `cid` at `version`, as the pair that opens and seals
+/// them (RFC 9001 §5.2).
+///
+/// Initial keys are public by construction — they are derived from the
+/// destination connection id, which is on the wire — which is why they are
+/// only ever used until the handshake keys replace them, and why they are
+/// always AES-128-GCM whatever suites TLS later negotiates. The contexts are
+/// prepared, so the result is ready to use.
+///
+/// The only refusal is `InvalidVersion`, for a version this core does not
+/// speak. `cid` is borrowed for the call and nothing retains it.
+///
 pub fn deriveInitialKeyMaterial(
     cid: []const u8,
     version: u32,
@@ -604,6 +684,13 @@ fn deriveKeyPaddedL(secret: [32]u8, actual_len: usize, label: []const u8) [max_k
     return result;
 }
 
+/// The header-protection key for `secret`, zero-padded to the widest key
+/// array, under the label `version` spells (RFC 9001 §5.4).
+///
+/// `actual_len` is the key length the traffic secret was derived for — 32 for
+/// the SHA-256 suites, 16 for the Initial keys — and the difference shows up
+/// as zeros past the key that is really there.
+///
 pub fn deriveHpKeyPaddedV(secret: [32]u8, actual_len: usize, version: u32) [max_key_len]u8 {
     return deriveKeyPaddedL(secret, actual_len, protocol.quicLabel(version, .hp));
 }
@@ -619,6 +706,10 @@ pub fn deriveNextTrafficSecret(current: [32]u8) [32]u8 {
     return deriveNextTrafficSecretV(current, protocol.QUIC_V1);
 }
 
+/// The next traffic secret in a key update, under `version`'s label
+/// (RFC 9001 §6.1). A pure derivation: no state, no randomness, and the same
+/// input always gives the same output.
+///
 pub fn deriveNextTrafficSecretV(current: [32]u8, version: u32) [32]u8 {
     return hkdfExpandLabel(current, protocol.quicLabel(version, .ku), "", 32);
 }

@@ -477,6 +477,97 @@ status of the completed corrected survey. Nothing until that run finishes. The
 earlier 18 executed / 20 build-only / 70 failed / exit 1 result describes the
 pre-address, pre-fixture survey and is not this one's outcome. -->
 
+### 8. Repairs to contracts the audit found, named by what each one stops
+
+None of these is a protocol change. They are places where the core took a
+decision it could not take back — consumed a frame, spent a packet number,
+filled a buffer with a key it did not have — and where the API around it did
+not say so before the caller had already paid.
+
+**A refused read keeps the bytes (`src/quic/stream.zig`).** `FrameSorter.pop`
+removed a chunk and then discovered it could not copy it, freed the
+allocation and returned null: a run the peer had already been credited for,
+and which it will never retransmit because from its side it was delivered. The
+chunk goes back at the head of the list with its hole count undone, and the
+list has the slot it just vacated, so the restore cannot fail. `peekLen` is the
+new way to ask how much a read holds without taking it, which is what lets a
+caller make room *before* the read rather than after it.
+
+**`ReceiveStream.read` and `CryptoStream.read` say what a caller owns
+(`src/quic/stream.zig`, `src/quic/crypto_stream.zig`).** The slice either
+returns is an allocation the caller frees with the stream's allocator, and the
+read position, `bytes_read` and the connection credit have all moved by the
+time it is handed over.
+
+**Version Negotiation packets have a length, and are recognised before one is
+read (`src/quic/packet.zig`, `src/quic/connection.zig`,
+`src/quic/connection_manager.zig`).** A VN header carries no Length field, so
+`parse` left `remainder_len` undefined — and both datagram walkers stepped by
+it before `recv` had decided to ignore the packet. The whole remainder of the
+datagram is the packet, as it already was for Retry and 1-RTT, and a VN packet
+now ends the walk instead of stepping by a length it never had.
+
+**A server with no token key issues no NEW_TOKEN (`src/quic/connection.zig`).**
+`token_key` defaulted to sixteen zero bytes, so a token sealed under it was
+sealed under a key every reader of the wire has, and it outlived the connection
+that issued it. The key is now optional and its absence means no token rather
+than a predictable one.
+
+**A refused construction frees what it built (`src/quic/connection.zig`).**
+`acceptInto` initialises a connection and then allocates — the TLS handshake,
+the resized datagram queues — with no `errdefer` between, so a failure after
+the handshake leaked it. One `errdefer conn.deinit()` right after the literal
+closes every path, because the literal initialises every member `deinit`
+touches.
+
+**A client's transport parameters borrow its own connection ids
+(`src/quic/connection.zig`).** `connectInto` built them pointing at the stack
+locals it drew the ids from, and then copied those ids into the connection —
+so the parameters of a client's first Initial pointed at a dead frame. They
+are bound to `conn.scid` after the copy instead, which is what
+`acceptInto`'s own comment says it does. The by-value `accept` and `connect`
+wrappers now say plainly that they move a connection whose parameters borrow
+from itself, and point at the `Into` variants.
+
+**A close packet waits for a buffer that can hold it
+(`src/quic/connection.zig`).** `sendAt` copied `close_pkt_len` bytes into
+`out_buf` and cleared the retransmit trigger with no check that the buffer was
+that long. A caller with a smaller buffer now gets zero and keeps the trigger.
+
+**QUIC-LB states the combined length its fixed buffer assumes
+(`src/quic/quic_lb.zig`).** `extractServerId` decodes into a 20-byte stack
+buffer because the longest payload a connection id may carry is 19 bytes —
+`server_id_len + nonce_len`, plus the first octet, and QUIC's own 20-byte
+limit. The rule is now on `Config`, where the two lengths are written down,
+with the per-field ranges marked as necessary and not sufficient. Nothing
+validates it at runtime: a config is written once and packed on every packet,
+so a check would buy a per-packet cost to catch a constant.
+
+**`decryptPayload` cannot be out of memory (`src/quic/crypto.zig`).** It
+declared `error.OutOfMemory` and could only ever produce
+`error.AuthenticationFailed`; no allocation happens on that path. The set is
+now what the code can return, so `packet.decrypt` propagates a smaller set as a
+consequence, and `Connection.recv`'s bare `catch` can no longer swallow an
+allocator error that was never there.
+
+**The wrapper states what its room costs (`src/transport/quic_bridge.zig`).**
+`Connection.sendAt` consumes what it packs, so `Conn.drain` asks the core for a
+datagram only where it can finish the job: an empty `out`, a buffer under one
+padded Initial, or a path with no address is refused with nothing built, and
+room running out between datagrams is a short answer rather than a refusal, so
+every datagram built is inside a run that is handed back. `Stream.drain` takes
+the room in its caller's sink before the read that would hand over the bytes.
+`Bridge.create` keeps `error.Canceled` apart from `error.EntropyUnavailable`,
+because one is the caller's own cancellation and the other is an `std.Io` that
+cannot key the bridge. And a peer pin now forces a certificate: the pin is
+read out of the same block `require_peer_certificate` decides whether to ask
+for, so a caller that named a peer and cleared that flag had its pin dropped.
+
+**The module root states the four rules (`src/lib.zig`).** Time, randomness,
+the allocator and ownership are parameters and per-declaration contracts, and
+none of them was written down at the one place a consumer starts reading. Each
+re-export now says what that module is and what it borrows.
+
 ## Measured cost
 
 | | Predicted | Measured |
