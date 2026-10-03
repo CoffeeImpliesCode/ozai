@@ -6,12 +6,22 @@
 const std = @import("std");
 const mem = std.mem;
 
+/// An IPv4 endpoint. A value: copying one copies the address, and nothing
+/// here owns memory.
+///
+/// `bytes` is in network order and `port` in host order, which is the seam's
+/// problem and not the caller's; see the module doc.
 pub const Ipv4Address = struct {
     bytes: [4]u8,
     /// The socket seam converts host byte order to kernel byte order.
     port: u16,
 };
 
+/// An IPv6 endpoint. A value, and like `Ipv4Address` a copy is independent.
+///
+/// `scope_id` is the RFC 4007 interface zone, which is part of path identity
+/// for a link-local address and zero for everything else — including a
+/// synthetic address, which has no interface to name.
 pub const Ipv6Address = struct {
     bytes: [16]u8,
     port: u16,
@@ -19,6 +29,16 @@ pub const Ipv6Address = struct {
     scope_id: u32 = 0,
 };
 
+/// A path's address: one of the two families, or `unset`.
+///
+/// `unset` is not a wildcard and not an error. It is the address a path has
+/// before anything has named one, and a connection whose path is still unset
+/// cannot send: `Address.eql` reports two unset paths as equal, so a path
+/// that has not been named is not mistaken for a migration.
+///
+/// Equality is byte-for-byte over the family, the address, the port and the
+/// scope; a caller that wants to compare only the addresses asks
+/// `sameIp`, which ignores the port the way a routing table does.
 pub const Address = union(enum) {
     unset,
     ipv4: Ipv4Address,

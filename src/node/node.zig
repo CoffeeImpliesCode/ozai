@@ -240,12 +240,12 @@ pub const poll_interval_ms = 250;
 /// than the count, and the two disagreeing is a finding.
 pub const named_ring = 8;
 
-/// The pass bound on a close that does not finish.
+/// The pass bound on a close that does not finish in one pass.
 ///
-/// Every step of `router.Shutdown` answers the event that drove it, so a
-/// close is one pass; the bound is there for the case where it is not, and it
-/// asserts rather than spinning.
-pub const max_close_steps = 4;
+/// A close is four phases and `finish` takes one iteration per phase, so this
+/// is the bound on a close that is resumed from somewhere in the middle. It
+/// asserts rather than spinning — `AGENTS.md` §1.
+pub const max_close_steps = 8;
 
 /// The gossip protocol's ALPN, which is also the only protocol this node
 /// speaks. `docs/PLAN.md` names it at M11.
@@ -420,11 +420,22 @@ pub const Config = struct {
 
 /// One datagram a relay handed this node, and the node it came from.
 ///
-/// The payload is owned by the node's inbox until `clearDelivered`, because a
-/// relay frame borrows its datagrams out of the bytes they were read from and
-/// those are reused on the next read.
+/// `data` is a copy this node allocated from its own `gpa`, not a view of the
+/// bytes the relay frame was read from: a relay frame borrows its datagrams out
+/// of its inbox and that inbox is reused by the next read, so a payload handed
+/// out has to be a copy or it is a view of a buffer that has moved on.
+///
+/// **Two lifetimes, and they are not the same one.** The payload is owned by
+/// the node until `clearDelivered` gives it back — or until `deinit`, which
+/// frees whatever is still listed — and the node's allocator is the one that
+/// frees it. The list it sits in does not survive the next delivery: appending
+/// to it may move it. `Node.delivered` says which is which from the outside.
 pub const Delivered = struct {
+    /// The node id the relay says this datagram came from. Copied, and so
+    /// independent of the payload and of every other item on the list.
     src: NodeId,
+    /// The datagram bytes this node copied. Empty is a datagram of no bytes,
+    /// which the relay protocol permits and which is not an absence.
     data: []u8,
 };
 
@@ -433,6 +444,15 @@ pub const Delivered = struct {
 /// Everything is a set a seam below already published, so a caller of `step`
 /// writes the same error name the seam's own tests write. The two arms that
 /// are this file's own are named for what they are.
+///
+/// One of these arrives only from a `std.Io` that has refused, and it says
+/// which refusal: `error.Canceled` is this file or a seam below asking the
+/// caller's runtime for cancellation and being told to stop — `Bridge.create`
+/// drawing the two transport secrets, and `Socket` around any `recvmsg` or
+/// `sendmsg` — while `error.EntropyUnavailable` is that
+/// same `Io` saying it cannot produce secure entropy at all. A cancelled
+/// runtime is still a runtime; a caller that retries `create` on another `Io`
+/// has not learned anything it did not already know.
 pub const Error =
     bridge_mod.Error ||
     bridge_mod.CreateError ||
@@ -727,6 +747,34 @@ const Spoke = struct {
 /// router calls is handed this struct's address as its context. A node that
 /// moved after either of those was taken would invalidate both, so `create` is
 /// the only way to build one and the pointer it returns is the node.
+///
+/// **The address is the node's whole identity, and it stays put.** Two things
+/// hold it and both are taken once, in `create`: the lease `Loop.acquire`
+/// hands back reads through `&self.accept.shutdown`, and the handler context
+/// the router is given is `@ptrCast(self)`. A value copied out of `create`'s
+/// result would be a second node sharing one lease and one handler context, so
+/// the pointer is what every other call on this type takes and `Node` is never
+/// copied by value.
+///
+/// **One thread owns a node, and one call at a time.** Nothing in this struct
+/// is locked and the only atomic is `Stop.flag`, so `start`, `step`, `wait`,
+/// `run`, `close`, `delivered`, `clearDelivered` and `sendThrough` are
+/// single-threaded operations on a node one thread owns. The one call that may
+/// come from another thread while `run` is inside `poll` is `Stop.request`,
+/// which is one atomic store and is documented as async-signal-safe for
+/// exactly that reason.
+///
+/// **Not reentrant either**, and this is a property of where the callbacks sit
+/// rather than of their signatures. Every call this file makes into a
+/// `ProtocolHandler` or an `IncomingFilter` is made from inside a pass, so a
+/// handler that called `step`, `run` or `close` would re-enter the pass that
+/// called it with the connection table and the accept-task table mid-walk.
+/// `shutdown` is the one that looks harmless and is not: it runs inside
+/// `performShutdown`, before the machine has advanced past the handlers, and
+/// the ordering upstream's shutdown is *about* is that a handler's resources
+/// are released while the accepts that might still be using them are running
+/// and never after. `shutdownHandler` is the discipline to copy — it gives up
+/// the handler's own state and touches nothing else.
 pub const Node = struct {
     gpa: Allocator,
 
@@ -741,6 +789,12 @@ pub const Node = struct {
     dialer: *Dialer,
     map: addr_map.MappedAddrs,
     socket_open: bool,
+
+    /// Whether the endpoint step of the shutdown has been performed. The
+    /// machine emits `close_endpoint` once, on the event before it, so a close
+    /// resumed at `closing_endpoint` has to know whether the step it owes
+    /// already ran or is the one that failed. See `finish`.
+    endpoint_closed: bool,
 
     /// The router's table and the accept loop over it. `entries` is the
     /// storage `Builder` writes into and `table` is the frozen view of it, so
@@ -814,6 +868,39 @@ pub const Node = struct {
     /// Build a node from `config`, with `seed` as the root of every generator
     /// it draws from.
     ///
+    /// **`gpa` is this node's allocator for its whole life.** Every allocation
+    /// made after this call — the egress list, the three scratch buffers, the
+    /// relay's tables and queues, every payload a relay hands this node — is
+    /// made from it, and `deinit` returns every one to it. So `gpa` has to
+    /// outlive the node: a caller that frees it first has a `deinit` writing to
+    /// memory it no longer owns.
+    ///
+    /// **`config` is taken by value, so everything in it is copied, except
+    /// what it points at.** The secret is copied and the copy is zeroed by
+    /// `deinit`, so the caller keeps the one it passed and should zero it in
+    /// its own turn; there is no move here to observe and nothing to give up.
+    /// Two fields are borrowed instead, because copying either would be an
+    /// allocation this constructor has no reason to make: `alpn`, which is
+    /// registered with the router here and read for as long as the node lives,
+    /// and `peers`, which `start` walks on a later pass. **Both must outlive
+    /// the node, not merely the call.**
+    ///
+    /// A `Peer.addr` is borrowed twice over and the second borrow outlives the
+    /// first. `start` hands it to the dialer, and the dialer copies it into
+    /// this node's address map — but `NodeAddr` owns only the outer list it
+    /// allocates, and a `.custom` address inside it keeps pointing at the
+    /// caller's own bytes (`base/addr.zig`'s `CustomAddr`). So the outer
+    /// address storage belongs to `gpa` and is freed by `deinit`, while the
+    /// payload inside it is the caller's and has to outlive the node.
+    ///
+    /// **A cancelled `io` is `error.Canceled`, not `error.EntropyUnavailable`.**
+    /// The two transport secrets are drawn from `io.randomSecure` here and
+    /// nowhere else, so an `Io` that is cancelled while they are being drawn
+    /// answers `error.Canceled` and one that has no secure entropy answers
+    /// `error.EntropyUnavailable`. Nothing is left behind either way: every
+    /// line below this one is under an `errdefer`, so a failed `create` frees
+    /// the socket, the bridge, the dialer and every buffer it had taken.
+    ///
     /// `io` is used for exactly one thing: the two transport secrets
     /// `Bridge.create` was not given. It is null-drawn from `io.randomSecure`
     /// rather than from a process CSPRNG because a global generator is what
@@ -842,6 +929,7 @@ pub const Node = struct {
             .dialer = undefined,
             .map = addr_map.MappedAddrs.init(),
             .socket_open = true,
+            .endpoint_closed = false,
             .entries = undefined,
             .table = undefined,
             .tasks = undefined,
@@ -971,6 +1059,26 @@ pub const Node = struct {
     /// is still serving is a misuse and not a cleanup. The report is at error
     /// level on purpose: it is a finding, and `zig build test`'s runner fails an
     /// artifact that logged one.
+    ///
+    /// **It is the only exit, and it takes the node with it.** The pointer
+    /// `create` returned is dead afterwards, so every `Delivered.data`, every
+    /// `Peer` address the map still holds and the node's own copy of the
+    /// secret all end here rather than at a second call. Nothing may outlive
+    /// this call except what `create` borrowed and the caller still owns.
+    ///
+    /// **It may not run under a `run` or a `step` that is still on the
+    /// stack.** `run` closes the node on its way out precisely so that the
+    /// caller reaches this call with the shutdown already run out; a caller
+    /// that destroys a node whose loop is still passing it frees the buffers
+    /// the pass is writing into. Single-threaded, like everything else here.
+    ///
+    /// What it gives back, in the order it gives it: the endpoint lease, every
+    /// dialled connection and the core's sweep, the relay's clients and
+    /// whatever the relay handed over, the dialer, the bridge, the four heap
+    /// buffers, the address map, the three bookkeeping tables, the socket, and
+    /// finally the node itself. The address map's own storage goes with it; the
+    /// payloads inside a `.custom` address are the caller's and are untouched,
+    /// because `NodeAddr` never owned them.
     pub fn deinit(self: *Node) void {
         switch (self.lease.deinit()) {
             .closed => {},
@@ -1145,6 +1253,17 @@ pub const Node = struct {
     /// same node driven twice at two instants with two generators is two
     /// nodes' worth of answers, and that is what lets the test below drive a
     /// whole connection without a clock.
+    ///
+    /// **A failed pass is a node to be closed, not a pass to be replayed.**
+    /// Each seam consumes before it can fail. A datagram `take` took is gone
+    /// from the socket whether the core took it or refused it, and a gossip
+    /// timer `gossip` has already taken out of `self.timers` by the time
+    /// `feedGossip` propagates the failure that produced it. So a caller that
+    /// answers a failed `step` by running the same pass again is replaying an
+    /// event this node has already acted on, and nothing here promises that is
+    /// safe. The two honest answers are `close` — which is what `run` does on
+    /// its own error path, and which abandons the gossip layer rather than
+    /// rewinding it — and throwing the node away.
     pub fn step(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!bool {
         self.stats.steps += 1;
         var moved = try self.take(io, at, random);
@@ -1194,37 +1313,152 @@ pub const Node = struct {
 
     /// Wind the node down, in the order `router.Shutdown` enforces.
     ///
-    /// Every step of that machine answers the event that drove it, so this is
-    /// one pass. The loop is here for the case where it is not, and it
-    /// asserts rather than spinning — `AGENTS.md` §1: loops have fixed upper
-    /// bounds.
+    /// Every step of that machine answers the event that drove it, so a close
+    /// from `.serving` is one pass; `finish` is what the rest of it looks like.
+    ///
+    /// **It resumes rather than refusing.** A close that stopped part way — a
+    /// send that failed in `close_endpoint`, the one step that needs a runtime —
+    /// leaves the machine in `.closing_endpoint` with the descriptor open, and
+    /// the next `close` picks that phase up and finishes it. So a caller that
+    /// gets an error out of a close knows two things: which send failed, and
+    /// that a later close with a working socket will complete the shutdown.
+    /// `run` does not rely on that — its error path ends in `dispose`, which
+    /// cannot fail.
+    ///
+    /// **What it guarantees on return is the machine at `.closed`**: the
+    /// handler's own state released, every accept task cancelled, the
+    /// descriptor shut. A return is only reached there, because every other
+    /// exit is an error the caller has been handed.
+    ///
+    /// **This is `run`'s close, and a caller picks one or the other.**
+    /// `run` closes on its way out, so a `close` after it is the no-op the
+    /// `.closed` phase makes it. Calling `close` on a node a `run` is passing
+    /// right now is a re-entry into the pass driving the machine; `Node` says
+    /// what that means.
     pub fn close(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!void {
-        if (self.accept.shutdown.phase != .serving) return;
-        try self.feed(io, .close_requested, at, random);
+        if (self.accept.shutdown.phase == .closed) return;
+        try self.finish(io, at, random);
+    }
+
+    /// Drive the shutdown out of whatever phase it is in, feeding each phase
+    /// what it is waiting for until it reaches `closed`.
+    ///
+    /// **`close` resumes rather than refusing, and this is why.** A close that
+    /// stopped part way — a send that failed in `close_endpoint` — leaves the
+    /// machine in `closing_endpoint` with the descriptor open, and returning
+    /// there because the phase is no longer `serving` would leave a node nothing
+    /// could ever finish. So one iteration per phase, each feeding that phase
+    /// its own event, which is what `max_close_steps` bounds.
+    ///
+    /// One phase is different: the machine emits `close_endpoint` on the event
+    /// before it and never twice, so a close resumed at `closing_endpoint` is
+    /// performing the action that failed rather than being told it is owed.
+    fn finish(self: *Node, io: ?std.Io, at: ?Instant, random: std.Random) Error!void {
         var steps: usize = 0;
-        while (self.accept.shutdown.phase != .closed) : (steps += 1) {
+        while (self.accept.shutdown.phase != .closed) {
             std.debug.assert(steps < max_close_steps);
-            _ = try self.step(io, at, random);
+            steps += 1;
+            switch (self.accept.shutdown.phase) {
+                .serving => try self.feed(io, .close_requested, at, random),
+                .draining_handlers => try self.feed(io, .handler_finished, at, random),
+                .cancelling_accepts => try self.feed(io, .accepts_cancelled, at, random),
+                .closing_endpoint => {
+                    // The one phase whose action can have failed. The machine
+                    // emits `close_endpoint` on the event before this phase and
+                    // never emits it twice, so it is performed again here
+                    // unless the flag says it already completed — which is the
+                    // difference between a close that is progressing and one
+                    // that is being resumed.
+                    if (!self.endpoint_closed) {
+                        const owed = try self.performShutdown(
+                            io,
+                            .{ .action = .close_endpoint, .panicked = null },
+                            at,
+                            random,
+                        );
+                        // The one answer this action has. Asserted rather than
+                        // read: a second one would mean the machine and this
+                        // loop disagree about what advances the phase.
+                        std.debug.assert(owed != null and
+                            std.meta.activeTag(owed.?.event) == .endpoint_closed);
+                    }
+                    try self.feed(io, .endpoint_closed, at, random);
+                },
+                .closed => unreachable,
+            }
         }
+    }
+
+    /// The shutdown with nothing graceful left to do: no runtime, no instant,
+    /// and so no connection closes — the handler released, every accept reaped,
+    /// the descriptor shut, the machine at `closed`.
+    ///
+    /// **This is the backstop behind `run`'s promise**, and `run` reaches it
+    /// two ways: a clock it never read, and a graceful close it could not
+    /// perform. What it gives up is not reportable — it sends nothing, so there
+    /// is no error and no count — and what it does not give up is local:
+    /// `deinit` finds a closed endpoint, a lease that reports it, and the core
+    /// connections its own walk already handles.
+    ///
+    /// It cannot fail. With no `Io` to ask and no instant to stamp, every step
+    /// is a counter or a call into this node's own state, so an error here would
+    /// be a claim this file cannot make. It panics rather than leave a
+    /// half-disposed node behind a swallowed error.
+    fn dispose(self: *Node) void {
+        self.finish(null, null, self.generator()) catch |err| std.debug.panic(
+            "a shutdown with no runtime and no instant failed: {t}",
+            .{err},
+        );
+        std.debug.assert(self.accept.shutdown.phase == .closed);
+        std.debug.assert(!self.socket_open);
     }
 
     /// The loop, with a clock. `stop` ends it, and the node is closed either
     /// way.
     ///
-    /// This is the only function in the project that reads a clock, and it
-    /// reads it through the `Io` the caller handed it and hands the result to
-    /// `step` as data.
+    /// **The node is closed on every exit, and the promise covers the exits
+    /// this loop did not choose.** A pass can fail — a socket write the `Io`
+    /// refuses, a bridge that would not allocate, a `checkCancel` answered with
+    /// `error.Canceled` — and the `errdefer` below is what closes the node then.
+    /// It is registered *before* the first clock read, because `create` has
+    /// already opened the descriptor and a clock this node cannot use is an exit
+    /// like any other.
     ///
-    /// The stop is checked once per pass, before the pass rather than after
-    /// it, so a signal that lands while `wait` is inside `poll` costs at most
-    /// `poll_interval_ms`. That is the price of a loop with no cancellation
-    /// point of its own, and it is the same bound `Socket.awaitReadable`
-    /// already names.
+    /// **The error the loop failed with is what `run` returns.** A close that
+    /// fails as well is reported at error level beside it and never in place of
+    /// it: a caller that asked to be cancelled has to hear `error.Canceled` and
+    /// not the residue of cleaning up after it. `windDown` is that close and
+    /// `dispose` is the backstop behind it.
+    ///
+    /// **The instant this loop reads is the instant the close is stamped
+    /// with.** A peer driven on a clock of its own — a test's virtual one —
+    /// reads close times from a timeline this loop is not on, and waits out its
+    /// own retransmit timeout to believe one. Two ends of a connection on two
+    /// clocks are two nodes' worth of answers, which is `step`'s rule and this
+    /// loop's.
+    ///
+    /// The stop is checked once per pass, before the pass rather than after it,
+    /// so a signal that lands while `wait` is inside `poll` costs at most
+    /// `poll_interval_ms` — the same bound `Socket.awaitReadable` names.
+    ///
+    /// One thread, one `run`, and never from a signal handler. See `Node`.
     pub fn run(self: *Node, io: std.Io, stop: *const Stop) Error!void {
+        // The instant of the pass being run, and null until one has been read.
+        // A close needs an instant to stamp a connection close with and a
+        // disposal does not, which is what makes this the right type for the
+        // register below rather than a plain `Instant`.
+        var at: ?Instant = null;
+        errdefer self.windDown(io, at);
         var dialled = false;
         while (true) {
-            const at = try instantOf(io);
-            if (stop.expired(at)) break;
+            const now = try instantOf(io);
+            at = now;
+            if (stop.expired(now)) {
+                // The break is taken on a pass that read a clock, so this close
+                // has the instant it stamps its connection closes with.
+                try self.close(io, now, self.generator());
+                break;
+            }
             // The dials happen on the first pass rather than in the caller, so
             // that a stop raised before the loop is entered closes a node that
             // never dialled anything — which is what `start` is idempotent
@@ -1232,17 +1466,42 @@ pub const Node = struct {
             // this line costs nothing.
             if (!dialled) {
                 dialled = true;
-                try self.start(at, self.generator());
+                try self.start(now, self.generator());
             }
             // The pass's own answer is not read here. A poll loop has one tick,
             // and whether the tick moved anything changes what the caller may
             // do next rather than how long this loop waits; `step`'s `bool` is
             // for a caller driving passes itself, which is what the test at the
             // bottom of this file is.
-            _ = try self.step(io, at, self.generator());
+            _ = try self.step(io, now, self.generator());
             try self.wait(io, poll_interval_ms);
         }
-        try self.close(io, try instantOf(io), self.generator());
+    }
+
+    /// The close a failed `run` owes: a graceful one where there is an instant
+    /// to stamp it with, and the disposal behind it in every case.
+    ///
+    /// **The graceful half runs with cancellation protection switched on**
+    /// (`std.Io.CancelProtection`), which is the runtime's own answer to
+    /// "finish this": every `Io` call inside it stops being a cancellation
+    /// point, so this file does not have to guess which of its calls a backend
+    /// consults. The previous setting is restored on the way out.
+    ///
+    /// It is bounded — one step per shutdown phase, one pass over the
+    /// connection table, one `sendmsg` per egress run, no wait — and it runs
+    /// after the error that ended the loop has already been decided. Whatever
+    /// it cannot finish is handed to `dispose`, which is the only part of this
+    /// that cannot fail.
+    fn windDown(self: *Node, io: std.Io, at: ?Instant) void {
+        if (at) |stamp| {
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            self.close(io, stamp, self.generator()) catch |err| std.log.err(
+                "node {f} could not be closed gracefully after its loop ended: {t}",
+                .{ self.bridge.nodeId(), err },
+            );
+        }
+        if (self.accept.shutdown.phase != .closed) self.dispose();
     }
 
     // -- the transport ------------------------------------------------------
@@ -1595,9 +1854,9 @@ pub const Node = struct {
     /// `Answer.count` is for.
     fn feed(
         self: *Node,
-        io: std.Io,
+        io: ?std.Io,
         first: endpoint.Event,
-        at: Instant,
+        at: ?Instant,
         random: std.Random,
     ) Error!void {
         var pending: [max_pending_events]endpoint.Event = undefined;
@@ -1624,9 +1883,9 @@ pub const Node = struct {
     /// `spawn` and `cancel_accepts`.
     fn perform(
         self: *Node,
-        io: std.Io,
+        io: ?std.Io,
         action: endpoint.Action,
-        at: Instant,
+        at: ?Instant,
         random: std.Random,
     ) Error!?Answer {
         switch (action) {
@@ -1682,9 +1941,9 @@ pub const Node = struct {
     /// (`router.zig:642-650`).
     fn performShutdown(
         self: *Node,
-        io: std.Io,
+        io: ?std.Io,
         owed: endpoint.ShutdownStep,
-        at: Instant,
+        at: ?Instant,
         random: std.Random,
     ) Error!?Answer {
         if (owed.panicked) |reaped| std.log.err(
@@ -1734,24 +1993,44 @@ pub const Node = struct {
             },
             // Upstream `endpoint.close()` (`protocol.rs:613`), which
             // force-closes whatever the accepts left. This node's endpoint is
-            // its socket and the connections the core holds, so both go: every
-            // connection is closed at the caller's instant and the close is
-            // drained and written out, so the peer is told rather than left to
-            // time out. `sweep` is what frees the entries, and `deinit` frees
-            // whatever `sweep` did not.
+            // its socket and the connections the core holds, so both go:
+            // `closeConnections` stamps and writes, and `shutdownSocket`
+            // releases the descriptor.
+            //
+            // **The descriptor is released on every path and the connections
+            // only where there is an instant to stamp them with.** A null
+            // instant is the disposal path — `dispose` is its only caller — and
+            // a connection close is the one thing here that needs a clock
+            // reading. Those connections are then left to `deinit`'s own walk.
+            // Releasing the descriptor is the part that cannot be deferred to
+            // anything, so it is not.
             .close_endpoint => {
-                var index: usize = 0;
-                while (self.bridge.connectionAt(index)) |conn| : (index += 1) {
-                    conn.entry.conn.close(0, "", at);
-                    for (try conn.drain(self.egress, self.out, at, random)) |egress| {
-                        self.stats.datagrams_out += egress.send.datagramCount();
-                        self.note(try self.socket.send(io, egress.to, egress.send));
-                    }
+                if (io) |runtime| {
+                    if (at) |stamp| try self.closeConnections(runtime, stamp, random);
                 }
+                self.endpoint_closed = true;
                 self.shutdownSocket();
                 return .{ .event = .endpoint_closed };
             },
             .none => return null,
+        }
+    }
+
+    /// Stamp a close on every connection the core holds and write it out, so
+    /// each peer is told rather than left to time out.
+    ///
+    /// **A failure here leaves the machine in `closing_endpoint` and the
+    /// descriptor open**, and that is reported rather than papered over:
+    /// `finish` re-performs this step on the next close, and `dispose` is the
+    /// backstop behind both.
+    fn closeConnections(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!void {
+        var index: usize = 0;
+        while (self.bridge.connectionAt(index)) |conn| : (index += 1) {
+            conn.entry.conn.close(0, "", at);
+            for (try conn.drain(self.egress, self.out, at, random)) |egress| {
+                self.stats.datagrams_out += egress.send.datagramCount();
+                self.note(try self.socket.send(io, egress.to, egress.send));
+            }
         }
     }
 
@@ -2360,14 +2639,7 @@ pub const Node = struct {
         }
         switch (message) {
             .relay_to_client_datagram, .relay_to_client_datagram_batch => |frame| {
-                // Owned, because the frame borrows out of the bytes it was read
-                // from and those are reused by the next read.
-                const owned = try self.gpa.dupe(u8, frame.datagrams.contents);
-                try spoke.delivered.append(self.gpa, .{
-                    .src = frame.node_id,
-                    .data = owned,
-                });
-                self.stats.relay_datagrams_out += 1;
+                try self.retain(spoke, frame);
             },
             .endpoint_gone => {
                 self.stats.relay_peer_gone += 1;
@@ -2381,18 +2653,74 @@ pub const Node = struct {
         }
     }
 
+    /// Retain one datagram the relay handed this node, and count it.
+    ///
+    /// **The copy is the node's, and the guard for it is taken before the list
+    /// is.** `relay_frame.decode` borrows a frame's datagrams out of the bytes
+    /// that frame was read from, and those bytes are reused by the next read,
+    /// so a payload handed to a caller has to be copied rather than pointed
+    /// at. Copying makes it an allocation this node owns from that line on,
+    /// and the append that publishes it can still fail — so the `errdefer`
+    /// sits between the two: an append that cannot be given the copy releases
+    /// it rather than leaving one payload behind for every frame refused on
+    /// the way to the list.
+    ///
+    /// Nothing bounds the list. `delivered` hands out what is on it and
+    /// `clearDelivered` is what gives the payloads back, so a relay that keeps
+    /// answering grows it until a caller clears it — which is the same
+    /// contract `Delivered` states from the outside.
+    fn retain(self: *Node, spoke: *Spoke, frame: relay_frame.DatagramFrame) Error!void {
+        const owned = try self.gpa.dupe(u8, frame.datagrams.contents);
+        errdefer self.gpa.free(owned);
+        try spoke.delivered.append(self.gpa, .{
+            .src = frame.node_id,
+            .data = owned,
+        });
+        self.stats.relay_datagrams_out += 1;
+    }
+
     // -- the relay's public face --------------------------------------------
 
-    /// What this node's relay has handed back, oldest first. Owned by the node
-    /// until `clearDelivered`.
+    /// What this node's relay has handed back, oldest first. A node that has
+    /// not reached a relay answers an empty slice, and so does one that has
+    /// called `clearDelivered`: both are "nothing is waiting", not "no relay".
+    ///
+    /// **The slice is a descriptor into a list that grows, and the payloads in
+    /// it are not.** Two different lifetimes, and a caller has to know which
+    /// one it is holding:
+    ///
+    /// - *The returned slice* points into `spoke.delivered`, an `ArrayList`
+    ///   this node appends to in `retain`. The next datagram a relay hands
+    ///   over may reallocate that list, and the slice this call returned
+    ///   describes the old storage. Take the items — or `data.len`, or the
+    ///   count — before driving another pass, and take the slice again if you
+    ///   need it after one.
+    /// - *Each `Delivered.data`* is a copy this node allocated, and it stays
+    ///   valid across every later delivery. What ends it is `clearDelivered`,
+    ///   or `deinit` if the caller never got there.
+    ///
+    /// `delivered` takes `*const Node` and mutates nothing, so reading the
+    /// list is safe from a caller holding only a shared borrow; it is not safe
+    /// from another thread while a pass is running.
     pub fn delivered(self: *const Node) []const Delivered {
         const spoke = self.spoke orelse return &.{};
         return spoke.delivered.items;
     }
 
-    /// Forget everything the relay has handed back, freeing the payloads.
+    /// Forget everything the relay has handed back, and free the payloads.
+    ///
+    /// Each `data` is freed here and nowhere else, and the list is emptied in
+    /// the same pass, so a second call finds nothing to free and `deinit`
+    /// finds nothing to give back. A caller holding a slice from `delivered`
+    /// holds freed memory afterwards; a caller holding one `data` holds it
+    /// until this call and not one pass longer.
+    ///
+    /// The list's capacity is kept, so a caller that clears every pass pays
+    /// for one growth rather than one per pass. A caller that never clears
+    /// grows the list for as long as the relay keeps answering — the copy in
+    /// `retain` is the price of handing a caller bytes it can keep.
     pub fn clearDelivered(self: *Node) void {
-        const spoke = self.spoke orelse return;
+        const spoke = &(self.spoke orelse return);
         for (spoke.delivered.items) |item| self.gpa.free(item.data);
         spoke.delivered.clearRetainingCapacity();
     }
@@ -3192,6 +3520,205 @@ test "a stop asked for before the loop is entered ends it and closes the node" {
     try t.expectEqual(@as(u64, 0), node.stats.steps);
 }
 
+/// A runtime that is cancelled the way a real backend is: it answers
+/// `checkCancel` with `error.Canceled` until the task blocks cancellation, and
+/// it honours `swapCancelProtection` to know when that is.
+///
+/// Two vtable fields and one double, so every other answer stays the live
+/// backend's and the close these tests watch afterwards is a real write rather
+/// than a stub. A `checkCancel` that always answered `error.Canceled` would
+/// describe a runtime no backend is: the protection `run` relies on to write
+/// its CONNECTION_CLOSEs is exactly what such a double ignores.
+/// Kept on the thread that asked for it: the vtable slot receives only the
+/// backend's own userdata, so a per-test struct could not reach it without
+/// taking every other slot's userdata with it and breaking the live backend.
+threadlocal var cancel_protection: std.Io.CancelProtection = .unblocked;
+
+/// The two slots of an otherwise untouched vtable, and the whole of the double.
+fn cancelledCheck(userdata: ?*anyopaque) std.Io.Cancelable!void {
+    _ = userdata;
+    if (cancel_protection == .blocked) return;
+    return error.Canceled;
+}
+
+fn cancelledSwap(userdata: ?*anyopaque, new: std.Io.CancelProtection) std.Io.CancelProtection {
+    _ = userdata;
+    const previous = cancel_protection;
+    cancel_protection = new;
+    return previous;
+}
+
+test "a cancelled Io ends the loop, and the node is closed with its closes written" {
+    // Two nodes, because the half of the promise that can fail is the one with
+    // something to release: `close` writes a CONNECTION_CLOSE per connection
+    // before it shuts the descriptor, and that write is the only work the
+    // shutdown asks of a runtime at all.
+    const listener = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x61),
+        .listen = loopback,
+        .topic = briskTopic(),
+    }, 0x6161);
+    defer listener.deinit();
+
+    const peers = [_]Peer{.{
+        .id = listener.nodeId(),
+        .addr = .{ .ip = listener.address() },
+    }};
+    const dialer = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xa1),
+        .listen = loopback,
+        .peers = &peers,
+        .topic = briskTopic(),
+    }, 0xa1a1);
+    defer dialer.deinit();
+
+    // A live connection, established over real sockets exactly as the test
+    // above establishes one.
+    var at: Instant = start_ns;
+    try dialer.start(at, dialer.generator());
+    var pass: usize = 0;
+    while (pass < max_passes) : (pass += 1) {
+        at += time_quantum;
+        _ = try dialer.step(t.io, at, dialer.generator());
+        _ = try listener.step(t.io, at, listener.generator());
+    }
+    try t.expectEqual(@as(usize, 1), dialer.establishedCount());
+    try t.expectEqual(@as(usize, 1), listener.establishedCount());
+
+    // A runtime that refuses. Every other answer stays the live backend's, so
+    // the close this test watches afterwards is a real write and not a stub.
+    cancel_protection = .unblocked;
+    var vtable = t.io.vtable.*;
+    vtable.checkCancel = cancelledCheck;
+    vtable.swapCancelProtection = cancelledSwap;
+    const cancelled: std.Io = .{ .userdata = t.io.userdata, .vtable = &vtable };
+    defer cancel_protection = .unblocked;
+
+    var stop = Stop.init();
+    const steps_before = dialer.stats.steps;
+    const written_before = dialer.stats.datagrams_out;
+    try t.expectError(error.Canceled, dialer.run(cancelled, &stop));
+
+    // The exit is the cancellation and not the work: one pass ran and stopped at
+    // the socket's first question.
+    try t.expectEqual(steps_before + 1, dialer.stats.steps);
+
+    // The node is closed. This is the promise, and it is a promise about the
+    // exits the loop did not choose: whatever ended `run`, a caller left
+    // holding this node holds a closed one — the shutdown out of `serving`, the
+    // accepts reaped, the descriptor gone.
+    try t.expectEqual(router.Shutdown.Phase.closed, dialer.accept.shutdown.phase);
+    try t.expectEqual(@as(u64, 1), dialer.stats.handler_shutdowns);
+    try t.expectEqual(@as(usize, 0), dialer.accept.live);
+    try t.expect(!dialer.socket_open);
+
+    // And the peer was told rather than left to time out, which is the half
+    // that needs cancellation protection: `run` answers the cancellation it was
+    // given, not the one the close would have hit on the same `Io`.
+    try t.expect(dialer.stats.datagrams_out > written_before);
+
+    // The listener closes too, or its `defer deinit` reports an endpoint
+    // dropped without a close and the error-level log fails the artifact.
+    try listener.close(t.io, at, listener.generator());
+}
+
+/// A clock whose answer `Instant` — a signed 64-bit nanosecond count — cannot
+/// hold, which is what `error.InstantOutOfRange` is for. One field of an
+/// otherwise untouched vtable again, and this time the refusal is the clock
+/// rather than the runtime.
+fn unusableClock(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+    return .{ .nanoseconds = std.math.maxInt(i96) };
+}
+
+test "a clock this node cannot use still closes the node" {
+    // The exit before the loop body, and the reason the cleanup is registered
+    // before the first clock read rather than after it: `create` has already
+    // opened the descriptor, so a caller that gets this error back and then
+    // calls `deinit` must not be left holding an endpoint that was never shut.
+    const node = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x7c),
+        .listen = loopback,
+        .topic = briskTopic(),
+    }, 0x3737);
+    defer node.deinit();
+
+    var vtable = t.io.vtable.*;
+    vtable.now = unusableClock;
+    const broken: std.Io = .{ .userdata = t.io.userdata, .vtable = &vtable };
+
+    var stop = Stop.init();
+    try t.expectError(error.InstantOutOfRange, node.run(broken, &stop));
+
+    // Nothing ran, and the node is closed anyway. With no instant to stamp a
+    // connection close with there is nothing graceful left to do, so this is the
+    // disposal path: the handler released, the descriptor shut, the machine at
+    // `closed`.
+    try t.expectEqual(@as(u64, 0), node.stats.steps);
+    try t.expectEqual(router.Shutdown.Phase.closed, node.accept.shutdown.phase);
+    try t.expectEqual(@as(u64, 1), node.stats.handler_shutdowns);
+    try t.expectEqual(@as(usize, 0), node.accept.live);
+    try t.expect(!node.socket_open);
+}
+
+test "a close that cannot write is finished by the close after it" {
+    // The residue a failed send leaves, and what has to be able to clear it.
+    // `close_endpoint` is the only step that touches a runtime, so a socket that
+    // refuses its sends stops the machine in `closing_endpoint` with the
+    // descriptor open — and a close that refuses to resume there would leave a
+    // node nothing can ever finish.
+    const listener = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x62),
+        .listen = loopback,
+        .topic = briskTopic(),
+    }, 0x6262);
+    defer listener.deinit();
+
+    const peers = [_]Peer{.{
+        .id = listener.nodeId(),
+        .addr = .{ .ip = listener.address() },
+    }};
+    const dialer = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xa2),
+        .listen = loopback,
+        .peers = &peers,
+        .topic = briskTopic(),
+    }, 0xa2a2);
+    defer dialer.deinit();
+
+    var at: Instant = start_ns;
+    try dialer.start(at, dialer.generator());
+    var pass: usize = 0;
+    while (pass < max_passes) : (pass += 1) {
+        at += time_quantum;
+        _ = try dialer.step(t.io, at, dialer.generator());
+        _ = try listener.step(t.io, at, listener.generator());
+    }
+    try t.expectEqual(@as(usize, 1), dialer.establishedCount());
+
+    // A runtime that refuses, and a close that therefore stops on the first
+    // send it cannot make.
+    cancel_protection = .unblocked;
+    var vtable = t.io.vtable.*;
+    vtable.checkCancel = cancelledCheck;
+    vtable.swapCancelProtection = cancelledSwap;
+    const cancelled: std.Io = .{ .userdata = t.io.userdata, .vtable = &vtable };
+    defer cancel_protection = .unblocked;
+    try t.expectError(error.Canceled, dialer.close(cancelled, at, dialer.generator()));
+
+    // Mid-shutdown, with the descriptor still open: the state this test is for.
+    try t.expectEqual(router.Shutdown.Phase.closing_endpoint, dialer.accept.shutdown.phase);
+    try t.expect(dialer.socket_open);
+
+    // And the next close finishes it rather than refusing, which means
+    // re-performing the step that failed and then reporting it — the machine
+    // will not emit `close_endpoint` twice on its own.
+    try dialer.close(t.io, at, dialer.generator());
+    try t.expectEqual(router.Shutdown.Phase.closed, dialer.accept.shutdown.phase);
+    try t.expect(!dialer.socket_open);
+
+    try listener.close(t.io, at, listener.generator());
+}
+
 test "a stop becomes due at the instant it was given and not before" {
     var stop = Stop.init();
     try t.expect(!stop.expired(start_ns));
@@ -3926,6 +4453,80 @@ test "a relay client reads past a frame it cannot decode and acts on one frame o
     try t.expectEqual(@as(usize, 0), inbox.items.len);
 
     for (nodes) |node| try node.close(t.io, at, node.generator());
+}
+
+test "a payload the relay handed over is retained once and given back once" {
+    // The ownership of one delivered datagram, in both directions: the copy is
+    // the node's, and it is freed by exactly one of `clearDelivered` and
+    // `deinit`. The relay does not have to be standing up for either — what is
+    // under test is the pair of lines that own the payload, not the frames
+    // around them.
+    const node = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x3d),
+        .listen = loopback,
+        .alpn = relay_alpn,
+    }, 0x3d3d);
+    defer node.deinit();
+
+    // The node's own storage, so `delivered` and `clearDelivered` are reading
+    // and freeing the same list the delivery appended to, and `deinit` finds
+    // whatever is left on it.
+    node.spoke = .{
+        .conn = 0,
+        .stream = null,
+        .handshake = .{ .established = .signed_challenge },
+        .inbox = .empty,
+        .delivered = .empty,
+    };
+
+    const src = (try identityOf(0x4e)).nodeId();
+    const frame = relay_frame.DatagramFrame{
+        .node_id = src,
+        .datagrams = .{
+            .ecn = null,
+            .segment_size = null,
+            .contents = "from-the-relay",
+        },
+    };
+
+    // **The list refuses it.** The copy is made before the list is asked to
+    // hold it, so an append that cannot grow must give the copy back rather
+    // than leave one payload behind for every frame refused on the way. The
+    // allocator refuses the *second* allocation of the call — the first is the
+    // copy — and `t.allocator` underneath it is a leak detector, so a copy
+    // nobody frees fails this test even though nothing here can see it.
+    {
+        var failing = t.FailingAllocator.init(t.allocator, .{});
+        failing.fail_index = failing.alloc_index + 1;
+        failing.resize_fail_index = failing.resize_index + 1;
+        const whole = node.gpa;
+        node.gpa = failing.allocator();
+        defer node.gpa = whole;
+        try t.expectError(error.OutOfMemory, node.retain(&node.spoke.?, frame));
+    }
+    try t.expectEqual(@as(usize, 0), node.delivered().len);
+    try t.expectEqual(@as(u64, 0), node.stats.relay_datagrams_out);
+
+    // Retained: one copy, the node's own allocator's, counted once, and the
+    // source id carried alongside the bytes rather than borrowed from them.
+    try node.retain(&node.spoke.?, frame);
+    try t.expectEqual(@as(usize, 1), node.delivered().len);
+    try t.expectEqual(src, node.delivered()[0].src);
+    try t.expectEqualStrings("from-the-relay", node.delivered()[0].data);
+    try t.expectEqual(@as(u64, 1), node.stats.relay_datagrams_out);
+
+    // And given back by exactly one call. `clearDelivered` frees the payload
+    // and empties the list together, so a second call has nothing to free and
+    // the `defer node.deinit()` above finds nothing either — a double free
+    // here would be the other half of the same claim.
+    node.clearDelivered();
+    try t.expectEqual(@as(usize, 0), node.delivered().len);
+    node.clearDelivered();
+
+    // The node still has to be closed rather than dropped: `deinit` reports an
+    // endpoint abandoned in `serving` at error level, and an error-level log
+    // fails the artifact for a reason that has nothing to do with the payload.
+    try node.close(t.io, start_ns, node.generator());
 }
 
 test "a message length round-trips at every varint width" {

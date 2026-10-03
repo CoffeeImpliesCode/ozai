@@ -92,6 +92,9 @@ const last_chunk_widths = [_]u64{std.math.maxInt(u64)};
 /// chunks. `widths` borrows; a value that outlives the buffer it was read from
 /// has to copy it first, for the reason `CustomAddr.parse` gives.
 pub const RangeSpec = struct {
+    /// The widths, borrowed from wherever the spec came. Nothing here
+    /// allocates, and a spec decoded through `parse` borrows the caller's
+    /// buffer, so it must not outlive that buffer.
     widths: []const u64,
 
     /// Selects nothing. `isEmpty` is true, and `resolve` yields no spans.
@@ -111,6 +114,8 @@ pub const RangeSpec = struct {
     /// case in the decoder.
     pub const verified_size: RangeSpec = .{ .widths = &last_chunk_widths };
 
+    /// Whether the spec selects nothing at all, which is a spec with no
+    /// widths — not `all`, which has one width of zero.
     pub fn isEmpty(self: RangeSpec) bool {
         return self.widths.len == 0;
     }
@@ -121,6 +126,10 @@ pub const RangeSpec = struct {
         return self.widths.len == 1 and self.widths[0] == 0;
     }
 
+    /// The same widths in the same order. A decoded spec and one a caller
+    /// built over the same numbers are equal; two specs that select the same
+    /// chunks by different widths are not, because the widths are the wire
+    /// form.
     pub fn eql(a: RangeSpec, b: RangeSpec) bool {
         return std.mem.eql(u64, a.widths, b.widths);
     }
@@ -189,6 +198,8 @@ pub const RangeSpec = struct {
         return .{ .widths = widths[0..count] };
     }
 
+    /// The widths in braces, for a log line and for the failing-decoder
+    /// messages in this file's tests. Not the wire form: see `write`.
     pub fn format(self: RangeSpec, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.writeAll("RangeSpec{");
         for (self.widths, 0..) |width, index| {
@@ -202,13 +213,23 @@ pub const RangeSpec = struct {
 /// The chunk count a spec selects: a floor, and a ceiling that is null when
 /// the walk ends inside a selected span.
 pub const ChunkCount = struct {
+    /// Chunks selected at least. Exact when `max` is not null; otherwise the
+    /// closed selected spans alone.
     min: u64,
+    /// Chunks selected at most, or null when the open-ended tail means the
+    /// total depends on the blob the spec is read against.
     max: ?u64,
 };
 
 /// One selected span: `size` chunks starting at chunk `offset`.
+///
+/// Both fields count chunks, not bytes, and `offset + size` may be one past
+/// the blob's last chunk: `resolve` cuts a span at the blob's end.
 pub const Span = struct {
+    /// The first chunk of the span, counted from the start of the blob.
     offset: u64,
+    /// How many chunks the span covers. Never zero: a zero-width span is not
+    /// handed out at all.
     size: u64,
 };
 
@@ -220,6 +241,7 @@ pub const Span = struct {
 /// debug. The rules are `resolve`'s because they are the reader's and not the
 /// walk's.
 pub const SpanIter = struct {
+    /// The spec being read. Borrowed for as long as the walk is used.
     spec: RangeSpec,
     /// The width the walk is on, and past the end once the list is spent.
     index: usize = 0,
@@ -236,6 +258,12 @@ pub const SpanIter = struct {
     /// is the whole difference between the tail and the spans inside it.
     tail_given: bool = false,
 
+    /// The next selected span, or null once the walk is spent.
+    ///
+    /// `null` is the end, and it stays the end: a second call after it
+    /// returns null again. The spans come out in increasing offset order, and
+    /// a span that starts past the end of the blob is the blob's last chunk
+    /// however many such spans the spec has.
     pub fn next(self: *SpanIter) ?Span {
         if (self.total == 0) return null;
         while (self.index < self.spec.widths.len) {
@@ -275,7 +303,13 @@ pub const SpanIter = struct {
 /// One pair of a `RangeSpecSeq`: how far past the previous pair's start this
 /// one begins, and the spec for the blobs in between.
 pub const Item = struct {
+    /// How many blobs after the previous pair's start this one begins at. A
+    /// zero delta puts the pair on the blob *after* the one before it; a
+    /// `u64.max` is legal off a peer's wire, and the walk saturates rather
+    /// than wrapping behind itself.
     delta: u64,
+    /// The spec for the blobs this pair covers. Its `widths` are borrowed,
+    /// and after a decode they share one buffer across every item.
     spec: RangeSpec,
 };
 
@@ -292,10 +326,17 @@ pub const Item = struct {
 /// `[]u64` the specs in it share. See `RangeSpec` for why neither type
 /// allocates.
 pub const RangeSpecSeq = struct {
+    /// The pairs, one per run of blobs. Borrowed, and after a decode each
+    /// item's `spec.widths` is borrowed from the same buffer, so the whole
+    /// sequence must not outlive it.
     items: []const Item,
 
+    /// No pairs at all: a legal decode of the one-byte frame `00`, and a walk
+    /// that ends immediately.
     pub const empty: RangeSpecSeq = .{ .items = &.{} };
 
+    /// Whether the sequence names no blobs. Distinct from a one-item sequence
+    /// whose spec is `RangeSpec.empty`, which still walks one blob.
     pub fn isEmpty(self: RangeSpecSeq) bool {
         return self.items.len == 0;
     }
@@ -311,6 +352,12 @@ pub const RangeSpecSeq = struct {
         return len > 0 and !self.items[len - 1].spec.isEmpty();
     }
 
+    /// The same pairs, same order, same deltas and same widths. This compares
+    /// the encoding as it stands rather than the chunks the two would select,
+    /// so two sequences that cover a collection identically can still differ.
+    ///
+    /// The specs' borrowed widths are compared by value, so two sequences over
+    /// different buffers holding the same numbers are equal.
     pub fn eql(a: RangeSpecSeq, b: RangeSpecSeq) bool {
         if (a.items.len != b.items.len) return false;
         for (a.items, b.items) |left, right| {
@@ -369,6 +416,8 @@ pub const RangeSpecSeq = struct {
         return .{ .items = items[0..count] };
     }
 
+    /// The pairs as `(delta, RangeSpec{…})` in braces, for a log line and for
+    /// this file's failing-decoder messages. Not the wire form: see `write`.
     pub fn format(self: RangeSpecSeq, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.writeAll("RangeSpecSeq{");
         for (self.items, 0..) |item, index| {
@@ -388,6 +437,8 @@ pub const RangeSpecSeq = struct {
 /// current spec in place, which is how a delta larger than one repeats a spec
 /// across the blobs in between.
 pub const Iter = struct {
+    /// The sequence being walked. Borrowed for as long as the walk is used, and
+    /// its items' `spec.widths` must outlive the walk as well.
     seq: RangeSpecSeq,
     /// The pair being considered, and `items.len` once the walk is spent.
     index: usize = 0,
@@ -400,6 +451,12 @@ pub const Iter = struct {
     /// The spec blobs before the first pair get.
     current: RangeSpec = .empty,
 
+    /// The spec for the next blob, or null once the sequence is spent.
+    ///
+    /// The value borrows the sequence's widths, so it stays valid only as long
+    /// as the sequence does. Blobs before the first pair get `RangeSpec.empty`,
+    /// and a pair whose start the walk has not reached leaves the current spec
+    /// in place — that is how a delta larger than one repeats a spec.
     pub fn next(self: *Iter) ?RangeSpec {
         if (self.index >= self.seq.items.len) return null;
         const item = self.seq.items[self.index];
@@ -421,10 +478,20 @@ pub const Iter = struct {
 
 /// The unbounded walk: the same, with the last spec repeated forever.
 pub const InfiniteIter = struct {
+    /// The sequence being walked, borrowed for as long as the walk is used.
+    /// The fields below advance as `next` is called; a caller reads them to
+    /// tell how much of the walk is real and how far along it is.
     seq: RangeSpecSeq,
+    /// The pair being taken next, and `items.len` once the sequence is spent
+    /// and the walk is repeating.
     index: usize = 0,
+    /// The start of the pair at `index`, as the running sum of the deltas
+    /// already taken.
     consumed: u64 = 0,
+    /// The blob the walk is at, counting from zero.
     offset: u64 = 0,
+    /// The spec handed out for the blob the walk is at. Before the first pair
+    /// this is `RangeSpec.empty`.
     current: RangeSpec = .empty,
 
     /// Whether the walk is past the sequence and now repeating.
@@ -432,6 +499,12 @@ pub const InfiniteIter = struct {
         return self.index >= self.seq.items.len;
     }
 
+    /// The spec for the next blob. Never null: once the sequence is spent the
+    /// last spec repeats forever, and the caller bounds the walk with
+    /// `isAtEnd` to tell the real blobs from the repeated ones.
+    ///
+    /// The value borrows the sequence's widths, so it stays valid only as long
+    /// as the sequence does.
     pub fn next(self: *InfiniteIter) RangeSpec {
         if (self.index < self.seq.items.len) {
             const item = self.seq.items[self.index];

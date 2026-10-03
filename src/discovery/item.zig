@@ -99,6 +99,12 @@ const tag_custom = 2;
 /// so such an arm cannot be added without the compiler pointing at it.
 pub const max_encoded_addr_length = 1 + 1 + 2 + 1 + addr.RelayUrl.max_host_length;
 
+/// Why an item cannot be written in its canonical encoding: the caller's buffer
+/// was too small for it, or one of its addresses is one no record can hold.
+///
+/// `Item.canonicalBytes` returns this; the comparison inside `Item.order` cannot
+/// answer at all, and falls back to `TransportAddr.order` instead — which gives
+/// the same answer for every address the encoder accepts.
 pub const EncodeError = error{
     /// `out` cannot hold the whole encoding. Size it with `maxEncodedLength`.
     BufferTooSmall,
@@ -109,6 +115,13 @@ pub const EncodeError = error{
 };
 
 /// One discovery result: an address, the service that reported it, and when.
+///
+/// An `Item` is a shallow value over somebody else's address list: it owns the
+/// `NodeAddr` struct, not the `addrs` slice behind it, and a copy of an `Item`
+/// shares that slice with the original rather than duplicating it. So an item
+/// read out of a `resolve.Stream` is valid exactly as long as that stream is,
+/// and an item to keep past it is an item to copy the addresses into. Who
+/// allocated the list, and who releases it, is `base/addr.zig`'s rule.
 pub const Item = struct {
     /// Upstream's `endpoint_info: EndpointInfo`. ozai's `NodeAddr` carries the
     /// node id beside the paths, so the whole upstream struct is one field
@@ -122,6 +135,9 @@ pub const Item = struct {
     /// from the network it queried; nothing in this module reads a clock.
     last_updated: ?u64,
 
+    /// An item over `endpoint`, storing its address list rather than taking it.
+    /// The caller still owns that list and still releases it, and the returned
+    /// item is valid for as long as the list is.
     pub fn init(
         endpoint: addr.NodeAddr,
         provenance: Provenance,
@@ -304,8 +320,12 @@ fn compareAddr(a: addr.TransportAddr, b: addr.TransportAddr) ?std.math.Order {
     return std.mem.order(u8, left_bytes, right_bytes);
 }
 
-/// The best item, or null when there is none. The one place a merge asks
-/// which of two results wins, so nothing else needs an opinion of its own.
+/// The best item of `items`, or null when there is none. The one place a merge
+/// asks which of two results wins, so nothing else needs an opinion of its own.
+///
+/// Returns a copy of that item, not a reference to it, and the copy is as
+/// shallow as `Item` is: it borrows the winner's address list, so reading it
+/// after the list is released reads freed memory.
 pub fn winner(items: []const Item) ?Item {
     var best: ?Item = null;
     for (items) |item| {
@@ -318,12 +338,23 @@ pub fn winner(items: []const Item) ?Item {
     return best;
 }
 
-/// Every distinct item, best first.
+/// Every distinct item of `items`, best first, in storage this call allocates
+/// from `alloc` and the caller releases with `alloc.free`.
 ///
 /// Not a second precedence rule: this is the input sorted and deduplicated
 /// under `Item.order`, so it is the same answer whatever order the sources
 /// answered in. Two items that compare `.eq` are equal in every field, which
 /// is what makes dropping one of them drop nothing.
+///
+/// Only the array is new. Every `Item` in it is a shallow copy of an input, so
+/// the merged list owns no address and releases none: `alloc.free` hands back
+/// the array alone, and the merged list is dead as soon as the addresses behind
+/// its items are — which for items out of a resolve is when that stream is
+/// closed. A caller that wants the merge to outlive them copies each address
+/// list out first.
+///
+/// `error.OutOfMemory` allocates nothing that survives: the sorted copy is
+/// released before the error leaves, and the output array was never built.
 pub fn merge(alloc: std.mem.Allocator, items: []const Item) std.mem.Allocator.Error![]Item {
     const sorted = try alloc.dupe(Item, items);
     defer alloc.free(sorted);

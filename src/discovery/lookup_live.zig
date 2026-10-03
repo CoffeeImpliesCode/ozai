@@ -179,8 +179,29 @@ pub const poll_slice_ms: i32 = 20;
 /// are two calls, and nothing about them can be proved without standing
 /// something in for the descriptor. `transport/socket.zig` is the live arm and
 /// the unit tests are the other one.
+///
+/// Nothing here is owned: `ctx` is whatever the wire wraps — a `*socket.Socket`
+/// for the live arm — and it has to stay alive for as long as the `Datagram`
+/// that wraps it, because every call reaches through it. Each call runs
+/// synchronously, on the thread that asked through the seam, and returns before
+/// that call does, and nothing is retained between them: `receiveAnswer` reads
+/// what `receive` returned inside the same call and hands a copy of it upward,
+/// so a wire may not return bytes that die before that call returns. Nothing
+/// reenters the `Datagram` from a wire call: `stop` is the one callback that can
+/// arrive from elsewhere — `src/node/node.zig` says a stop may be raised from a
+/// signal handler — and it is the one that must therefore do nothing but latch
+/// and name the socket.
 const Wire = struct {
+    /// The value the two calls and the stop are made on, borrowed. Reachable
+    /// from every call below, so it outlives them.
     ctx: *anyopaque,
+    /// Called with the framed query and the server the retrieval named, both by
+    /// value, and returns once the datagram is away.
+    ///
+    /// `error.Canceled` crosses the seam as `SocketError.Canceled` and every
+    /// other arm of `socket.SendError` as `SocketError.Refused` — that mapping
+    /// is `sendQuery`'s, because cancellation is the one thing a lookup acts on
+    /// differently and the two sets name it differently.
     send: *const fn (
         ctx: *anyopaque,
         io: std.Io,
@@ -193,16 +214,34 @@ const Wire = struct {
         into: []u8,
         timeout_ms: ?i32,
     ) socket.ReceiveError!socket.Received,
+    /// Called with the buffer to read into and at most `timeout_ms`, where null
+    /// waits as long as the caller means. The `socket.Received` it returns
+    /// borrows `into`, which is why the seam refuses a coalesced read and copies
+    /// nothing out of it itself.
     /// Name the socket stopped, for a wire that holds one to name. Null where
     /// there is none, and the difference is the whole of what the scripted arm
     /// can be asked to prove: it holds no descriptor, so there is no wait in
     /// flight to end and no queue to leave behind.
+    ///
+    /// With a null one, `stop` still latches and the seam still refuses every
+    /// later ask; what it cannot do is end a wait that is already inside the
+    /// kernel. A wire that holds a descriptor therefore has to supply this,
+    /// because a latch nobody polls is the failure the module doc names.
     stop: ?*const fn (ctx: *anyopaque) void,
 };
 
+///
 /// The live `lookup_io.Datagram`: the query, the answer, and the handle that
 /// stops both.
+///
+/// The latch is what makes a stop final: it is set once and never cleared, and
+/// every entry to the seam reads it, so an ask after an abort is refused rather
+/// than sent. A copy of this value copies the latch and not the socket, so the
+/// `Datagram` a `Retrieval` holds has to be the one the handle stops.
 pub const Datagram = struct {
+    /// The socket to go out on, borrowed. It and the `Datagram` both have to
+    /// outlive every `Retrieval` begun from `seam`, because a retrieval holds
+    /// the seam and the seam points here.
     wire: Wire,
     /// Set by `stop` and read at every seam entry and after every wait. The
     /// latch, and no longer the whole of `stop`: a wait already inside `poll`
@@ -216,7 +255,9 @@ pub const Datagram = struct {
     /// `Retrieval` that is held by a stream, and a descriptor reached through
     /// a pointer into a value that had to be copied to be returned is a
     /// dangling one. Opening the socket is `transport/socket.zig`'s call and
-    /// the caller makes it.
+    /// the caller makes it. The socket therefore has to outlive this value and
+    /// every `Retrieval` begun from its `seam`; closing it first leaves those
+    /// asks writing to a descriptor nobody owns.
     pub fn init(handle: *socket.Socket) Datagram {
         return .{
             .wire = .{
@@ -229,6 +270,12 @@ pub const Datagram = struct {
     }
 
     /// This value as the `lookup_io.Datagram` a `Retrieval` is begun with.
+    ///
+    /// The returned handle borrows this, so a `Retrieval` begun from it is dead
+    /// the moment this value is moved or released, and `cancel` from
+    /// `Stream.deinit` reads the latch through it — which is why a caller that
+    /// wants its own copy of the handle keeps the `Datagram` alive until every
+    /// stream is closed.
     pub fn seam(self: *Datagram) lookup_io.Datagram {
         return .{
             .ctx = @ptrCast(@alignCast(self)),
@@ -239,7 +286,8 @@ pub const Datagram = struct {
     }
 
     /// Whether the abort handle has fired, for a caller that would rather not
-    /// start a lookup than ask and be refused.
+    /// start a lookup than ask and be refused. It is final: a `true` here is a
+    /// `true` on every later read, and no ask this value makes will be sent.
     pub fn aborted(self: *const Datagram) bool {
         return self.stopped.load(.acquire);
     }

@@ -161,6 +161,57 @@ and pays that back through `zig build quic-test`; the cache roots are there
 because a lint section reports whatever the file list hands it, and build
 output is not a defect.
 
+### Consume as a package
+
+The package registers two modules: `ozai` and `quic`. `ozai` imports the same
+QUIC core internally. It does not export an `ozai.quic` alias.
+
+Add an `ozai` dependency to `build.zig.zon`. Use its registered modules in
+your build:
+
+```zig
+const dep = b.dependency("ozai", .{
+    .target = target,
+    .optimize = optimize,
+});
+const app = b.addExecutable(.{
+    .name = "app",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }),
+});
+app.root_module.addImport("ozai", dep.module("ozai"));
+app.root_module.addImport("quic", dep.module("quic"));
+```
+
+The Linux socket and node drivers require libc. Pure codecs and state machines
+do not. Import `quic` when your source names the core's types.
+Fetched packages include the module sources, vendored license, README and
+architecture and decision documents. Build checks resolve paths from the package
+root, not the consuming application's working directory.
+
+### Contract changes
+
+An API audit on 2026-10-03 repaired nine reproduced defects and settled the
+ownership, default, callback and range contracts of the published surface.
+[`DECISIONS/0003`](docs/DECISIONS/0003-api-contract-cutover.md) records each
+change, what a consumer pays for it, and the alternative that was rejected.
+The ones that change a call site:
+
+| Change | What a consumer does |
+|---|---|
+| `BlobTicket.new` takes the address list | drop `address.deinit` and call `ticket.deinit` |
+| `discovery.Published` carries an allocator | add `.alloc` to every literal |
+| `PkarrPublisher.init()` | pass no allocator |
+| `DnsAddressLookup.init` | pass answers and cancellation only |
+| `holepunch.decide` takes `Candidates`; `holepunch.settle` takes no local set | pass the set at the gate, not at settlement |
+| `pkarr` encoders answer `EncodeError` | `try` where a `[]const u8` was returned |
+| `Conn.drain` can return a short prefix | loop until the answer is empty |
+| `Bridge.create` can answer `error.Canceled` | handle it apart from `error.EntropyUnavailable` |
+
 ### Cross-platform tests
 
 `cross-test.profile.sh` runs the full 543-test Linux socket/process suite,
@@ -290,7 +341,7 @@ closed output pipes are removed from polling, and premature EOF fails the wait.
 
 ```
 src/root.zig            public surface
-src/base/               identity and addressing — pure, no I/O
+src/base/               identity, addressing and an explicit entropy edge
 src/examples/           runnable proofs
 test/                   integration tests, outside src/ so they are reachable
 docs/                   plan, architecture, decision records

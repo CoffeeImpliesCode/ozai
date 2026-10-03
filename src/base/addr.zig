@@ -19,6 +19,11 @@ pub const IpAddress = union(enum) {
     v4: [4]u8,
     v6: [16]u8,
 
+    /// The address `text` names, or null when it names neither family.
+    ///
+    /// Both families are parsed bare, without the brackets a URI would carry
+    /// around an IPv6 literal, and no zone or prefix is accepted. A name is
+    /// not an address: resolving one belongs to `src/discovery/`.
     pub fn parse(text: []const u8) ?IpAddress {
         // `IpAddress.parseLiteral` wants IPv6 in URI bracket form, which is not
         // what anyone types into a config file. Parse each family bare instead.
@@ -31,6 +36,9 @@ pub const IpAddress = union(enum) {
         return .{ .v6 = v6.bytes };
     }
 
+    /// Every v4 address before every v6 one, then lexicographic over the
+    /// family's bytes. `SocketAddr` and `TransportAddr` order on top of this,
+    /// so it is what decides the order a node's addresses encode in.
     pub fn order(self: IpAddress, other: IpAddress) std.math.Order {
         return switch (self) {
             .v4 => |a| switch (other) {
@@ -44,6 +52,10 @@ pub const IpAddress = union(enum) {
         };
     }
 
+    /// A dotted quad for v4, lowercase hex with no brackets or colons for v6.
+    /// `SocketAddr.format` is the form that has both the address and a port;
+    /// this one leaves the v6 form unbracketed, so it cannot be pasted where
+    /// a URI expects one.
     pub fn format(self: IpAddress, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .v4 => |b| try writer.print("{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }),
@@ -52,8 +64,16 @@ pub const IpAddress = union(enum) {
     }
 };
 
+/// An IP address and a port: one directly reachable endpoint.
+///
+/// An owned fixed-size value with no allocation and no borrow, so it can be
+/// stored in a set, put on the wire, and copied freely. The port is whatever
+/// the caller put there: zero is not refused here, unlike `RelayUrl`, which
+/// has a scheme to infer a default from.
 pub const SocketAddr = struct {
+    /// The address. Nothing else in the struct borrows or owns.
     ip: IpAddress,
+    /// The port. Any `u16` is a valid value of this field.
     port: u16,
 
     /// The longest text `format` can produce, which is what a caller holding a
@@ -68,6 +88,9 @@ pub const SocketAddr = struct {
     /// number is a buffer nobody has checked.
     pub const max_text_length: usize = 2 + 2 * 16 + 1 + 5;
 
+    /// `address:port`, with a v6 address in brackets and every field written
+    /// out: no elided zeros, no shortened IPv6 form, and no zone. At most
+    /// `max_text_length` characters.
     pub fn format(self: SocketAddr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self.ip) {
             .v4 => |address| try writer.print("{d}.{d}.{d}.{d}", .{
@@ -85,6 +108,8 @@ pub const SocketAddr = struct {
         try writer.print(":{d}", .{self.port});
     }
 
+    /// Address first, then port. The order a set of direct addresses iterates
+    /// in, and therefore the order a blob ticket writes them.
     pub fn order(self: SocketAddr, other: SocketAddr) std.math.Order {
         return switch (self.ip.order(other.ip)) {
             .eq => std.math.order(self.port, other.port),
@@ -93,6 +118,7 @@ pub const SocketAddr = struct {
     }
 };
 
+/// Everything a relay URL's text can be refused for.
 pub const RelayUrlParseError = error{
     /// Not a URI, or a URI missing the parts a relay needs.
     Malformed,
@@ -135,16 +161,39 @@ pub const RelayUrlResolveError = error{
 pub const RelayUrl = struct {
     /// RFC 1035 §2.3.4 maximum name length.
     pub const max_host_length = 253;
+    /// The port `parse` fills in when the text carries none.
     pub const default_http_port = 80;
+    /// The port `parse` fills in when the text carries none.
     pub const default_https_port = 443;
 
+    /// `http` or `https`, and nothing else: `parse` refuses every other
+    /// scheme. The declaration order is also the sort order, so `http` is the
+    /// lower of the two.
     pub const Scheme = enum { http, https };
 
+    /// Which of the two defaults the port came from when the text gave none.
     scheme: Scheme,
+    /// The host, left-padded into a fixed array. Only `host[0..host_length]`
+    /// is part of the value; the rest is unspecified padding and two `RelayUrl`
+    /// values parsed from the same text may differ there. Compare with `order`
+    /// or `hostSlice`, never field by field — `host` as a whole array is not
+    /// the host, and a `RelayUrl` built by hand may leave the tail as it
+    /// found it.
     host: [max_host_length]u8,
+    /// How many bytes of `host` the host occupies. Zero is never a valid
+    /// value of this field: `parse` refuses an empty host.
     host_length: u8,
+    /// The port. Zero is `error.InvalidPort`, so unlike `SocketAddr.port`
+    /// every value of this field names a connectable port.
     port: u16,
 
+    /// The relay URL `text` names, with the scheme's default port filled in
+    /// when the text carries none. A path of `/` or none at all is accepted;
+    /// anything else, a query or a fragment is `UnexpectedComponent`.
+    ///
+    /// The host keeps the bytes `text` carried, brackets included for an IPv6
+    /// literal, and the padding past `host_length` is left unspecified; see
+    /// the `host` field.
     pub fn parse(text: []const u8) RelayUrlParseError!RelayUrl {
         const uri = std.Uri.parse(text) catch return error.Malformed;
         if (uri.query != null or uri.fragment != null) return error.UnexpectedComponent;
@@ -217,6 +266,10 @@ pub const RelayUrl = struct {
         try writer.writeAll("/");
     }
 
+    /// Scheme, then port, then the host's own bytes. The padding past
+    /// `host_length` is not compared, so this is the equality two relay URLs
+    /// have as addresses: a field-wise comparison of `host` would disagree
+    /// with it.
     pub fn order(self: RelayUrl, other: RelayUrl) std.math.Order {
         if (self.scheme != other.scheme) {
             return std.math.order(@intFromEnum(self.scheme), @intFromEnum(other.scheme));
@@ -266,10 +319,16 @@ pub const RelayUrl = struct {
     }
 };
 
+/// The id's width in the binary form: a little-endian `u64`.
 pub const custom_id_length = 8;
+/// The most payload bytes a `CustomAddr` carries inline, and the ceiling a
+/// decoded ticket holds one to.
 pub const max_inline_length = 30;
 
+/// Everything a custom address's two textual/binary forms refuse.
 pub const CustomAddrParseError = error{
+    /// No `_` separator, a data half that is not hex, or a binary form shorter
+    /// than the id.
     Malformed,
     /// The hex id must fit a u64, so at most 16 digits and no `0x`.
     IdOutOfRange,
@@ -290,7 +349,13 @@ pub const CustomAddrParseError = error{
 /// onto the heap, so a pointer to a frame that has already been popped keeps
 /// being read long after the frame is gone.
 pub const CustomAddr = struct {
+    /// The transport this address is for, from the public transport registry.
     id: u64,
+    /// The transport's payload. Borrowed from whatever `parse` or
+    /// `parseBinary` was given, so it has to stay alive and unmodified for as
+    /// long as any copy of this address is read — including after the address
+    /// has been copied into a `NodeAddr` by `insert`, which does not take a
+    /// copy of the bytes.
     data: []const u8,
 
     /// Binary form: little-endian u64 id, then raw data. Eight bytes minimum.
@@ -302,8 +367,10 @@ pub const CustomAddr = struct {
         return .{ .id = id, .data = bytes[custom_id_length..] };
     }
 
-    /// Write the binary form into `out`, which must be
-    /// `custom_id_length + self.data.len` long.
+    /// Write the binary form into `out`, which must be exactly
+    /// `custom_id_length + self.data.len` long. A buffer of any other length
+    /// is a caller error the assertion catches; nothing is written and no
+    /// error is returned, because there is no partial form to return.
     pub fn writeBinary(self: CustomAddr, out: []u8) void {
         std.debug.assert(out.len == custom_id_length + self.data.len);
         std.mem.writeInt(u64, out[0..custom_id_length], self.id, .little);
@@ -338,11 +405,16 @@ pub const CustomAddr = struct {
         return .{ .id = id, .data = storage[0..data_length] };
     }
 
+    /// `<hex id>_<hex data>`, the inverse of `parse`: the id without `0x` or
+    /// leading zeros, then each payload byte as two hex digits.
     pub fn format(self: CustomAddr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("{x}_", .{self.id});
         for (self.data) |byte| try writer.print("{x:0>2}", .{byte});
     }
 
+    /// Id first, then payload bytes lexicographically. Two custom addresses
+    /// are the same address exactly when this says `.eq`, which is what makes
+    /// a repeated one in a ticket a duplicate rather than a second path.
     pub fn order(self: CustomAddr, other: CustomAddr) std.math.Order {
         if (self.id != other.id) return std.math.order(self.id, other.id);
         return std.mem.order(u8, self.data, other.data);
@@ -350,6 +422,10 @@ pub const CustomAddr = struct {
 };
 
 /// One way to reach a node.
+///
+/// A value with no lifetime of its own: `relay` and `ip` are inline values,
+/// and `custom` borrows its payload, so a `TransportAddr` may be copied into
+/// storage that outlives the bytes it points at. Nothing here owns anything.
 pub const TransportAddr = union(enum) {
     /// A relay server that will forward datagrams for us.
     relay: RelayUrl,
@@ -358,6 +434,10 @@ pub const TransportAddr = union(enum) {
     /// A registered non-IP transport.
     custom: CustomAddr,
 
+    /// Variant first — relay, then ip, then custom — and the inner value's own
+    /// order within a variant. Every sorted list in ozai is ordered by this,
+    /// so it is also what decides which of two equal-looking addresses a
+    /// duplicate collapses to.
     pub fn order(self: TransportAddr, other: TransportAddr) std.math.Order {
         const self_tag = std.meta.activeTag(self);
         const other_tag = std.meta.activeTag(other);
@@ -371,6 +451,8 @@ pub const TransportAddr = union(enum) {
         };
     }
 
+    /// `relay:`, `ip:` or `custom:` followed by the inner value's own text
+    /// form. For a human and a log; the wire has its own encoding.
     pub fn format(self: TransportAddr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .relay => |url| {
@@ -399,17 +481,45 @@ fn orderTransport(a: TransportAddr, b: TransportAddr) std.math.Order {
 /// `addrs` is kept sorted and duplicate-free. That invariant is what makes an
 /// address encode to the same bytes every time, which is in turn what makes a
 /// ticket a stable identifier rather than a fresh value on every send.
+///
+/// **The list is all a `NodeAddr` owns.** One allocation, made by `withRelay`,
+/// `init` or `insert` and released by exactly one `deinit`. A `.custom`
+/// address inside it *borrows* its payload from whoever parsed it; `deinit`
+/// does not free a borrow and cannot, since the payload is not reachable from
+/// here. A caller that owns such a payload keeps that obligation across every
+/// `insert` and after `deinit`.
+///
+/// Copying a `NodeAddr` copies the handle, not the storage: both copies name
+/// one allocation, so exactly one of them may be freed and both read the same
+/// addresses. `insert` replaces the allocation, so after a successful insert
+/// the previous value is dangling — see `insert`.
 pub const NodeAddr = struct {
+    /// The identity every one of `addrs` is a path to.
     node_id: NodeId,
     /// Sorted by `TransportAddr.order`, unique. Mutate only through `insert`.
     addrs: []TransportAddr,
 
+    /// An address with no paths: the empty list. It owns nothing, so `deinit`
+    /// on it frees nothing and is safe.
     pub fn init(node_id: NodeId) NodeAddr {
         return .{ .node_id = node_id, .addrs = &.{} };
     }
 
-    /// Insert keeping the slice sorted and unique. Returns false, unchanged, when
-    /// the address was already present.
+    /// Insert keeping the slice sorted and unique. Returns `null`, with
+    /// nothing allocated and the receiver unchanged, when the address was
+    /// already present.
+    ///
+    /// On success the returned `NodeAddr` holds a *new* allocation — `realloc`
+    /// may also have moved the old one — so the receiver and every copy of it
+    /// are invalid: do not read through them and do not free them. Adopt the
+    /// returned value from here on.
+    ///
+    /// `error.OutOfMemory` leaves the receiver exactly as it was and still
+    /// valid, so the caller keeps owning its list; nothing was allocated.
+    ///
+    /// Either way the caller keeps ownership of `addr`: a successful insert
+    /// copies the `TransportAddr` shallowly, so a `.custom` payload stays a
+    /// borrow the caller must keep alive for as long as the list is read.
     pub fn insert(
         self: NodeAddr,
         alloc: std.mem.Allocator,
@@ -429,6 +539,10 @@ pub const NodeAddr = struct {
         return .{ .node_id = self.node_id, .addrs = grown };
     }
 
+    /// A one-address `NodeAddr` carrying `url`, with a new list allocation.
+    ///
+    /// `error.OutOfMemory` allocates nothing, and `url` is a value, so the
+    /// caller's copy is unaffected either way.
     pub fn withRelay(
         alloc: std.mem.Allocator,
         node_id: NodeId,
@@ -438,10 +552,16 @@ pub const NodeAddr = struct {
         return .{ .node_id = node_id, .addrs = one };
     }
 
+    /// Free the address list, and nothing else.
+    ///
+    /// Custom payloads in the list are the caller's and are left untouched;
+    /// whoever allocated one still owns it. The address and every copy of it
+    /// are invalid afterward, and a second call is a double free.
     pub fn deinit(self: NodeAddr, alloc: std.mem.Allocator) void {
         alloc.free(self.addrs);
     }
 
+    /// How many of `addrs` are relay addresses.
     pub fn relayCount(self: NodeAddr) usize {
         var count: usize = 0;
         for (self.addrs) |addr| {
@@ -450,6 +570,8 @@ pub const NodeAddr = struct {
         return count;
     }
 
+    /// The node id in hex, then every address as `relay:`, `ip:` or
+    /// `custom:`, separated by spaces.
     pub fn format(self: NodeAddr, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try self.node_id.format(writer);
         for (self.addrs) |addr| {

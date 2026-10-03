@@ -144,8 +144,15 @@ pub const Instant = i64;
 /// stale when `batch.zig` grows an arm.
 pub const Error = batch.Error || error{
     /// The caller's `out` array or `scratch`/`buffer` had no room for what
-    /// the core produced. Nothing was sent; the caller decides whether to
-    /// grow the room and try again or to drop the connection.
+    /// the core produced.
+    ///
+    /// **Named for the ways that can happen, not for a mid-flight one.**
+    /// `Conn.drain` raises this before the core has built anything, because
+    /// the core consumes what it packs: room running out between datagrams is
+    /// not a refusal but a short answer, with the flight behind it untouched.
+    /// `Bridge.recv` raises it for a datagram larger than `scratch`, which
+    /// costs nothing either. A caller that grows the room and calls again
+    /// gets the work it was refused.
     NoRoom,
     /// The core had no stream id for this end to open: the peer's transport
     /// parameters have not been applied yet, or it has granted no more streams
@@ -185,7 +192,27 @@ pub const CreateError = error{
     /// The `std.Io` handed to `create` had no secure entropy source and the
     /// caller did not supply the two transport keys itself.
     EntropyUnavailable,
+    /// The `std.Io` was told to stop while `create` was drawing one of those
+    /// two keys: `std.Io.Cancelable` arriving through `randomSecure`.
+    ///
+    /// **Its own answer, not `EntropyUnavailable`'s.** They are facts about
+    /// different layers. This one is the caller's own cancellation, which the
+    /// caller retries when it chooses and which says nothing at all about the
+    /// entropy source; the other is an `std.Io` that cannot key this bridge
+    /// and never will. Reporting the first as the second told a cancelling
+    /// caller that its entropy was broken.
+    Canceled,
 };
+
+/// The room one datagram of egress needs, in bytes: RFC 9000 §14.1's padded
+/// Initial, taken from the core that pads to it rather than written down
+/// here, so a change to the core's floor moves this with it.
+///
+/// It is a floor and not a ceiling because of how the core builds a datagram:
+/// it pads an Initial up to this size and does that arithmetic against the
+/// buffer it was handed, so a shorter buffer is one where a packet has
+/// already consumed the frames it packed and has nowhere to put them.
+const min_datagram = quic.connection_manager.MIN_INITIAL_DATAGRAM;
 
 /// The configuration a caller supplies, in this project's vocabulary.
 ///
@@ -205,6 +232,14 @@ pub const Config = struct {
     /// Null is not "any peer". `require_peer_certificate` still holds and the
     /// peer has proved possession of whatever id it presented, which is a
     /// weaker answer than the one this field asks for.
+    ///
+    /// **A pin here demands a certificate whatever `require_peer_certificate`
+    /// says**, and that is the whole precedence between the two fields: the
+    /// core reads the pin out of the client-auth block, and
+    /// `require_peer_certificate` is what decides whether that block is asked
+    /// for at all, so a caller that named a peer and turned the certificate
+    /// off would have had its pin dropped without being told — a pin the
+    /// field next to it can erase is not a pin. See `demandsPeerCertificate`.
     expect_peer: ?NodeId = null,
     /// Whether a connection opened here must present a certificate at all.
     ///
@@ -212,6 +247,11 @@ pub const Config = struct {
     /// know who is on the other end. A synthetic address names a path, not a
     /// peer, and a peer that presents no key has proved nothing at all — not
     /// even that it is the node a neighbouring path belongs to.
+    ///
+    /// False accepts a peer that proves nothing, and it is the only
+    /// configuration in which `expect_peer` is not enforced, so it belongs to
+    /// a caller that has decided identity is not this connection's business.
+    /// A config that names a peer is not one of those.
     require_peer_certificate: bool = true,
     /// The one ALPN this build speaks. The core takes a list because it is a
     /// general TLS stack; a node speaks one, and a list here would be a
@@ -231,6 +271,21 @@ pub const Config = struct {
     /// and two fields in the core.
     static_reset_key: ?[16]u8 = null,
 };
+
+/// Whether a connection opened on `config` must present a certificate.
+///
+/// A peer pin implies it, and that implication is the entire precedence
+/// rule: `expect_peer` says *which* key a peer has to hold and
+/// `require_peer_certificate` says *that it has one*, so a caller that set
+/// the first and cleared the second had asked for the stronger of the two
+/// answers. The core keeps both in one block (`buildTlsConfig`), and
+/// withholding that block withholds the pin with it — a caller could name a
+/// peer and get a connection that never compared a certificate against it.
+/// Only a config that names no peer and asks for no certificate accepts an
+/// anonymous one, and it has to say so in both fields to get there.
+fn demandsPeerCertificate(config: Config) bool {
+    return config.expect_peer != null or config.require_peer_certificate;
+}
 
 /// One QUIC connection the core owns, as a borrowed handle.
 ///
@@ -290,8 +345,33 @@ pub const Conn = struct {
     /// function's: it hands over the payload and leaves `batch.Runs` to the
     /// caller, because only the caller knows what its socket can do.
     ///
-    /// A send that was refused leaves the core's state as it was; the
-    /// refused error is logged and named as `Error.CoreRefused`.
+    /// # What the room costs, and when it gets asked about
+    ///
+    /// `Connection.sendAt` consumes what it packs — a CRYPTO frame's bytes
+    /// leave the send buffer, a packet number is spent, the packet goes into
+    /// the retransmission ledger — and it does that before the caller learns
+    /// anything. So the room is checked before the core is asked for a
+    /// datagram, never after:
+    ///
+    /// - **No slot and no room for a datagram is `error.NoRoom`, or
+    ///   `error.NoPathAddress` for a path with no peer address, and both are
+    ///   raised with nothing built.** An empty `out`, a `buffer` under
+    ///   `min_datagram` and a path no address reached are the whole of it. The
+    ///   flight is exactly as it was, and the retry after a bigger buffer
+    ///   emits the datagram this call refused.
+    /// - **Room running out mid-flight is not a refusal.** The loop stops
+    ///   between datagrams with everything it built already inside a run it is
+    ///   about to hand back, so the returned slice is a prefix of what `out`
+    ///   and `buffer` had room for, and the rest of the flight is still the
+    ///   core's to send. Call `drain` again for the rest; an empty slice is
+    ///   how a call says the connection has nothing left.
+    ///
+    /// A datagram the core refused to build is `Error.CoreRefused`, with the
+    /// core's own answer logged before the refusal is named so nothing is
+    /// dropped on the floor. It is the one failure here that is not a room
+    /// question, and the one with a cost: a datagram already built in this
+    /// pass is inside no returned send, because a function that returns
+    /// either a refusal or a list cannot hand back both.
     pub fn drain(
         self: Conn,
         out: []Egress,
@@ -308,18 +388,36 @@ pub const Conn = struct {
         // second opinion — and `.ect0` is what the validator counts against
         // the peer's ACK_ECN counts, so any other value would fail the path.
         const ecn: ?batch.Ecn = batch.Recv.ecnFromBits(conn.getEcnMark());
+        // The peer address, read once and before anything is built: it is the
+        // same address for every send on this connection until the core
+        // migrates it, and a path with no address is refused here rather than
+        // halfway through a run that has to be handed back whole.
+        const core_peer = conn.peerAddress().*;
+        if (core_peer == .unset) return error.NoPathAddress;
+        const to = fromCoreAddress(&core_peer) orelse return error.NoPathAddress;
+        if (out.len == 0 or buffer.len < min_datagram) return error.NoRoom;
+
         var filled: usize = 0;
         var used: usize = 0;
         // The run being accumulated: `run_size` is 0 when no run is open.
         var run_start: usize = 0;
         var run_size: usize = 0;
         while (true) {
+            // A free slot for this datagram, before it is built. Two while a
+            // run is open: one for the close this datagram may trigger, and
+            // one owed either way to the close of whatever run this datagram
+            // opens. Holding that second one back is what lets the loop stop
+            // at any datagram boundary — the run it leaves open still has the
+            // slot its close needs.
+            const slots = out.len - used;
+            if (slots == 0 or (run_size != 0 and slots < 2)) break;
+            if (buffer.len - filled < min_datagram) break;
+
             const len = conn.sendAt(buffer[filled..], at, random) catch |err| {
                 std.log.warn("quic bridge: the core refused to build a packet: {t}", .{err});
                 return error.CoreRefused;
             };
             if (len == 0) break;
-            if (len > buffer.len - filled) return error.NoRoom;
             if (run_size == 0) {
                 run_size = len;
             } else if (len != run_size) {
@@ -327,14 +425,16 @@ pub const Conn = struct {
                 // the last, so a change of size ends the run. Continuing
                 // anyway would hand the socket a `UDP_SEGMENT` value that
                 // does not describe the payload.
-                used = try closeRun(out, used, buffer, run_start, filled, run_size, ecn, self);
+                used = try closeRun(out, used, buffer, run_start, filled, run_size, ecn, to);
                 run_start = filled;
                 run_size = len;
             }
             filled += len;
         }
         if (run_size != 0) {
-            used = try closeRun(out, used, buffer, run_start, filled, run_size, ecn, self);
+            // Safe by the loop's own arithmetic rather than by hope: the slot
+            // was reserved before the datagram that opened this run.
+            used = try closeRun(out, used, buffer, run_start, filled, run_size, ecn, to);
         }
         return out[0..used];
     }
@@ -449,15 +549,41 @@ pub const Stream = struct {
     /// a framed protocol parses a message in place and borrows into the bytes
     /// it was handed, and those bytes must outlive the message, which a borrow
     /// of the core's chunk cannot because the next read has already taken it.
+    ///
+    /// **The room is taken before the bytes, because the bytes are gone once
+    /// the core has handed them over.** A read advances the stream's position,
+    /// charges the peer for what it read, and transfers an owned allocation
+    /// out; an allocator that then refuses the append has dropped a run the
+    /// peer will never retransmit, because from the core's side it was
+    /// delivered. So this asks the core how much the next read holds —
+    /// `ReceiveStream.peekLen`, which consumes nothing — reserves exactly
+    /// that, and reads afterwards.
+    ///
+    /// **What a refused allocation leaves.** Everything appended before the
+    /// refusal stays in `sink`, which is the caller's, and every byte the sink
+    /// did not take is still pending on the stream, in order. A retry with an
+    /// allocator that answers appends exactly the bytes this call stopped at,
+    /// and none of them twice. `false` therefore means "nothing was appended",
+    /// which is also what a stream with nothing ready means; `sink.len` is
+    /// what tells those two apart.
+    ///
+    /// **A partial sink is rarer than the sentence above suggests.** Contiguous
+    /// frames are coalesced into one run before it is read, and a second run is
+    /// only readable once the gap before it is filled, so a drain in practice
+    /// either moves one whole run or moves nothing: the common refusal is the
+    /// first reserve, and the sink is untouched. The contract above is the one
+    /// that holds either way.
     pub fn drain(
         self: *Stream,
         gpa: std.mem.Allocator,
         sink: *std.ArrayList(u8),
     ) std.mem.Allocator.Error!bool {
         var moved = false;
-        while (self.entry.recv.read()) |chunk| {
-            defer gpa.free(chunk);
-            try sink.appendSlice(gpa, chunk);
+        while (self.entry.recv.peekLen()) |len| {
+            try sink.ensureUnusedCapacity(gpa, len);
+            const chunk = self.entry.recv.read() orelse break;
+            sink.appendSliceAssumeCapacity(chunk);
+            gpa.free(chunk);
             moved = true;
         }
         return moved;
@@ -616,7 +742,10 @@ pub const Bridge = struct {
             .alpn_list = undefined,
             .client_auth = .{
                 .expect_node_id = if (config.expect_peer) |peer| peer.toBytes() else null,
-                .mode = if (config.require_peer_certificate) .required else .optional,
+                // A pin implies a certificate, so the two fields are read
+                // through one decision rather than two: see
+                // `demandsPeerCertificate`.
+                .mode = if (demandsPeerCertificate(config)) .required else .optional,
             },
         };
         self.manager = Manager.init(
@@ -673,6 +802,11 @@ pub const Bridge = struct {
     /// client handshake, so setting it would read as a second pin and enforce
     /// nothing; the pin a server enforces is `client_auth.expect_node_id`,
     /// set above.
+    ///
+    /// The block is handed over whenever a peer is pinned, not only when a
+    /// certificate is demanded: it is where the pin lives, so withholding it
+    /// withholds the pin — see `demandsPeerCertificate`, which is also what
+    /// `Config.require_peer_certificate` no longer decides on its own.
     fn buildTlsConfig(self: *Bridge, config: Config) quic.tls13.TlsConfig {
         self.spki = tls13.ed25519Spki(&self.node_id.toBytes());
         self.cert_chain = .{self.spki[0..]};
@@ -682,7 +816,7 @@ pub const Bridge = struct {
             .private_key_bytes = self.seed[0..],
             .private_key_algorithm = .ed25519,
             .alpn = &self.alpn_list,
-            .client_auth = if (config.require_peer_certificate) &self.client_auth else null,
+            .client_auth = if (demandsPeerCertificate(config)) &self.client_auth else null,
         };
     }
 
@@ -801,14 +935,21 @@ fn connectionConfig(config: Config, retry_token_key: [16]u8) quic.connection.Con
 /// own entropy, reached through the handle the caller was already given: no
 /// global, nothing stored, and a test that wants determinism passes the key
 /// instead.
+///
+/// Both of its answers keep their own name. They arrive together in one
+/// error set (`std.Io.RandomSecureError`) and mean opposite things to
+/// whatever is above: `EntropyUnavailable` is an `std.Io` that cannot key
+/// this bridge and never will, and `Canceled` is the caller stopping this
+/// operation, which the caller retries when it chooses. Collapsing them told
+/// a cancelling caller that its entropy source was broken, and told an
+/// `std.Io` with no entropy that its own cancellation should be retried.
 fn drawKey(io: std.Io, supplied: ?[16]u8) CreateError![16]u8 {
     if (supplied) |key| return key;
     var drawn: [16]u8 = undefined;
-    // `RandomSecureError` is `EntropyUnavailable` and `Cancelable`. Neither
-    // is actionable separately here — there is no cancellation to propagate
-    // from a constructor with nothing to unwind past — and both mean the same
-    // thing to a caller: this `std.Io` cannot key this bridge.
-    io.randomSecure(&drawn) catch return error.EntropyUnavailable;
+    io.randomSecure(&drawn) catch |err| switch (err) {
+        error.EntropyUnavailable => return error.EntropyUnavailable,
+        error.Canceled => return error.Canceled,
+    };
     return drawn;
 }
 
@@ -835,6 +976,12 @@ fn group(contents: []const u8, size: usize, ecn: ?batch.Ecn) batch.Error!batch.S
 }
 
 /// Close the run that ended at `end` and start nothing.
+///
+/// `to` is the address `Conn.drain` resolved before it asked the core for
+/// anything, so this cannot discover a path with no address after the run it
+/// is closing has already been built. The `out.len` check is the slot the
+/// caller counted for this close; a run of equal-size datagrams always
+/// divides by its size, so `group` is not what refuses here.
 fn closeRun(
     out: []Egress,
     used: usize,
@@ -843,11 +990,11 @@ fn closeRun(
     end: usize,
     size: usize,
     ecn: ?batch.Ecn,
-    conn: Conn,
+    to: SocketAddr,
 ) Error!usize {
     if (used == out.len) return error.NoRoom;
     out[used] = .{
-        .to = conn.peer() orelse return error.NoPathAddress,
+        .to = to,
         .send = try group(buffer[begin..end], size, ecn),
     };
     return used + 1;
@@ -926,14 +1073,14 @@ const Prng = std.Random.DefaultPrng;
 /// from: a QUIC packet is at most a path MTU and no path MTU is larger.
 const max_datagram = 1500;
 
-/// The core's floor for a datagram that may open a connection, re-exported
-/// rather than written down: a test that pads to its own idea of 1200 would
-/// keep passing if the core's floor moved.
-const min_initial = quic.connection_manager.MIN_INITIAL_DATAGRAM;
+/// The core's floor for a datagram, re-exported rather than written down: a
+/// test that pads to its own idea of 1200 would keep passing if the core's
+/// floor moved. The same value `Conn.drain` refuses a short buffer against.
+const min_initial = min_datagram;
 
-/// How many socket writes one `drain` may hand back before the room is
-/// called too small. A connection's whole flight fits; a caller that wants
-/// less can pass less and learn it from `Error.NoRoom`.
+/// How many socket writes one `drain` hands back. A connection's whole flight
+/// fits; a caller that wants fewer gets a short answer rather than a refusal
+/// — see `Conn.drain` — and asks again for the rest.
 const max_egress = 32;
 
 /// How many datagrams `exchange` moves before it decides the two ends have
@@ -1488,4 +1635,325 @@ test "a transport key the caller supplied is used, and one it did not is drawn f
     // And a different key from the supplied one, or the two draws above
     // would only be proving that `retry_token_key` is not read.
     try t.expect(!std.mem.eql(u8, &supplied, &drawn_a.manager.retry_token_key));
+}
+
+test "an allocator that refuses the sink leaves every byte pending for the next pass" {
+    // A stream is the one thing in this file a test can drive without a
+    // peer: the core hands out a receive half, and a STREAM frame is all it
+    // takes to fill it.
+    const message = "the relay frame this pass must not lose";
+    var core = quic_stream.Stream.init(t.allocator, 0);
+    defer core.deinit();
+    try core.recv.handleStreamFrame(0, message, false);
+    var stream: Stream = .{ .entry = &core };
+
+    var sink: std.ArrayList(u8) = .empty;
+    defer sink.deinit(t.allocator);
+
+    // The sink's first allocation is the refusal: the run the peer sent is
+    // already buffered and untouched, because the room is taken before the
+    // read that would hand it over.
+    var refusing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    try t.expectError(error.OutOfMemory, stream.drain(refusing.allocator(), &sink));
+    try t.expectEqual(@as(usize, 0), sink.items.len);
+
+    // The retry yields the bytes the refusal interrupted at, once, in order.
+    try t.expect(try stream.drain(t.allocator, &sink));
+    try t.expectEqualStrings(message, sink.items);
+    try t.expect(!try stream.drain(t.allocator, &sink));
+}
+
+test "no egress room leaves the flight unsent, and the retry after it emits the flight" {
+    var server_secret = try SecretKey.fromSeed(server_seed);
+    defer server_secret.deinit();
+    var client_secret = try SecretKey.fromSeed(client_seed);
+    defer client_secret.deinit();
+
+    var engine = Prng.init(19);
+    const bridge = try Bridge.create(t.allocator, t.io, .{
+        .secret = server_secret,
+        .alpn = alpn,
+    }, engine.random());
+    defer bridge.destroy();
+    var map = addr_map.MappedAddrs.init();
+    defer map.deinit(t.allocator);
+    var client: Client = undefined;
+    try client.init(client_secret, server_secret.nodeId(), 20, start);
+    defer client.deinit();
+
+    // The client's first Initial, accepted. The connection therefore holds a
+    // whole flight that nothing has sent yet.
+    var scratch: [2 * max_datagram]u8 = undefined;
+    const len = try client.conn.sendAt(&client.buffer, start, client.random());
+    const ingress = try bridge.recv(&map, .{
+        .bytes = client.buffer[0..len],
+        .from = client_addr,
+        .local = server_addr,
+        .ecn = null,
+    }, scratch[0..], start, client.random());
+    const conn = switch (ingress.outcome) {
+        .processed => |handled| handled,
+        else => return error.TestUnexpectedResult,
+    };
+
+    var egress: [max_egress]Egress = undefined;
+    var out: [max_egress * max_datagram]u8 = undefined;
+    var no_slot: [0]Egress = undefined;
+    var too_short: [min_datagram - 1]u8 = undefined;
+
+    // Both refusals come before the core is asked for anything.
+    try t.expectError(error.NoRoom, conn.drain(no_slot[0..], out[0..], start, client.random()));
+    try t.expectError(error.NoRoom, conn.drain(egress[0..], too_short[0..], start, client.random()));
+
+    // And the flight is still there: the datagram both refusals declined to
+    // produce is the one this call gets.
+    const sends = try conn.drain(egress[0..], out[0..], start, client.random());
+    try t.expect(sends.len > 0);
+    try t.expect(sends[0].send.contents.len > 0);
+}
+
+test "an egress array that fills up is a short answer, and asking again finishes the flight" {
+    var server_secret = try SecretKey.fromSeed(server_seed);
+    defer server_secret.deinit();
+    var client_secret = try SecretKey.fromSeed(client_seed);
+    defer client_secret.deinit();
+
+    var engine = Prng.init(21);
+    const bridge = try Bridge.create(t.allocator, t.io, .{
+        .secret = server_secret,
+        .alpn = alpn,
+    }, engine.random());
+    defer bridge.destroy();
+    var map = addr_map.MappedAddrs.init();
+    defer map.deinit(t.allocator);
+    var client: Client = undefined;
+    try client.init(client_secret, server_secret.nodeId(), 22, start);
+    defer client.deinit();
+
+    var scratch: [2 * max_datagram]u8 = undefined;
+    const len = try client.conn.sendAt(&client.buffer, start, client.random());
+    const ingress = try bridge.recv(&map, .{
+        .bytes = client.buffer[0..len],
+        .from = client_addr,
+        .local = server_addr,
+        .ecn = null,
+    }, scratch[0..], start, client.random());
+    const conn = switch (ingress.outcome) {
+        .processed => |handled| handled,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // One slot at a time, as a caller with a small array would. Every call
+    // answers with what it could carry, the first is not empty because there
+    // is a flight waiting, and the calls end rather than repeating a
+    // refusal: nothing the core produced was dropped on the way.
+    var one: [1]Egress = undefined;
+    var out: [max_datagram]u8 = undefined;
+    var passes: usize = 0;
+    while (passes < max_rounds) : (passes += 1) {
+        const sends = try conn.drain(one[0..], out[0..], start, client.random());
+        if (sends.len == 0) break;
+        try t.expectEqual(one.len, sends.len);
+        try t.expect(sends[0].send.contents.len > 0);
+    }
+    try t.expect(passes < max_rounds);
+    try t.expectEqual(
+        @as(usize, 0),
+        (try conn.drain(one[0..], out[0..], start, client.random())).len,
+    );
+}
+
+/// An `std.Io` that is `std.Io.failing` in every way but one: its entropy
+/// source answers the caller's own cancellation instead of refusing.
+///
+/// The vtable is a file-scope constant rather than a copy made per call: a
+/// `std.Io` holds a pointer to its vtable, so returning one built on the stack
+/// hands the caller a pointer to a frame that has already returned. Debug
+/// happened to keep that address readable; ReleaseSafe did not.
+const cancelled_vtable: std.Io.VTable = blk: {
+    var vtable = std.Io.failing.vtable.*;
+    vtable.randomSecure = struct {
+        fn draw(_: ?*anyopaque, _: []u8) std.Io.RandomSecureError!void {
+            return error.Canceled;
+        }
+    }.draw;
+    break :blk vtable;
+};
+
+fn cancelledIo() std.Io {
+    return .{ .userdata = null, .vtable = &cancelled_vtable };
+}
+
+test "an entropy draw that was cancelled is not reported as a broken entropy source" {
+    var server_secret = try SecretKey.fromSeed(server_seed);
+    defer server_secret.deinit();
+    var engine = Prng.init(23);
+
+    // `std.Io.failing` is the std-supplied `std.Io` with no entropy at all,
+    // which is the other of the two answers.
+    try t.expectError(
+        error.EntropyUnavailable,
+        Bridge.create(t.allocator, std.Io.failing, .{
+            .secret = server_secret,
+            .alpn = alpn,
+        }, engine.random()),
+    );
+    try t.expectError(
+        error.Canceled,
+        Bridge.create(t.allocator, cancelledIo(), .{
+            .secret = server_secret,
+            .alpn = alpn,
+        }, engine.random()),
+    );
+
+    // A supplied key is never drawn, so the same two `std.Io`s build a bridge
+    // without either refusal.
+    const supplied: [16]u8 = @splat(0x55);
+    const bridge = try Bridge.create(t.allocator, cancelledIo(), .{
+        .secret = server_secret,
+        .alpn = alpn,
+        .retry_token_key = supplied,
+        .static_reset_key = supplied,
+    }, engine.random());
+    defer bridge.destroy();
+    try t.expectEqualSlices(u8, &supplied, &bridge.manager.retry_token_key);
+}
+
+test "a peer pin is enforced whatever the caller said about certificates" {
+    var server_secret = try SecretKey.fromSeed(server_seed);
+    defer server_secret.deinit();
+    var client_secret = try SecretKey.fromSeed(client_seed);
+    defer client_secret.deinit();
+    var engine = Prng.init(25);
+
+    // The pin, with the certificate requirement explicitly cleared. The core
+    // reads the pin out of the block that requirement decides on, so this is
+    // the configuration in which an unenforced pin was possible.
+    const pinned = try Bridge.create(t.allocator, t.io, .{
+        .secret = server_secret,
+        .expect_peer = client_secret.nodeId(),
+        .require_peer_certificate = false,
+        .alpn = alpn,
+    }, engine.random());
+    defer pinned.destroy();
+    const tls = pinned.tlsConfig();
+    try t.expect(tls.client_auth != null);
+    try t.expectEqual(
+        client_secret.nodeId().toBytes(),
+        tls.client_auth.?.expect_node_id.?,
+    );
+    try t.expectEqual(tls13.ClientAuth.Mode.required, tls.client_auth.?.mode);
+
+    // Naming no peer and asking for no certificate is the one configuration
+    // that accepts an anonymous peer, and it still asks for one by default.
+    const anonymous = try Bridge.create(t.allocator, t.io, .{
+        .secret = server_secret,
+        .require_peer_certificate = false,
+        .alpn = alpn,
+    }, engine.random());
+    defer anonymous.destroy();
+    try t.expectEqual(@as(?*const ClientAuth, null), anonymous.tlsConfig().client_auth);
+
+    const defaulted = try Bridge.create(t.allocator, t.io, .{
+        .secret = server_secret,
+        .alpn = alpn,
+    }, engine.random());
+    defer defaulted.destroy();
+    const default_tls = defaulted.tlsConfig();
+    try t.expect(default_tls.client_auth != null);
+    try t.expectEqual(tls13.ClientAuth.Mode.required, default_tls.client_auth.?.mode);
+    try t.expectEqual(@as(?[32]u8, null), default_tls.client_auth.?.expect_node_id);
+}
+
+test "one egress slot at a time sends as much as the whole array sends" {
+    var server_secret = try SecretKey.fromSeed(server_seed);
+    defer server_secret.deinit();
+    var client_secret = try SecretKey.fromSeed(client_seed);
+    defer client_secret.deinit();
+
+    // Two bridges and two clients over one identity and one seed, so both
+    // sides hold the same flight and either drain is free to produce it. One
+    // is drained into the whole array, the other one slot at a time; the bytes
+    // that come out have to be the same, or a caller with a small array loses
+    // what a caller with a big one sends — which is the whole cost of a
+    // commit boundary that is checked one datagram too late.
+    var wide_engine = Prng.init(31);
+    const wide = try Bridge.create(t.allocator, t.io, .{
+        .secret = server_secret,
+        .alpn = alpn,
+    }, wide_engine.random());
+    defer wide.destroy();
+    var narrow_engine = Prng.init(31);
+    const narrow = try Bridge.create(t.allocator, t.io, .{
+        .secret = server_secret,
+        .alpn = alpn,
+    }, narrow_engine.random());
+    defer narrow.destroy();
+    var map: addr_map.MappedAddrs = .init();
+    defer map.deinit(t.allocator);
+    // A second mapping table, so the address the first accept allocated is not
+    // still in the one the second accept reads: both sides then hold the same
+    // state and any difference in the bytes is the drain's.
+    var narrow_map: addr_map.MappedAddrs = .init();
+    defer narrow_map.deinit(t.allocator);
+    var scratch: [2 * max_datagram]u8 = undefined;
+
+    var wide_client: Client = undefined;
+    try wide_client.init(client_secret, server_secret.nodeId(), 32, start);
+    defer wide_client.deinit();
+    const wide_len = try wide_client.conn.sendAt(&wide_client.buffer, start, wide_client.random());
+    const wide_ingress = try wide.recv(&map, .{
+        .bytes = wide_client.buffer[0..wide_len],
+        .from = client_addr,
+        .local = server_addr,
+        .ecn = null,
+    }, scratch[0..], start, wide_client.random());
+    const wide_conn = switch (wide_ingress.outcome) {
+        .processed => |handled| handled,
+        else => return error.TestUnexpectedResult,
+    };
+
+    var narrow_client: Client = undefined;
+    try narrow_client.init(client_secret, server_secret.nodeId(), 32, start);
+    defer narrow_client.deinit();
+    const narrow_len = try narrow_client.conn.sendAt(&narrow_client.buffer, start, narrow_client.random());
+    const narrow_ingress = try narrow.recv(&narrow_map, .{
+        .bytes = narrow_client.buffer[0..narrow_len],
+        .from = client_addr,
+        .local = server_addr,
+        .ecn = null,
+    }, scratch[0..], start, narrow_client.random());
+    const narrow_conn = switch (narrow_ingress.outcome) {
+        .processed => |handled| handled,
+        else => return error.TestUnexpectedResult,
+    };
+
+    var egress: [max_egress]Egress = undefined;
+    var out: [max_egress * max_datagram]u8 = undefined;
+    var wide_bytes: std.ArrayList(u8) = .empty;
+    defer wide_bytes.deinit(t.allocator);
+    for (try wide_conn.drain(egress[0..], out[0..], start, wide_client.random())) |send| {
+        try wide_bytes.appendSlice(t.allocator, send.send.contents);
+    }
+
+    var one: [1]Egress = undefined;
+    var narrow_out: [max_datagram]u8 = undefined;
+    var narrow_bytes: std.ArrayList(u8) = .empty;
+    defer narrow_bytes.deinit(t.allocator);
+    var passes: usize = 0;
+    while (passes < max_rounds) : (passes += 1) {
+        const sends = try narrow_conn.drain(one[0..], narrow_out[0..], start, narrow_client.random());
+        if (sends.len == 0) break;
+        for (sends) |send| try narrow_bytes.appendSlice(t.allocator, send.send.contents);
+    }
+
+    // The consumer-visible claim is that a caller with a one-slot array loses
+    // nothing, so the totals must match. The bytes of two separately built
+    // connections are not the same bytes — connection ids and the transcript
+    // that covers them differ — and nothing in the core's contract says they
+    // should be, so asserting that would assert a property this test's own
+    // premise cannot deliver.
+    try t.expect(wide_bytes.items.len > 0);
+    try t.expectEqual(wide_bytes.items.len, narrow_bytes.items.len);
+    try t.expect(passes > 0);
 }

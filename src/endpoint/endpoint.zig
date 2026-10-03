@@ -131,14 +131,38 @@ pub const Event = union(enum) {
 /// decides a protocol: an action is a command the caller's runtime performs or a
 /// report it logs, and the loop is the only thing in the project that knows the
 /// order they may happen in.
+///
+/// **Every action is performed by the thread that called `Loop.step`, before
+/// that step's own answer is fed back in.** The loop is pure, so the command
+/// has to leave it: a caller that takes an action and never answers it has left
+/// the loop waiting on an event that will not come, and a caller that answers an
+/// event it did not perform is answering a step that never happened. Which
+/// answer each action owes is that action's own doc, and none of them is
+/// optional except `none`.
+///
+/// **Arguments are borrowed for the length of that call.** `offer` carries the
+/// attempt the loop is holding and `spawn` the task the loop has just written
+/// into the caller's own storage; both are the caller's to read now and not to
+/// keep, because the loop moves the moment it is answered — `offer`'s attempt
+/// is spent by the answer, and `spawn`'s slot is the caller's task table, which
+/// a later reap may reuse.
 pub const Action = union(enum) {
     /// Ask the filter about this attempt — the payload, so a caller never has to
     /// remember which one it fed in — and report the answer as
     /// `Event.filtered`. The two steps a caller takes to get past one datagram
     /// (`protocol.rs:568-574`).
+    ///
+    /// The caller's answer is `Event.filtered`, and it is owed: an attempt the
+    /// loop is holding is acted on once, and only once the verdict arrives.
     offer: Incoming,
     /// Take this accept task and drive it to the end. Upstream
     /// `join_set.spawn` (`:601-603`).
+    ///
+    /// The caller drives the task — `Node` runs it through
+    /// `router.dispatchStep` and reports the outcome — and owes
+    /// `Event.reaped` when it ends, which is what frees the slot. A task the
+    /// caller never reaps is a slot the loop will not reuse and a count it
+    /// cannot get right at the close.
     spawn: Task,
     /// Refuse: the peer is told at once, and this is the only way anything here
     /// can tell a peer anything. Upstream `incoming.refuse()` (`:588`).
@@ -148,6 +172,13 @@ pub const Action = union(enum) {
     ignore,
     /// The shutdown's next step, which is the router's own machine: the
     /// handlers, then the cancel, then the close, in that order.
+    ///
+    /// **This is where a handler is called.** The caller performs the router's
+    /// step and feeds back the completion event it owes: a
+    /// `shutdown_handlers` of *n* is answered with *n* `handler_finished`, and
+    /// each `ProtocolHandler.shutdown` runs on the caller's thread, inside that
+    /// step, before the accepts are cancelled. See `ProtocolHandler`'s note for
+    /// what a handler may not do from there.
     shutdown: ShutdownStep,
     /// Nothing: this event is not this phase's business, or the step is already
     /// done. Upstream's `trace!` arms (`:559-565`).
@@ -197,6 +228,18 @@ pub const Step = struct {
 /// is the router's own machine. Nothing here reads a clock, a socket or the
 /// environment, so a test drives a whole connection — and a whole shutdown —
 /// with no runtime at all.
+///
+/// **One thread steps a loop, and the caller keeps it.** `step` takes the loop
+/// by value and hands the next one back, so the caller is the one assigning it
+/// — and `acquire`'s lease reads through *this* loop's `shutdown`, so a loop
+/// copied somewhere else while a lease is held leaves the lease watching a
+/// machine nobody is driving. There is no lock in this struct and no atomic, so
+/// two threads stepping one loop is a data race with a deterministic-looking
+/// answer, which is the worst kind.
+///
+/// **`tasks` is the caller's storage and must outlive the loop**, and so must
+/// the table in `router` and any `incoming_filter`'s own context: the loop
+/// holds pointers into all three and reads them on every step.
 pub const Loop = struct {
     /// The table an attempt is dispatched through, and the table whose
     /// registration order the ALPNs were offered in. The caller's.
@@ -225,6 +268,14 @@ pub const Loop = struct {
     /// A loop over a table, a filter that may be absent, and a task table the
     /// caller sizes. The two counts are stated here and restated at the close,
     /// which is the only moment both can be right — see `beginShutdown`.
+    /// **A table with no registrations is a legitimate endpoint, not an empty
+    /// one.** Its `handlers` count is zero and its close therefore owes no
+    /// handler at all, which `router.Shutdown` answers on the first step rather
+    /// than waiting for a `handler_finished` nobody can send. An attempt that
+    /// arrives is offered to the filter and, with no filter, accepted; it then
+    /// spawns a task that the dispatch drops, saying nothing to the peer, because
+    /// no ALPN claims it (`protocol.rs:653-656`). The close still reaches
+    /// `closed`.
     pub fn init(
         router_table: *const router.Router,
         incoming_filter: ?IncomingFilter,
@@ -274,6 +325,12 @@ pub const Loop = struct {
     /// Every event is named in every phase, so an event added later has to be
     /// classified here rather than absorbed by a wildcard and never reaching the
     /// phase that owed it.
+    ///
+    /// **One step, one action, one answer.** The caller performs the action and
+    /// feeds the event the loop owes back in — `Event`'s own docs say which is
+    /// which — and the loop is pure in between, so the same state and the same
+    /// event always give the same action. A copy made before the assignment and
+    /// kept past it is two loops sharing one task table.
     pub fn step(self: Loop, event: Event) Step {
         return switch (self.shutdown.phase) {
             .serving => self.serving(event),
@@ -489,6 +546,11 @@ fn spawn(next: Loop, id: u64) Step {
 /// directions: one too high waits for a `handler_finished` that never comes, and
 /// one too low cancels the accepts while a handler is still using the
 /// connections its own `accept` is holding.
+///
+/// **Zero is a real answer.** A table with no registrations hands back a
+/// `Shutdown` that owes no handler, and `router.Shutdown` takes that as the
+/// cancel being owed immediately — so a caller must not read zero as "wait for
+/// a report" and must not hold the close back for one.
 pub fn handlerCount(router_table: *const router.Router) usize {
     var distinct: usize = 0;
     for (router_table.entries, 0..) |entry, index| {
@@ -1025,6 +1087,64 @@ test "several accept tasks are held at once and torn down in the router's order"
     // asking `endpoint.accept()`.
     const late = loop.step(.{ .arrived = direct(9) });
     try t.expectEqual(Action.none, late.action);
+}
+
+test "an endpoint with nothing registered still cancels its accepts and closes" {
+    // The shape `handlerCount` answers zero for, and the one place a loop has to
+    // be right about a close that owes no handler at all. Entering
+    // `draining_handlers` here would wait for a `handler_finished` the loop can
+    // never be given, and every event after it is held while it waits.
+    var entries: [1]router.Entry = undefined;
+    var builder = router.Builder.init(&entries);
+    const table = builder.build();
+    try t.expectEqual(@as(usize, 0), handlerCount(&table));
+
+    var tasks: [1]Task = undefined;
+    var loop = Loop.init(&table, null, &tasks);
+    try t.expectEqual(@as(usize, 0), loop.shutdown.handlers);
+    try t.expectEqual(router.Shutdown.Phase.serving, loop.shutdown.phase);
+
+    // One attempt, offered and answered with no filter to ask. It is accepted
+    // and dispatched, and the dispatch finds no ALPN to send it to — upstream
+    // warns and returns there, and the peer is told nothing
+    // (`protocol.rs:653-656`).
+    var step = try offer(&loop, direct(1));
+    loop = step.loop;
+    try t.expectEqual(router.Shutdown.Phase.serving, loop.shutdown.phase);
+    try t.expectEqual(@as(usize, 1), loop.live);
+
+    // The close, and the whole of it in the two reports it owes: with no
+    // handler there is no drain to wait on, so the cancel is the first thing
+    // the close asks for.
+    step = loop.step(.close_requested);
+    loop = step.loop;
+    try t.expectEqual(router.Shutdown.Action.cancel_accepts, owed(step.action).?);
+    try t.expectEqual(router.Shutdown.Phase.cancelling_accepts, loop.shutdown.phase);
+    // The accept the table could not dispatch is still running, and the cancel
+    // is what reaps it.
+    try t.expectEqual(@as(usize, 1), loop.live);
+    try t.expectEqual(@as(usize, 1), loop.shutdown.accepts);
+
+    step = loop.step(.{ .reaped = .{ .id = 1, .ended = .cancelled } });
+    loop = step.loop;
+    try t.expectEqual(Action.none, step.action);
+    try t.expectEqual(@as(usize, 0), loop.live);
+
+    // And the endpoint closes, reached without a single handler report anywhere
+    // in the walk.
+    step = loop.step(.accepts_cancelled);
+    loop = step.loop;
+    try t.expectEqual(router.Shutdown.Action.close_endpoint, owed(step.action).?);
+    try t.expectEqual(router.Shutdown.Phase.closing_endpoint, loop.shutdown.phase);
+    step = loop.step(.endpoint_closed);
+    loop = step.loop;
+    try t.expectEqual(Action.none, step.action);
+    try t.expectEqual(router.Shutdown.Phase.closed, loop.shutdown.phase);
+
+    // So the lease reports the close rather than an endpoint dropped open: the
+    // one good answer, reached on the path that owes no handler.
+    var lease = loop.acquire();
+    try t.expectEqual(router.Release.closed, lease.deinit());
 }
 
 test "an endpoint dropped without close is reported" {
