@@ -107,12 +107,13 @@ pub fn endpointIdFromName(name: []const u8) NameError!addr.NodeId {
 /// DNS record is written by whoever runs the authoritative server for an origin,
 /// and a resolver that could also write one would make "what the network says
 /// about this node" and "what this node says about itself" the same value.
+///
+/// The origin is the caller's, not this type's: the name `_iroh.<z32>.<origin>`
+/// is built with `queryName` and asked for by `lookup_io.Retrieval`, and by the
+/// time an answer exists the name has done its work. Nothing here reads a name,
+/// so nothing here keeps an origin — upstream holds an `Arc<String>` and takes
+/// a `&str` per call to build a query this service never builds.
 pub const DnsAddressLookup = struct {
-    /// The origin the records live under, borrowed from whoever built the
-    /// lookup. Upstream holds an `Arc<String>` and takes a `&str` per call; the
-    /// borrow is the same lifetime decision with less ceremony, and nothing here
-    /// allocates so there is nothing to own.
-    origin: []const u8,
     /// The TXT records the query returned, already fetched and already one
     /// string per record.
     ///
@@ -128,22 +129,29 @@ pub const DnsAddressLookup = struct {
     answers: resolve.RecordSet,
     /// How to stop the query. Null when there was none — a lookup against a
     /// cached answer has nothing to cancel, and saying so is different from
-    /// having a cancellation that nobody fired.
+    /// having a cancellation that nobody fired. Non-null is fired once per
+    /// stream, from `Stream.deinit`, so the handle it points at has to outlive
+    /// every stream started here.
     cancellation: ?resolve.Cancellation,
+    /// Borrowed by every `resolve.AddressLookup` handed out of `lookup`.
     vtable: resolve.AddressLookup.VTable = dns_vtable,
 
+    /// A resolver over one already-fetched answer set. The records are borrowed,
+    /// so they have to stay valid and unchanged until every stream started
+    /// against this service is closed; two streams each read their own copy of
+    /// the set, and so walk one buffer from its start twice.
     pub fn init(
-        origin: []const u8,
         answers: resolve.RecordSet,
         cancellation: ?resolve.Cancellation,
     ) DnsAddressLookup {
         return .{
-            .origin = origin,
             .answers = answers,
             .cancellation = cancellation,
         };
     }
 
+    /// A handle onto this service. Borrowed, so the service has to outlive every
+    /// stream started through the handle.
     pub fn lookup(self: *DnsAddressLookup) resolve.AddressLookup {
         return .{ .vtable = &self.vtable, .ctx = @ptrCast(@alignCast(self)) };
     }
@@ -345,7 +353,7 @@ test "a TXT lookup yields one item, tagged as the dns service" {
     const records = "addr=192.168.96.145:60165\x00" ++
         "addr=213.208.157.87:60165\x00" ++
         "relay=https://euw1-1.relay.iroh.network./\x00";
-    var service = DnsAddressLookup.init(prod_origin, .init(records), null);
+    var service = DnsAddressLookup.init(.init(records), null);
 
     var stream = (try service.lookup().resolve(t.allocator, id)) orelse
         return error.TestUnexpectedResult;
@@ -365,7 +373,6 @@ test "a TXT lookup yields one item, tagged as the dns service" {
 test "a TXT answer that is not records fails the lookup, not the stream" {
     const id = try key.NodeId.parseHex(upstream_id);
     var service = DnsAddressLookup.init(
-        prod_origin,
         .init("relay=https://relay.example./\x00hostname=x\x00"),
         null,
     );
@@ -393,7 +400,6 @@ test "dropping a DNS stream stops the query behind it" {
         }
     };
     var service = DnsAddressLookup.init(
-        prod_origin,
         .init("relay=https://relay.example./\x00"),
         .{ .ctx = @ptrCast(@alignCast(&cancels)), .stop = Counter.stop },
     );
@@ -415,7 +421,7 @@ test "an empty answer is a node that published nothing" {
     // looking. The item carries the node and no addresses, which is upstream's
     // `EndpointInfo::from_txt_lookup` over an empty `lookup`.
     const id = try key.NodeId.parseHex(upstream_id);
-    var service = DnsAddressLookup.init(prod_origin, .init(""), null);
+    var service = DnsAddressLookup.init(.init(""), null);
     var stream = (try service.lookup().resolve(t.allocator, id)) orelse
         return error.TestUnexpectedResult;
     defer stream.deinit();

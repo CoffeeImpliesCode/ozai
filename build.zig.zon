@@ -9,7 +9,9 @@
         "build.zig.zon",
         "src",
         "test",
-        "examples",
+        "README.md",
+        "TODO.md",
+        "docs",
         // The QUIC substrate is a module of this package, so a fetched copy
         // without it builds to a module-not-found rather than to a stack.
         // `vendor/` also has to be a subdirectory rather than a file list:

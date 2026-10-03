@@ -1,16 +1,36 @@
+//! Closed ranges of packet numbers, and the descending set that merges them.
+//!
+//! `RangeSet` is how this tree remembers which packet numbers it has seen:
+//! it keeps one allocator it was given and borrows nothing from its caller,
+//! and one `deinit` releases every byte it holds. It is reached through
+//! `ack_handler.ReceivedPacketTracker.received`, which builds an ACK frame
+//! from the ranges it returns.
+//!
+//! The slice `getRanges` hands out points into the set's own storage. `add`,
+//! `addRange` and `removeBelow` all move it, so a slice is valid only until
+//! the next call on the same set.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
-/// A range [start, end] (inclusive on both ends) of packet numbers.
+/// One closed span of packet numbers or stream offsets. Both ends are
+/// members: `size` counts `end - start + 1` values, and
+/// `.{ .start = 5, .end = 5 }` is the single value 5 rather than an empty
+/// span. A pair with `start > end` never reaches this struct — `RangeSet`
+/// treats it as an empty addition and stores nothing — so the ordering
+/// holds for any `Range` a caller can construct by hand.
 pub const Range = struct {
     start: u64,
     end: u64,
 
+    /// Whether `val` is `start`, `end`, or between them.
     pub fn contains(self: Range, val: u64) bool {
         return val >= self.start and val <= self.end;
     }
 
+    /// How many values the span holds. Never zero for a stored range, so a
+    /// caller testing for emptiness asks `RangeSet.len` instead.
     pub fn size(self: Range) u64 {
         return self.end - self.start + 1;
     }
@@ -22,10 +42,28 @@ pub const Range = struct {
 ///
 /// Following quic-go's approach of maintaining ranges in descending order
 /// for efficient ACK frame generation.
+///
+/// The set owns every range it holds and borrows nothing: it retains the
+/// allocator given to `init` and `deinit` frees the array with it. Neither
+/// copying the struct nor moving it invalidates the ranges, so a `RangeSet`
+/// may be returned by value from a constructor; the two copies then name one
+/// owner and exactly one of them must be `deinit`'d.
 pub const RangeSet = struct {
+    /// Retained at `init` for the set's whole life. Every allocation `add`
+    /// and `addRange` make comes from it, `deinit` returns them with it, and
+    /// the set never frees it itself. Writing to this field after `init`
+    /// makes `deinit` release through a different allocator than the one
+    /// that allocated.
     allocator: Allocator,
+
+    /// Owned by the set, ordered by descending `start`, so `items[0]` always
+    /// holds the largest value and the last item the smallest. `init` leaves
+    /// it as a static empty slice with no capacity, so a set that never
+    /// receives an addition allocates nothing at all.
     ranges: std.ArrayList(Range),
 
+    /// A set holding no values. The allocator is retained immediately; one
+    /// `deinit` is owed whether or not the set ever grew.
     pub fn init(allocator: Allocator) RangeSet {
         return .{
             .allocator = allocator,
@@ -33,28 +71,40 @@ pub const RangeSet = struct {
         };
     }
 
+    /// Releases the range array. Does not free `allocator`, which the caller
+    /// still owns. The set is unusable afterwards and a second call frees
+    /// the same bytes twice.
     pub fn deinit(self: *RangeSet) void {
         self.ranges.deinit(self.allocator);
     }
 
-    /// Returns the number of ranges.
+    /// How many ranges the set holds, not how many values: a set of ten
+    /// disjoint packet numbers is one range here. Use `getRanges` and sum
+    /// `Range.size` when a count of values is what the bound is on.
     pub fn len(self: *const RangeSet) usize {
         return self.ranges.items.len;
     }
 
-    /// Returns the largest value in the set, or null if empty.
+    /// The largest value held, or `null` when the set is empty. `null` is how
+    /// emptiness is spelled: value 0 is a member like any other and is never
+    /// reported as the absent answer.
     pub fn largest(self: *const RangeSet) ?u64 {
         if (self.ranges.items.len == 0) return null;
         return self.ranges.items[0].end;
     }
 
-    /// Returns the smallest value in the set, or null if empty.
+    /// The smallest value held, or `null` when the set is empty, for the same
+    /// reason `largest` reports `null`.
     pub fn smallest(self: *const RangeSet) ?u64 {
         if (self.ranges.items.len == 0) return null;
         return self.ranges.items[self.ranges.items.len - 1].start;
     }
 
-    /// Check if a value is contained in any range.
+    /// Whether any range holds `val`. A value this set has dropped through
+    /// `removeBelow` is reported absent, so a caller that prunes to bound
+    /// memory cannot use this to tell "never seen" from "no longer
+    /// remembered".
+
     pub fn contains(self: *const RangeSet, val: u64) bool {
         const items = self.ranges.items;
         if (items.len == 0) return false;
@@ -70,12 +120,20 @@ pub const RangeSet = struct {
         return false;
     }
 
-    /// Add a single value to the range set. Merges adjacent/overlapping ranges.
+    /// Adds `val`, merging it into whichever ranges touch it.
+    ///
+    /// `error.OutOfMemory` leaves the set exactly as it was: the append and
+    /// the merge are one step, and the step that can fail runs before
+    /// anything is written. `len` may not grow at all, since a value
+    /// adjacent to an existing range extends it instead.
     pub fn add(self: *RangeSet, val: u64) !void {
         try self.addRange(val, val);
     }
 
-    /// Add a range [start, end] to the set. Merges with existing ranges as needed.
+    /// Adds every value in `[start, end]`, merging with any range that
+    /// touches or abuts it. `start > end` is an empty span and succeeds
+    /// without touching the set; the same `error.OutOfMemory` leaves the set
+    /// unchanged.
     pub fn addRange(self: *RangeSet, start: u64, end: u64) !void {
         if (start > end) return;
 
@@ -135,7 +193,9 @@ pub const RangeSet = struct {
         }
     }
 
-    /// Remove all values below (exclusive) the given value.
+    /// Drops every value strictly below `val`; `val` itself and everything
+    /// above it are kept. Shrinks the backing array without releasing it, so
+    /// the memory a large set held stays with the set until `deinit`.
     pub fn removeBelow(self: *RangeSet, val: u64) void {
         const items = self.ranges.items;
         if (items.len == 0) return;
@@ -164,7 +224,9 @@ pub const RangeSet = struct {
         }
     }
 
-    /// Get ranges as a slice (descending order - largest first).
+    /// The ranges, descending, largest first. The slice points into the set's
+    /// own array and is invalidated by `add`, `addRange` and `removeBelow`;
+    /// it is not invalidated by any read.
     pub fn getRanges(self: *const RangeSet) []const Range {
         return self.ranges.items;
     }

@@ -305,6 +305,8 @@ pub fn writeNodeId(writer: *postcard.Writer, id: NodeId) postcard.Error!void {
     try writer.writeArray(key.NodeId.byte_length, &id.toBytes());
 }
 
+/// 32 raw bytes as a `NodeId`. The bytes are checked, so a well-formed
+/// encoding of a non-point is `error.NotANodeId` rather than a value.
 pub fn readNodeId(reader: *postcard.Reader) (postcard.Error || BodyError)!NodeId {
     const bytes = try reader.readArray(key.NodeId.byte_length);
     return NodeId.fromBytes(bytes) catch error.NotANodeId;
@@ -324,11 +326,18 @@ pub fn writeRelayUrl(writer: *postcard.Writer, url: RelayUrl) postcard.Error!voi
     try writer.writeBytes(scratch[0..out.end]);
 }
 
+/// A relay URL from its length-prefixed text. The text is validated UTF-8 by
+/// `readStr` and then by `RelayUrl.parse`, so both a malformed encoding and a
+/// URL this build will not accept are refused — the latter as
+/// `error.BadRelayUrl`.
 pub fn readRelayUrl(reader: *postcard.Reader) (postcard.Error || BodyError)!RelayUrl {
     const text = try reader.readStr();
     return RelayUrl.parse(text) catch error.BadRelayUrl;
 }
 
+/// A socket address: the family as a `varint(u32)`, then the address bytes and
+/// the port. An exhaustive family enum, so a family byte this build has no arm
+/// for is `error.UnknownVariant`.
 pub fn writeSocketAddr(writer: *postcard.Writer, value: SocketAddr) postcard.Error!void {
     switch (value.ip) {
         .v4 => |octets| {
@@ -343,6 +352,8 @@ pub fn writeSocketAddr(writer: *postcard.Writer, value: SocketAddr) postcard.Err
     try writer.writeU16(value.port);
 }
 
+/// A socket address read back. The value owns its bytes and borrows nothing;
+/// the reader is left on the first byte after the port.
 pub fn readSocketAddr(reader: *postcard.Reader) postcard.Error!SocketAddr {
     const family = try reader.readVariant(IpFamily);
     return .{
@@ -372,25 +383,23 @@ fn writeTransportAddr(writer: *postcard.Writer, one: TransportAddr) postcard.Err
     }
 }
 
-fn readTransportAddr(
-    alloc: Allocator,
-    reader: *postcard.Reader,
-) (postcard.Error || BodyError || Allocator.Error)!TransportAddr {
+/// One address off the wire, with a custom payload still borrowing the
+/// reader's input. `decodeBytes` copies the payload after the list is
+/// canonical, so a value this returns is only meaningful while `bytes`
+/// is alive.
+fn readTransportAddr(reader: *postcard.Reader) (postcard.Error || BodyError)!TransportAddr {
     return switch (try reader.readVariant(TransportTag)) {
         .relay => .{ .relay = try readRelayUrl(reader) },
         .ip => .{ .ip = try readSocketAddr(reader) },
-        .custom => try readCustomAddr(alloc, reader),
+        .custom => try readCustomAddr(reader),
     };
 }
 
-fn readCustomAddr(
-    alloc: Allocator,
-    reader: *postcard.Reader,
-) (postcard.Error || BodyError || Allocator.Error)!TransportAddr {
+fn readCustomAddr(reader: *postcard.Reader) (postcard.Error || BodyError)!TransportAddr {
     const id = try reader.readU64();
     const data = try reader.readBytes();
     if (data.len > addr.max_inline_length) return error.CustomAddrTooLong;
-    return .{ .custom = .{ .id = id, .data = try alloc.dupe(u8, data) } };
+    return .{ .custom = .{ .id = id, .data = data } };
 }
 
 fn maxTransportAddrLength(one: TransportAddr) usize {
@@ -402,7 +411,8 @@ fn maxTransportAddrLength(one: TransportAddr) usize {
 }
 
 /// Sort an address list into `TransportAddr.order` and drop duplicates.
-/// Returns the surviving prefix, which is always the whole slice.
+/// Returns the surviving prefix, which is shorter than the input exactly when
+/// the input held a duplicate.
 ///
 /// postcard reads a `BTreeSet` by inserting, so upstream's own decoder
 /// collapses duplicates and imposes the set's order on whatever order the
@@ -414,6 +424,12 @@ fn maxTransportAddrLength(one: TransportAddr) usize {
 /// Every ticket upstream writes is already in this order, so in practice this
 /// is one comparison pass; the sort is what makes the guarantee hold for a
 /// peer that sends the same address twice, or out of order.
+///
+/// Nothing is allocated and nothing is freed: a duplicate is dropped as a
+/// value, so a caller whose list holds *owned* custom payloads must free the
+/// dropped one itself, and a caller whose payloads are borrows must not. Both
+/// decoders here sidestep the question by collapsing duplicates while the
+/// payloads still borrow the frame; see `EndpointTicket.decodeBytes`.
 pub fn canonicalizeAddrs(addrs: []TransportAddr) []TransportAddr {
     var out = addrs;
     std.mem.sort(TransportAddr, out, {}, lessTransportAddr);
@@ -440,12 +456,28 @@ fn lessTransportAddr(_: void, a: TransportAddr, b: TransportAddr) bool {
 /// Variant 1 carries the whole `EndpointAddr`, so unlike a blob ticket this
 /// one is lossless: every `TransportAddr` a peer can hold survives the round
 /// trip, and `encode` has nothing to report.
+///
+/// A ticket *built* by `new` borrows: this type has no `deinit`, so the
+/// address list stays the caller's and the custom payloads in it stay
+/// borrowed too. Only a `Decoded` owns storage, which is why `decodeBytes`
+/// and `decodeString` hand one back rather than a bare ticket.
 pub const EndpointTicket = struct {
     /// The kind prefix, and the only spelling `decodeString` accepts.
     pub const kind = "endpoint";
 
+    /// The node and its addresses. For a ticket from `new` this borrows the
+    /// caller's `NodeAddr` — list and payloads alike; for one inside a
+    /// `Decoded` it is owned and released by that wrapper.
     addr: NodeAddr,
 
+    /// A ticket over `address`, which it **borrows**.
+    ///
+    /// Nothing is copied and nothing is allocated, so `address` must stay
+    /// alive, and must not be freed or mutated through another owner, for as
+    /// long as the ticket is encoded from. This is the opposite of
+    /// `BlobTicket.new`, which takes its address over: an `EndpointTicket`
+    /// carries no custom payload copy to release, so it has no teardown to
+    /// make the transfer unambiguous, and borrowing is the honest contract.
     pub fn new(address: NodeAddr) EndpointTicket {
         return .{ .addr = address };
     }
@@ -488,9 +520,16 @@ pub const EndpointTicket = struct {
 
     /// postcard bytes to a ticket.
     ///
-    /// `alloc` takes the address list and every custom transport payload in
-    /// it, and the result says so, so that the two cannot be confused with a
-    /// ticket the caller built and therefore owns differently.
+    /// `alloc` takes the address list and every custom transport payload the
+    /// result carries, and `Decoded` says so, so a ticket that borrows its
+    /// payloads and one that owns them cannot be confused at the call site.
+    ///
+    /// A custom payload is copied only after the list is canonical, so a
+    /// duplicate a peer sent costs no allocation and owns nothing; the
+    /// surviving entries each get one copy. Every failure path — a malformed
+    /// body, a `TransportAddr` this build refuses, or an allocation that
+    /// fails part way through the copies — frees the payloads copied so far
+    /// and the list, and returns nothing.
     pub fn decodeBytes(alloc: Allocator, bytes: []const u8) DecodeError!Decoded {
         var reader = postcard.Reader.init(bytes);
         // The ticket discriminant is read as a number rather than through
@@ -508,15 +547,34 @@ pub const EndpointTicket = struct {
         // below is bounded by the size of the input.
         const count = try reader.readLen();
 
+        // Every address here still borrows `bytes`. That is what makes a
+        // duplicate free to drop and what lets one payload be compared against
+        // another before either is copied.
         var addrs: std.ArrayList(TransportAddr) = .empty;
         errdefer addrs.deinit(alloc);
-        errdefer freeCustomPayloads(alloc, addrs.items);
-        for (0..count) |_| try addrs.append(alloc, try readTransportAddr(alloc, &reader));
+        for (0..count) |_| try addrs.append(alloc, try readTransportAddr(&reader));
         try reader.finish();
         // The wire order is upstream's `BTreeSet` order, which a peer is free
         // to ignore, and the set collapses a repeated address on the way in.
         // Both happen here; see `canonicalizeAddrs`.
         addrs.items = canonicalizeAddrs(addrs.items);
+
+        // The list is final, so the copies are the ones that survive. A
+        // payload freed below is one this call allocated and nothing else
+        // holds.
+        var owned: usize = 0;
+        errdefer {
+            for (addrs.items[0..owned]) |one| {
+                if (one == .custom) alloc.free(one.custom.data);
+            }
+        }
+        while (owned < addrs.items.len) : (owned += 1) {
+            const one = &addrs.items[owned];
+            switch (one.*) {
+                .custom => |*custom| custom.data = try alloc.dupe(u8, custom.data),
+                else => {},
+            }
+        }
 
         return .{ .ticket = .{
             .addr = .{ .node_id = id, .addrs = try addrs.toOwnedSlice(alloc) },
@@ -543,16 +601,26 @@ pub const EndpointTicket = struct {
 /// borrows that address's payloads instead, and a `deinit` that could not tell
 /// those two apart would free a borrow. Only `decodeBytes` and `decodeString`
 /// produce one of these, so only they can be freed this way.
+///
+/// Copying a `Decoded` copies the handle, not the storage: both copies name
+/// one set of allocations and exactly one of them may be freed.
 pub const Decoded = struct {
+    /// The ticket. Its `NodeAddr` borrows nothing: every custom payload in
+    /// `addr.addrs` is a copy this `Decoded` owns, and the outer list is one
+    /// allocation of its own.
     ticket: EndpointTicket,
 
-    /// Free the address list and every custom transport payload in it, all of
-    /// which came from `alloc` when the ticket was read.
+    /// Free the address list and every custom transport payload in it, each
+    /// exactly once. All of them came from the `alloc` given to `decodeBytes`
+    /// or `decodeString`, and the allocator that frees them is that same one.
     ///
-    /// Inserting a *new* custom address into the list borrows that address's
-    /// payload, and freeing it here would free a borrow. Inserting an address
-    /// of any other kind is fine: the payloads already in the list are the
-    /// same ones either way.
+    /// This is the only release for those allocations, so it runs exactly
+    /// once per decode. Inserting a *new* custom address into the list after
+    /// the decode borrows that address's payload, and freeing it here would
+    /// free a borrow; inserting an address of any other kind is fine, because
+    /// the payloads already in the list are the same ones either way.
+    ///
+    /// The ticket and every copy of it are invalid afterward.
     pub fn deinit(self: Decoded, alloc: Allocator) void {
         freeCustomPayloads(alloc, self.ticket.addr.addrs);
         self.ticket.addr.deinit(alloc);
@@ -979,4 +1047,87 @@ test "a decoded address list is sorted and duplicate-free whatever order it arri
 
     var again: [64]u8 = undefined;
     try expectHexEqual(golden_hex, try decoded.ticket.encode(&again));
+}
+
+/// An endpoint ticket body whose address list is the given number of copies
+/// of one custom transport, so a decode has to collapse duplicates that each
+/// carry their own payload.
+fn duplicateCustomBody(copies: usize) !struct { body: [256]u8, len: usize } {
+    var body: [256]u8 = undefined;
+    var writer = postcard.Writer.init(&body);
+    try writer.writeVariant(WireVariant.variant1);
+    try writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
+    try writer.writeLen(copies);
+    for (0..copies) |_| {
+        try writeTransportAddr(&writer, .{ .custom = .{ .id = 42, .data = "duplicate" } });
+    }
+    return .{ .body = body, .len = writer.finish().len };
+}
+
+/// Accounting wrapper: `EndpointTicket.decodeBytes` is the only allocator user
+/// here, so the bytes it allocates and frees are the whole balance.
+fn decodeAccounting(alloc: Allocator, bytes: []const u8) !void {
+    var tracking = t.FailingAllocator.init(alloc, .{});
+    const decoded = try EndpointTicket.decodeBytes(tracking.allocator(), bytes);
+    decoded.deinit(tracking.allocator());
+    try t.expectEqual(
+        tracking.allocated_bytes,
+        tracking.freed_bytes,
+    );
+}
+
+test "a duplicate custom payload is freed exactly once, and only the survivor is copied" {
+    const alloc = t.allocator;
+    // Two copies of one address: the decode keeps one entry and must own one
+    // payload for it. The dropped copy is never allocated, so the balance
+    // after `deinit` is zero rather than one leaked payload.
+    const made = try duplicateCustomBody(2);
+    const body = made.body[0..made.len];
+
+    var tracking = t.FailingAllocator.init(alloc, .{});
+    const decoded = try EndpointTicket.decodeBytes(tracking.allocator(), body);
+    try t.expectEqual(@as(usize, 1), decoded.ticket.addr.addrs.len);
+    const custom = decoded.ticket.addr.addrs[0];
+    try t.expectEqual(TransportAddr.custom, std.meta.activeTag(custom));
+    try t.expectEqual(@as(u64, 42), custom.custom.id);
+    try t.expectEqualSlices(u8, "duplicate", custom.custom.data);
+    // The surviving payload is a copy, not the frame's bytes: the frame is
+    // about to be freed, and the payload is still readable.
+    try t.expect(custom.custom.data.ptr != "duplicate".ptr);
+    decoded.deinit(tracking.allocator());
+    try t.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+
+    // A single copy is the same balance, so the fix is not "free the tail".
+    const one = try duplicateCustomBody(1);
+    try decodeAccounting(alloc, one.body[0..one.len]);
+}
+
+test "a malformed body copies nothing, and every allocation index frees what it took" {
+    const alloc = t.allocator;
+    // Three distinct custom addresses, so a successful decode holds three
+    // payload copies and a failure part way through the copies has something
+    // to hand back.
+    var body: [256]u8 = undefined;
+    var writer = postcard.Writer.init(&body);
+    try writer.writeVariant(WireVariant.variant1);
+    try writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
+    try writer.writeLen(3);
+    try writeTransportAddr(&writer, .{ .custom = .{ .id = 1, .data = "first" } });
+    try writeTransportAddr(&writer, .{ .custom = .{ .id = 2, .data = "second" } });
+    try writeTransportAddr(&writer, .{ .custom = .{ .id = 3, .data = "third" } });
+    const whole = writer.finish();
+
+    // Truncated inside the third address. The payload copies come after the
+    // whole body is read, so this fails having allocated only the address
+    // list, and the list is what has to come back. The decoder names the
+    // refusal by the field it could not read, not by the truncation.
+    try t.expectError(
+        error.BadLength,
+        EndpointTicket.decodeBytes(alloc, whole[0 .. whole.len - 4]),
+    );
+
+    // And a body that would otherwise succeed, at every allocation index: the
+    // copies are the last thing a decode does, so these are the indices where
+    // one, two or three payloads have already been taken.
+    try t.checkAllAllocationFailures(alloc, decodeAccounting, .{whole});
 }

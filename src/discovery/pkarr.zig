@@ -135,6 +135,24 @@ pub const VerifyError = error{
     WrongSigner,
     /// The signature did not verify over the signable form.
     BadSignature,
+    /// The body is longer than `max_dns_length`, so there is no signable form
+    /// of this packet to check and nothing behind it that a pkarr peer could
+    /// have signed. Reachable only from a `Packet` built by hand: `parse`,
+    /// `fromParts` and `fromRelayPayload` refuse that length before a packet
+    /// exists.
+    BodyTooLarge,
+};
+
+/// Errors from writing a packet or its signable form into caller storage.
+///
+/// Every one of these writes into a buffer sized for the longest legal form,
+/// so the only thing left to refuse is a value the cap does not allow. It is a
+/// narrower set than `Error`, which also names every way a decode can fail, and
+/// it is separate because no decode failure is reachable from an encoder.
+pub const EncodeError = error{
+    /// The body is longer than `max_dns_length`, so it has no legal encoding.
+    /// Reachable only from a `Packet` built by hand or widened after a decode.
+    BodyTooLarge,
 };
 
 /// A signed pkarr packet: who signed it, when they say they signed it, and
@@ -150,8 +168,15 @@ pub const Packet = struct {
     /// Microseconds since the unix epoch, as the eight big-endian bytes the
     /// header carries. Authored by the signer, and trusted only for ordering.
     timestamp: u64,
-    /// The DNS body, exactly as it arrived. Not parsed; see the module
-    /// comment.
+    /// The DNS body, exactly as it arrived, and at most `max_dns_length` bytes.
+    /// Not parsed; see the module comment.
+    ///
+    /// That length is an invariant every decoder here establishes and no field
+    /// list can: `Packet` is four public fields, so a hand-built one can hold a
+    /// body over the cap. The two fixed buffers this file writes through — `out`
+    /// in `encode`, `scratch` in `signable` — are sized for the cap and not for
+    /// whatever this slice happens to be, so every one of those writes checks
+    /// the length and answers `error.BodyTooLarge` rather than assuming it.
     dns: []const u8,
 
     /// Decode a whole packet: the wire form a DHT `v`/`k`/`sig`/`seq` item
@@ -223,14 +248,23 @@ pub const Packet = struct {
     }
 
     /// The bytes the signature covers: the BEP-0044 signable form of this
-    /// packet's own timestamp and body.
-    pub fn signable(self: Packet, out: *[max_signable_length]u8) []const u8 {
+    /// packet's own timestamp and body, written into `out`.
+    ///
+    /// `error.BodyTooLarge` is the only failure: `out` is sized for the longest
+    /// form a legal packet can produce, so nothing else can be short.
+    pub fn signable(self: Packet, out: *[max_signable_length]u8) EncodeError![]const u8 {
         return signableForm(self.timestamp, self.dns, out);
     }
 
-    /// The wire form, written into `out`. Infallible: a `Packet` cannot hold
-    /// a body over the cap, and the caller sized `out` for the worst one.
-    pub fn encode(self: Packet, out: *[max_packet_length]u8) []const u8 {
+    /// The wire form, written into `out`, which is sized for the longest packet
+    /// the cap allows.
+    ///
+    /// `error.BodyTooLarge` when `dns` is over the cap. No decoder produces
+    /// such a packet — `parse` and `fromParts` refuse that length — but this is
+    /// a struct of four public fields, and an encoder that trusted the cap would
+    /// write past `out` rather than answer.
+    pub fn encode(self: Packet, out: *[max_packet_length]u8) EncodeError![]const u8 {
+        if (self.dns.len > max_dns_length) return error.BodyTooLarge;
         const key_bytes = self.public_key.toBytes();
         const sig_bytes = self.signature.toBytes();
         @memcpy(out[0..signature_offset], &key_bytes);
@@ -254,9 +288,15 @@ pub const Packet = struct {
 
     /// Check the signature against the key in this packet's own header,
     /// strictly. Use `verify` when the caller knows which node it asked for.
+    ///
+    /// `error.BodyTooLarge` is a refusal to check rather than a failed check: a
+    /// body over the cap has no signable form, so there is nothing to verify
+    /// against and reporting it as a bad signature would name a fault that did
+    /// not happen.
     pub fn verifySelf(self: Packet) VerifyError!void {
         var scratch: [max_signable_length]u8 = undefined;
-        self.signature.verifyStrict(self.signable(&scratch), self.public_key) catch
+        const form = try self.signable(&scratch);
+        self.signature.verifyStrict(form, self.public_key) catch
             return error.BadSignature;
     }
 };
@@ -276,11 +316,15 @@ pub const Packet = struct {
 /// all of `out`: the format is given exactly the room its own worst case
 /// needs, so `NoSpaceLeft` is a property of `max_prefix_length` being wrong
 /// and of nothing else. A reader checks one constant, and it is checked.
+/// `error.BodyTooLarge` when `dns` is longer than `max_dns_length`: the copy
+/// below writes into a buffer sized for the cap, and a bound every caller has to
+/// have checked is not a bound this function has.
 pub fn signableForm(
     timestamp: u64,
     dns: []const u8,
     out: *[max_signable_length]u8,
-) []const u8 {
+) EncodeError![]const u8 {
+    if (dns.len > max_dns_length) return error.BodyTooLarge;
     const prefix = std.fmt.bufPrint(out[0..max_prefix_length], "3:seqi{d}e1:v{d}:", .{
         timestamp,
         dns.len,
@@ -312,8 +356,8 @@ pub const max_prefix_length = 6 + 20 + 4 + 20 + 1;
 pub const max_signable_length = 6 + 20 + 4 + 4 + 1 + max_dns_length;
 
 // The format writes into `out[0..max_prefix_length]`, so that slice has to
-// exist. A body over the cap would overrun `out` on the copy below whatever
-// this says; `fromParts` and `sign` are what refuse one.
+// exist. `signableForm` refuses a body over the cap before it copies anything,
+// and this is the other half of that: the room the copy is then given.
 comptime {
     std.debug.assert(max_prefix_length <= max_signable_length);
 }
@@ -327,6 +371,9 @@ comptime {
 ///
 /// `scratch` receives the signable form, which is transient and is sized for
 /// the largest legal body whether or not this one is.
+///
+/// `error.BodyTooLarge` when `dns` is over the cap, and nothing is written to
+/// `out` on that path.
 pub fn sign(
     secret: SecretKey,
     timestamp: u64,
@@ -334,10 +381,9 @@ pub fn sign(
     scratch: *[max_signable_length]u8,
     out: *[max_packet_length]u8,
 ) Error![]const u8 {
-    if (dns.len > max_dns_length) return error.BodyTooLarge;
     const packet: Packet = .{
         .public_key = secret.nodeId(),
-        .signature = secret.sign(signableForm(timestamp, dns, scratch)),
+        .signature = secret.sign(try signableForm(timestamp, dns, scratch)),
         .timestamp = timestamp,
         .dns = dns,
     };
@@ -446,7 +492,7 @@ test "golden: a captured packet decodes into its three fields" {
 
     // And the whole thing re-encodes to the bytes it was parsed from.
     var out: [max_packet_length]u8 = undefined;
-    try expectHex(captured, packet.encode(&out));
+    try expectHex(captured, try packet.encode(&out));
 }
 
 test "golden: the signable form is the BEP-0044 prefix, not the packet" {
@@ -455,7 +501,7 @@ test "golden: the signable form is the BEP-0044 prefix, not the packet" {
     // 4280d6a9e8a7afe43e59d251ea5211d0b8a1d936: `signable(42, b"hi")` is
     // `"3:seqi42e1:v2:hi"`.
     var scratch: [max_signable_length]u8 = undefined;
-    try t.expectEqualStrings("3:seqi42e1:v2:hi", signableForm(42, "hi", &scratch));
+    try t.expectEqualStrings("3:seqi42e1:v2:hi", try signableForm(42, "hi", &scratch));
 
     // The captured packet's own form, byte for byte: the marker, the decimal
     // timestamp, the `e1:v` record header, the decimal body length, the
@@ -463,18 +509,18 @@ test "golden: the signable form is the BEP-0044 prefix, not the packet" {
     var wire: [max_packet_length]u8 = undefined;
     const captured = try hexBytes(&wire, small_packet_hex);
     const packet = try Packet.parse(captured);
-    const signable = packet.signable(&scratch);
+    const signable = try packet.signable(&scratch);
     try t.expectEqualStrings("3:seqi1700000000000000e1:v109:", signable[0..30]);
     try t.expectEqualSlices(u8, packet.dns, signable[30..]);
 
     // An empty body is still a form: the length is a zero, not an omission.
-    try t.expectEqualStrings("3:seqi0e1:v0:", signableForm(0, "", &scratch));
+    try t.expectEqualStrings("3:seqi0e1:v0:", try signableForm(0, "", &scratch));
 
     // The bound is tight. A body at the cap under the largest timestamp there
     // is fills the buffer exactly, so a bound that was merely sufficient is
     // one this would not catch.
     var at_max: [max_dns_length]u8 = @splat(0x78);
-    const longest = signableForm(std.math.maxInt(u64), &at_max, &scratch);
+    const longest = try signableForm(std.math.maxInt(u64), &at_max, &scratch);
     try t.expectEqual(max_signable_length, longest.len);
 }
 
@@ -554,7 +600,7 @@ test "the cap is 1104 and it is enforced on both sides" {
     try t.expectEqual(max_dns_length, big.dns.len);
     try t.expectEqual(vector_timestamp, big.timestamp);
     var out: [max_packet_length]u8 = undefined;
-    try expectHex(at_max, big.encode(&out));
+    try expectHex(at_max, try big.encode(&out));
     try big.verify(big.public_key);
 
     // One byte more is one byte too many, whether the overage is read as a
@@ -583,6 +629,41 @@ test "the cap is 1104 and it is enforced on both sides" {
     const round_tripped = try Packet.parse(wire);
     try t.expectEqualSlices(u8, at_cap_body, round_tripped.dns);
     try round_tripped.verify(secret.nodeId());
+}
+
+test "a packet built by hand over the cap is refused, not written past" {
+    // `Packet` is four public fields and nothing enforces the cap on a struct
+    // literal, so a caller can hold a body no peer could have signed. Every
+    // fixed buffer in this file is sized for the cap rather than for the slice
+    // it was handed, so each of these three writes either checks the length or
+    // runs off the end of a caller's buffer; they check it. The cap is not
+    // reachable from a decoded packet, which is what makes this a hand-built
+    // case and not a network one.
+    var secret = try SecretKey.fromSeed(vector_seed);
+    defer secret.deinit();
+
+    var scratch: [max_signable_length]u8 = undefined;
+    var out: [max_packet_length]u8 = undefined;
+    var over: [max_dns_length + 1]u8 = @splat(0x78);
+    var packet: Packet = .{
+        .public_key = secret.nodeId(),
+        .signature = secret.sign(
+            try signableForm(vector_timestamp, over[0..max_dns_length], &scratch),
+        ),
+        .timestamp = vector_timestamp,
+        .dns = &over,
+    };
+
+    try t.expectError(error.BodyTooLarge, packet.encode(&out));
+    try t.expectError(error.BodyTooLarge, packet.signable(&scratch));
+    try t.expectError(error.BodyTooLarge, packet.verifySelf());
+
+    // And with the last byte dropped it is a packet again: the refusal is the
+    // cap and not the shape of the value. The signature above was made over the
+    // body at the cap, so this is also the round trip at the boundary.
+    packet.dns = over[0..max_dns_length];
+    try t.expectEqual(max_packet_length, (try packet.encode(&out)).len);
+    try packet.verifySelf();
 }
 
 test "every declared decode error has a case" {

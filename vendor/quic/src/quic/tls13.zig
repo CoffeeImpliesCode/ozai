@@ -1,15 +1,22 @@
-// TLS 1.3 handshake for QUIC (RFC 8446 + RFC 9001)
-//
-// Supports TLS_AES_128_GCM_SHA256 (0x1301) only.
-// X25519 for key exchange. Ed25519 for a peer's identity, and for the
-// CertificateVerify that proves possession of it.
-//
-// A peer's certificate is a 44-byte DER `SubjectPublicKeyInfo` around the 32
-// raw bytes of an Ed25519 key, and those 32 bytes are the node id. There is
-// no chain to walk, no host name to match and no validity date to read: a
-// peer is the key it presents or the handshake ends. Upstream validated an
-// X.509 chain here, and every part of that is gone — see
-// `liftEd25519Spki`, which is the whole of certificate validation now.
+//! TLS 1.3 handshake for QUIC (RFC 8446 + RFC 9001), sans-IO.
+//!
+//! Supports TLS_AES_128_GCM_SHA256 (0x1301) only.
+//! X25519 for key exchange. Ed25519 for a peer's identity, and for the
+//! CertificateVerify that proves possession of it.
+//!
+//! A peer's certificate is a 44-byte DER `SubjectPublicKeyInfo` around the 32
+//! raw bytes of an Ed25519 key, and those 32 bytes are the node id. There is
+//! no chain to walk, no host name to match and no validity date to read: a
+//! peer is the key it presents or the handshake ends. Upstream validated an
+//! X.509 chain here, and every part of that is gone — see
+//! `liftEd25519Spki`, which is the whole of certificate validation now.
+//!
+//! The state machine is `Tls13Handshake`, driven by `step` with bytes from
+//! the crypto streams and an `Action` back. Time and randomness are
+//! arguments on `step`, never stored: nothing here reads a clock or reaches
+//! for a CSPRNG, so two runs driven with two clocks and two generators are
+//! two different runs. A `TlsConfig` is borrowed whole for the handshake's
+//! life, and `deinit` releases what the handshake allocated.
 
 const std = @import("std");
 const io = @import("../io_compat.zig");
@@ -19,6 +26,8 @@ const quic_crypto = @import("crypto.zig");
 const protocol = @import("protocol.zig");
 const transport_params = @import("transport_params.zig");
 const limits = @import("limits.zig");
+/// Re-exported so a caller can name the private-key types without importing
+/// `rsa.zig` itself; the contract is at that file's own declarations.
 pub const rsa = @import("rsa.zig");
 
 const Certificate = std.crypto.Certificate;
@@ -41,10 +50,22 @@ const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 
 const P256 = crypto.ecc.P256;
 
+/// The three QUIC encryption levels and their numeric encoding. Re-exported
+/// from `crypto.zig`, which owns the contract; `Action.level` and
+/// `CryptoStreamManager.getStream` both use these values as indices.
 pub const EncryptionLevel = quic_crypto.EncryptionLevel;
 
+/// Which private key a certificate's leaf is signed with, and therefore
+/// which CertificateVerify scheme this side can produce. It is a property of
+/// the key material, not a preference: `signatureSchemeFor` maps it onto the
+/// schemes the peer's `signature_algorithms` offers.
 pub const PrivateKeyAlgorithm = enum {
+    /// ECDSA over P-256 with SHA-256. The default in every config that does
+    /// not say otherwise, and the only scheme a node id certificate is
+    /// verified with when the peer's certificate is an X.509 one.
     ecdsa_p256_sha256,
+    /// Ed25519, RFC 8032. What a node presents as itself, and what
+    /// `liftEd25519Spki` extracts from a peer's certificate.
     ed25519,
     /// Signs with RSA-PSS (rsa_pss_rsae_*), SHA-256 unless the client offers
     /// only SHA-384 or SHA-512.
@@ -54,6 +75,12 @@ pub const PrivateKeyAlgorithm = enum {
 /// The CertificateVerify scheme for a key, from the client's
 /// signature_algorithms (the list body: big-endian u16s). Null when the
 /// client offers none that fits.
+///
+/// `offered` is borrowed and is walked in preference order per algorithm —
+/// ECDSA, then Ed25519, then RSA from SHA-256 down — so the result is the
+/// first of this key's schemes the client listed, not the client's first
+/// scheme that this key supports. Null is what makes a server unable to
+/// complete: `HandshakeFailure` is the error the caller sees.
 pub fn signatureSchemeFor(alg: PrivateKeyAlgorithm, offered: []const u8) ?tls.SignatureScheme {
     const ours: []const tls.SignatureScheme = switch (alg) {
         .ecdsa_p256_sha256 => &.{.ecdsa_secp256r1_sha256},
@@ -73,6 +100,14 @@ pub fn signatureSchemeFor(alg: PrivateKeyAlgorithm, offered: []const u8) ?tls.Si
 // ─── CertificateVerify signature verification ────────────────────────
 
 /// Checks a CertificateVerify signature made with the leaf's public key.
+///
+/// `sig_algo` is the scheme from the peer's CertificateVerify, and
+/// `signed_content` the 64-space-padded transcript string built for it. A
+/// `null` scheme, a public key whose category does not match the scheme, a
+/// key that will not parse, or a signature that does not verify are all the
+/// same answer: `error.BadCertificateVerify`, with nothing retained. The
+/// caller cannot tell a forged signature from an unsupported one, which is
+/// deliberate — the distinction would tell a prober which half they got.
 pub fn verifyCertificateVerifySignature(
     pub_key_bytes: []const u8,
     pub_key_algo: Certificate.AlgorithmCategory,
@@ -270,17 +305,49 @@ fn readTlv(b: []const u8, pos: usize, limit: usize) ?Tlv {
 /// client identity, because a session ticket is bearer material: it is handed
 /// to the client and replayable, so a node id recovered from one would be a
 /// credential rather than a proof of possession (DECISIONS/0001 item 4).
+///
+/// What a set node id actually buys, stated once here because two fields of
+/// two structs would each say it: the check is that the 32 bytes inside the
+/// peer's `SubjectPublicKeyInfo` equal this array, byte for byte. It is not
+/// a lookup, not a membership test and not a chain walk — a certificate that
+/// carries some other key fails with `error.BadCertificateVerify` whatever
+/// issued it, and a peer that presents this key with a signature made by
+/// anything else fails at the CertificateVerify. Together those two make it
+/// a proof of possession rather than a claim.
+///
+/// With `null` the check does not run, and the handshake succeeds for any key
+/// the peer can sign with: the connection then knows the peer holds the id it
+/// presented and nothing more. A caller that wants identity and leaves this
+/// null has a connection with a key and no node.
 pub const ClientAuth = struct {
     /// The node id the client's certificate has to carry. Null accepts any
     /// key, and then the client has proved possession of the id it presented
     /// rather than being the node we asked for.
+    ///
+    /// Compared against the key lifted from the peer's certificate, so it
+    /// pins the key and not a subject, an issuer or a name. A client that
+    /// sends no certificate fails on `mode` before this is consulted; a
+    /// client that sends one carrying a different key fails on this, with
+    /// `error.BadCertificateVerify`, whatever `mode` says.
     expect_node_id: ?[32]u8 = null,
+    /// What happens when the client sends no certificate at all. `.required`
+    /// is the default and fails the handshake with
+    /// `error.CertificateRequired`; `.optional` lets it through with no
+    /// client identity, and `peerNodeId` then answers null.
     mode: Mode = .required,
 
+    /// Whether a client that sends no certificate is refused or let through.
+    /// Two tags, exhaustive, and no third answer: a peer that sends a
+    /// certificate is judged by `expect_node_id` either way.
     pub const Mode = enum {
         /// No certificate: the handshake fails with certificate_required.
+        /// The default. `expect_node_id` is not consulted, because there is
+        /// nothing to compare — the absence is the failure.
         required,
         /// No certificate: the handshake completes without a client identity.
+        /// The connection is established and authenticated as the server, and
+        /// nothing about the client is known; a caller that treats this as
+        /// `required` has an unauthenticated peer.
         optional,
     };
 };
@@ -307,6 +374,13 @@ pub const client_auth_signature_schemes = blk: {
 /// so there is no issuer to point it at and nothing for a client to choose
 /// between. The extension is still parsed on the way in, because a peer we
 /// do not control may send one.
+///
+/// The result borrows `buf` and is valid until the caller writes it again.
+/// `error.BufferTooSmall` when `buf` cannot hold the whole message — which
+/// is the only failure — and it is checked before anything is written, so
+/// `buf` is untouched on that path. The size is fixed, so a caller can
+/// compute it once; the returned slice is shorter by the extension header
+/// this build emits and is not a compile-time constant.
 pub fn buildCertificateRequest(buf: []u8) error{BufferTooSmall}![]const u8 {
     const sig = client_auth_signature_schemes;
     const exts_len: usize = 4 + 2 + sig.len;
@@ -328,6 +402,14 @@ pub fn buildCertificateRequest(buf: []u8) error{BufferTooSmall}![]const u8 {
 /// The signature_algorithms list body from a CertificateRequest's body (the
 /// message without its 4-byte header); `DecodeError` on a malformed one.
 /// RFC 8446 §4.3.2 makes the extension mandatory.
+///
+/// `body` is borrowed and the result points into it, so the slice dies with
+/// the buffer it was parsed from. `error.IllegalParameter` for a non-empty
+/// context — this stack never sends post-handshake authentication — or for a
+/// second signature_algorithms extension; `error.MissingExtension` when
+/// there is none, which RFC 8446 §4.3.2 makes mandatory; `error.DecodeError`
+/// for a length that does not close the message or an odd-length list.
+/// Nothing is allocated, so no failure leaves state behind.
 pub fn parseCertificateRequest(body: []const u8) error{ DecodeError, MissingExtension, IllegalParameter }![]const u8 {
     if (body.len < 1) return error.DecodeError;
     const ctx_len = body[0];
@@ -358,6 +440,20 @@ pub fn parseCertificateRequest(body: []const u8) error{ DecodeError, MissingExte
 /// The leaf of a Certificate message body (RFC 8446 §4.4.2) and up to
 /// `out.len` certificates, leaf first, in `out`. Null for an empty list.
 /// The context must be empty: we never send one.
+///
+/// Every slice written into `out` borrows `body`, so the whole `out` dies
+/// with the buffer the message was parsed from; nothing is copied and the
+/// caller frees nothing. `out` is only written up to the point of failure —
+/// on error the first `n` entries hold valid slices and the rest keep
+/// whatever the caller had there, so `out` is not cleared and not filled.
+///
+/// `error.IllegalParameter` for a non-empty context, which only
+/// post-handshake authentication uses here; `error.BadCertificate` when the
+/// chain is longer than `out`, which is the caller's bound on chain depth and
+/// not a claim that the chain is bad; `error.DecodeError` for a zero-length
+/// certificate, a length that does not close the message, or an extension
+/// block that runs past it. Null is the answer for a well-formed empty list,
+/// which is how a client answers a CertificateRequest it cannot meet.
 pub fn parseCertificateList(body: []const u8, out: [][]const u8) error{ DecodeError, IllegalParameter, BadCertificate }!?[]const []const u8 {
     if (body.len < 4) return error.DecodeError;
     if (body[0] != 0) return error.IllegalParameter;
@@ -384,18 +480,41 @@ pub fn parseCertificateList(body: []const u8, out: [][]const u8) error{ DecodeEr
 
 // ─── TranscriptHash ──────────────────────────────────────────────────
 
+/// The running SHA-256 over every handshake message, which is what every
+/// Finished, CertificateVerify and key derivation in TLS 1.3 is computed
+/// over.
+///
+/// It owns nothing and borrows nothing: `update` copies the bytes it is
+/// given, so the caller's buffer is free immediately, and a copy of the
+/// struct is an independent transcript. `current` snapshots rather than
+/// consumes, so a caller may take the hash as often as it likes and then
+/// keep going. Not thread-safe.
 pub const TranscriptHash = struct {
+    /// The running hash state. The whole of the transcript, and the reason a
+    /// `TranscriptHash` may be copied: it is a value, not a pointer.
     state: Sha256,
 
+    /// An empty transcript: the hash of nothing, which is the value TLS 1.3
+    /// calls `Hash("")` and the first input to every derivation.
     pub fn init() TranscriptHash {
         return .{ .state = Sha256.init(.{}) };
     }
 
-    // Update with a raw TLS handshake message (type + 3-byte length + body).
+    /// Update with a raw TLS handshake message (type + 3-byte length + body).
+    ///
+    /// The whole message, header included, and in wire order: the transcript
+    /// is a hash of bytes exactly as they appear, so a caller that skips the
+    /// four-byte header, reorders anything, or feeds a re-encoded message
+    /// instead of the received one computes a different — and wrong —
+    /// Finished. `msg` is borrowed and not retained.
     pub fn update(self: *TranscriptHash, msg: []const u8) void {
         self.state.update(msg);
     }
 
+    /// The hash of everything fed in so far, without consuming the
+    /// transcript. This is the value passed to every `derive*` method and to
+    /// `computeFinishedVerifyData`, and the one a handshake must snapshot
+    /// before adding its own Finished to the transcript.
     pub fn current(self: *const TranscriptHash) [32]u8 {
         // Copy the state to get a snapshot without consuming it
         var copy = self.state;
@@ -405,19 +524,62 @@ pub const TranscriptHash = struct {
 
 // ─── KeySchedule ─────────────────────────────────────────────────────
 
+/// The RFC 8446 §7.1 key schedule: every secret TLS 1.3 derives, and the
+/// QUIC key contexts made from them.
+///
+/// It owns nothing and borrows nothing, and holds no clock: every secret is
+/// derived from arguments the caller supplies — a PSK, a shared secret, a
+/// transcript hash — so the same inputs give the same schedule. It is a
+/// plain value of nine 32-byte secrets and two flags; copying one copies
+/// the secrets, and there is no `deinit` because there is nothing to release.
+/// A schedule that has not been derived from yet has zero in the fields
+/// marked optional below, which is why `computed_handshake` and
+/// `computed_app` exist rather than a test for zero.
+///
+/// The methods that take a traffic secret (`makeOpen`, `makeSeal` and their
+/// variants) are static and allocate nothing: the returned `Open` and `Seal`
+/// own no memory, so copying one is cheap and safe.
 pub const KeySchedule = struct {
+    /// The 0-RTT secret, from which the early traffic secret is derived.
+    /// Valid from `init` or `initWithPsk` and never zero afterwards.
     early_secret: [32]u8,
+    /// Set by `deriveHandshakeSecrets` from the shared secret and the
+    /// transcript. Before that call it is undefined, not zero — read it only
+    /// when `computed_handshake` is set.
     handshake_secret: [32]u8,
+    /// Set by `deriveAppSecrets`, which is what makes `computed_app` true.
+    /// Undefined until then.
     master_secret: [32]u8,
+    /// The handshake traffic secret this side writes with: the server's on a
+    /// server, the client's on a client. Set together with the peer's by
+    /// `deriveHandshakeSecrets`.
     client_handshake_traffic_secret: [32]u8,
+    /// The handshake traffic secret the peer writes with, and so the one this
+    /// side decrypts with. The mirror of the field above.
     server_handshake_traffic_secret: [32]u8,
+    /// The application traffic secret this side writes with, set by
+    /// `deriveAppSecrets`. The mirror of the two fields below it.
     client_app_traffic_secret: [32]u8,
+    /// The application traffic secret the peer writes with, set by
+    /// `deriveAppSecrets`.
     server_app_traffic_secret: [32]u8,
+    /// Zero until `deriveResumptionMasterSecret` runs, which is after the
+    /// full transcript. Zero is the "no ticket will be issued" answer, not an
+    /// unusable secret.
     resumption_master_secret: [32]u8 = .{0} ** 32,
+    /// The client early traffic secret for 0-RTT. Zero until
+    /// `deriveEarlyDataSecret` runs; a 0-RTT key made from a zero secret
+    /// would be one anyone could forge, so no caller may make one before it.
     client_early_traffic_secret: [32]u8 = .{0} ** 32,
+    /// Whether `deriveHandshakeSecrets` has run, and so whether the
+    /// handshake secrets above hold anything. A flag rather than a zero test,
+    /// because a real secret can be all zeros.
     computed_handshake: bool = false,
+    /// Whether `deriveAppSecrets` has run, for the application secrets.
     computed_app: bool = false,
 
+    /// A full handshake's schedule: the early secret extracted from a zero
+    /// salt and a zero input key, and nothing derived from it yet.
     pub fn init() KeySchedule {
         var ks: KeySchedule = undefined;
         ks.computed_handshake = false;
@@ -431,6 +593,9 @@ pub const KeySchedule = struct {
     }
 
     // Initialize with a PSK (for session resumption)
+    /// A resumed handshake's schedule, with `early_secret` extracted from the
+    /// ticket's PSK instead of a zero key. `psk` is taken by value; the
+    /// caller may release whatever it came from.
     pub fn initWithPsk(psk: [32]u8) KeySchedule {
         var ks: KeySchedule = undefined;
         ks.computed_handshake = false;
@@ -442,17 +607,28 @@ pub const KeySchedule = struct {
         return ks;
     }
 
-    // Derive client early traffic secret for 0-RTT data
+    /// Derives the client early traffic secret for 0-RTT from
+    /// `early_secret` and the transcript hash as it stands before the
+    /// ClientHello. Must run before any 0-RTT key is made; it is a
+    /// resumption-only step, and a full handshake never calls it.
     pub fn deriveEarlyDataSecret(self: *KeySchedule, transcript_hash: [32]u8) void {
         self.client_early_traffic_secret = deriveSecret(self.early_secret, "c e traffic", transcript_hash);
     }
 
-    // Derive resumption master secret (after full handshake transcript)
+    /// Derives the resumption master secret, which is what a server seals a
+    /// session ticket under and what a client recovers a PSK from. The
+    /// transcript hash must be the full handshake's, taken before either
+    /// side's Finished is added — deriving it later gives a secret the peer
+    /// cannot derive, and the ticket is then unusable rather than rejected.
     pub fn deriveResumptionMasterSecret(self: *KeySchedule, transcript_hash: [32]u8) void {
         self.resumption_master_secret = deriveSecret(self.master_secret, "res master", transcript_hash);
     }
 
-    // Derive handshake secrets from the shared secret and transcript hash.
+    /// Derives the handshake secrets from the shared secret and transcript
+    /// hash. Sets both handshake traffic secrets and `computed_handshake`.
+    /// `shared_secret` is borrowed and not retained, so the caller may clear
+    /// its copy immediately. Idempotent in effect, not in state: a second
+    /// call with a different shared secret silently replaces the first.
     pub fn deriveHandshakeSecrets(self: *KeySchedule, shared_secret: []const u8, transcript_hash: [32]u8) void {
         // derived1 = Derive-Secret(early_secret, "derived", Hash(""))
         const empty_hash = tls.emptyHash(Sha256);
@@ -470,7 +646,13 @@ pub const KeySchedule = struct {
         self.computed_handshake = true;
     }
 
-    // Derive application secrets from the transcript hash after server Finished.
+    /// Derives the master and application traffic secrets, and sets
+    /// `computed_app`. The transcript hash must be the one from before this
+    /// side's own Finished is added to the transcript — on a client that is
+    /// the hash as of the server's Finished, on a server the one as of the
+    /// client's Certificate and CertificateVerify — because the Finished is
+    /// then derived from the master secret this call produces. A hash taken
+    /// too late yields keys that do not match the peer's.
     pub fn deriveAppSecrets(self: *KeySchedule, transcript_hash: [32]u8) void {
         // derived2 = Derive-Secret(handshake_secret, "derived", Hash(""))
         const empty_hash = tls.emptyHash(Sha256);
@@ -489,7 +671,11 @@ pub const KeySchedule = struct {
         self.computed_app = true;
     }
 
-    // Derive QUIC Open/Seal keys from a traffic secret (AES-128-GCM, 16-byte keys).
+    /// The QUIC packet protection keys for one traffic secret, as the TLS
+    /// labels name them: the AEAD key, the 12-byte IV and the header
+    /// protection key. A caller should prefer `makeOpen` or `makeSeal`, which
+    /// build the contexts these feed; the arrays are what those are made
+    /// from, and are fixed at AES-128-GCM sizes whatever the cipher suite.
     pub fn deriveQuicKeys(traffic_secret: [32]u8) struct { key: [16]u8, iv: [12]u8, hp: [16]u8 } {
         return .{
             .key = quic_crypto.hkdfExpandLabel(traffic_secret, "quic key", "", 16),
@@ -498,22 +684,38 @@ pub const KeySchedule = struct {
         };
     }
 
+    /// An `Open` for QUIC v1 with AES-128-GCM. It owns no allocation, so it
+    /// is cheap to copy and safe to keep; the peer never sees it.
     pub fn makeOpen(traffic_secret: [32]u8) quic_crypto.Open {
         return makeOpenWithCipher(traffic_secret, .aes_128_gcm_sha256);
     }
 
+    /// A `Seal` for QUIC v1 with AES-128-GCM, on the same terms as `makeOpen`.
+    /// The keys are copied in and the secret is not retained.
     pub fn makeSeal(traffic_secret: [32]u8) quic_crypto.Seal {
         return makeSealWithCipher(traffic_secret, .aes_128_gcm_sha256);
     }
 
+    /// As `makeOpen`, for a chosen cipher suite, still with the QUIC v1 HKDF
+    /// labels.
     pub fn makeOpenWithCipher(traffic_secret: [32]u8, cipher: quic_crypto.CipherSuite) quic_crypto.Open {
         return makeOpenFull(traffic_secret, cipher, protocol.QUIC_V1);
     }
 
+    /// As `makeSeal`, for a chosen cipher suite, still with the QUIC v1 HKDF
+    /// labels.
     pub fn makeSealWithCipher(traffic_secret: [32]u8, cipher: quic_crypto.CipherSuite) quic_crypto.Seal {
         return makeSealFull(traffic_secret, cipher, protocol.QUIC_V1);
     }
 
+    /// An `Open` for a chosen cipher suite and QUIC version. `version`
+    /// selects the HKDF label prefix, so it must be the version the traffic
+    /// secret itself was derived under: a mismatch produces a key the peer
+    /// cannot reproduce, which shows up as every packet failing to decrypt
+    /// rather than as an error here.
+    ///
+    /// The returned context is prepared, so it is ready to use and owns no
+    /// allocation.
     pub fn makeOpenFull(traffic_secret: [32]u8, cipher: quic_crypto.CipherSuite, version: u32) quic_crypto.Open {
         const kl = cipher.keyLen();
         const label_iv = protocol.quicLabel(version, .iv);
@@ -527,6 +729,8 @@ pub const KeySchedule = struct {
         return open;
     }
 
+    /// As `makeSeal`, for a chosen cipher suite and QUIC version, with the
+    /// same requirement that `version` match the derivation.
     pub fn makeSealFull(traffic_secret: [32]u8, cipher: quic_crypto.CipherSuite, version: u32) quic_crypto.Seal {
         const kl = cipher.keyLen();
         const label_iv = protocol.quicLabel(version, .iv);
@@ -540,7 +744,12 @@ pub const KeySchedule = struct {
         return seal;
     }
 
-    // Compute the Finished verify_data.
+    /// Computes the Finished verify_data: an HMAC over the transcript hash
+    /// keyed by the base traffic secret, which is what RFC 8446 §4.4.4
+    /// defines. Static, so each side can compute the other's value without a
+    /// handshake object; `base_key` is the traffic secret being finished and
+    /// `transcript_hash` the transcript up to but not including this
+    /// Finished.
     pub fn computeFinishedVerifyData(base_key: [32]u8, transcript_hash: [32]u8) [32]u8 {
         const finished_key = quic_crypto.hkdfExpandLabel(base_key, "finished", "", 32);
         return tls.hmac(HmacSha256, &transcript_hash, finished_key);
@@ -553,37 +762,104 @@ pub const KeySchedule = struct {
 
 // ─── Session Ticket (0-RTT resumption) ───────────────────────────────
 
+/// One resumption ticket, from both ends: what a server seals and hands out,
+/// and what a client parses back out of a NewSessionTicket.
+///
+/// It is a plain value with no allocator and no borrow — the `ticket` array is
+/// inline, at most 512 bytes — so it can be stored in a config, returned by
+/// value and copied freely. What the *caller* must keep is the
+/// `Resumption.client` pointer that refers to it, which stays borrowed for
+/// the handshake's life.
+///
+/// A ticket is bearer material: whoever holds `psk` resumes as the peer this
+/// connection authenticated. That is why a client config keeps it behind
+/// `TlsConfig.resumption` and why a server's sealing key and a client's
+/// ticket cannot be set independently of each other.
+///
+/// `creation_time` and `lifetime` are in seconds and are only ever
+/// subtracted, so both ends may use any base their own clock uses.
 pub const SessionTicket = struct {
-    psk: [32]u8, // Pre-shared key derived from resumption_master_secret
-    ticket: [512]u8 = .{0} ** 512, // Opaque ticket data (encrypted by server)
+    /// Pre-shared key derived from resumption_master_secret
+    ///
+    /// The secret a resumed handshake starts from. It is the whole security
+    /// of the resumption: possession of it is what a replayed ticket proves.
+    psk: [32]u8,
+    /// Opaque ticket data (encrypted by server)
+    ///
+    /// At most 512 bytes; `ticket_len` says how many. The server fills it
+    /// with AES-128-GCM output under its `TicketKey` and a client fills it
+    /// with the bytes from the NewSessionTicket, so neither end can read the
+    /// other's fields out of it.
+    ticket: [512]u8 = .{0} ** 512,
+    /// Bytes of `ticket` in use, at most 512. Zero is a ticket that was
+    /// never filled, not an empty one.
     ticket_len: u16 = 0,
-    ticket_age_add: u32 = 0, // Age obfuscation value
+    /// Age obfuscation value
+    ///
+    /// RFC 8446 §4.6.1's per-ticket nonce, subtracted from the client's age
+    /// before it is compared to the server's clock. A client that has not
+    /// stored it may leave it zero; the server then rejects an aged ticket
+    /// rather than mis-timing one.
+    ticket_age_add: u32 = 0,
     /// A second on the caller's clock, not on the epoch. Only differences
     /// against another stamp from that same clock are ever taken of it, so
     /// the base cancels and nothing here depends on what zero means.
     creation_time: i64 = 0,
-    lifetime: u32 = 0, // Seconds
-    max_early_data_size: u32 = 0, // From early_data extension
-    alpn: [16]u8 = .{0} ** 16, // Negotiated ALPN
+    /// How long the ticket stays usable, in seconds from
+    /// `creation_time`. Zero — the default — is "not recorded", and makes
+    /// `isExpired` answer true for any clock at or after the instant it was
+    /// stamped.
+    lifetime: u32 = 0,
+    /// How much 0-RTT data the peer said it would accept, in bytes. Zero
+    /// means the peer offered no early_data extension, and a resuming client
+    /// must then send none rather than treating the ticket as permission.
+    max_early_data_size: u32 = 0,
+    /// Negotiated ALPN
+    ///
+    /// At most 16 bytes; `alpn_len` says how many. A resumed handshake has to
+    /// offer the same protocol, so this is what a client checks its own
+    /// proposal against before sending 0-RTT.
+    alpn: [16]u8 = .{0} ** 16,
+    /// Bytes of `alpn` in use, at most 16.
     alpn_len: u8 = 0,
 
     // RFC 9000 §7.4.1: remembered transport parameters for 0-RTT
+    ///
+    /// What the connection that issued the ticket was told, carried forward
+    /// so a 0-RTT attempt is sent under limits the peer has already granted.
+    /// These are an optimisation: dropping them costs 0-RTT its remembered
+    /// limits and nothing else, and they are not consulted on a full
+    /// handshake. A remembered limit below what the peer has since granted is
+    /// simply superseded when the peer's own parameters arrive.
     initial_max_data: u64 = 0,
     initial_max_stream_data_bidi_local: u64 = 0,
     initial_max_stream_data_bidi_remote: u64 = 0,
     initial_max_stream_data_uni: u64 = 0,
     initial_max_streams_bidi: u64 = 0,
     initial_max_streams_uni: u64 = 0,
+    /// The connection id limit to assume before the peer's parameters arrive.
+    /// Two is RFC 9000 §5.1.1's floor and this stack's default; a peer that
+    /// advertised a higher one supersedes it.
     active_connection_id_limit: u64 = 2,
 
+    /// The opaque ticket bytes, as a slice of the inline array. Valid as long
+    /// as the ticket is not moved or overwritten, and freed with nothing.
     pub fn getTicket(self: *const SessionTicket) []const u8 {
         return self.ticket[0..self.ticket_len];
     }
 
+    /// The ALPN the original connection negotiated, at most 16 bytes. A
+    /// resumed handshake must offer this one again; a zero `alpn_len` is a
+    /// ticket from a connection that negotiated no protocol.
     pub fn getAlpn(self: *const SessionTicket) []const u8 {
         return self.alpn[0..self.alpn_len];
     }
 
+    /// Whether the ticket is past `lifetime` at `now_s`. Both are seconds on
+    /// this clock and the comparison is a plain difference, so a client may
+    /// only ask about a ticket it stamped itself. A zero `lifetime` — the
+    /// default — makes every ticket expired, which is the safe answer for a
+    /// ticket whose lifetime was never recorded.
     pub fn isExpired(self: *const SessionTicket, now_s: i64) bool {
         return (now_s - self.creation_time) > @as(i64, self.lifetime);
     }
@@ -607,8 +883,17 @@ const sealed_ticket_len = 80;
 /// two generators, which is the property the whole pure core is for
 /// (DECISIONS/0002).
 pub const TicketKey = struct {
+    /// The AES-128-GCM key itself. Sixteen bytes, held in the clear because
+    /// the process holding it is the one sealing tickets; nothing here
+    /// protects it at rest, which is why it is generated once and never
+    /// written anywhere else.
     bytes: [16]u8,
 
+    /// Draws a key from `random`, the caller's generator, borrowed for the
+    /// call and not retained. A value with no deinit and no owner: whoever
+    /// holds it owns the tickets it seals and opens them for as long as it
+    /// lives, and there is no setter, so replacing a key means replacing
+    /// every config that holds it.
     pub fn generate(random: std.Random) TicketKey {
         var key: TicketKey = undefined;
         random.bytes(&key.bytes);
@@ -630,7 +915,11 @@ pub const TicketKey = struct {
 /// The tag says which end is speaking, so a client config cannot be handed
 /// a sealing key and a server config cannot be handed a ticket.
 pub const Resumption = union(enum) {
+    /// This side is a server: it seals tickets under this key and opens them
+    /// under it, and holds the key by value.
     server: TicketKey,
+    /// This side is a client: it resumes with this ticket, and borrows it —
+    /// the `TlsConfig.resumption` pointer must outlive the handshake.
     client: *const SessionTicket,
 
     /// The key to seal and open tickets under, or null on a config that
@@ -657,12 +946,26 @@ pub const Resumption = union(enum) {
 // ─── Server certificates / SNI ───────────────────────────────────────
 
 /// A certificate chain and the private key for its leaf.
+///
+/// Every field borrows: the chain and the key must outlive the
+/// `TlsConfig` that holds this and the handshake built from it, and nothing
+/// here is copied. The key is the one that signs *this* side's
+/// CertificateVerify — it is not the peer's, and `ClientAuth.expect_node_id`
+/// is what says whose is whose.
 pub const ServerCertificate = struct {
     /// DER-encoded certificates, leaf first.
+    ///
+    /// This stack never walks the chain: `liftEd25519Spki` reads the leaf and
+    /// that is the whole of validation. The rest is carried so a peer that
+    /// does walk it has something to walk.
     cert_chain_der: []const []const u8,
     /// Raw P-256 scalar or Ed25519 seed (32 bytes), or an RSA key's PKCS#1
     /// DER, as `extractPrivateKey` returns them.
     private_key_bytes: []const u8,
+    /// Which algorithm the key above is. Defaults to P-256 because that is
+    /// what `extractPrivateKey` most often returns; a caller supplying an
+    /// Ed25519 or RSA key must set it, or the handshake will pick a scheme
+    /// the key cannot sign with and fail with `error.HandshakeFailure`.
     private_key_algorithm: PrivateKeyAlgorithm = .ecdsa_p256_sha256,
 };
 
@@ -673,21 +976,44 @@ pub const CertEntry = struct {
     /// exactly one label (`a.example.com`, not `example.com` or
     /// `a.b.example.com`). Matching is ASCII case-insensitive.
     server_names: []const []const u8,
+    /// The certificate and key to present. Borrowed from the same storage
+    /// `server_names` names, and like them it has to outlive every handshake
+    /// this entry serves.
     cert: ServerCertificate,
     /// Ask clients that reach this certificate for one of their own.
+    ///
+    /// Overrides `TlsConfig.client_auth` for this entry only, because a
+    /// certificate served for some names may have a different policy from
+    /// one served for others. Null means the connection-wide policy applies,
+    /// not that no certificate is asked for.
     client_auth: ?*const ClientAuth = null,
 };
 
+/// The certificate chosen for a ClientHello, and whether the client's name
+/// chose it. `entry` points into the `entries` slice the selection was made
+/// from, so both it and `CertEntry.cert` borrow that slice and die with it;
+/// nothing is copied.
 pub const CertSelection = struct {
     entry: *const CertEntry,
     /// False when the client sent no SNI or nothing matched it, so the first
     /// entry was used as the default.
+    ///
+    /// The distinction a caller needs: false means this certificate was
+    /// served because nothing better was available, and a client that sent a
+    /// name this server does not serve got a certificate for a different
+    /// name. True means the name matched and nothing is wrong.
     matched: bool,
 };
 
 /// Picks the certificate for a ClientHello's SNI: an exact name first, then a
 /// one-label wildcard, then `entries[0]`. Returns null only when `entries` is
 /// empty.
+///
+/// `sni` is the host_name out of the extension, or null when the client sent
+/// none; a trailing dot is stripped, because RFC 6066 forbids it and clients
+/// send it anyway. Matching is ASCII case-insensitive, and a `"*."` entry
+/// matches exactly one label. `entries` is borrowed and not retained, nothing
+/// is allocated, and the only failure is an empty list.
 pub fn selectCertificate(entries: []const CertEntry, sni: ?[]const u8) ?CertSelection {
     return selectCertificateFor(entries, sni, null);
 }
@@ -697,6 +1023,13 @@ pub fn selectCertificate(entries: []const CertEntry, sni: ?[]const u8) ?CertSele
 /// client's signature_algorithms list body. The default step considers every
 /// entry, so a client that cannot verify `entries[0]` gets another
 /// certificate rather than a failed handshake.
+///
+/// `sig_algs` is the list body, borrowed and not retained; null is the same
+/// as passing no preference at all, which is what `selectCertificate` does.
+/// The preference only chooses *within* a step: an exact match whose key the
+/// client cannot verify still wins over a wildcard whose key it can, because
+/// the name is what the client asked for. The result borrows `entries` and
+/// nothing is allocated, so the only failure is an empty list.
 pub fn selectCertificateFor(entries: []const CertEntry, sni: ?[]const u8, sig_algs: ?[]const u8) ?CertSelection {
     if (entries.len == 0) return null;
     const Pick = struct {
@@ -754,6 +1087,15 @@ pub fn selectCertificateFor(entries: []const CertEntry, sni: ?[]const u8, sig_al
 
 /// Parses the host_name out of a server_name extension body (RFC 6066 §3).
 /// Returns null for a list with no host_name entry.
+///
+/// The result borrows `data`, so it lives as long as the parsed extension and
+/// nothing is allocated. Null is a well-formed list with no host_name — a
+/// client that sent no name — and is not an error.
+///
+/// `error.DecodeError` for anything malformed: a length that does not close
+/// the extension, an empty list, a second host_name entry, or a zero-length
+/// name. Other name types in the list are skipped rather than refused, since
+/// RFC 6066 §3 defines them for other uses and this stack has none.
 pub fn parseServerNameExtension(data: []const u8) error{DecodeError}!?[]const u8 {
     if (data.len < 2) return error.DecodeError;
     const list_len: usize = readU16(data); // widened: + 2 overflows u16 at 0xFFFF
@@ -779,20 +1121,44 @@ pub fn parseServerNameExtension(data: []const u8) error{DecodeError}!?[]const u8
 
 /// One TLS 1.3 session's configuration.
 ///
+/// Every field borrows and none is copied: the certificate chain, the
+/// private key, the ALPN strings, the SNI, the client-auth policy, the
+/// ticket, the resumption key and the transport parameters all have to
+/// outlive the `Tls13Handshake` built from this config, and the handshake
+/// stores the config itself rather than references into it. There is no
+/// `deinit` for a config — the caller frees whatever it pointed at, in its
+/// own order — and writing a field after the handshake has started has no
+/// effect on that handshake.
+///
+/// It is a plain value and may be copied or rebuilt per connection; a copy
+/// shares every borrow with the original and must outlive the same span.
+///
 /// There is no chain to walk and no flag to switch that off: a peer is
 /// identified by the key its certificate carries, and the two ways of
 /// saying which key that is — a node id (`expect_peer_node_id`) or a
 /// fingerprint of the certificate itself (`cert_hashes`) — are fields here,
 /// said separately, rather than one switch that stands for both.
 pub const TlsConfig = struct {
-    cert_chain_der: []const []const u8, // DER-encoded certificates
-    private_key_bytes: []const u8, // See ServerCertificate.private_key_bytes
+    /// This side's own certificate chain, leaf first, used when `certs` is
+    /// empty. Ignored on a client and whenever `certs` is non-empty.
+    cert_chain_der: []const []const u8,
+    /// See ServerCertificate.private_key_bytes
+    ///
+    /// The key that signs this side's CertificateVerify, on the same terms.
+    private_key_bytes: []const u8,
+    /// Which algorithm the key above is, with the same default and the same
+    /// consequence of getting it wrong as `ServerCertificate`'s.
     private_key_algorithm: PrivateKeyAlgorithm = .ecdsa_p256_sha256,
     /// Server only: certificates chosen by the ClientHello's SNI (see
     /// `selectCertificate`). When non-empty, this replaces `cert_chain_der` /
     /// `private_key_bytes` / `private_key_algorithm`, with `certs[0]` as the
     /// default for a client that sends no SNI or an unknown name.
     certs: []const CertEntry = &.{},
+    /// The application protocols this side will speak, in preference order.
+    /// A server picks the first its client also offered and echoes it; a
+    /// client offers them all and fails with `error.NoApplicationProtocol`
+    /// when the server's answer is not among them. Empty is a config that
+    /// will negotiate no protocol, which a peer is entitled to refuse.
     alpn: []const []const u8,
     /// Server only: ask for a client certificate. With `certs`, the
     /// selected entry's `client_auth` applies instead.
@@ -800,6 +1166,10 @@ pub const TlsConfig = struct {
     /// Client only: presented when the server asks for a certificate;
     /// without one the client answers with an empty Certificate.
     client_certificate: ?ServerCertificate = null,
+    /// The host name to put in the ClientHello's server_name extension.
+    /// Client only, borrowed for the handshake's life, and null means no SNI
+    /// at all — which is what a client connecting by address rather than by
+    /// name sends, and what makes a server pick its default certificate.
     server_name: ?[]const u8 = null, // SNI (client only)
     /// The node id the peer's certificate has to carry, compared byte for
     /// byte against the 32 bytes lifted from its `SubjectPublicKeyInfo`.
@@ -825,49 +1195,157 @@ pub const TlsConfig = struct {
     /// with, a server the key it seals and opens tickets under. Null is a
     /// connection that never resumes, and it is one null for both roles.
     resumption: ?Resumption = null,
-    cipher_suite_only: ?quic_crypto.CipherSuite = null, // If set, offer ONLY this cipher suite
-    quic_version: u32 = protocol.QUIC_V1, // QUIC version (affects HKDF labels)
+    /// The only cipher suite this side will offer or accept. Null offers
+    /// `aes_128_gcm_sha256`, which is the only suite this handshake
+    /// implements either way — so setting this narrows nothing today and is
+    /// here to keep a future suite from being negotiated by accident.
+    cipher_suite_only: ?quic_crypto.CipherSuite = null,
+    /// The QUIC version the keys are labelled for. It must be the version
+    /// the connection is speaking: the label prefix goes into every key
+    /// derivation, so a mismatch yields keys the peer cannot reproduce and
+    /// every packet fails to decrypt rather than an error at handshake time.
+    quic_version: u32 = protocol.QUIC_V1,
 };
 
 // ─── Handshake state machine ─────────────────────────────────────────
 
+/// Everything `Tls13Handshake.step` can fail with, and what each one means on
+/// the wire.
+///
+/// Any member ends the handshake: `Connection` translates it into a QUIC
+/// close — `TransportParameterError` into a TRANSPORT_PARAMETER_ERROR
+/// transport error, every other member into CRYPTO_ERROR carrying the TLS
+/// alert named on that tag — and the handshake value is not used again. So
+/// none of these leaves partial state a caller has to unwind: the only
+/// residue is whatever the caller had already done with earlier `Action`s,
+/// which the connection has itself closed over.
+///
+/// The tags are exhaustive, so a `switch` over them is checked, and
+/// `InternalError` is the catch-all for anything a local step could not do.
 pub const HandshakeError = error{
+    /// A message arrived in a state that does not allow it, or one this
+    /// stack refuses in QUIC: KeyUpdate (RFC 9001 §6) and EndOfEarlyData
+    /// (§8.3) both MUST NOT be used and are refused here rather than
+    /// handled. Maps to the `unexpected_message` alert.
     UnexpectedMessage,
+    /// A handshake message did not parse: a length that does not close it, a
+    /// field past the end, or a list whose own length disagrees with its
+    /// contents. The one error a peer can trigger deliberately and cheaply.
+    /// Maps to `decode_error`.
     DecodeError,
+    /// The peer's certificate is unusable for a reason that is not its
+    /// signature: a chain longer than the caller allowed in
+    /// `parseCertificateList`, or a certificate the SPKI rules reject where
+    /// `BadCertificateVerify` does not fit. Maps to `bad_certificate`.
     BadCertificate,
+    /// The peer's CertificateVerify did not verify under the key its
+    /// certificate carries, or the certificate carries a key other than the
+    /// one that was expected. `verifyCertificateVerifySignature` returns this
+    /// for an unsupported scheme too, so the two are indistinguishable by
+    /// design. Maps to `decrypt_error`.
     BadCertificateVerify,
+    /// The peer's Finished did not verify against the transcript this side
+    /// has. Maps to `decrypt_error`; the connection closes, so nothing after
+    /// this point is recoverable.
     BadFinished,
+    /// A local step failed that the peer did not cause: an output buffer too
+    /// small for a message this stack builds, or a private key that will not
+    /// parse. Maps to `internal_error`.
     InternalError,
+    /// The key exchange produced nothing usable: the peer's P-256 point did
+    /// not parse, the scalar multiplication failed, or the X25519 scalarmult
+    /// returned an all-zero shared secret. Maps to `internal_error`, because
+    /// telling a peer its point was rejected is information it can use.
     KeyScheduleError,
+    /// The ClientHello or ServerHello offered no key share this side can use:
+    /// no group in common, or none of the offered groups produced a usable
+    /// share. Maps to `handshake_failure`.
     NoKeyShare,
+    /// The peer's supported_versions named no version this stack speaks.
+    /// Maps to `protocol_version`.
     UnsupportedVersion,
+    /// The peer named no application protocol, or named one this side does
+    /// not offer in `alpn`. Maps to `no_application_protocol`.
     NoApplicationProtocol,
+    /// An extension RFC 8446 makes mandatory for this message was absent —
+    /// supported_versions, key_share, or signature_algorithms in a
+    /// CertificateRequest. Maps to `missing_extension`.
     MissingExtension,
     /// The client offers no signature scheme our certificate can use.
+    /// `signatureSchemeFor` found nothing in the client's
+    /// signature_algorithms that the configured key can sign with, so the
+    /// server has no CertificateVerify it could produce. Maps to
+    /// `handshake_failure`.
     HandshakeFailure,
+    /// The peer's QUIC transport parameters are malformed or violate a limit
+    /// this stack enforces. The one member of this set that is *not* a TLS
+    /// alert: `Connection` turns it into a QUIC TRANSPORT_PARAMETER_ERROR
+    /// transport close instead of a CRYPTO_ERROR.
     TransportParameterError,
     /// `ClientAuth.mode` is `.required` and the client sent no certificate.
+    /// Also raised when a server must sign and has no certificate at all.
+    /// Maps to `certificate_required`.
     CertificateRequired,
+    /// A field carried a value RFC 8446 forbids: a non-empty
+    /// certificate_request_context, a second copy of an extension, or a
+    /// context where this stack sends none. Maps to `illegal_parameter`.
     IllegalParameter,
 };
 
+/// What one `step` produced, for the caller to carry out. Exhaustive, so a
+/// `switch` over it is checked — with `_continue` in it, which is why the
+/// tags below carry what a caller is meant to do rather than only what the
+/// handshake did.
 pub const Action = union(enum) {
+    /// Handshake bytes to hand to the crypto stream at `level`. The bytes
+    /// borrow the handshake's own output buffer, so the caller must queue
+    /// them before the next `step`.
     send_data: SendData,
+    /// Packet protection keys for `level`, to install in the connection. The
+    /// contexts own no allocation; the caller stores them and keeps them
+    /// until a key update replaces them.
     install_keys: InstallKeys,
+    /// Nothing more can be done until `provideData` supplies more of the
+    /// peer's flight. `step` may be called again before that and will keep
+    /// answering this.
     wait_for_data,
+    /// The handshake is done: `isComplete` is true, keys are installed, and
+    /// further `step` calls answer `complete` while still consuming
+    /// post-handshake messages a client can receive.
     complete,
     // Internal: signal to continue processing
+    /// Not a caller-visible outcome. `step` uses it to tell its own loop to
+    /// go round again after consuming a message without producing anything,
+    /// and returns it by accident: a caller that treats it as an action will
+    /// do nothing at all and spin.
     _continue,
 };
 
+/// One flight of handshake bytes, at the encryption level they must be sent
+/// under.
 pub const SendData = struct {
+    /// Where to write them. The bytes go into the crypto stream for this
+    /// level, and must go there before the next `step`: the slice they borrow
+    /// is the handshake's output buffer, which the next flight overwrites.
     level: EncryptionLevel,
+    /// The bytes, borrowing the handshake's `out_buf`. Valid until the next
+    /// `step` and no longer; the caller copies them into the crypto stream
+    /// and frees nothing.
     data: []const u8,
 };
 
+/// The packet protection contexts for one encryption level.
 pub const InstallKeys = struct {
+    /// Which level these are for. `.early_data` is 0-RTT and arrives before
+    /// the handshake completes; the other three replace what the connection
+    /// already holds.
     level: EncryptionLevel,
+    /// The context for reading packets at this level. The peer writes with
+    /// the traffic secret this side does not hold.
     open: quic_crypto.Open,
+    /// The context for writing packets at this level, holding this side's
+    /// traffic secret. It owns no allocation and does not retain the
+    /// handshake.
     seal: quic_crypto.Seal,
 };
 
@@ -898,67 +1376,184 @@ const HandshakeState = enum {
     connected,
 };
 
+/// One TLS 1.3 handshake in progress, and its whole state.
+///
+/// It is about 52 KB, almost all of it the inbound and outbound flight
+/// buffers, which is why `initClientInto` and `initServerInto` build it in
+/// place rather than returning it by value. It is a single value with one
+/// owner: the caller supplies the storage, and `deinit` releases what the
+/// handshake allocated inside it. Copying one copies the whole 52 KB and
+/// would leave two owners of `peer_cert`, so a handshake must not be
+/// copied.
+///
+/// What it borrows is `config` and everything `config` points at, plus
+/// `local_transport_params`, which is encoded into `tp_encoded` during
+/// construction precisely so a later move cannot leave a dangling slice.
+/// All of it must outlive the handshake.
+///
+/// It reads no clock and holds no entropy: `step` takes `now_s` and
+/// `random` per call and stores neither, so the same handshake driven twice
+/// with two clocks is two different handshakes. `peer_cert` is the one
+/// allocation it makes, and only a server with client authentication in force
+/// ever allocates it.
+///
+/// Not thread-safe.
 pub const Tls13Handshake = struct {
+    /// Where in the flight this handshake is. Internal state, but readable:
+    /// it is what `isComplete` reports, and a caller resuming a suspended
+    /// handshake has nothing else to reconstruct progress from.
     state: HandshakeState,
+    /// Which end this side speaks, fixed at construction. Decides the
+    /// transcript order, which secrets are ours, and whether a client
+    /// certificate is expected.
     is_server: bool,
+    /// Every handshake message so far, in wire order. Appended to before a
+    /// message is acted on, which is what makes Finished and
+    /// CertificateVerify verifiable.
     transcript: TranscriptHash,
+    /// The secrets derived so far. `computed_handshake` and `computed_app`
+    /// say which of them hold anything.
     key_schedule: KeySchedule,
+    /// The configuration, copied in by value at construction. Every slice in
+    /// it still borrows the caller's memory, which is why the whole of
+    /// `TlsConfig`'s borrow obligation lands here too.
     config: TlsConfig,
+    /// This side's QUIC transport parameters, sent in the extension. Their
+    /// connection ids borrow the connection's own arrays and are encoded
+    /// into `tp_encoded` here, so this value may be moved afterwards without
+    /// dangling.
     local_transport_params: transport_params.TransportParams,
+    /// The peer's, once its extension has been decoded and checked, or null
+    /// before that. A decoded set of parameters borrows the buffer it was
+    /// decoded from — here the handshake's own `in_buf` — so it must not be
+    /// read after a later `provideData` compacts that buffer.
     peer_transport_params: ?transport_params.TransportParams = null,
 
     // X25519 key pair
+    /// This side's X25519 private scalar. Written once by the `init*`
+    /// constructors from `random` and never read again except to derive the
+    /// shared secret; the peer never sees it.
     x25519_secret: [32]u8 = undefined,
+    /// This side's X25519 public key, offered in the key_share. Sent to the
+    /// peer in the clear.
     x25519_public: [32]u8 = undefined,
+    /// The peer's X25519 public key from the key_share. Undefined until a
+    /// key share has been processed, and only meaningful for the group in
+    /// `negotiated_group`.
     peer_x25519_public: [32]u8 = undefined,
 
     // P-256 key exchange
+    /// This side's P-256 private scalar, the same arrangement as
+    /// `x25519_secret`. Offered alongside X25519 in the ClientHello so a peer
+    /// that does not do X25519 still has a group in common.
     p256_secret: [32]u8 = undefined,
-    p256_public: [65]u8 = undefined, // our uncompressed public point
-    peer_p256_public: [65]u8 = undefined, // peer's uncompressed public point
+    /// our uncompressed public point — the 0x04-prefixed SEC1 form offered
+    /// in the key_share, and therefore public.
+    p256_public: [65]u8 = undefined,
+    /// peer's uncompressed public point — undefined until a key share has
+    /// been processed, and only meaningful for the group in
+    /// `negotiated_group`.
+    peer_p256_public: [65]u8 = undefined,
+    /// The group the shared secret came from. The ClientHello offers both,
+    /// and only the one the peer echoed is used; a key share for the other
+    /// group is present but never read.
     negotiated_group: tls.NamedGroup = .x25519,
 
     // Outgoing flight, built in place; see limits.tls_handshake_out.
+    /// The flight being assembled, and the buffer every `SendData.data`
+    /// borrows. Fixed at `limits.tls_handshake_out` bytes, which is the
+    /// ceiling on one flight; a flight that would exceed it fails with
+    /// `error.InternalError` rather than growing.
     out_buf: [limits.tls_handshake_out]u8 = undefined,
+    /// Bytes of `out_buf` valid.
     out_len: usize = 0,
 
     // Pending actions returned by step()
+    /// Set when handshake keys are ready; consumed by the next `step`, which
+    /// returns the `InstallKeys` instead of doing anything else. A caller
+    /// that sees it has not yet installed handshake keys.
     pending_install_handshake: bool = false,
+    /// The same for the application keys, which arrive after the peer's
+    /// Finished has been verified.
     pending_install_app: bool = false,
+    /// Whether handshake keys have been handed out. Kept so the connection
+    /// can tell "installed" from "not yet offered".
     handshake_keys_installed: bool = false,
+    /// Whether 1-RTT keys have been handed out. False on a connection that
+    /// never completes, and the reason a client with no server Finished is
+    /// not sending application data.
     app_keys_installed: bool = false,
 
     // Pre-encoded transport params (avoids dangling slice issues after struct move)
+    /// This side's transport parameters, already encoded, so the extension
+    /// body can be written after the struct has moved without following a
+    /// slice into the caller's arrays.
     tp_encoded: [256]u8 = undefined,
+    /// Bytes of `tp_encoded` valid. A `local_transport_params.encode` that
+    /// did not fit is silently dropped and this stays zero, which the peer
+    /// then sees as an absent extension.
     tp_encoded_len: usize = 0,
 
     // Peer flight being reassembled; see limits.tls_handshake_in.
+    /// The peer's bytes, copied in by `provideData` and parsed in place.
+    /// Fixed at `limits.tls_handshake_in`; `provideData` drops whatever it
+    /// cannot hold rather than failing, so a flight larger than the buffer
+    /// stalls the handshake instead of ending it.
     in_buf: [limits.tls_handshake_in]u8 = undefined,
+    /// Bytes of `in_buf` valid.
     in_len: usize = 0,
+    /// How far into `in_buf` the parser has consumed. `provideData`
+    /// compacts the buffer when this is past zero and the next copy would not
+    /// fit, which is also why `peer_transport_params` must not be read after
+    /// a later call.
     in_offset: usize = 0,
 
     // Client random for ServerHello matching
+    /// The random this client put in its ClientHello, kept so the ServerHello
+    /// can be checked against it.
     client_random: [32]u8 = undefined,
 
     // Peer's legacy_session_id from ClientHello (must be echoed in ServerHello)
+    /// The `legacy_session_id` the client sent, echoed verbatim in the
+    /// ServerHello. RFC 8446 §4.1.2 caps it at 32 bytes; this stack does not
+    /// enforce that cap, so a longer one is truncated rather than refused.
     peer_session_id: [32]u8 = .{0} ** 32,
+    /// Bytes of `peer_session_id` in use, at most 32.
     peer_session_id_len: u8 = 0,
 
     // Server hello random
+    /// The random from the ServerHello. Checked against nothing here; it is
+    /// kept because the transcript needs the bytes and a re-encode would not
+    /// reproduce them.
     server_random: [32]u8 = undefined,
 
     /// The peer's node id, lifted out of the 32 bytes its certificate's
     /// `SubjectPublicKeyInfo` carries. Null until a Certificate is accepted,
     /// and the only thing a lifted key ever has to be.
+    ///
+    /// Lifted, not compared: whether it is the node the caller wanted is
+    /// decided by `TlsConfig.expect_peer_node_id`, and a mismatch ends the
+    /// handshake rather than leaving this field set to something rejected.
     peer_node_id: ?[32]u8 = null,
 
     // Transcript hash at server Finished for app key derivation
+    /// The transcript as of the server's Finished, snapshotted because the
+    /// application secrets are derived from that point and the transcript
+    /// keeps moving afterwards.
     transcript_at_server_finished: [32]u8 = undefined,
 
     // Negotiated cipher suite (set during ServerHello processing)
+    /// The suite both sides settled on. `aes_128_gcm_sha256` until a
+    /// ServerHello says otherwise, and the value every `makeOpen` and
+    /// `makeSeal` on the application keys is built with — so it must be set
+    /// before those are derived, not after.
     negotiated_cipher_suite: quic_crypto.CipherSuite = .aes_128_gcm_sha256,
 
     // PSK / 0-RTT fields
+    /// Whether this handshake resumed from a ticket. A PSK skips the
+    /// server's own Certificate and CertificateVerify and nothing else; it
+    /// does not skip the client's certificate, because a session ticket is
+    /// bearer material.
     using_psk: bool = false,
 
     /// Client: the server asked for a client certificate. Without one to
@@ -987,6 +1582,8 @@ pub const Tls13Handshake = struct {
     /// server advertising several has to echo the one that matched, not
     /// its own first choice.
     selected_alpn: [32]u8 = .{0} ** 32,
+    /// Bytes of `selected_alpn` in use. Zero before a match, which is how
+    /// `negotiatedAlpn` tells "not chosen yet" from "chosen nothing".
     selected_alpn_len: usize = 0,
 
     /// Server: the certificate we present — the config's single one, or the
@@ -995,13 +1592,33 @@ pub const Tls13Handshake = struct {
     /// Server: the CertificateVerify scheme, picked from the ClientHello.
     server_sig_scheme: tls.SignatureScheme = .ecdsa_secp256r1_sha256,
 
+    /// Server: whether 0-RTT was accepted. Requires both that the client
+    /// offered the early_data extension and that the PSK opened; either
+    /// alone is not a licence to send, and this is the answer the connection
+    /// acts on.
     zero_rtt_accepted: bool = false,
+    /// Set once the 0-RTT keys are ready; consumed by the next `step`, which
+    /// returns the `InstallKeys` and nothing else. The first thing a resumed
+    /// client is handed.
     pending_install_early: bool = false,
+    /// A NewSessionTicket this side received, parsed and verified. The client
+    /// holds at most the most recent one, so a later ticket replaces this;
+    /// null until one arrives and after a server has none.
     received_ticket: ?SessionTicket = null,
+    /// Nonce counter for each ticket this server issues, incremented per
+    /// ticket. It is what makes two tickets from one handshake differ, so a
+    /// peer cannot tell a replay from a fresh ticket by the ciphertext
+    /// alone.
     ticket_nonce_counter: u32 = 0,
 
     /// The protocol in force: what the server matched, or — on a client,
     /// or before a match — the first one we offered.
+    ///
+    /// A slice of `selected_alpn`, or of `config.alpn[0]`, or a static empty
+    /// string: it borrows the handshake and is invalidated by the next `step`
+    /// that changes the selection. Before a handshake this is the config's
+    /// first entry rather than an answer, so a caller that reads it early
+    /// sees an intention, not a negotiation.
     pub fn negotiatedAlpn(self: *const @This()) []const u8 {
         if (self.selected_alpn_len > 0) return self.selected_alpn[0..self.selected_alpn_len];
         return if (self.config.alpn.len > 0) self.config.alpn[0] else "";
@@ -1015,6 +1632,18 @@ pub const Tls13Handshake = struct {
     /// here. A handshake that reached for a global CSPRNG could not be driven
     /// twice with two different generators, and that is the property the pure
     /// core is for (DECISIONS/0002).
+    ///
+    /// `out` is the caller's storage and stays theirs; this fills it in place
+    /// and never frees it. `config` is copied in, which copies its borrows
+    /// and not the bytes behind them, so every slice in it — the chain, the
+    /// key, the ALPN strings, the SNI, the resumption ticket — must outlive
+    /// `out`. `local_tp` is read and encoded here and then not needed, so its
+    /// own borrows end with this call. `random` is borrowed for the call and
+    /// not retained: three key pairs and the greased transport parameter come
+    /// from it and nothing is stored but the resulting keys.
+    ///
+    /// Cannot fail, and does no I/O: a client is ready to send its
+    /// ClientHello at the first `step`.
     pub fn initClientInto(
         out: *Tls13Handshake,
         config: TlsConfig,
@@ -1083,6 +1712,10 @@ pub const Tls13Handshake = struct {
         self.negotiated_group = .x25519;
     }
 
+    /// `initClientInto` returning by value. The same 52 KB is copied out of
+    /// this frame and into the caller's, so prefer the `*Into` form wherever
+    /// the stack has a fixed place to put one; a caller that wants a value
+    /// may `deinit` it exactly once, as with any handshake.
     pub fn initClient(
         config: TlsConfig,
         local_tp: transport_params.TransportParams,
@@ -1093,6 +1726,8 @@ pub const Tls13Handshake = struct {
         return self;
     }
 
+    /// `initServerInto` returning by value, with the same stack cost as
+    /// `initClient` and the same ownership.
     pub fn initServer(
         config: TlsConfig,
         local_tp: transport_params.TransportParams,
@@ -1104,6 +1739,12 @@ pub const Tls13Handshake = struct {
     }
 
     /// Builds the server handshake in place — see initClientInto.
+    ///
+    /// A server generates no P-256 key pair: it only ever answers with the
+    /// group the client chose, so there is nothing of its own to offer. The
+    /// greased transport parameter is drawn from `random` for the same
+    /// protocol-probe reason as on the client, and unlike the ECDSA nonce and
+    /// the PSS salt, repeating it costs nothing.
     pub fn initServerInto(
         out: *Tls13Handshake,
         config: TlsConfig,
@@ -1165,7 +1806,21 @@ pub const Tls13Handshake = struct {
         self.negotiated_group = .x25519;
     }
 
-    // Provide incoming crypto stream data to the handshake.
+    /// Hands the handshake more of the peer's flight, copied in.
+    ///
+    /// `data` is borrowed for the call and copied, so the caller's buffer is
+    /// free immediately and may be reused as soon as this returns. Bytes are
+    /// appended to the handshake's own inbound buffer, compacted first when
+    /// the consumed prefix has left room at the end; a caller may therefore
+    /// pass a slice of any part of its own buffer, including one that
+    /// overlaps a previous call's.
+    ///
+    /// It cannot fail and it never rejects: whatever does not fit in
+    /// `limits.tls_handshake_in` is dropped rather than refused, so a peer
+    /// that sends a flight larger than the buffer stalls this handshake
+    /// instead of ending it, and no error tells the caller anything was
+    /// lost. Handing over data does not advance the state machine — `step`
+    /// does.
     pub fn provideData(self: *Tls13Handshake, data: []const u8) void {
         // Compact buffer if we've consumed some data and need space
         if (self.in_offset > 0 and self.in_len - self.in_offset + data.len > self.in_buf.len - self.in_offset) {
@@ -1182,29 +1837,46 @@ pub const Tls13Handshake = struct {
         self.in_len += copy_len;
     }
 
-    // Step the handshake state machine. Returns an action for the caller.
-    // Call repeatedly until you get wait_for_data or complete.
-    //
-    // `now_s` is a second on the caller's clock and `random` is the caller's
-    // entropy, both passed in per step and never stored: a handshake holding
-    // either could not be driven twice with two different clocks.
-    //
-    // The base of `now_s` is not specified, and the connection supplies a
-    // monotonic instant. That is enough. The one value written from it is a
-    // session ticket's creation time, and it goes into a ticket this server
-    // seals with AES-128-GCM under `ticket_key`, so the peer receives opaque
-    // bytes and cannot read the base. The field is not read back on this side
-    // either: a resuming server recovers only the PSK from the sealed ticket,
-    // and the client stamps its own `creation_time` from its own `now_s` when
-    // it parses the ticket. So what the arithmetic needs is just that both
-    // sides of every subtraction come off one clock, which they do — the age
-    // in `buildClientHello` is the client's resumption instant minus the
-    // client's parse instant. A monotonic base that restarts with the process
-    // could only mis-age a ticket that outlived the clock that stamped it,
-    // and a process cannot outlive its own clock.
-    //
-    // Nothing else in this file needs a clock at all: every timeout belongs to
-    // the connection, not to TLS.
+    /// Advances the handshake by one step and returns the action the caller
+    /// must carry out. Call repeatedly until it answers `wait_for_data` or
+    /// `complete`.
+    ///
+    /// Exactly one action per call, and the caller must finish carrying it out
+    /// before calling again: a `SendData` borrows the handshake's output
+    /// buffer and the next `step` overwrites it, and an `InstallKeys` must
+    /// reach the connection before the packets it protects are built. Keys
+    /// are offered ahead of any work the state machine would otherwise do, so
+    /// the first calls after a key derivation return `install_keys` and make
+    /// no progress beyond it.
+    ///
+    /// `now_s` is a second on the caller's clock and `random` is the caller's
+    /// entropy, both passed in per step and never stored: a handshake holding
+    /// either could not be driven twice with two different clocks.
+    ///
+    /// The base of `now_s` is not specified, and the connection supplies a
+    /// monotonic instant. That is enough. The one value written from it is a
+    /// session ticket's creation time, and it goes into a ticket this server
+    /// seals with AES-128-GCM under `ticket_key`, so the peer receives opaque
+    /// bytes and cannot read the base. The field is not read back on this side
+    /// either: a resuming server recovers only the PSK from the sealed ticket,
+    /// and the client stamps its own `creation_time` from its own `now_s` when
+    /// it parses the ticket. So what the arithmetic needs is just that both
+    /// sides of every subtraction come off one clock, which they do — the age
+    /// in `buildClientHello` is the client's resumption instant minus the
+    /// client's parse instant. A monotonic base that restarts with the process
+    /// could only mis-age a ticket that outlived the clock that stamped it,
+    /// and a process cannot outlive its own clock.
+    ///
+    /// Nothing else in this file needs a clock at all: every timeout belongs to
+    /// the connection, not to TLS.
+    ///
+    /// Fails with any member of `HandshakeError`, each of which ends the
+    /// handshake at the connection. Because the connection closes on the
+    /// first one, nothing here leaves partial state a caller has to unwind
+    /// — but `step` may already have appended this peer's message to the
+    /// transcript and set its `pending_install_*` flag before failing, so a
+    /// caller that keeps using the handshake after an error gets keys for a
+    /// conversation that never happened.
     pub fn step(self: *Tls13Handshake, now_s: i64, random: std.Random) !Action {
         // If we need to install early (0-RTT) keys, do that first
         if (self.pending_install_early) {
@@ -1304,11 +1976,22 @@ pub const Tls13Handshake = struct {
         }
     }
 
+    /// Whether the handshake has reached `connected`. True from the moment
+    /// `step` first answers `complete`, and it stays true: post-handshake
+    /// messages a client receives afterwards are still consumed by `step`
+    /// without changing the answer. A NewSessionTicket is one of them.
     pub fn isComplete(self: *const Tls13Handshake) bool {
         return self.state == .connected;
     }
 
     /// Frees what the handshake allocated. The struct itself is the caller's.
+    ///
+    /// One allocation, `peer_cert`, and only a server that asked for a client
+    /// certificate ever makes it. Released with `allocator`, which the
+    /// connection set through the same field; a handshake built without one
+    /// never allocated and so has nothing to free. Afterwards the handshake
+    /// is unusable, `peerCertificate` answers null because `peer_cert` is
+    /// cleared, and a second `deinit` is a no-op rather than a double free.
     pub fn deinit(self: *Tls13Handshake) void {
         if (self.peer_cert) |c| if (self.allocator) |a| a.free(c);
         self.peer_cert = null;
@@ -1317,6 +2000,13 @@ pub const Tls13Handshake = struct {
     /// Server: the client's certificate — the 44-byte `SubjectPublicKeyInfo`
     /// its node id is wrapped in — once the handshake completes. Null when
     /// none was asked for, or `.optional` and none was sent.
+    ///
+    /// The slice is owned by the handshake and borrowed here: the caller
+    /// frees nothing, and `deinit` releases it, so a slice taken before
+    /// `deinit` dangles after it. It is null until the state reaches
+    /// `connected` even on a server that did receive a certificate, so a
+    /// caller reading it while the handshake is still running sees null
+    /// rather than a partial answer.
     pub fn peerCertificate(self: *const Tls13Handshake) ?[]const u8 {
         if (self.state != .connected) return null;
         return self.peer_cert;
@@ -1325,6 +2015,17 @@ pub const Tls13Handshake = struct {
     /// The node id the peer's certificate carried, or null before one was
     /// accepted. Compared against `expect_peer_node_id` when that is set;
     /// with no pin, this is a claim the peer proved it holds.
+    ///
+    /// By value, so it survives `deinit` and can be kept for the life of the
+    /// connection. Null until `connected`, and — on a client, or on a server
+    /// with client authentication off — null for good: there is no node id
+    /// when no certificate was asked for, which is why this is not an
+    /// accessor for "the peer's identity" but for "the certificate it
+    /// presented".
+    ///
+    /// When `expect_peer_node_id` was set, a mismatch ended the handshake
+    /// before it completed, so a non-null answer here is already the node
+    /// that was asked for and not merely a key.
     pub fn peerNodeId(self: *const Tls13Handshake) ?[32]u8 {
         if (self.state != .connected) return null;
         return self.peer_node_id;
@@ -3190,10 +3891,31 @@ fn writeU16(buf: []u8, val: u16) void {
 
 // ─── Minimal PEM parser ──────────────────────────────────────────────
 
+/// Decodes the base64 body of the first `CERTIFICATE` section of `pem_data`
+/// into `out`, and returns the slice of `out` it used.
+///
+/// The result borrows `out` and the caller frees nothing; the input is
+/// borrowed too. Only the first section is read, so a PEM bundle of several
+/// certificates yields the leaf. `error.DecodeError` for a missing or
+/// unterminated marker, a body longer than the parser's 8 KiB scratch buffer,
+/// a base64 body that will not decode, and a decoded length that does not fit
+/// `out` — in that last case `out` is untouched, and the error is the same one
+/// a malformed body gives, so a caller cannot tell a short buffer from bad
+/// input except by sizing `out` correctly.
 pub fn parsePemCert(pem_data: []const u8, out: []u8) ![]const u8 {
     return parsePemSection(pem_data, "CERTIFICATE", out);
 }
 
+/// Decodes a private key from `pem_data` into `out`, trying `EC PRIVATE KEY`,
+/// then `RSA PRIVATE KEY`, then `PRIVATE KEY` (PKCS#8).
+///
+/// The result borrows `out` as in `parsePemCert`. Which label matched is not
+/// reported: the DER is the same either way and `extractPrivateKey` is what
+/// says what it is, so a caller that needs to know should call that. The
+/// `error.DecodeError` of the last attempt is the one returned when none of
+/// the three sections is present, which is why a key file with a
+/// `-----BEGIN OPENSSH PRIVATE KEY-----` header reports a decode failure
+/// rather than an unsupported format.
 pub fn parsePemPrivateKey(pem_data: []const u8, out: []u8) ![]const u8 {
     return parsePemSection(pem_data, "EC PRIVATE KEY", out) catch
         parsePemSection(pem_data, "RSA PRIVATE KEY", out) catch
@@ -3228,6 +3950,12 @@ fn parsePemSection(pem_data: []const u8, comptime label: []const u8, out: []u8) 
 
 // Extract the 32-byte raw private key from a DER-encoded EC private key.
 // RFC 5915: ECPrivateKey ::= SEQUENCE { version, privateKey, ... }
+//
+// A slice of `der`, so the caller frees nothing and the DER must outlive
+// whatever is configured from it. `error.DecodeError` for anything that is
+// not that shape, including an EC key that is not P-256 — the scalar must be
+// exactly 32 bytes, which is what makes this P-256 and not P-384. Nothing is
+// allocated, so no failure leaves anything behind.
 pub fn extractEcPrivateKey(der: []const u8) ![]const u8 {
     // Simple DER walk: SEQUENCE -> version INTEGER -> OCTET STRING (the key)
     if (der.len < 2) return error.DecodeError;
@@ -3258,6 +3986,12 @@ pub fn extractEcPrivateKey(der: []const u8) ![]const u8 {
 
 // Extract the 32-byte raw private key from a PKCS#8 DER-encoded private key.
 // PKCS#8: SEQUENCE { version, AlgorithmIdentifier, OCTET STRING { ECPrivateKey } }
+//
+// A slice of `der`, borrowed as in `extractEcPrivateKey`, and the same
+// `error.DecodeError` for anything that does not walk. The
+// AlgorithmIdentifier is skipped rather than checked, so a PKCS#8 wrapper
+// around a non-EC key is not recognised here — `extractPrivateKey` is what
+// tries each shape in turn.
 pub fn extractPkcs8EcPrivateKey(der: []const u8) ![]const u8 {
     // Walk the outer SEQUENCE
     if (der.len < 2 or der[0] != 0x30) return error.DecodeError;
@@ -3331,6 +4065,12 @@ fn readDerValue(der: []const u8, pos: *usize, expected_tag: u8) ![]const u8 {
 
 // Extract the 32-byte Ed25519 seed from a PKCS#8 DER-encoded private key.
 // RFC 8410: AlgorithmIdentifier OID 1.3.101.112, PrivateKey OCTET STRING.
+//
+// A slice of `der`, borrowed. Unlike the EC path this one *does* check the
+// OID and refuses an AlgorithmIdentifier with anything else in it, and it
+// accepts the seed either directly in the PrivateKey OCTET STRING or wrapped
+// in one more (RFC 8410's CurvePrivateKey). `error.DecodeError` for anything
+// else, including a seed that is not 32 bytes.
 pub fn extractEd25519PrivateKey(der: []const u8) ![]const u8 {
     var outer_pos: usize = 0;
     const outer = try readDerValue(der, &outer_pos, 0x30);
@@ -3367,14 +4107,38 @@ pub fn extractRsaPrivateKey(der: []const u8) rsa.Error![]const u8 {
     return pkcs1;
 }
 
+/// A private key lifted out of DER: the bytes to sign with, and which
+/// algorithm they are. A plain value with no allocator; `bytes` borrows the
+/// DER it was extracted from and dies with it.
 pub const PrivateKey = struct {
     /// A slice of the DER it was extracted from.
+    ///
+    /// Not copied and not owned: it points into the caller's decoded buffer,
+    /// so that buffer must outlive both this value and the `TlsConfig` it
+    /// eventually reaches. What the bytes are depends on `algorithm` — a raw
+    /// P-256 scalar or Ed25519 seed of exactly 32 bytes, or a whole PKCS#1
+    /// RSAPrivateKey for RSA — which is why the two are not interchangeable
+    /// and why `TlsConfig.private_key_algorithm` has to be set from this
+    /// rather than assumed.
     bytes: []const u8,
+    /// Which of the three shapes `bytes` is, and therefore what a config
+    /// holding it must sign with. Taken from whichever extractor succeeded,
+    /// so it cannot disagree with `bytes`.
     algorithm: PrivateKeyAlgorithm,
 };
 
 /// Recognizes an EC P-256 (SEC1 or PKCS#8), Ed25519 (PKCS#8) or RSA (PKCS#1
 /// or PKCS#8) private key, as `parsePemPrivateKey` decodes it.
+///
+/// Tries the three shapes in that order and returns the first that fits, so
+/// a DER that could parse as more than one resolves the same way every time.
+/// The result borrows `der` and frees nothing.
+///
+/// `error.UnsupportedKey` when the DER is well formed but is none of the
+/// three — a DSA key, say — and `error.InvalidKey` when it is an RSA key
+/// whose numbers do not fit together, which is the one case where something
+/// was recognised and then refused. Both leave `der` untouched and nothing
+/// allocated.
 pub fn extractPrivateKey(der: []const u8) error{ UnsupportedKey, InvalidKey }!PrivateKey {
     if (extractEcPrivateKey(der)) |k| return .{ .bytes = k, .algorithm = .ecdsa_p256_sha256 } else |_| {}
     if (extractPkcs8EcPrivateKey(der)) |k| return .{ .bytes = k, .algorithm = .ecdsa_p256_sha256 } else |_| {}

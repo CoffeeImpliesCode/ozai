@@ -1,3 +1,13 @@
+//! QUIC frame types, the wire codec that decodes and encodes them, and the
+//! queue that holds control frames until the next packet can carry them.
+//!
+//! Everything is a pure function of the caller's bytes: no allocator, no
+//! clock, no socket. The one obligation a caller has to read is that
+//! `Frame.parse` and `Frame.parseSized` **borrow** — every slice in a decoded
+//! `Frame` points into the `[]u8` it was handed — while a `Frame` built by a
+//! caller owns whatever slices were put in it, and `PendingControlFrame`
+//! owns nothing at all because every variant is inline fixed storage.
+
 const std = @import("std");
 const io = @import("../io_compat.zig");
 
@@ -17,10 +27,21 @@ pub fn paddingLen(bytes: []const u8) usize {
     return i;
 }
 
+/// The failure a decode can report (RFC 9000 §12.4). It is returned for a
+/// frame type this module does not know, a length that does not fit, an
+/// ACK range below packet number 0, and any other frame the RFC calls
+/// malformed. It is the codec's own error set; a caller turns it into the
+/// `frame_encoding_error` transport code when it closes the connection.
 pub const FrameError = error{
     FrameEncodingError,
 };
 
+/// The QUIC frame types (RFC 9000 §12.4 Table 3) as the varint that appears
+/// on the wire. `stream` (0x08) is the base: 0x08..0x0f are the same frame
+/// with OFF/LEN/FIN flags set, so 0x08 is the canonical tag. `_` matches any
+/// other ID; `Frame.parseSized` answers `error.FrameEncodingError` for those
+/// rather than producing a `Frame`. The tag is the union tag of `Frame`, so a
+/// `Frame`'s `std.meta.activeTag` is this enum.
 pub const FrameType = enum(u64) {
     padding = 0x00,
     ping = 0x01,
@@ -53,7 +74,11 @@ pub const FrameType = enum(u64) {
     _,
 };
 
-/// QUIC transport error codes (RFC 9000 Section 20).
+/// The error codes a CONNECTION_CLOSE carries (RFC 9000 §20). `_` is any code
+/// an application or a future RFC chooses: `Connection` puts application
+/// codes there, so a peer can send one this module cannot name and the
+/// connection still closes. `cryptoError` builds the CRYPTO_ERROR range that
+/// has no tags here.
 pub const TransportError = enum(u64) {
     no_error = 0x00,
     internal_error = 0x01,
@@ -76,12 +101,22 @@ pub const TransportError = enum(u64) {
     _,
 
     /// Create a CRYPTO_ERROR code (0x100 + TLS alert code)
+    ///
+    /// The result is a raw `u64`, not a `TransportError` tag: RFC 9000 §20.1
+    /// puts CRYPTO_ERROR at 0x100 and above, which is outside every tag named
+    /// above, so a caller passes the value straight through to
+    /// `closeWithTransportError` rather than casting it. `alert` is the TLS
+    /// alert number the handshake produced, not a QUIC code.
     pub fn cryptoError(alert: u64) u64 {
         return 0x100 + alert;
     }
 };
 
 /// ACK range: represents a contiguous range of acknowledged packet numbers.
+///
+/// Inclusive at both ends: a single-packet range has `start == end`. A
+/// `Frame` never contains a range reaching below packet number 0 — a decode
+/// that would produce one is `error.FrameEncodingError`.
 pub const AckRange = struct {
     /// Smallest packet number in this range.
     start: u64,
@@ -90,29 +125,71 @@ pub const AckRange = struct {
 };
 
 /// Maximum number of additional ACK ranges stored inline (avoids allocation).
+///
+/// A wire ACK frame may declare more ranges than this; `parseSized` validates
+/// every one of them and keeps only the first `MAX_ACK_RANGES`, so `Frame`'s
+/// `ack_range_count` never exceeds this. A frame declaring more is not
+/// truncated silently into a wrong answer, only into a shorter ACK.
 pub const MAX_ACK_RANGES: usize = 32;
 
+/// One QUIC frame, tagged by `FrameType`.
+///
+/// **Which variants borrow.** Every `[]u8` and `[]const u8` payload a decode
+/// produces — `crypto.data`, `new_token`, `stream.data`,
+/// `new_connection_id.conn_id`, `connection_close.reason`,
+/// `application_close.reason`, `datagram.data` and
+/// `datagram_with_length.data` — is a view into the buffer `parse` was
+/// handed, not a copy. The caller must keep that buffer alive and unmodified
+/// for as long as it reads them. `path_challenge`, `path_response` and
+/// `new_connection_id.stateless_reset_token` are fixed-size arrays copied out
+/// of the wire, so those three own their bytes and are safe to keep.
+///
+/// A `Frame` built by hand owns whatever slices were put into it and releases
+/// nothing: it never allocates and it never frees. A caller that decoded a
+/// frame, kept one slice, and wants it past the receive buffer copies it.
+///
+/// `Frame` is a plain value — no allocator, no clock, no thread state — so it
+/// may be copied freely and used from more than one thread; a decoded one is
+/// only as shareable as the buffer behind it.
 pub const Frame = union(FrameType) {
+    /// How many leading zero bytes this PADDING frame covers. On the wire
+    /// PADDING is a run of zero bytes with no length of its own, and a decode
+    /// coalesces the whole run into one frame; `write` emits `size` zeros.
     padding: usize,
 
     ping: void,
 
     ack: struct {
+        /// Largest packet number the peer acknowledges.
         largest_ack: u64,
+        /// The peer's ACK delay as it went on the wire, unscaled: the
+        /// consumer applies `TransportParams.ack_delay_exponent` to get
+        /// microseconds.
         ack_delay: u64,
+        /// How far below `largest_ack` the first acknowledged range reaches.
+        /// The range is `[largest_ack - first_ack_range, largest_ack]`.
         first_ack_range: u64,
+        /// How many entries of `ack_ranges` are valid, 0 to `MAX_ACK_RANGES`.
+        /// The tail of the array is not part of the frame even after a decode.
         ack_range_count: u8 = 0,
+        /// Ranges below the first, in descending order. Only
+        /// `ack_ranges[0..ack_range_count]` is valid.
         ack_ranges: [MAX_ACK_RANGES]AckRange = undefined,
     },
 
     ack_ecn: struct {
+        /// The same four ACK fields, with the same validity rule on
+        /// `ack_ranges`; the three ECN counts follow.
         largest_ack: u64,
         ack_delay: u64,
         first_ack_range: u64,
         ack_range_count: u8 = 0,
         ack_ranges: [MAX_ACK_RANGES]AckRange = undefined,
+        /// Packets the peer received with ECN ECT(0), cumulative.
         ecn_ect0: u64,
+        /// Packets the peer received with ECN ECT(1), cumulative.
         ecn_ect1: u64,
+        /// Packets the peer received with ECN CE, cumulative.
         ecn_ce: u64,
     },
 
@@ -128,16 +205,25 @@ pub const Frame = union(FrameType) {
     },
 
     crypto: struct {
+        /// Byte offset into the CRYPTO stream this data belongs at.
         offset: u64,
+        /// Borrowed from the decode buffer; see the type doc.
         data: []u8,
     },
+    /// The token a Retry handed out. Borrowed from the decode buffer.
     new_token: []u8,
 
     stream: struct {
+        /// Which stream this frame carries data on.
         stream_id: u64,
+        /// Byte offset into that stream.
         offset: u64,
+        /// `data.len`; repeated so a caller does not have to trust the slice
+        /// it was handed.
         length: u64,
+        /// Whether this frame carries the stream's final byte.
         fin: bool,
+        /// Borrowed from the decode buffer; see the type doc.
         data: []u8,
     },
 
@@ -161,9 +247,15 @@ pub const Frame = union(FrameType) {
     streams_blocked_uni: u64,
 
     new_connection_id: struct {
+        /// The peer's sequence number for this connection ID.
         seq_num: u64,
+        /// The lowest sequence number the peer still wants; a receiver retires
+        /// everything below it.
         retire_prior_to: u64,
+        /// Borrowed from the decode buffer; see the type doc.
         conn_id: []u8,
+        /// Copied out of the wire at decode, so it is owned and stays valid
+        /// past the receive buffer.
         stateless_reset_token: [16]u8,
     },
 
@@ -175,13 +267,19 @@ pub const Frame = union(FrameType) {
     path_response: [8]u8,
 
     connection_close: struct {
+        /// The transport error code, or an application code when the peer used
+        /// 0x1c anyway.
         error_code: u64,
+        /// The frame type that triggered the close; 0 when none did.
         frame_type: u64,
+        /// Borrowed from the decode buffer; see the type doc.
         reason: []u8,
     },
 
     application_close: struct {
+        /// An application-defined code. There is no RFC meaning for it.
         error_code: u64,
+        /// Borrowed from the decode buffer; see the type doc.
         reason: []u8,
     },
 
@@ -191,18 +289,31 @@ pub const Frame = union(FrameType) {
     immediate_ack: void,
 
     datagram: struct {
+        /// Everything left in the packet, borrowed from the decode buffer.
+        /// A DATAGRAM frame has no length field, so this is the remainder by
+        /// definition.
         data: []u8,
     },
-
     datagram_with_length: struct {
+        /// The declared payload, borrowed from the decode buffer. `const`
+        /// because the wire carries no reason for a decoded DATAGRAM to be
+        /// rewritten.
         data: []const u8,
     },
 
-    // draft-ietf-quic-ack-frequency
+    /// draft-ietf-quic-ack-frequency: the peer telling this endpoint when to
+    /// ACK. Purely inbound state; it is not flow control and grants no credit.
     ack_frequency: struct {
+        /// The peer's sequence number for this request, so a later request
+        /// from the same peer supersedes this one.
         sequence_number: u64,
+        /// ACK after this many ack-eliciting packets. 0 is not a special
+        /// value here: it is the number the peer sent.
         ack_eliciting_threshold: u64,
-        request_max_ack_delay: u64, // microseconds
+        /// Microseconds; the longest the peer asks this endpoint to wait
+        /// between ACKs.
+        request_max_ack_delay: u64,
+        /// Packets out of order before the peer wants an immediate ACK.
         reordering_threshold: u64,
     },
 
@@ -216,6 +327,20 @@ pub const Frame = union(FrameType) {
     }
 
     /// Parse a single frame from a byte buffer.
+    ///
+    /// `bytes` is the packet payload from the current frame onward; the
+    /// returned `Frame`'s slices borrow it, so it must stay alive and
+    /// unmodified as long as they are read. Nothing is allocated and nothing
+    /// is copied except `path_challenge`, `path_response` and
+    /// `new_connection_id.stateless_reset_token`.
+    ///
+    /// `error.FrameEncodingError` is a frame this module cannot decode: an
+    /// unknown type, a body running past the end, an ACK range below packet
+    /// number 0, or a connection ID length outside 1..20. `error.EndOfStream`
+    /// is a varint cut off at the end. Neither returns a frame.
+    ///
+    /// The buffer may hold frames after this one; use `parseSized` to find
+    /// where it ended.
     pub fn parse(bytes: []u8) !Frame {
         var size: usize = undefined;
         return parseSized(bytes, &size);
@@ -223,6 +348,12 @@ pub const Frame = union(FrameType) {
 
     /// Parse a single frame, and set `size` to the bytes it took up, so the
     /// next frame starts at `bytes[size..]`.
+    ///
+    /// Identical to `parse` in what it decodes, borrows and fails on; `size`
+    /// is how a caller walks a coalesced packet one frame at a time. It is
+    /// written on the error path too, where it names how far the reader got
+    /// rather than where a frame ended — so only a successful call's `size`
+    /// points at the next frame.
     pub fn parseSized(bytes: []u8, size: *usize) !Frame {
         var stream = io.fixedBufferStream(bytes);
         var reader = &stream;
@@ -514,6 +645,16 @@ pub const Frame = union(FrameType) {
     }
 
     /// Write a frame to the given writer.
+    ///
+    /// `writer` is anything with the `writeAll`/`writeByte`/`writeVarInt`
+    /// method surface. The slices in `self` are read and not retained, so a
+    /// frame decoded from a receive buffer can be written straight back out
+    /// while that buffer is still alive.
+    ///
+    /// The only failures are the writer's — `error.NoSpaceLeft` from a full
+    /// buffer — and a write cut short leaves a prefix of the frame in the
+    /// writer, which the caller must treat as a discarded packet. Allocates
+    /// nothing.
     pub fn write(self: Frame, writer: anytype) !void {
         switch (self) {
             .padding => |size| {
@@ -716,6 +857,13 @@ pub const Frame = union(FrameType) {
         }
     }
 
+    /// Whether this frame is ack-eliciting (RFC 9000 §13.2.1): a peer that
+    /// receives one owes an ACK for it.
+    ///
+    /// False for PADDING, ACK, ACK_ECN and both CONNECTION_CLOSE forms — the
+    /// frames that must not provoke an ACK or would loop. True for everything
+    /// else, DATAGRAM included. Depends only on the tag, never on the payload,
+    /// so a decoded frame and a hand-built one answer the same.
     pub fn isAckEliciting(self: Frame) bool {
         return switch (self) {
             .padding, .ack, .ack_ecn, .connection_close, .application_close => false,
@@ -724,6 +872,13 @@ pub const Frame = union(FrameType) {
         };
     }
 
+    /// Whether this frame is path validation (RFC 9000 §8.2): it proves a path
+    /// is live but carries no application data.
+    ///
+    /// True for PADDING, NEW_CONNECTION_ID, PATH_CHALLENGE and
+    /// PATH_RESPONSE, and false for every other frame including STREAM and
+    /// the CLOSE forms. A caller uses this to keep packets that only prove a
+    /// path out of the congestion controller's accounting.
     pub fn isProbing(self: Frame) bool {
         return switch (self) {
             .padding, .new_connection_id, .path_challenge, .path_response => true,
@@ -732,6 +887,13 @@ pub const Frame = union(FrameType) {
     }
 
     /// Check if this frame type is allowed in the given packet type (RFC 9000 §12.5, Table 3).
+    ///
+    /// Whether the frame may legally appear in a packet of that encryption
+    /// level; it says nothing about whether the packet may be sent at all.
+    /// PADDING and PING are legal everywhere, ACK/ACK_ECN/CRYPTO and transport
+    /// CONNECTION_CLOSE are legal everywhere except 0-RTT, the connection-ID
+    /// and handshake frames are 1-RTT only, and everything else is 0-RTT or
+    /// 1-RTT. Reads only.
     pub fn isAllowedIn(self: Frame, pkt_type: packet.PacketType) bool {
         return switch (self) {
             // PADDING, PING: all packet types
@@ -775,16 +937,33 @@ pub const Frame = union(FrameType) {
 
 /// A pending control frame to be sent in the next outgoing packet.
 /// Uses value types only (no slices) to avoid dangling references.
+///
+/// Every variant is inline fixed-size storage, so a `PendingControlFrame`
+/// owns its bytes, borrows nothing, and survives in a queue across packets
+/// with no lifetime to track. It allocates nothing and needs no teardown, and
+/// a copy is an independent value. It is not a `Frame` and does not convert
+/// one-way for every variant: `toFrame` answers `unreachable` for
+/// `new_token` and `new_connection_id`, which `write` serializes directly
+/// because their payload lives in a fixed buffer this type would have to
+/// borrow to hand to a `Frame`.
 pub const PendingControlFrame = union(enum) {
     ping: void,
     path_challenge: [8]u8,
     path_response: [8]u8,
     retire_connection_id: u64,
     connection_close: struct {
+        /// The transport or application code, depending on `is_app`.
         error_code: u64,
+        /// The frame type that triggered the close, or 0. Only meaningful
+        /// when `is_app` is false.
         frame_type: u64,
+        /// Which CONNECTION_CLOSE variant `write` emits: true for the
+        /// application form (0x1d, no `frame_type`, empty reason), false for
+        /// the transport form (0x1c). One tag carries both because the reason
+        /// is dropped either way.
         is_app: bool,
     },
+
     max_data: u64,
     max_stream_data: struct {
         stream_id: u64,
@@ -800,9 +979,16 @@ pub const PendingControlFrame = union(enum) {
         limit: u64,
     },
     new_token: struct {
+        /// Inline storage for the token. 92 bytes is the largest a
+        /// NEW_TOKEN may carry (RFC 9000 §19.7), so the token is copied in
+        /// rather than borrowed; `token_len` says how much of it is real.
         token_buf: [92]u8 = .{0} ** 92,
+        /// Bytes of `token_buf` to emit, 0 to 92. `write` does not check the
+        /// bound, so a producer that sets more than 92 gets a slice that runs
+        /// past the array.
         token_len: u8 = 0,
     },
+
     reset_stream: struct {
         stream_id: u64,
         error_code: u64,
@@ -813,12 +999,23 @@ pub const PendingControlFrame = union(enum) {
         error_code: u64,
     },
     new_connection_id: struct {
+        /// The sequence number to attach to this connection ID.
         seq_num: u64,
+        /// The lowest sequence number the peer should keep.
         retire_prior_to: u64,
+        /// Inline storage for the connection ID, at most 20 bytes (RFC 9000
+        /// §17.2); only `cid_buf[0..cid_len]` is the ID.
         cid_buf: [20]u8,
+        /// Bytes of `cid_buf` that are the ID, 1 to 20.
         cid_len: u8,
+        /// The token a reset for this connection ID must end with, copied in
+        /// alongside the ID so the pair stays together in the queue.
         stateless_reset_token: [16]u8,
     },
+
+    /// draft-ietf-quic-ack-frequency: when the peer asked this endpoint to
+    /// ACK. The fields carry the same meanings as `Frame.ack_frequency`, and
+    /// `request_max_ack_delay` is still microseconds here.
     ack_frequency: struct {
         sequence_number: u64,
         ack_eliciting_threshold: u64,
@@ -829,6 +1026,12 @@ pub const PendingControlFrame = union(enum) {
 
     /// Write this pending control frame directly on the wire.
     /// For new_connection_id we serialize directly (avoids dangling slice from toFrame()).
+    ///
+    /// `writer` is anything with the `writeAll`/`writeByte`/`writeVarInt`
+    /// surface, and the only failures are the writer's — a partial write is
+    /// the caller's to treat as a discarded frame. The two variants whose
+    /// payload is a fixed buffer are serialized here rather than through
+    /// `toFrame`, which cannot represent them without a borrow.
     pub fn write(self: PendingControlFrame, writer: anytype) !void {
         switch (self) {
             .new_token => |nt| {
@@ -852,6 +1055,15 @@ pub const PendingControlFrame = union(enum) {
     }
 
     /// Convert to a Frame for writing on the wire.
+    ///
+    /// The result borrows nothing: every payload is copied into the `Frame`'s
+    /// own fixed-size fields, and the CONNECTION_CLOSE reason becomes an empty
+    /// static slice. It is a value the caller owns outright and can write out
+    /// with `Frame.write` after this returns.
+    ///
+    /// `new_token` and `new_connection_id` answer `unreachable` — a `Frame`
+    /// would have to borrow their inline buffers — so a caller must route those
+    /// two through `PendingControlFrame.write` instead.
     pub fn toFrame(self: PendingControlFrame) Frame {
         return switch (self) {
             .ping => .{ .ping = {} },
@@ -893,23 +1105,52 @@ pub const PendingControlFrame = union(enum) {
 /// regenerated or superseded); frames the peer must eventually see go through
 /// `tryPush`, and their producer retries on a later pass when it fails.
 /// CONNECTION_CLOSE always gets in: one slot is held back for it.
+///
+/// The queue owns its storage: the fixed array is inline in the value, nothing
+/// is allocated and nothing is borrowed, so there is no teardown and a copy
+/// is a full independent copy. Its capacity comes from
+/// `limits.zig.pending_frames`, so making the queue larger is a change to
+/// `Connection`'s footprint, not to this file. Nothing here synchronises:
+/// a queue belongs to one connection on one thread.
 pub const PendingFrameQueue = struct {
     const capacity = @import("limits.zig").pending_frames;
 
+    /// The slots, in the order they will be popped. Only
+    /// `items[0..len]` is live; the tail is whatever the last eviction left.
+    /// A caller reading the array directly takes on the queue's own invariant.
     items: [capacity]PendingControlFrame = undefined,
+    /// How many slots are live, 0 to `capacity`. `capacity` is an `usize` and
+    /// `len` a `u8`, so the two only meet because the capacity is small
+    /// enough; a capacity above 255 would make `len` unable to hold it.
     len: u8 = 0,
 
     /// Queue `frame`, dropping it if the queue is full; see `tryPush`.
+    ///
+    /// The fire-and-forget entry: no return value, so a caller learns nothing
+    /// about whether the frame survived. That is the point — a PING or a
+    /// PATH_RESPONSE is regenerated or superseded, and losing it is cheaper
+    /// than branching. A frame the peer must see goes through `tryPush`.
     pub fn push(self: *PendingFrameQueue, frame: PendingControlFrame) void {
         _ = self.tryPush(frame);
     }
 
     /// Whether `n` new, unmerged frames would fit.
+    ///
+    /// It counts the slot held back for CONNECTION_CLOSE, so a true answer
+    /// means those `n` frames would all queue without evicting anything. A
+    /// merge into an existing frame frees room, so this is the pessimistic
+    /// test and may say no where `tryPush` would still succeed. Reads only.
     pub fn hasRoomFor(self: *const PendingFrameQueue, n: usize) bool {
         return self.len + n < capacity;
     }
 
     /// Put back a frame just popped. Never fails: `pop` freed its slot.
+    ///
+    /// It cannot return an error, but it is not lossless: if the queue filled
+    /// between the `pop` and this call, and the frame does not merge into
+    /// something already queued, the frame is dropped without a diagnostic.
+    /// A caller that popped a frame it must eventually send either has the
+    /// room for it or knows it does not.
     pub fn requeue(self: *PendingFrameQueue, frame: PendingControlFrame) void {
         if (self.tryPush(frame)) return;
         if (self.len < capacity) {
@@ -920,6 +1161,18 @@ pub const PendingFrameQueue = struct {
 
     /// Queue `frame`, merging it into a queued frame of the same kind where
     /// one exists. False if it did not fit.
+    ///
+    /// A merge means the queue does not grow: a second PING or IMMEDIATE_ACK
+    /// is discarded as a duplicate, and a second MAX_DATA, MAX_STREAMS_*,
+    /// DATA_BLOCKED, STREAMS_BLOCKED_* or a same-stream MAX_STREAM_DATA /
+    /// STREAM_DATA_BLOCKED keeps the larger of the old and new values. The
+    /// merge only ever raises a limit, so a peer never sees a smaller one.
+    /// True means the frame is queued or merged; false means nothing changed
+    /// and the caller still owns `frame`.
+    ///
+    /// CONNECTION_CLOSE always returns true: one slot is reserved for it, and
+    /// if even that is taken the last queued frame is evicted, because nothing
+    /// queued matters once the connection is closing.
     pub fn tryPush(self: *PendingFrameQueue, frame: PendingControlFrame) bool {
         var i: u8 = 0;
         while (i < self.len) : (i += 1) {
@@ -1011,6 +1264,17 @@ pub const PendingFrameQueue = struct {
         return false;
     }
 
+    /// Takes the oldest queued frame, or `null` when the queue is empty.
+    ///
+    /// FIFO: the frame at `items[0]` comes out and the rest shift down, so
+    /// the order a producer pushed them in is the order a caller sees. The
+    /// result is a value copy that owns its bytes and outlives the queue, so
+    /// it stays usable after the slot is reused.
+    ///
+    /// A caller that pops and cannot send has to hand the frame back with
+    /// `requeue`; nothing else preserves it. Cost is a shift of the remaining
+    /// slots, so a caller draining a full queue pays capacity² copies rather
+    /// than a constant time.
     pub fn pop(self: *PendingFrameQueue) ?PendingControlFrame {
         if (self.len == 0) return null;
         const item = self.items[0];

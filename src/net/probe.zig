@@ -268,6 +268,17 @@ pub const Protocols = struct {
     qad_ipv4: bool = false,
     qad_ipv6: bool = false,
 
+    /// Whether this set plans a probe of that family at all.
+    ///
+    /// The whole of `Options::as_protocols` in one call, and the only test the
+    /// plan applies to a family: a probe outside the set is never scheduled, so
+    /// a browser build and a QUIC build differ here and nowhere else. `false`
+    /// is not "disabled for this round" — it is "this node does not have the
+    /// transport for it", which is why a `false` QAD family also suppresses the
+    /// classification that only a QAD answer could produce.
+    ///
+    /// By value, like `ProbeResult.relay`: these are three bools, and a pointer
+    /// would only decide nothing.
     pub fn includes(self: Protocols, probe: Probe) bool {
         return switch (probe) {
             .https => self.https,

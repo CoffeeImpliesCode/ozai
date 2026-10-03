@@ -26,6 +26,16 @@ const stateless_reset = @import("stateless_reset.zig");
 const ecn = @import("ecn.zig");
 const quic_lb = @import("quic_lb.zig");
 
+/// Where a connection is in RFC 9000 §10's lifecycle, as one value.
+///
+/// The order is the order states are entered and, except for `terminated`,
+/// left: `first_flight` while the Initial is outstanding, `handshake` once a
+/// handshake key is installed, `connected` when the handshake is confirmed,
+/// then `closing` (a close is outstanding), `draining` (the peer's close was
+/// acknowledged and the 3×PTO is running) and `terminated`. A connection
+/// never returns to an earlier state, which is what lets a caller read this
+/// instead of tracking its own copy of the transitions.
+///
 pub const State = enum(u8) {
     first_flight = 0,
     handshake = 1,
@@ -35,6 +45,14 @@ pub const State = enum(u8) {
     terminated = 5,
 };
 
+/// One path challenge's progress (RFC 9000 §8.2.2).
+///
+/// `idle` is a path nobody has proposed or one that has finished validating;
+/// `validated` is where a path's address is proved and stays until a
+/// migration proposes a new one, so a caller reading only this cannot tell
+/// "never tried" from "already proved" — `PathValidator` is the thing that
+/// can.
+///
 pub const PathValidationState = enum {
     idle,
     pending,
@@ -42,6 +60,14 @@ pub const PathValidationState = enum {
     failed,
 };
 
+/// One outstanding path challenge: the value that was sent, when, and how
+/// many times it has been retried.
+///
+/// The challenge is drawn from the caller's generator and kept here, because a
+/// response is only a response to the value that was asked for. Retries are
+/// bounded and the state is per path, so a connection can have one candidate
+/// validating while its active path is long since proved.
+///
 pub const PathValidator = struct {
     challenge_data: [8]u8 = .{0} ** 8,
     state: PathValidationState = .idle,
@@ -92,6 +118,17 @@ pub const PathValidator = struct {
     }
 };
 
+/// One path: the local and peer addresses a datagram arrived between, and the
+/// validation and byte counters that belong to them.
+///
+/// A connection holds two — one active, one migration candidate — and indexes
+/// one active; a candidate that has not been proposed is `unset` on both
+/// addresses rather than absent, which is why an unset path compares equal to
+/// itself and does not read as a migration. `bytes_received` and
+/// `bytes_sent` are the anti-amplification ledger: `canSend` is the only
+/// thing that consults them, and a server may not answer with three times what
+/// it has received until a path is validated (RFC 9000 §8.1).
+///
 pub const NetworkPath = struct {
     /// `unset` until a caller names the path, which is what a second
     /// `NetworkPath` is: a connection carries one active path and one
@@ -131,6 +168,15 @@ pub const NetworkPath = struct {
     }
 };
 
+/// One connection id this side issued, in the pool that issues them.
+///
+/// Owns its bytes: `cid_buf` is 20 bytes and `cid_len` says how many of them
+/// this id has, so `getCid` is a view into the entry and never a dangling
+/// slice. `stateless_reset_token` is the token advertised beside this id, and
+/// a peer sends it back in a stateless reset that has to find this
+/// connection. `in_use` is whether this side currently sends to it, and
+/// `occupied` whether the slot holds a live id at all.
+///
 pub const ConnectionIdEntry = struct {
     cid_buf: [20]u8 = .{0} ** 20,
     cid_len: u8 = 0,
@@ -144,6 +190,16 @@ pub const ConnectionIdEntry = struct {
     }
 };
 
+/// The connection ids this side issued and has not retired, at most
+/// `MAX_POOL_SIZE` of them.
+///
+/// A fixed array, not a heap: the count is a protocol constant (RFC 9000 §5.1.1
+/// lets a peer limit it, and this tree honours a lower limit) and a server
+/// that allocated per connection would pay for ids it never issues. Entries
+/// are added with `addPeerCid`, handed out with `consumeUnused`, and dropped by
+/// `removeBySeq`/`retirePriorTo`; a peer that retires one by sequence number
+/// removes it here rather than in the packet path.
+///
 pub const ConnectionIdPool = struct {
     const MAX_POOL_SIZE: usize = 8;
 
@@ -509,17 +565,46 @@ pub const DatagramQueue = struct {
     }
 };
 
+/// An application-level close: the code it carries and the reason it gives.
+///
+/// `reason` is borrowed from the frame it was decoded from and is good until
+/// the next packet is parsed — long enough to log it, not long enough to keep.
+/// `is_app` separates this from a transport error: an application close uses
+/// the application error space (0x1c in a CONNECTION_CLOSE frame) and the
+/// peer reports it as an application error, while a transport error closes
+/// with a transport code the protocol defines.
+///
 pub const ConnectionError = struct {
     is_app: bool,
     code: u64,
     reason: []const u8,
 };
 
-// ECN codepoint values from IP TOS field (2 low bits)
+/// The four ECN codepoints, as the two low bits of an IP header carry them.
+///
+/// They are the values `RecvInfo.ecn` holds and `getEcnMark` answers with, and
+/// the wire type is `u2` because two bits are all a codepoint takes. `ECT1` and
+/// `ECT0` are the two marks a sender chooses between; `CE` is what a router
+/// sets when it cannot forward the marking, and a path that sees one fails
+/// validation (RFC 9000 §13.4.2.1).
 pub const ECN_NOT_ECT: u2 = 0b00;
 pub const ECN_ECT1: u2 = 0b01;
 pub const ECN_ECT0: u2 = 0b10;
 pub const ECN_CE: u2 = 0b11;
+
+/// What one received datagram was, as the connection is told about it.
+///
+/// A value the caller fills in per datagram: where it came from and where it
+/// was sent to are the two addresses the connection's path logic compares
+/// against, `ecn` is the codepoint the IP header carried, and `datagram_size`
+/// is how many bytes the *datagram* was, not this packet.
+///
+/// That last field is why it exists: a datagram may carry several coalesced
+/// packets, and the anti-amplification ledger counts the datagram once. It
+/// must therefore be the full size on the first packet and zero on the ones
+/// after it, which `handleDatagram` does and a caller driving `recv` directly
+/// has to do itself.
+///
 
 pub const RecvInfo = struct {
     to: address.Address,
@@ -564,8 +649,6 @@ pub const ConnectionConfig = struct {
     static_reset_key: ?[16]u8 = null,
 };
 
-/// A QUIC connection.
-///
 // General queue for packets that can't be decrypted yet because the keys
 // for their encryption level aren't installed (0-RTT before the early-data
 // key, Handshake/1-RTT before those keys — e.g. a multi-Initial ClientHello
@@ -605,6 +688,18 @@ const UndecryptablePackets = struct {
 /// This is the central state machine that manages the QUIC protocol.
 /// Following quic-go's architecture, the connection runs an event-driven
 /// loop that processes received packets, handles timers, and sends data.
+///
+/// It is a value about 185 KB across, owns nothing on construction and frees
+/// everything in `deinit`, and it borrows inside itself: `local_params` and
+/// the handshake's transport parameters point at its own connection-id
+/// arrays. That is why it is built in place by `acceptInto`/`connectInto`
+/// rather than returned by value — see `local_params` — and why a caller that
+/// keeps one owns it by pointer.
+///
+/// Two parameters rather than four: `now` is an argument of every ingress,
+/// egress and timer pass and `random` of every draw, so the whole state
+/// machine can be driven in virtual time from a seeded generator with no clock
+/// and no entropy source behind it.
 pub const Connection = struct {
     version: u32 = undefined,
     is_server: bool,
@@ -645,9 +740,25 @@ pub const Connection = struct {
     conn_flow_ctrl: flow_control.ConnectionFlowController = undefined,
     streams: stream_mod.StreamsMap = undefined,
     crypto_streams: crypto_stream.CryptoStreamManager = undefined,
+    /// Builds the packets this connection sends, and owns its own copies of
+    /// both connection ids — so it keeps working after this connection moves,
+    /// which is what lets `sendAt` be called on any copy. It is still internal
+    /// state: nothing outside this file should build a packet through it,
+    /// because `sendAt` is what applies the congestion window, the pacer and
+    /// the amplification budget a direct call would bypass.
+    ///
     packer: packet_packer.PacketPacker = undefined,
 
     // Transport parameters
+    /// This side's transport parameters. **They borrow this connection's own
+    /// connection-id arrays** — `original_destination_connection_id`,
+    /// `initial_source_connection_id` and `retry_source_connection_id` point
+    /// into `scid`, `dcid` and `odcid_buf` — so they are bound after those are
+    /// stored, and a connection must be built in place by `acceptInto` or
+    /// `connectInto` and not moved afterwards. The by-value `accept` and
+    /// `connect` wrappers exist for a caller with stack to spare that does not
+    /// read these parameters back.
+    ///
     local_params: transport_params.TransportParams = .{},
     peer_params: ?transport_params.TransportParams = null,
 
@@ -746,8 +857,12 @@ pub const Connection = struct {
     new_token_buf: [packet.TOKEN_MAX_LEN]u8 = .{0} ** packet.TOKEN_MAX_LEN,
     new_token_len: u8 = 0,
 
-    // Token key for NEW_TOKEN generation (server, shared with retry_token_key)
-    token_key: [16]u8 = .{0} ** 16,
+    /// The key this side seals NEW_TOKENs under, on a server. Null means it
+    /// has none, and it issues no token at all: a token sealed under a key
+    /// every reader could guess proves nothing and outlives the connection
+    /// that issued it. Shared with the Retry token key; see
+    /// `ConnectionConfig.token_key`.
+    token_key: ?[16]u8 = null,
 
     // ECN validation: peer-reported ECN counts from ACK_ECN frames (RFC 9000 §13.4.2.1)
     // Track per-space to detect increases; only Application space matters in practice
@@ -847,6 +962,14 @@ pub const Connection = struct {
             .streams = stream_mod.StreamsMap.init(allocator, is_server),
             .crypto_streams = crypto_stream.CryptoStreamManager.init(allocator),
         };
+
+        // Everything below this line can allocate, and a failure there leaves
+        // a connection that is half built. `deinit` is written for a fully
+        // built one and is safe here because the literal above initialises
+        // every member it frees, so the TLS handshake, the datagram queues and
+        // the stream maps are all in their empty state until something puts
+        // something in them.
+        errdefer conn.deinit();
 
         // Set connection IDs:
         // Server: dcid = client's SCID (for sending TO client), scid = our generated CID
@@ -972,9 +1095,7 @@ pub const Connection = struct {
         }
 
         // Set token key for NEW_TOKEN generation (server)
-        if (config.token_key) |tk| {
-            conn.token_key = tk;
-        }
+        conn.token_key = config.token_key;
 
         // Configure stream limits
         conn.streams.setMaxIncomingStreams(
@@ -999,7 +1120,12 @@ pub const Connection = struct {
         }
     }
 
-    /// Convenience wrapper for callers with stack to spare.
+    /// Convenience wrapper for callers with stack to spare. Prefer
+    /// `acceptInto` anywhere the 185 KB temporary matters, and anywhere the
+    /// connection is kept: this returns by value, and a connection's
+    /// transport parameters borrow its own connection-id arrays, so the copy
+    /// the caller receives holds slices into the frame this ran in. Build in
+    /// place and own a `*Connection` unless the stack is the point.
     pub fn accept(
         allocator: std.mem.Allocator,
         header: packet.Header,
@@ -1599,11 +1725,14 @@ pub const Connection = struct {
     }
 
     fn newTokenFrame(self: *Connection, now: i64, random: std.Random) ?frame_mod.PendingControlFrame {
+        // No key, no token: sealing one under an absent key would be sealing
+        // it under something a reader has, which is worse than sending none.
+        const token_key = self.token_key orelse return null;
         var nt_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
         const nt_len = packet.generateNewToken(
             &nt_buf,
             self.paths[self.active_path_idx].peer_addr,
-            self.token_key,
+            token_key,
             now,
             random,
         ) catch return null;
@@ -2793,8 +2922,6 @@ pub const Connection = struct {
         }
     }
 
-    /// Install handshake-level encryption keys.
-    /// Called when the TLS handshake produces Handshake-level secrets.
     /// Switch the connection to a new QUIC version (Compatible Version Negotiation, RFC 9368).
     /// Re-derives Initial keys asymmetrically:
     /// - Server: keeps v1 open keys (to decrypt client retransmissions), switches seal to v2
@@ -2832,6 +2959,9 @@ pub const Connection = struct {
         std.log.info("switchVersion: 0x{x:0>8} -> 0x{x:0>8}", .{ old_version, new_version });
     }
 
+    /// Install handshake-level encryption keys, and forget the ones the
+    /// handshake supersedes. Called when TLS produces Handshake-level secrets.
+    ///
     pub fn installHandshakeKeys(self: *Connection, open: quic_crypto.Open, seal: quic_crypto.Seal) void {
         // Packet number space index 1 = Handshake
         self.pkt_num_spaces[1].crypto_open = open;
@@ -3148,7 +3278,10 @@ pub const Connection = struct {
             if (self.close_pkt_len > 0) {
                 // Already built the close packet
                 if (self.needs_close_retransmit) {
-                    // Retransmit saved close packet
+                    // A buffer that cannot hold the packet is not a refusal of
+                    // it: nothing is copied, the trigger stands, and the next
+                    // pass with room still has this packet to send.
+                    if (out_buf.len < self.close_pkt_len) return 0;
                     self.needs_close_retransmit = false;
                     const len = self.close_pkt_len;
                     @memcpy(out_buf[0..len], self.close_pkt_buf[0..len]);
@@ -3954,7 +4087,6 @@ pub const Connection = struct {
         _ = self.datagram_send_queue.push(data, now);
     }
 
-    /// Returns true if the datagram send queue is full.
     /// Bytes the application can still write, across every stream, before the
     /// peer's MAX_DATA is spent. Bytes written but not yet sent count as spent:
     /// they spend it on the way out. Advisory — a write past it is not refused,
@@ -3978,6 +4110,9 @@ pub const Connection = struct {
         return ss.write_offset -| ss.send_offset;
     }
 
+    /// Whether the datagram send queue is full, which is a reason to send
+    /// before queueing another datagram rather than an error.
+    ///
     pub fn isDatagramSendQueueFull(self: *const Connection) bool {
         return self.datagram_send_queue.isFull();
     }
@@ -4293,10 +4428,6 @@ pub const Connection = struct {
         return if (self.ecn_validator.shouldMark()) ECN_ECT0 else ECN_NOT_ECT;
     }
 
-    /// Initiate a client-side connection migration (RFC 9000 Section 9).
-    /// Consumes a fresh DCID from the peer CID pool and queues PATH_CHALLENGE.
-    /// The caller is responsible for actually sending from a new local address.
-    /// Returns true if migration was initiated, false if no unused CID is available.
     /// Moves off a DCID the peer retired, onto the lowest CID it still allows.
     fn replaceRetiredDcid(self: *Connection) void {
         var best: ?*ConnectionIdEntry = null;
@@ -4318,6 +4449,16 @@ pub const Connection = struct {
         self.dcid_seq = entry.seq_num;
     }
 
+    /// Initiate a client-side connection migration (RFC 9000 §9).
+    ///
+    /// Consumes a fresh destination CID from the peer pool and queues a
+    /// PATH_CHALLENGE on it. The caller is responsible for actually sending
+    /// from a new local address; nothing here opens one.
+    ///
+    /// False when the peer issued no unused CID, which is a fact about the
+    /// peer's `active_connection_id_limit` rather than a failure: the caller
+    /// can ask again once the peer has issued one.
+    ///
     pub fn initiateClientMigration(self: *Connection) bool {
         const entry = self.peer_cid_pool.consumeUnused() orelse return false;
         self.useDcid(entry);
@@ -4408,6 +4549,22 @@ pub const Connection = struct {
 
             const pkt_start = fbs.seek;
             var header = packet.Header.parse(&fbs, self.scid_len) catch break;
+            // A Version Negotiation packet is a whole datagram, not a packet
+            // inside one, and it is the one type whose header has no Length
+            // field for this loop to step by. Hand it to recv — which is where
+            // a client acts on one — and stop, rather than reading a length
+            // this packet never had.
+            if (header.packet_type == .version_negotiation) {
+                // A client acts on one here; a server has nothing to do with
+                // it. Whatever `recv` answers, the walk ends here, because the
+                // packet is the whole datagram and there is no length to step
+                // by. A refusal is reported rather than dropped: it says the
+                // packet was not one this end could read.
+                self.recv(&header, &fbs, info, now, random) catch |err| {
+                    std.log.debug("version negotiation packet refused: {t}", .{err});
+                };
+                break;
+            }
             const full_size = fbs.seek - pkt_start + header.remainder_len;
 
             // Only count datagram_size for the first packet to avoid
@@ -4518,6 +4675,12 @@ pub fn connectInto(
     conn.dcid_len = 8;
     @memcpy(conn.dcid[0..8], &dcid);
 
+    // The transport parameters borrow this connection's own connection ids, so
+    // they are bound here, after the ids are stored — not to the locals they
+    // were drawn from. A parameter still pointing at this frame would be
+    // encoded from a dead slot in the very first Initial.
+    conn.local_params.initial_source_connection_id = conn.scid[0..conn.scid_len];
+
     // Save the initial DCID as the Original Destination CID (needed for Retry handling)
     conn.odcid_len = 8;
     @memcpy(conn.odcid_buf[0..8], &dcid);
@@ -4621,8 +4784,12 @@ pub fn connectInto(
     return;
 }
 
-/// Convenience wrapper for callers with stack to spare. Prefer connectInto
-/// anywhere the 185 KB temporary matters.
+/// Convenience wrapper for callers with stack to spare. Prefer `connectInto`
+/// anywhere the 185 KB temporary matters, and anywhere the connection is
+/// kept: this returns by value, and a connection's transport parameters
+/// borrow its own connection-id arrays, so the copy the caller receives holds
+/// slices into the frame this ran in. Build in place and own a
+/// `*Connection` unless the stack is the point.
 pub fn connect(
     allocator: std.mem.Allocator,
     server_name: []const u8,
@@ -6577,4 +6744,121 @@ test "connection flow control: a repeated RESET_STREAM counts its final size onc
 
     try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.highest_received);
     try std.testing.expectEqual(@as(u64, 1000), conn.conn_flow_ctrl.base.bytes_read);
+}
+
+test "a server with no token key issues no NEW_TOKEN at all" {
+    var rng = TestRandom{};
+    const local = address.Address.initIpv4(.{ 0, 0, 0, 0 }, 443);
+    const remote = address.Address.initIpv4(.{ 192, 168, 1, 100 }, 12345);
+    const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const scid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
+    const header = packet.Header{
+        .packet_type = .initial,
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .dcid = &dcid,
+        .scid = &scid,
+        .token = &.{},
+        .packet_number = 0,
+        .packet_number_len = 1,
+        .remainder_len = 0,
+    };
+
+    var keyed = try Connection.accept(
+        std.testing.allocator,
+        header,
+        local,
+        remote,
+        true,
+        .{ .token_key = @splat(0x11) },
+        null,
+        null,
+        null,
+        test_now,
+        rng.random(),
+    );
+    defer keyed.deinit();
+    try std.testing.expect(keyed.newTokenFrame(test_now, rng.random()) != null);
+
+    // A connection with no token key has no secret to seal one with, and the
+    // zero key it would otherwise use is a key every reader of the wire has:
+    // a token sealed under it proves nothing and outlives the connection that
+    // issued it. No token, no frame.
+    var unkeyed = try Connection.accept(
+        std.testing.allocator,
+        header,
+        local,
+        remote,
+        true,
+        .{},
+        null,
+        null,
+        null,
+        test_now,
+        rng.random(),
+    );
+    defer unkeyed.deinit();
+    try std.testing.expectEqual(@as(?[16]u8, null), unkeyed.token_key);
+    try std.testing.expect(unkeyed.newTokenFrame(test_now, rng.random()) == null);
+}
+
+test "handleDatagram: a version negotiation packet ends the walk, not its length field" {
+    var rng = TestRandom{};
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // RFC 9000 §6.1: long header, version zero, both connection ids, then the
+    // versions. There is no Length field, so there is nothing in the packet
+    // that says how long it is — the whole datagram is the packet, and a
+    // server ignores it (a client is the only end that acts on one).
+    const local = address.Address.initIpv4(.{ 0, 0, 0, 0 }, 443);
+    const remote = address.Address.initIpv4(.{ 192, 168, 1, 100 }, 12345);
+    var datagram = [_]u8{0} ** 64;
+    datagram[0] = 0xc0;
+    std.mem.writeInt(u32, datagram[1..5], 0, .big);
+    datagram[5] = 8;
+    @memcpy(datagram[6..14], &conn.dcid);
+    datagram[14] = 8;
+    @memcpy(datagram[15..23], &conn.scid);
+    std.mem.writeInt(u32, datagram[23..27], 0x1a2a3a4a, .big);
+    std.mem.writeInt(u32, datagram[27..31], 0x5a5a5a5a, .big);
+
+    conn.handleDatagram(&datagram, .{
+        .to = local,
+        .from = remote,
+        .datagram_size = datagram.len,
+    }, test_now, rng.random());
+
+    // Ignored, so not closed, not acknowledged and not counted as received:
+    // the packet was read as a packet and nothing in it was acted on.
+    try std.testing.expect(!conn.isClosed());
+    try std.testing.expectEqual(@as(u64, 0), conn.getStats().packets_received);
+}
+
+test "sendAt: a closing packet waits for a buffer that can hold it" {
+    var rng = TestRandom{};
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+
+    // A close packet is saved at up to 256 bytes and re-sent on the trigger.
+    // A caller whose buffer is shorter than that has not refused the packet —
+    // it has asked for one it cannot hold, and the answer is a retry, not a
+    // truncated copy and not a consumed trigger.
+    conn.state = .closing;
+    conn.close_pkt_len = conn.close_pkt_buf.len;
+    @memset(&conn.close_pkt_buf, 0xaa);
+    conn.needs_close_retransmit = true;
+
+    var short: [16]u8 = undefined;
+    @memset(&short, 0x5a);
+    try std.testing.expectEqual(@as(usize, 0), try conn.sendAt(&short, test_now, rng.random()));
+    // Nothing was written and the trigger stands, so the next pass with room
+    // still has the packet to send.
+    try std.testing.expectEqualSlices(u8, &[_]u8{0x5a} ** 16, &short);
+    try std.testing.expect(conn.needs_close_retransmit);
+
+    var roomy: [300]u8 = undefined;
+    const len = try conn.sendAt(&roomy, test_now, rng.random());
+    try std.testing.expectEqual(@as(usize, conn.close_pkt_len), len);
+    try std.testing.expectEqualSlices(u8, &conn.close_pkt_buf, roomy[0..len]);
+    try std.testing.expect(!conn.needs_close_retransmit);
 }

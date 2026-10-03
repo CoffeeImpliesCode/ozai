@@ -8,6 +8,12 @@ const packet = @import("packet.zig");
 const protocol = @import("protocol.zig");
 
 /// QUIC Transport Parameter IDs (RFC 9000 Section 18.2).
+///
+/// The values are the varint that goes on the wire, so `@intFromEnum` of a
+/// tag is what `encode` writes and what `decode` switches on. `_` catches
+/// every other ID — unknown extension parameters and the greased IDs of
+/// RFC 9000 §18.1 (31*N+27), which `decode` skips by their declared length
+/// rather than rejecting.
 pub const ParamId = enum(u64) {
     original_destination_connection_id = 0x00,
     max_idle_timeout = 0x01,
@@ -33,23 +39,56 @@ pub const ParamId = enum(u64) {
 };
 
 /// Server's Preferred Address (RFC 9000 §9.6, §18.2).
+///
+/// Every field is fixed-size, so the whole parameter is owned by value: it
+/// borrows nothing, allocates nothing, has no teardown, and copying it copies
+/// every byte. It is peer-supplied, so a non-null `TransportParams.preferred_address`
+/// is a claim a peer made about an address this endpoint has not verified.
 pub const PreferredAddress = struct {
+    /// The offered IPv4 address as 4 octets in network order.
     ipv4_addr: [4]u8 = .{0} ** 4,
+    /// Network byte order. 0 is how RFC 9000 §9.6 says the IPv4 half is
+    /// absent, so a zero port means `hasIpv4` is false and the address octets
+    /// beside it are meaningless.
     ipv4_port: u16 = 0,
+    /// The offered IPv6 address as 16 octets in network order.
     ipv6_addr: [16]u8 = .{0} ** 16,
+    /// Network byte order, with the same 0-means-absent rule as `ipv4_port`.
     ipv6_port: u16 = 0,
+    /// Inline storage for the connection ID the peer wants this endpoint to
+    /// use when migrating. Fixed at 20 bytes because that is the RFC 9000
+    /// §17.2 maximum connection ID length; only `cid_buf[0..cid_len]` is the
+    /// ID and the rest is zero.
     cid_buf: [20]u8 = .{0} ** 20,
+    /// Bytes of `cid_buf` that carry the ID, 0 to 20. `decode` answers
+    /// `error.TransportParameterError` above 20, and `encode` writes whatever
+    /// this says without checking it, so a locally built value must set it.
     cid_len: u8 = 0,
+    /// The reset token to use for the connection ID the peer chose. Peer-
+    /// supplied and unverifiable, and it is the only thing that makes a reset
+    /// for the migrated connection recognisable.
     stateless_reset_token: [16]u8 = .{0} ** 16,
 
+    /// Whether the peer offered an IPv4 address, which RFC 9000 §9.6 encodes
+    /// as a non-zero port.
     pub fn hasIpv4(self: *const PreferredAddress) bool {
         return self.ipv4_port != 0;
     }
 
+    /// Whether the peer offered an IPv6 address, on the same zero-port rule as
+    /// `hasIpv4`. The two are independent: a peer may offer one, the other, or
+    /// both.
     pub fn hasIpv6(self: *const PreferredAddress) bool {
         return self.ipv6_port != 0;
     }
 
+    /// The connection ID the peer chose for this endpoint's use, as
+    /// `cid_buf[0..cid_len]`.
+    ///
+    /// Borrowed from this value, so it dies with it: a caller that keeps the
+    /// ID past the `PreferredAddress` copies it. It is empty when `cid_len` is
+    /// 0, and `decode` never produces that — a peer that offers a preferred
+    /// address must carry a connection ID with it.
     pub fn getCid(self: *const PreferredAddress) []const u8 {
         return self.cid_buf[0..self.cid_len];
     }
@@ -71,38 +110,125 @@ pub const PreferredAddress = struct {
 };
 
 /// QUIC Transport Parameters (RFC 9000 Section 18).
+///
+/// One value serves both directions and both roles: `Connection` fills one to
+/// send as its own limits, and `decode` fills one from what a peer sent. Only
+/// the connection IDs are borrows — they point into the buffer `decode` was
+/// handed — and everything else is either a scalar or inline fixed storage, so
+/// a decoded value owns nothing but those three slices and needs no teardown.
+/// A field is peer-supplied when it came out of `decode` and locally set when
+/// the caller put it there; `encode` emits a field only when it differs from
+/// its RFC default, so a value left at the default is a value not sent.
+///
+/// Every integer parameter below is a QUIC varint on the wire, so its legal
+/// range is 0 to 2^62-1 and nothing here narrows it further.
 pub const TransportParams = struct {
+    /// The connection ID this connection started with, as a length-prefixed
+    /// opaque field rather than a varint. `null` means the parameter was not
+    /// sent, which for a server is a protocol violation rather than an option;
+    /// `encode` writes whatever slice it holds and `decode` borrows it out of
+    /// its input, so it dies with that buffer.
     original_destination_connection_id: ?[]const u8 = null,
+    /// Milliseconds, as a varint. 0 is the RFC default and is not sent; there
+    /// is no other sentinel, so an endpoint that means "no timeout" states 0
+    /// and lets the peer apply its own policy.
     max_idle_timeout: u64 = 0,
+    /// 16 raw bytes, not a varint: the token to recognise a stateless reset
+    /// from this peer. `null` means the peer sent none, which is why this is
+    /// optional while RFC 9000 §10.3.1 requires it once the peer might issue a
+    /// Retry. A decode rejects any other length as
+    /// `error.TransportParameterError`.
     stateless_reset_token: ?[16]u8 = null,
+    /// Bytes. 65527 is the RFC default and is not sent; RFC 9000 §18.2 bounds
+    /// it below by 1200, the QUIC minimum datagram, and `Connection` is what
+    /// enforces that on a peer's value.
     max_udp_payload_size: u64 = 65527,
+    /// Bytes of connection-level flow control credit, as a varint. 0 is the
+    /// default and is not sent, which a peer reads as "no credit yet" rather
+    /// than "unlimited".
     initial_max_data: u64 = 0,
+    /// Bytes of flow control credit for a bidirectional stream this endpoint
+    /// opened. Varint, 0 default, 0 means zero credit and is not sent.
     initial_max_stream_data_bidi_local: u64 = 0,
+    /// Bytes of flow control credit for a bidirectional stream the peer
+    /// opened. Varint, 0 default, 0 means zero credit and is not sent.
     initial_max_stream_data_bidi_remote: u64 = 0,
+    /// Bytes of flow control credit for a unidirectional stream the peer
+    /// opened. Varint, 0 default, 0 means zero credit and is not sent.
     initial_max_stream_data_uni: u64 = 0,
+    /// How many bidirectional streams the peer may open, as a varint. 0 is
+    /// the default and is not sent, so an endpoint that sets it grants a
+    /// lifetime budget rather than a rate.
     initial_max_streams_bidi: u64 = 0,
+    /// How many unidirectional streams the peer may open. Varint, 0 default,
+    /// 0 is not sent.
     initial_max_streams_uni: u64 = 0,
+    /// The exponent the peer scales its reported ACK delay by, as a varint.
+    /// 3 is the RFC default and is not sent; RFC 9000 §18.2 caps it at 20, and
+    /// the scaling to nanoseconds is done by the reader, not here.
     ack_delay_exponent: u64 = 3,
+    /// Milliseconds — the wire unit, unlike the nanoseconds `RttStats` keeps.
+    /// 25 is the RFC default and is not sent; RFC 9000 §18.2 caps it at 2^14,
+    /// and `Connection` closes the connection on a larger peer value.
     max_ack_delay: u64 = 25,
+    /// A zero-length parameter whose presence is the whole meaning: true means
+    /// the peer asked this endpoint not to migrate. false means either "not
+    /// sent" or "sent with content", and `decode` treats any length as
+    /// present.
     disable_active_migration: bool = false,
+    /// The address the server wants this endpoint to migrate to. `null` means
+    /// none was offered; a server sends one on its Retry and on the first
+    /// Initial. The value is peer-supplied and fixed-size, so copying it copies
+    /// every byte and there is nothing to release.
     preferred_address: ?PreferredAddress = null,
+    /// How many connection IDs the peer may hold, as a varint. 2 is the RFC
+    /// default and is not sent; RFC 9000 §18.2 sets 2 as the floor, and a
+    /// smaller peer value is a transport parameter error for `Connection` to
+    /// detect.
     active_connection_id_limit: u64 = 2,
+    /// The connection ID this endpoint chose as its source, length-prefixed
+    /// opaque rather than a varint. `null` means not sent. On decode it
+    /// borrows the input buffer; `Connection` sets it locally before its own
+    /// first flight.
     initial_source_connection_id: ?[]const u8 = null,
+    /// The connection ID from the Retry that caused this attempt, same
+    /// encoding. `null` means no Retry happened, which is the ordinary case
+    /// and is not an error.
     retry_source_connection_id: ?[]const u8 = null,
+    /// Bytes: the largest DATAGRAM frame payload the sender will accept, as a
+    /// varint. `null` is not "unlimited" but "this endpoint does not support
+    /// DATAGRAM at all" (RFC 9221), and it is the parameter's absence that
+    /// tells the peer so — there is no zero value that means it.
     max_datagram_frame_size: ?u64 = null,
-
-    // draft-ietf-quic-ack-frequency: minimum ACK delay in microseconds.
-    // null = does not support ACK frequency extension.
+    /// Microseconds: the minimum delay the sender will put between ACKs if
+    /// asked. `null` means the ACK-frequency extension is not supported and
+    /// the parameter is not sent, which is the answer a peer acts on.
     min_ack_delay: ?u64 = null,
-
     /// RFC 9368 version_information transport parameter.
     /// chosen_version: the version used for this connection.
     /// available_versions: list of all supported versions (up to 8).
+    ///
+    /// `null` means the parameter is absent, and `encode` writes neither half
+    /// without it: the available list is nested inside it on the wire, so a
+    /// populated `version_info_available` with a null chosen version is
+    /// locally built state that never reaches the peer.
     version_info_chosen: ?u32 = null,
+    /// The peer-supported versions, big-endian on the wire. Only
+    /// `version_info_available[0..version_info_available_count]` is
+    /// meaningful; the tail is zero-filled and ignored by every reader here.
+    /// `decode` keeps the first 8 and drops the rest.
     version_info_available: [8]u32 = .{0} ** 8,
+    /// How many entries of `version_info_available` are set, 0 to 8. It is
+    /// the count `encode` writes and the bound `hasAvailableVersion` reads to,
+    /// so a value above 8 would read past the array.
     version_info_available_count: u8 = 0,
 
     /// Check if a version is listed in the peer's available versions.
+    ///
+    /// Reads only the first `version_info_available_count` entries, so a
+    /// version past 8 on the wire is invisible here. `version_info_chosen`
+    /// is not consulted: this answers about what the peer can speak, not about
+    /// what it chose.
     pub fn hasAvailableVersion(self: *const TransportParams, version: u32) bool {
         for (0..self.version_info_available_count) |i| {
             if (self.version_info_available[i] == version) return true;
@@ -113,6 +239,20 @@ pub const TransportParams = struct {
     /// Encode transport parameters into a buffer.
     ///
     /// `random` is drawn once, and only for the greased parameter below.
+    ///
+    /// Each parameter is emitted only when it differs from its RFC default, so
+    /// a `TransportParams` left at its defaults writes almost nothing — but the
+    /// greased parameter is always written, so the output is never empty.
+    /// `version_information` is written only when `version_info_chosen` is
+    /// non-null, and carries `version_info_available_count` entries.
+    ///
+    /// `writer` is anything with the `writeAll`/`writeByte`/`writeVarInt`
+    /// method surface, typically a `FixedBufferStream`; the caller's writer
+    /// owns the bytes and nothing is borrowed from it afterwards. The error
+    /// union is entirely the writer's — `error.NoSpaceLeft` from a full
+    /// buffer — because this call only ever writes. Allocates nothing. On an
+    /// error a prefix may already have reached `writer`, and the caller
+    /// decides whether that matters; nothing is rolled back.
     pub fn encode(self: *const TransportParams, writer: anytype, random: std.Random) !void {
         // Helper to write a single parameter
         const Helper = struct {
@@ -261,6 +401,24 @@ pub const TransportParams = struct {
     }
 
     /// Decode transport parameters from a buffer.
+    ///
+    /// The returned connection IDs — `original_destination_connection_id`,
+    /// `initial_source_connection_id` and `retry_source_connection_id` — point
+    /// into `data`, so `data` must stay alive and unmodified for as long as the
+    /// decoded `TransportParams` is used; nothing is copied and nothing is
+    /// allocated. Every other field is an inline value the decode owns.
+    ///
+    /// `error.TransportParameterError` is a length that runs past `data`, a
+    /// length that cannot survive a `usize`, a `stateless_reset_token` that is
+    /// not 16 bytes, or a `preferred_address` connection ID over 20 bytes.
+    /// `error.EndOfStream` is a varint truncated at the end of `data`. Neither
+    /// error yields a partial value: nothing is returned on either path.
+    ///
+    /// Unknown IDs — every greased ID of RFC 9000 §18.1 among them — are
+    /// skipped by their declared length, not rejected, and a
+    /// `version_information` whose length is not a positive multiple of 4 is
+    /// skipped the same way. A parameter repeated by a peer is decoded twice
+    /// and the last occurrence wins.
     pub fn decode(data: []const u8) !TransportParams {
         var params = TransportParams{};
         var fbs = io.fixedBufferStream(data);

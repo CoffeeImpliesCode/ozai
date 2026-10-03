@@ -37,12 +37,12 @@ pub fn main(init: std.process.Init) !void {
         node_id,
         try ozai.RelayUrl.parse("https://relay.ozai.invalid./"),
     );
+    defer address.deinit(alloc);
     // `insert` answers `null` only for an address the list already holds, and
     // the list holds exactly one relay, which a socket address cannot equal:
     // `TransportAddr.order` compares the variant before anything inside it.
     // zwanzig-disable-next-line: optional-unwrap
     address = (try address.insert(alloc, direct)).?;
-    defer address.deinit(alloc);
 
     try out_text.print("address     {f}\n", .{address});
 

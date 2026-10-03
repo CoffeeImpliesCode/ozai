@@ -1,3 +1,14 @@
+//! Assembling outgoing QUIC packets: header, frame selection, AEAD
+//! encryption, header protection and coalescing into one datagram.
+//!
+//! `PacketPacker` is reached through `Connection.packer` and is that
+//! connection's send state, not a general encoder: the connection owns the
+//! congestion window, the pacer and the anti-amplification budget, and only
+//! `Connection.sendAt` applies them. The packer owns its two connection-id
+//! buffers and borrows everything else — the streams, the crypto streams,
+//! the frame queue and the flow controller are all the caller's and must
+//! outlive the call.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
@@ -24,6 +35,10 @@ fn streamFrameHeaderOverhead(stream_id: u64, offset: u64, max_data_len: u64) usi
 const DEFAULT_MAX_PACKET_SIZE: usize = 1200;
 
 /// Absolute maximum packet size we ever assemble (probes included).
+///
+/// The ceiling on `PacketPacker.max_packet_size` and on the staging buffer:
+/// a caller asking for more is truncated to this rather than refused, so a
+/// probe for a path MTU above it silently probes 1500.
 const ABSOLUTE_MAX_PACKET_SIZE: usize = 1500;
 
 /// Minimum Initial packet size for client.
@@ -33,9 +48,17 @@ const MIN_INITIAL_PACKET_SIZE: usize = 1200;
 const AEAD_TAG_LEN: usize = crypto_mod.Aead.tag_length;
 
 /// Maximum packet number length.
+///
+/// Never read: the packet number is encoded through
+/// `crypto_mod.encodePacketNumber`, which returns its own length. The bound
+/// the packet builder actually uses is that function's four-byte output
+/// buffer, and this constant does not reach it.
 const MAX_PN_LEN: usize = 4;
 
 /// Header protection sample length.
+///
+/// Never read either; the four-byte minimum plaintext below is written out
+/// literally rather than derived from this.
 const SAMPLE_LEN: usize = crypto_mod.SAMPLE_LEN;
 
 /// The packet packer assembles outgoing QUIC packets.
@@ -45,43 +68,124 @@ const SAMPLE_LEN: usize = crypto_mod.SAMPLE_LEN;
 /// - Collecting frames (ACK, CRYPTO, STREAM, control)
 /// - Applying payload encryption and header protection
 /// - Padding Initial packets to minimum 1200 bytes
+///
+/// It owns the two connection-id buffers and borrows nothing else that needs
+/// releasing: there is no `deinit`, because every allocation it makes — the
+/// frame scratch buffers — is on the stack. That also means it allocates
+/// nothing whose lifetime outlives a call, and that a packer may be moved
+/// freely; what it must not do is move while a caller holds a slice from
+/// `getScid` or `getDcid`.
+///
+/// The fields below are the connection's send state rather than parameters
+/// of a call, and `Connection` writes most of them directly: `max_packet_size`
+/// after path MTU discovery, `key_phase` on a key update, `spin_bit` for
+/// passive RTT measurement, `ecn_mark` from the ECN validator before each
+/// send, and `initial_token` after a Retry.
 pub const PacketPacker = struct {
+    /// Kept from `init` and never read. Nothing in this file allocates: the
+    /// frame staging buffers are fixed-size stack arrays and the connection
+    /// ids are inline. A caller may write it, and no behaviour here changes.
     allocator: Allocator,
+    /// Whether this side is the server. Decides which packets get padded to
+    /// 1200 bytes: a client's standalone Initial is padded, a server's is
+    /// left short so the Handshake packet can carry the padding instead.
     is_server: bool,
 
     /// Source connection ID (owned buffer to avoid dangling slices).
+    ///
+    /// A copy, not a borrow: it is here so the packer keeps working after
+    /// the connection it was built from has moved or released the caller's
+    /// original. `init` copies without a length check, so a source id longer
+    /// than twenty bytes overflows here — the bound is RFC 9000 §17.2's
+    /// twenty, and the caller is what enforces it.
     scid_buf: [20]u8 = .{0} ** 20,
+    /// Bytes of `scid_buf` in use, at most twenty.
     scid_len: u8 = 0,
 
     /// Destination connection ID (owned buffer to avoid dangling slices).
+    ///
+    /// Same copy and same unchecked twenty-byte bound as `scid_buf`. Written
+    /// by `init` and by `updateDcid`, and read for every packet header, so
+    /// changing it changes where the next packet goes.
     dcid_buf: [20]u8 = .{0} ** 20,
+    /// Bytes of `dcid_buf` in use, at most twenty.
     dcid_len: u8 = 0,
 
     /// QUIC version.
+    ///
+    /// Written into every long header and, with `quic_version` on the TLS
+    /// config, decides the HKDF labels the keys were derived under. The two
+    /// must agree: a version negotiation that moves this without moving the
+    /// config produces packets whose keys do not match their labels.
     version: u32,
 
     /// Token for Initial packets (from Retry).
+    ///
+    /// Borrowed from the connection's Retry token buffer, not copied, so it
+    /// must stay alive and unchanged while the packer holds it; the
+    /// connection clears it by setting this field to null. Null sends a
+    /// zero-length token, which is what a first Initial does.
     initial_token: ?[]const u8 = null,
 
     /// Whether to send HANDSHAKE_DONE frame in the next 1-RTT packet (server only).
+    ///
+    /// One-shot: packing consumes it, so the connection re-arms it after a
+    /// PTO or a loss rather than leaving it set. Cleared by the caller at
+    /// the same time it queues the retransmission.
     send_handshake_done: bool = false,
 
     /// Current key phase bit for 1-RTT packets (toggled on key update).
+    ///
+    /// Set into the short header on every 1-RTT packet, so it must match the
+    /// seal actually used: writing it without rolling the keys produces
+    /// packets the peer will decrypt with the wrong key.
     key_phase: bool = false,
 
     /// Spin bit for passive RTT measurement (RFC 9000 §17.4).
+    ///
+    /// A peer that echoes it proves it received the packet, so it is set to
+    /// the connection's own answer to the last ACK and is not a local
+    /// decision at pack time.
     spin_bit: bool = false,
 
     /// Maximum packet size for regular (non-probe) packets.
+    ///
+    /// 1200 from `init`, raised as path MTU discovery succeeds. The packet
+    /// builder takes the smaller of this, 1500 and whatever the caller's
+    /// buffer has room for after the AEAD tag, so a value above 1500 buys
+    /// nothing and a short buffer quietly shrinks the packet.
     max_packet_size: usize = DEFAULT_MAX_PACKET_SIZE,
 
     /// Whether outgoing 1-RTT packets should be marked as ECN (ECT(0)).
     /// Set by connection before packing based on ECN validator state.
+    ///
+    /// Only 1-RTT packets are marked; Initial and Handshake packets never
+    /// are. The connection sets it from `ecn.EcnValidator.shouldMark` before
+    /// each send, and the value is recorded on the resulting `SentPacket` so
+    /// a CE report can be charged against what was marked.
     ecn_mark: bool = false,
 
     /// Connection-level flow controller (for send-side limit enforcement).
+    ///
+    /// Borrowed from `Connection.conn_flow_ctrl` and set before each send;
+    /// null means no connection-level limit is applied and new stream bytes
+    /// are packed regardless of `bytes_in_flight`. Bytes packed are charged
+    /// straight to `base.bytes_sent` here rather than through the stream's
+    /// own controller, so this pointer and the streams must describe the
+    /// same connection.
     conn_flow_ctrl: ?*flow_control.ConnectionFlowController = null,
 
+    /// A packer for one connection, with its connection ids copied in.
+    ///
+    /// `scid` and `dcid` are borrowed for the call and copied, so the caller
+    /// may release them immediately. Neither length is checked: anything
+    /// longer than twenty bytes overflows the inline buffers, and the
+    /// twenty-byte bound of RFC 9000 §17.2 is the caller's to enforce.
+    /// `version` is what goes in the long header from the first packet.
+    ///
+    /// Everything else is at its default: no token, 1200-byte packets, no
+    /// ECN marking and no flow control, so a packer built here sends until
+    /// the connection fills in the rest.
     pub fn init(
         allocator: Allocator,
         is_server: bool,
@@ -101,14 +205,26 @@ pub const PacketPacker = struct {
         return packer;
     }
 
+    /// The source connection id, as a slice of the packer's own buffer. It
+    /// stays valid until the packer moves, and is not invalidated by any
+    /// method here — the source id is written once, at `init`.
     pub fn getScid(self: *const PacketPacker) []const u8 {
         return self.scid_buf[0..self.scid_len];
     }
 
+    /// The destination connection id, as a slice of the packer's own
+    /// buffer. Invalidated by `updateDcid` and by moving the packer.
     pub fn getDcid(self: *const PacketPacker) []const u8 {
         return self.dcid_buf[0..self.dcid_len];
     }
 
+    /// Points the next packets at a different destination connection id.
+    ///
+    /// `new_dcid` is copied, so the caller may release it immediately, and
+    /// its length is not checked against the twenty-byte buffer — a longer id
+    /// overflows here. Does not touch the source id, and does not revisit
+    /// packets already built: a packet number spent under the old id stays
+    /// spent, which is why a peer migration is also a protocol event.
     pub fn updateDcid(self: *PacketPacker, new_dcid: []const u8) void {
         @memcpy(self.dcid_buf[0..new_dcid.len], new_dcid);
         self.dcid_len = @intCast(new_dcid.len);
@@ -119,6 +235,39 @@ pub const PacketPacker = struct {
     /// When ack_only is true, only ACK/CRYPTO/HANDSHAKE_DONE/control frames are packed (no stream/datagram data).
     /// `random` draws the packet numbers a level skips; the caller owns it, so a
     /// test pins the skip schedule with a seed instead of a process CSPRNG.
+    ///
+    /// The datagram to send is `out_buf[0..returned]`: every byte the packer
+    /// took — stream data, CRYPTO data, datagrams, control frames — is inside
+    /// that prefix and is gone from the queues that held it. Nothing may be
+    /// taken from `out_buf` beyond the returned count, and a caller that
+    /// writes fewer bytes than were returned has silently discarded frames
+    /// the queues will not offer again.
+    ///
+    /// Zero means nothing was packed and no packet was recorded: the packet
+    /// number each level took is given back, the caller's queues are
+    /// untouched, and nothing has to be sent. A caller must treat it as
+    /// "nothing to do", not as "an empty datagram".
+    ///
+    /// Each level present in the seals is offered a packet in turn, and each
+    /// is skipped when it has nothing to say — no seal, no room left in
+    /// `out_buf`, or an empty payload at that level. The padding to 1200 is
+    /// applied where RFC 9000 §14.1 asks for it and nowhere else.
+    ///
+    /// Two errors are reachable, and on either the return carries no count,
+    /// so the prefix of `out_buf` that is valid is unspecified and must be
+    /// discarded. `error.OutOfMemory` comes from recording a packet that has
+    /// already been written and encrypted: that packet's number is spent,
+    /// its bytes are in the buffer nobody is told about, and its frames are
+    /// gone from the queues. `error.NoSpaceLeft` comes from a write into a
+    /// level's staging buffer that the per-frame size checks did not
+    /// anticipate — the frames already packed at that level are lost the same
+    /// way. `Connection` closes the connection on both, which is the only
+    /// reason the frames are tolerable to lose.
+    ///
+    /// Everything else is borrowed for the duration of the call: the seals,
+    /// the stream and crypto-stream maps, the frame queue, the datagram queue
+    /// and the flow controller. `random` is the caller's generator and is
+    /// never retained.
     pub fn packCoalesced(
         self: *PacketPacker,
         out_buf: []u8,
@@ -244,6 +393,17 @@ pub const PacketPacker = struct {
     /// Returns the total packet size including header, encrypted payload, and AEAD tag.
     /// When zero_rtt=true, packs a 0-RTT Long Header packet (type 0x10) with only STREAM/DATAGRAM frames.
     /// When ack_only=true, skips stream and datagram frames (used when congestion-limited).
+    ///
+    /// Writes one packet at `offset` in `buf` and returns its length, or zero
+    /// when the level had nothing to say. Zero gives back the packet number
+    /// this level took and records nothing, so an empty poll costs no packet
+    /// number and does not push the PTO out.
+    ///
+    /// A frame it cannot record or cannot fit is re-queued rather than sent
+    /// untracked, and the packet is built in a fixed 1500-byte staging buffer
+    /// so the plaintext never lands in `buf`. `pad_target` pads this packet
+    /// to a size — RFC 9000 §14.1's 1200 for the Initial and Handshake
+    /// levels — and is ignored at 1-RTT, where a short packet is short.
     fn packSinglePacket(
         self: *PacketPacker,
         buf: []u8,
@@ -686,6 +846,26 @@ pub const PacketPacker = struct {
     /// Returns the total bytes written and the packet number used.
     /// `random` is the same generator the coalesced path draws from, so a probe
     /// and the data packets around it share one skip schedule.
+    ///
+    /// `target_size` is the datagram size being probed for, in bytes, and is
+    /// clamped to 1500 — a target above that probes 1500 and reports that,
+    /// rather than failing.
+    ///
+    /// The short answer: when `buf` cannot hold `target_size`, or `target_size`
+    /// is under 64, the result is `{ 0, 0 }`. That path takes no packet
+    /// number, records no packet, and writes nothing — a caller that treats a
+    /// zero `pn` as a real one would probe packet number zero.
+    ///
+    /// On success the packet is a 1-RTT PING padded to `target_size`, is
+    /// recorded as sent and in flight, and `pn` is the number it used. A lost
+    /// probe is handled by the ordinary loss path, so the caller does not
+    /// have to distinguish it.
+    ///
+    /// `error.NoSpaceLeft` from a header write the sizing did not anticipate,
+    /// which happens before anything is encrypted. `error.OutOfMemory` comes
+    /// from recording the probe, and that one comes after the packet is fully
+    /// written into `buf`: the bytes are there, the packet is not recorded,
+    /// and the caller has no count to find them by.
     pub fn packMtuProbe(
         self: *PacketPacker,
         buf: []u8,

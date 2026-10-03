@@ -1,3 +1,14 @@
+//! Path MTU discovery for the sans-I/O core: the binary search, the probe
+//! schedule, and the raise timer, as a state machine over caller-supplied
+//! nanosecond instants.
+//!
+//! Nothing here reads a clock or touches a socket. Every entry point takes the
+//! current instant as an `i64` nanosecond value the caller read, and the
+//! discoverer never interprets it — it only differences it, so a caller must
+//! keep passing instants from one monotonic clock. A `MtuDiscoverer` borrows
+//! nothing and allocates nothing; it is a value the `Connection` owns and
+//! resets on migration.
+
 const std = @import("std");
 const testing = std.testing;
 
@@ -22,6 +33,9 @@ const MIN_PROBE_INTERVAL: i64 = 200_000_000;
 /// Timer for re-probing after search completes (600 seconds = 10 minutes).
 const RAISE_TIMER_NS: i64 = 600_000_000_000;
 
+/// Which arm of the search a `MtuDiscoverer` is in. `.disabled` is the zero
+/// value and what a freshly default-constructed discoverer holds; it is also
+/// the only state `MtuDiscoverer.state` is allowed to hold before `start`.
 pub const MtuState = enum {
     /// Search not started yet (waiting for handshake).
     disabled,
@@ -37,33 +51,56 @@ pub const MtuState = enum {
 /// and MAX_PLPMTU to discover the largest packet size the path supports.
 /// Probes are PING+PADDING packets; ACK confirms success, loss narrows range.
 pub const MtuDiscoverer = struct {
+    /// Which arm of the search this discoverer is in. Nothing else reads it to
+    /// decide whether to probe; `shouldProbe` and `checkRaiseTimer` are the
+    /// only entries that consult it.
     state: MtuState = .disabled,
 
-    /// Current confirmed PLPMTU (largest size that was ACK'd).
+    /// Bytes. The largest probe size the path has acknowledged. `Connection`
+    /// copies it into the packer, the congestion controller and the pacer, so
+    /// this is the datagram size the outbound path is held to; it never falls
+    /// below `BASE_PLPMTU`.
     current_mtu: u16 = BASE_PLPMTU,
 
-    /// Lower bound for binary search (last confirmed good size).
+    /// Bytes. Lower bound of the binary search: the last size confirmed good.
+    /// `nextProbeSize` never proposes below it, and `onProbeAcked` raises it to
+    /// the size just acknowledged.
     search_min: u16 = BASE_PLPMTU,
 
-    /// Upper bound for binary search.
+    /// Bytes. Inclusive upper bound of the search range, at most `MAX_PLPMTU`.
+    /// `onProbeLost` lowers it to `probe_size` once that size has failed
+    /// `MAX_PROBES` times, and `checkRaiseTimer` restores it on re-probe.
     search_max: u16 = MAX_PLPMTU,
 
     /// Packet number of the last MTU probe sent (null if none outstanding).
     probe_pn: ?u64 = null,
 
-    /// Size of the last probe sent.
+    /// Bytes. The size `onProbeSent` recorded, which `onProbeAcked` promotes to
+    /// `current_mtu` and which `onProbeLost` turns into the new `search_max`.
+    /// 0 means no probe has been sent.
     probe_size: u16 = 0,
 
     /// Number of consecutive failed probes at current probe_size.
     probe_count: u8 = 0,
 
-    /// Time when the last probe was sent (nanoseconds).
+    /// The caller's monotonic instant, in nanoseconds, at which the last probe
+    /// went out. 0 is the sentinel for "never probed", so `shouldProbe` answers
+    /// true regardless of interval until the first `onProbeSent`. Every instant
+    /// must come from one clock: the only use here is a difference.
     last_probe_time: i64 = 0,
 
-    /// Time when search completed (for raise timer).
+    /// The caller's monotonic instant, in nanoseconds, at which the search
+    /// converged. Written by `onProbeAcked` and `onProbeLost` on the transition
+    /// into `.search_complete`, and read by `checkRaiseTimer` as the start of
+    /// the raise interval.
     search_complete_time: i64 = 0,
 
     /// Start MTU discovery (called after handshake completes).
+    ///
+    /// Moves `.disabled` to `.searching` and resets the search range and
+    /// `probe_count`. It is a no-op in any other state, so a caller that has
+    /// already started gets its in-flight search rather than a restarted one;
+    /// `reset` is the entry that restarts from `.search_complete`.
     pub fn start(self: *MtuDiscoverer) void {
         if (self.state != .disabled) return;
         self.state = .searching;
@@ -73,6 +110,13 @@ pub const MtuDiscoverer = struct {
     }
 
     /// Check if it's time to send a probe.
+    ///
+    /// `now` is the caller's monotonic instant in nanoseconds and
+    /// `smoothed_rtt` is the current estimate in nanoseconds, both on the same
+    /// clock as `last_probe_time`. True only in `.searching` with no probe
+    /// outstanding, and then only once `max(5 * smoothed_rtt, 200ms)` has
+    /// elapsed since `onProbeSent`. Reads only; it does not reserve the probe,
+    /// so a caller that sends nothing leaves the answer unchanged.
     pub fn shouldProbe(self: *const MtuDiscoverer, now: i64, smoothed_rtt: i64) bool {
         if (self.state != .searching) return false;
         // Don't probe if we have one outstanding
@@ -84,12 +128,23 @@ pub const MtuDiscoverer = struct {
         return (now - self.last_probe_time) >= interval;
     }
 
-    /// Get the next probe size (binary search midpoint).
+    /// Get the next probe size (binary search midpoint), in bytes.
+    ///
+    /// The midpoint of `[search_min, search_max]`, so never below `search_min`
+    /// and never above `search_max`. Reads only; the size is not consumed until
+    /// `onProbeSent` records it, and asking twice returns the same answer.
     pub fn nextProbeSize(self: *const MtuDiscoverer) u16 {
         return self.search_min + (self.search_max - self.search_min) / 2;
     }
 
     /// Record that a probe was sent.
+    ///
+    /// `pn` is the packet number the probe left under and `size` the value
+    /// `nextProbeSize` returned, in bytes; `now` is the caller's monotonic
+    /// instant in nanoseconds. This is what makes the probe outstanding, so
+    /// `shouldProbe` answers false until `onProbeAcked` or `onProbeLost` takes
+    /// the same `pn`. Any earlier outstanding probe is overwritten, not
+    /// reported.
     pub fn onProbeSent(self: *MtuDiscoverer, pn: u64, size: u16, now: i64) void {
         self.probe_pn = pn;
         self.probe_size = size;
@@ -97,6 +152,13 @@ pub const MtuDiscoverer = struct {
     }
 
     /// Called when the probe packet was ACK'd — the probed size works.
+    ///
+    /// `pn` must be the outstanding probe's packet number and the state must be
+    /// `.searching`; anything else returns false and changes nothing, so
+    /// `Connection` can hand this every ACK without filtering first. On true,
+    /// `probe_size` becomes `current_mtu` and `search_min`, `probe_count`
+    /// resets, and the search moves to `.search_complete` once the remaining
+    /// range is 20 bytes or narrower, or `current_mtu` reached `MAX_PLPMTU`.
     pub fn onProbeAcked(self: *MtuDiscoverer, pn: u64, now: i64) bool {
         if (self.probe_pn == null or self.probe_pn.? != pn) return false;
         if (self.state != .searching) return false;
@@ -119,6 +181,14 @@ pub const MtuDiscoverer = struct {
     }
 
     /// Called when the probe packet was declared lost — the probed size may not work.
+    ///
+    /// Same acceptance rule as `onProbeAcked`: false and unchanged unless `pn`
+    /// is the outstanding probe and the state is `.searching`. On true the
+    /// probe is no longer outstanding; `search_max` only drops to `probe_size`
+    /// once three consecutive losses have accumulated at that size, and the
+    /// search converges when the remaining range is 20 bytes or narrower. A
+    /// loss below that count reports true and narrows nothing, which is how
+    /// the caller tells a probe loss from an ordinary one.
     pub fn onProbeLost(self: *MtuDiscoverer, pn: u64, now: i64) bool {
         if (self.probe_pn == null or self.probe_pn.? != pn) return false;
         if (self.state != .searching) return false;
@@ -142,6 +212,12 @@ pub const MtuDiscoverer = struct {
     }
 
     /// Check if the raise timer has expired (re-probe after search_complete).
+    ///
+    /// In `.search_complete` and at least the raise interval past
+    /// `search_complete_time`, this returns the discoverer to `.searching`
+    /// with `search_max` back at `MAX_PLPMTU`. It does not lower `current_mtu`
+    /// or widen `search_min`: the next `onProbeAcked` does that. In every other
+    /// state, or before the interval has elapsed, nothing changes.
     pub fn checkRaiseTimer(self: *MtuDiscoverer, now: i64) void {
         if (self.state != .search_complete) return;
         if (now - self.search_complete_time >= RAISE_TIMER_NS) {
@@ -153,6 +229,11 @@ pub const MtuDiscoverer = struct {
     }
 
     /// Reset to base (e.g., on connection migration with IP change).
+    ///
+    /// `current_mtu` and `search_min` return to `BASE_PLPMTU`, `search_max` to
+    /// `MAX_PLPMTU`, any outstanding probe is forgotten, and the state lands in
+    /// `.searching` — not `.disabled` — because the new path is already usable.
+    /// Unlike `start` this runs from any state, including `.searching`.
     pub fn reset(self: *MtuDiscoverer) void {
         self.current_mtu = BASE_PLPMTU;
         self.search_min = BASE_PLPMTU;

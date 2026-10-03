@@ -28,6 +28,9 @@ const Ecdsa = crypto.sign.ecdsa.EcdsaP256Sha256;
 const Sha256 = crypto.hash.sha2.Sha256;
 const Prf = crypto.auth.hmac.Hmac(Sha256);
 
+/// Bytes of hedged nonce `sign` takes. The wire type is std's, so a caller
+/// that already holds std's `Ecdsa.noise_length` bytes can pass them
+/// unchanged.
 pub const noise_length = Ecdsa.noise_length;
 
 /// `j·16^i·G` at `[i][j - 1]`.
@@ -102,6 +105,26 @@ fn mulBase(t: *const [64][15]AffineCoordinates, k: [32]u8) P256 {
 }
 
 /// std's `Ecdsa.KeyPair.sign` for P-256/SHA-256, from the secret key alone.
+///
+/// For the same `secret_key`, `msg` and `noise` the result is byte-identical
+/// to `Ecdsa.KeyPair.sign`, so this can be substituted for it in a handshake
+/// without changing what a peer verifies.
+///
+/// `secret_key` is 32 big-endian bytes and is read only, never retained and
+/// never copied out; `msg` is hashed in place of being buffered. `noise` is
+/// the additional randomness RFC 6979 §3.2 adds: `null` means none supplied,
+/// which is what makes the signature fully deterministic, while a value makes
+/// it hedged — the same key and message then produce different bytes.
+///
+/// `error.NonCanonicalError` is `secret_key` not being a scalar below the
+/// group order, and `error.IdentityElement` is the rare draw that yields r or
+/// s equal to zero. Neither path writes anything the caller owns.
+///
+/// Allocates nothing and blocks on nothing. It is reentrant and safe to call
+/// from more than one thread: the precomputed table is built once under an
+/// atomic, and a caller that arrives while another thread is building it
+/// falls back to std's slower path rather than waiting. Nothing here may
+/// reenter this module.
 pub fn sign(secret_key: [32]u8, msg: []const u8, noise: ?[noise_length]u8) (crypto.errors.IdentityElementError || crypto.errors.NonCanonicalError)!Ecdsa.Signature {
     var msg_hash: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(msg, &msg_hash, .{});

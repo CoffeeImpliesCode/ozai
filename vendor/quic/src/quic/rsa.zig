@@ -15,9 +15,18 @@ const ff = std.crypto.ff;
 const mont = @import("mont.zig");
 const mem = std.mem;
 
+/// Smallest modulus this module will sign with, in bits. Below it
+/// `parsePkcs1` answers `error.UnsupportedKey` rather than degrading.
 pub const min_bits = 2048;
+/// Largest modulus this module will sign with, in bits, and the width every
+/// fixed buffer here is sized for: a signature, an encoded message, and each
+/// CRT half are all at most this many bits. `mont.zig`'s half-width ceiling is
+/// checked against this at comptime.
 pub const max_bits = 4096;
 /// Longest signature: one modulus length.
+/// `signPss` takes `out` at exactly this size for every key, so one buffer
+/// serves any key this module accepts; only `out[0..signatureLength]` is
+/// written.
 pub const max_signature_len = max_bits / 8;
 
 const Modulus = ff.Modulus(max_bits);
@@ -32,6 +41,10 @@ comptime {
 // 1.2.840.113549.1.1.1
 const rsa_encryption_oid = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
 
+/// Every failure a key can have. The three are ordered by how much was
+/// established: `DecodeError` is the encoding, `UnsupportedKey` is a
+/// well-formed key outside what this module signs with, and `InvalidKey` is a
+/// key whose numbers do not belong together.
 pub const Error = error{
     /// Not a well-formed key encoding.
     DecodeError,
@@ -43,10 +56,22 @@ pub const Error = error{
 
 /// A two-prime RSA private key. The fields are big-endian magnitudes without
 /// leading zeros, borrowed from the DER the key was parsed from.
+///
+/// All seven slices borrow one buffer — the DER `parsePkcs1` was handed — and
+/// nothing is copied. The key is valid only while that buffer is alive and
+/// unmodified, and a caller who needs the key to outlive the DER must copy it.
+/// The value itself owns nothing and has no teardown; copying a `PrivateKey`
+/// copies the borrows, not the bytes, so every copy depends on the same DER.
 pub const PrivateKey = struct {
+    /// The modulus n, the public half. Its byte length is
+    /// `signatureLength` and its bit length is `modulusBits`.
     n: []const u8,
+    /// The public exponent e. Capped at four bytes because std's verifier, and
+    /// so the self-check, takes exponents below 2^32.
     e: []const u8,
+    /// The first prime factor p, at most half the modulus.
     p: []const u8,
+    /// The second prime factor q, at most half the modulus.
     q: []const u8,
     /// d mod (p - 1)
     dp: []const u8,
@@ -57,6 +82,11 @@ pub const PrivateKey = struct {
 
     /// Parses a PKCS#1 RSAPrivateKey (RFC 8017 A.1.2). Checks the structure
     /// and sizes only; `check` proves the numbers belong together.
+    ///
+    /// The returned key's seven slices point into `der`: nothing is copied and
+    /// nothing is allocated, so `der` must stay alive and unmodified for as
+    /// long as the key or any copy of it is used. On any error no key is
+    /// produced and `der` is untouched.
     pub fn parsePkcs1(der: []const u8) Error!PrivateKey {
         var outer: Reader = .{ .buf = der };
         var r: Reader = .{ .buf = try outer.element(tag_sequence) };
@@ -91,6 +121,13 @@ pub const PrivateKey = struct {
 
     /// Returns the PKCS#1 RSAPrivateKey inside a PKCS#8 PrivateKeyInfo
     /// (RFC 5208) whose algorithm is rsaEncryption.
+    ///
+    /// The result is a view into `der`, not a copy: it borrows the same memory
+    /// for as long as it is used, and the caller must not write to `der` while
+    /// holding it. Passing it to `parsePkcs1` produces a `PrivateKey` that
+    /// keeps borrowing `der` transitively, so the two obligations are one.
+    /// A non-rsaEncryption algorithm is `error.UnsupportedKey`; a malformed
+    /// one is `error.DecodeError`, and neither writes anything.
     pub fn pkcs1FromPkcs8(der: []const u8) Error![]const u8 {
         var outer: Reader = .{ .buf = der };
         var r: Reader = .{ .buf = try outer.element(tag_sequence) };
@@ -107,18 +144,31 @@ pub const PrivateKey = struct {
         return r.element(tag_octet_string);
     }
 
+    /// The modulus size in bits, counted from the leading byte, so it is at
+    /// most `max_bits` for a key `parsePkcs1` accepted and 0 for a key whose
+    /// `n` is empty. Reads only; nothing is validated here.
     pub fn modulusBits(self: PrivateKey) usize {
         if (self.n.len == 0) return 0;
         return self.n.len * 8 - @clz(self.n[0]);
     }
 
     /// Signature length: the modulus length in bytes.
+    ///
+    /// Fixed per key, not per call: it is `n.len`, at most
+    /// `max_signature_len` for an accepted key. `signPss` returns exactly
+    /// this many bytes and a TLS 1.3 CertificateVerify carries them verbatim.
     pub fn signatureLength(self: PrivateKey) usize {
         return self.n.len;
     }
 
     /// Signs one message, proving the key's numbers fit together. A private
     /// key that fails here would fail every handshake.
+    ///
+    /// Signs a fixed string with a zero salt and throws the signature away, so
+    /// it costs a full RSA operation and allocates one stack buffer. Every
+    /// failure of `signPss` arrives here as `error.InvalidKey`: this proves
+    /// the key, not that this particular signing succeeded, and nothing is
+    /// retained.
     pub fn check(self: PrivateKey) Error!void {
         var sig: [max_signature_len]u8 = undefined;
         const salt: [32]u8 = @splat(0);
@@ -135,6 +185,18 @@ pub const PrivateKey = struct {
     /// repeats is the fixed padding a Bleichenbacher-style forgery works
     /// from. Production hands this a CSPRNG; a test hands it a seeded one, so
     /// the signature is the same bytes on every run.
+    ///
+    /// The result borrows `out`, not `msg` and not the key: it is
+    /// `out[0..signatureLength]`, valid until the caller rewrites `out`.
+    /// `error.UnsupportedKey` is a modulus too long for PSS to encode into and
+    /// `error.InvalidKey` is the self-check rejecting the result; on either,
+    /// `out[0..signatureLength]` is left zeroed or untouched, never a partial
+    /// signature, so the caller must not read it after an error. `out` beyond
+    /// that prefix is never written at all.
+    ///
+    /// Constant time in the exponent and the message, so the call is safe on a
+    /// thread the key is otherwise shared with. It allocates nothing and
+    /// retains nothing; `msg` and `random` are used only for this call.
     pub fn signPss(
         self: PrivateKey,
         comptime Hash: type,

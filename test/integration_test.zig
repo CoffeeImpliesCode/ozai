@@ -66,13 +66,14 @@ test "an address renders to the same text every time" {
 
     // The same two addresses, inserted in opposite orders.
     var relay_first = ozai.NodeAddr.init(node_id);
+    defer relay_first.deinit(alloc);
     relay_first = (try relay_first.insert(alloc, .{ .relay = relay })) orelse
         return error.TestUnexpectedResult;
     relay_first = (try relay_first.insert(alloc, direct)) orelse
         return error.TestUnexpectedResult;
-    defer relay_first.deinit(alloc);
 
     var ip_first = ozai.NodeAddr.init(node_id);
+    defer ip_first.deinit(alloc);
     ip_first = (try ip_first.insert(alloc, direct)) orelse
         return error.TestUnexpectedResult;
     ip_first = (try ip_first.insert(alloc, .{ .relay = relay })) orelse
@@ -83,7 +84,6 @@ test "an address renders to the same text every time" {
 
     var second: [256]u8 = undefined;
     const from_ip = try std.fmt.bufPrint(&second, "{f}", .{ip_first});
-    ip_first.deinit(alloc);
 
     // Insertion order must not change the bytes: relay sorts before ip by
     // variant, so it lands first either way. This is what lets a ticket be an

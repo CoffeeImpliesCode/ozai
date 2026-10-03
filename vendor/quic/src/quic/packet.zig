@@ -9,24 +9,63 @@ const crypto = @import("crypto.zig");
 const util = @import("util.zig");
 const stream = @import("stream.zig");
 
-// network byte order
+/// Network byte order, the order every field this module reads or writes is
+/// in. It is a constant rather than a parameter because the wire is not
+/// negotiable.
 pub const ENDIAN = std.builtin.Endian.big;
 
+/// Bit 7 of the first byte: set on every long-header packet, clear on every
+/// short-header one. It is what tells a parser which header it is looking at
+/// before anything else is read.
+///
 pub const LONG_HEADER_BIT: u8 = 0x80;
+/// Bit 6 of the first byte. QUIC requires it on every packet a version of
+/// this protocol defines, and a long-header packet without it is invalid
+/// (RFC 9000 §17.2); on a short header it is part of what header protection
+/// hides.
+///
 pub const FIXED_BIT: u8 = 0x40;
+/// Bit 2 of a short header's first byte: which generation of 1-RTT keys
+/// protected it, flipped on a key update (RFC 9001 §6.1).
+///
 pub const KEY_PHASE_BIT: u8 = 0x04;
 
+/// Bit 5 of a short header's first byte, used for passive round-trip
+/// measurement by the two ends rather than by the network (RFC 9000 §17.4).
+///
 pub const PACKET_SPIN_BIT = 0x20;
+/// Mask for the two bits of a long header's first byte that carry the packet
+/// type. The mapping from those bits to a type is version-dependent, which is
+/// what `longHeaderPacketType` is for.
+///
 pub const PACKET_TYPE_MASK = 0xF0;
 
+/// Largest a QUIC packet may be on the wire once headers and tags are on it:
+/// a 1500-byte path MTU plus a margin. A datagram longer than this is not
+/// this protocol's.
+///
 pub const MAX_PACKET_LEN = 1536;
+/// Bytes of a packet number on the wire at most: QUIC encodes one in one to
+/// four bytes, so the packet's own first byte says how long it is.
+///
 pub const MAX_PACKET_NUMBER_LEN = 4; // maxlength of a "packet number"
 
+/// Longest connection id a peer may send, and the width every cid buffer in
+/// this tree is sized to. A header naming a longer one is refused rather than
+/// truncated, because a truncated id routes nowhere (RFC 9000 §17.2).
+///
 pub const CONNECTION_ID_MAX_SIZE: u8 = 20;
 
 const PACKET_NUM_MASK: u8 = 0x03;
 
+/// Bytes of a stateless reset token. Same size as the Retry integrity tag
+/// below and for the same reason — both are 128-bit tags on the wire — but
+/// they are different things and neither is defined in terms of the other.
+///
 pub const STATELESS_RESET_TOKEN_SIZE = 16; // aren't these 2 the same?
+/// Bytes of the tag at the end of a Retry packet, checked before the token it
+/// follows is used (RFC 9000 §17.2.5).
+///
 pub const RETRY_INTEGRITY_TAG_SIZE = 16;
 // RFC 9001 §5.8: QUIC v1 Retry integrity key/nonce
 const RETRY_INTEGRITY_KEY_V1: [crypto.key_len]u8 = .{ 0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e };
@@ -35,6 +74,14 @@ const RETRY_INTEGRITY_NONCE_V1: [crypto.nonce_len]u8 = .{ 0x46, 0x15, 0x99, 0xd3
 const RETRY_INTEGRITY_KEY_V2: [crypto.key_len]u8 = .{ 0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2, 0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92 };
 const RETRY_INTEGRITY_NONCE_V2: [crypto.nonce_len]u8 = .{ 0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a };
 
+/// A packet type, as the value the header encodes it: a long header's bit
+/// pattern with the header bit and fixed bit already in it, so the enum value
+/// *is* the first byte for every type that carries one.
+///
+/// The value matters for short-header types (`.one_rtt` is `FIXED_BIT`) and is
+/// only the canonical encoding for long ones, which v2 remaps; see
+/// `longHeaderPacketType`.
+///
 pub const PacketType = enum(u8) {
     /// Initial packet
     initial = LONG_HEADER_BIT | FIXED_BIT | 0x00,
@@ -100,6 +147,14 @@ pub fn encodeLongHeaderTypeBits(pkt_type: PacketType, version: u32) u8 {
     return LONG_HEADER_BIT | FIXED_BIT | (bits << 4);
 }
 
+/// Which of QUIC's four encryption levels a packet belongs to.
+///
+/// Separate from `PacketType` because the mapping is neither one-to-one nor
+/// version-dependent: a 1-RTT packet is `.application` whatever the version,
+/// and `.one_rtt` and `.initial` share a value space without sharing an
+/// epoch. `fromPacketType` refuses Retry, Version Negotiation and the long
+/// header types with no epoch of their own.
+///
 pub const Epoch = enum(u8) {
     initial = 0,
     zero_rtt = 1,
@@ -127,6 +182,16 @@ test "Epoch fromPacketType" {
     try std.testing.expectError(error.InvalidPacketType, err);
 }
 
+/// Everything this module refuses about a packet's shape.
+///
+/// The names are the decoder's, not the protocol's: `InvalidVersion` is a
+/// version this core does not speak, `InvalidPacket` is a header that cannot
+/// be parsed as one — too short, a connection id that does not fit, a length
+/// that runs past the datagram — `InvalidPacketType` is a type that belongs
+/// to no encryption level, and `InvalidVarLength` is a varint that is not
+/// canonically encoded. None is a transport error to send: a peer that
+/// produces one is either not speaking this protocol or is attacking, and
+/// the connection drops the packet either way.
 pub const PacketError = error{
     InvalidVersion,
     InvalidPacket,
@@ -173,6 +238,16 @@ pub const Header = struct {
     /// The address verification token of the packet. Only present in `Initial`
     /// and `Retry` packets.
     token: ?[]const u8 = null,
+    /// What is left of this packet: everything after the header, up to and
+    /// including the packet number. Set by `parse` for every packet type, and
+    /// it is the only thing a reader of a coalesced datagram has to step to
+    /// the next packet.
+    ///
+    /// For the types with a Length field — Initial, 0-RTT, Handshake — it is
+    /// that field. For the types without one — Retry, 1-RTT, and Version
+    /// Negotiation, which is a whole datagram by definition — it is
+    /// everything left in the datagram. Nothing may read it as a length
+    /// without knowing which of those it has.
     remainder_len: usize = undefined,
 
     /// The packet number. It's only meaningful after the header protection is
@@ -332,6 +407,22 @@ fn splitProtected(header: *const Header, fbs: anytype, first_byte: u8, ad_buf: [
     };
 }
 
+/// Remove header protection from `header` and open its payload with the keys
+/// `space` holds for its epoch, in place.
+///
+/// Returns the plaintext, which is the same memory the ciphertext was in: the
+/// AEAD tag is consumed and the caller keeps the buffer it had, so this
+/// allocates nothing. `header` is updated — first byte restored, packet
+/// number decoded, reserved bits recorded — because the caller needs those
+/// to process what comes out.
+///
+/// Refuses `error.UndecryptablePacket` for a header that cannot be
+/// unprotected, `error.AuthenticationFailed` when the tag does not verify,
+/// and `error.InvalidPacket` when the datagram is too short to hold the
+/// sample header protection needs. It cannot fail for want of memory: the
+/// only allocation either could want is gone from this path, so a caller that
+/// handled an allocator error here was reading a signature this does not
+/// have.
 pub fn decrypt(header: *Header, fbs: anytype, space: *const PacketNumSpace) ![]u8 {
     // We need at least 4 bytes for packet number + 16 for sample
     if (fbs.seek + 4 + crypto.SAMPLE_LEN > fbs.buffer.len) {
@@ -585,7 +676,12 @@ pub fn parseQuicHeader(fbs: anytype, short_dcid_len: u8) !Header {
                 header.remainder_len = remaining;
             },
 
-            PacketType.version_negotiation => {},
+            // No Length field, and no need of one: a VN packet is a whole
+            // datagram by definition (RFC 9000 §6.1), so what is left of the
+            // datagram is the packet.
+            PacketType.version_negotiation => {
+                header.remainder_len = fbs.buffer.len - fbs.seek;
+            },
 
             PacketType.handshake, PacketType.zero_rtt => {
                 // Long header packets (like Initial but without Token field)
@@ -1438,4 +1534,27 @@ test "decodePacketNumber: RFC 9000 Appendix A examples" {
     // Half = 128. candidate = (0xfe & ~0xff) | 0x00 = 0xfe00? No...
     // Let's use the simplest case: largest=0, truncated=0, nbits=8 -> 0
     try std.testing.expectEqual(@as(u64, 0), decodePacketNumber(0, 0, 8));
+}
+
+test "a version negotiation packet carries no length field, so it is the whole datagram" {
+    // RFC 9000 §6.1: first byte with the long-header bit, a version of zero,
+    // both connection ids, then the versions a peer may choose from. There is
+    // no Length field anywhere in it.
+    var bytes = [_]u8{0} ** 40;
+    bytes[0] = 0xc0;
+    std.mem.writeInt(u32, bytes[1..5], 0, .big);
+    bytes[5] = 4;
+    @memcpy(bytes[6..10], &[_]u8{ 1, 2, 3, 4 });
+    bytes[10] = 4;
+    @memcpy(bytes[11..15], &[_]u8{ 5, 6, 7, 8 });
+    std.mem.writeInt(u32, bytes[15..19], protocol.QUIC_V1, .big);
+    std.mem.writeInt(u32, bytes[19..23], protocol.QUIC_V2, .big);
+
+    var fbs = io.fixedBufferStream(&bytes);
+    const header = try Header.parse(&fbs, 0);
+    try std.testing.expectEqual(PacketType.version_negotiation, header.packet_type);
+    // What is left of the datagram is the packet, and a reader that walks a
+    // coalesced datagram by this number steps over the whole thing instead of
+    // a value it never had.
+    try std.testing.expectEqual(bytes.len - fbs.seek, header.remainder_len);
 }

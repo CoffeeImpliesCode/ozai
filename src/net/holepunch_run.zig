@@ -102,17 +102,40 @@
 //!
 //! # Three buffers, because the gate compares against the last round
 //!
-//! `holepunch.PunchState.last` borrows the candidates the last round was
-//! started with, and `holepunch.decide` compares this round's sets against
-//! them. One buffer would be rewritten under that comparison, and a slice
-//! into storage the caller owns would make the caller's bookkeeping part of
-//! the gate's invariant. So each set this file keeps is its own buffer: live
-//! local, recorded local, and the peer's. `settle` copies the live local set
-//! into the recorded one and hands the gate *that* slice, and only an
-//! accepted round does so, because it is the only outcome that records a set
-//! at all. The copy is a few hundred bytes once a round, and it is what
-//! makes "a borrowed slice outlives its turn" a property of this type rather
-//! than of its caller's care.
+//! `holepunch.decide` compares this round's candidate sets against the ones
+//! the last round was started with, so those have to outlive the round that
+//! produced them. One buffer would be rewritten under the comparison, and a
+//! slice into storage the caller owns would make the caller's bookkeeping
+//! part of the gate's invariant. So each set this file keeps is its own
+//! buffer: live local, recorded local, and the peer's. `settle` copies the
+//! live local set into the recorded one and only an accepted round does so,
+//! because it is the only outcome that records a set at all. The copy is a
+//! few hundred bytes once a round.
+//!
+//! The recorded buffer is storage this file owns and nothing points into it.
+//! `ready` re-slices it on each turn and hands the slice to the gate as
+//! `holepunch.Candidates.previous_local`; the gate reads it and stores
+//! nothing. That is the whole point of the arrangement, and the earlier
+//! arrangement — handing the gate a slice of the recorded buffer and letting
+//! it keep that slice in `PunchState.last` — made a copy of a settled `Join`
+//! read the *original's* bytes, silently, with nothing to tell the two apart.
+//! A value that borrows from itself is not a value.
+//!
+//! # A value, and what that costs
+//!
+//! `Join` is a value: no pointer to the transport, no task, no allocator, and
+//! every set in it is its own storage. Copying or moving one carries all of
+//! it — including the recorded candidate set, which is why that set is
+//! re-sliced per turn rather than pointed at once. A copy is a snapshot: the
+//! two then answer independently, and acting on both means two nodes punching
+//! for one peer.
+//!
+//! One slice in a settled `Join` is still borrowed, and it is not one of the
+//! three buffers: `punch.last.remote` names the candidate list the QUIC stack
+//! returned, which arrives in `holepunch.Outcome.accepted` and belongs to the
+//! caller. The caller keeps it alive for as long as it reads `punch`, and a
+//! copy names the same caller buffer. The stack is one of the gaps above, so
+//! there is no producer here to hold anyone to that.
 //!
 //! # What the gate already decides, and what this file adds
 //!
@@ -143,12 +166,9 @@
 //!
 //! Every instant is an argument — `ready(now)` and `settle(now, outcome)` —
 //! and a test drives the whole chain on one, from a probe round that opened
-//! no socket to a punch decision nobody acted on. `Join` is a value: it holds
-//! no pointer to the transport, no task and no allocator, and every set in
-//! it is its own storage, so it can be copied and moved without invalidating
-//! anything. The one slice it still borrows is the candidate list the QUIC
-//! stack returned, which `settle` records on the caller's word — and the
-//! stack is one of the gaps above.
+//! no socket to a punch decision nobody acted on. Nothing here reads a clock,
+//! allocates, or touches a thread: see "A value, and what that costs" for what
+//! a `Join` owns and what it borrows.
 //!
 //! Upstream at n0-computer/iroh commit
 //! 187f59e80afdae6bd9866002b33d3365c00b06d8 — the pin `net/holepunch.zig`
@@ -309,7 +329,13 @@ const none_pruned: holepunch.Pruned = .{
 /// producers for both candidate sets and the verdict, and the three questions
 /// neither of the two modules above is asked.
 pub const Join = struct {
-    /// The gate's own state.
+    /// The gate's own state, held whole. Reachable and writable, because a
+    /// caller assembling a `Join` from parts needs it; the one rule that goes
+    /// with it is that `last.remote`, when set, names a buffer the *caller*
+    /// keeps alive, and that `previous` below stays the recorded local set for
+    /// whichever round `last` names. Writing `last` directly without putting
+    /// that set in `previous` makes `ready` compare this round's candidates
+    /// against the wrong one.
     punch: holepunch.PunchState = .{},
 
     /// What the last folded report said about the mapping, carried whole:
@@ -322,15 +348,20 @@ pub const Join = struct {
     /// the module doc.
     varies_by_dest: ?bool = null,
 
-    /// This node's candidates, as the gate compares them. This file's storage,
+    /// This node's candidates, as the gate compares them. This file's storage
     /// for the lifetime reason in the module doc: rewritten by every report
     /// and never by `settle`.
     local: Set = .{},
 
-    /// The set `punch.last.local` names, and which the gate compares `local`
-    /// against. Written by `settle` and by nothing else, so a round's
-    /// candidates survive every later report until the next round records
-    /// its own.
+    /// The set the last accepted round was started with, which the gate
+    /// compares `local` against. Written by `settle` and by nothing else, so a
+    /// round's candidates survive every later report until the next round
+    /// records its own.
+    ///
+    /// Plain storage: no slice stored anywhere names it, and `ready` slices it
+    /// afresh on each turn. That is what makes a copied `Join` independent of
+    /// the `Join` it was copied from. See the module doc under "A value, and
+    /// what that costs".
     previous: Set = .{},
 
     /// The peer's candidates, as the gate compares them. This file's storage
@@ -438,7 +469,11 @@ pub const Join = struct {
         if (!holepunch.mayAdvertise(advertised)) return .{ .tooManyAddresses = advertised };
         // The gate's turn reads its state and leaves it as it was, so only its
         // instruction is wanted here.
-        const step = holepunch.decide(self.punch, now, self.local.slice(), self.remote.slice());
+        const step = holepunch.decide(self.punch, now, .{
+            .local = self.local.slice(),
+            .remote = self.remote.slice(),
+            .previous_local = self.previous.slice(),
+        });
         return instruction(step.action);
     }
 
@@ -450,22 +485,24 @@ pub const Join = struct {
     /// a caller that classified it again would be a second opinion about a
     /// policy this file does not own.
     ///
-    /// What is left is the candidate set, and it is copied rather than
-    /// swapped: the record the gate keeps names `previous`, and `previous` is
-    /// written here and nowhere else. A buffer that is swapped into keeps its
-    /// address while its contents move, which leaves the gate's borrowed
-    /// slice naming the wrong set the moment the swap is done.
+    /// What is left is the candidate set the round started with, and it is
+    /// copied into `previous` rather than swapped in. A swap would keep the
+    /// buffer's address while its contents move, and `previous` is read by
+    /// value at the next `ready`, so a swap would have nothing to point at.
+    /// Only an accepted round copies: a refusal moved no candidate, so the
+    /// record the last accepted round made is still the record, and the gate
+    /// reads the same candidates as new and tries again rather than sitting
+    /// out the interval.
+    ///
+    /// The copy is the whole of the address-stability story for that set, and
+    /// it is deliberately the *last* thing that borrows from it: `previous` is
+    /// plain storage this file owns, and `ready` re-slices it on each turn.
+    /// Nothing reachable from `Join` stores a pointer into it, so a `Join`
+    /// copied or moved carries its recorded set with it — see the module doc
+    /// under "A value, and what that costs".
     pub fn settle(self: *Join, now: Nanos, outcome: holepunch.Outcome) Action {
-        // A refusal records nothing, so on that arm the copy does not happen
-        // and the record the last accepted round made stays where it is.
-        const record: []const SocketAddr = switch (outcome) {
-            .accepted => record: {
-                self.previous = self.local;
-                break :record self.previous.slice();
-            },
-            .refused => self.local.slice(),
-        };
-        const step = holepunch.settle(self.punch, now, record, outcome);
+        if (outcome == .accepted) self.previous = self.local;
+        const step = holepunch.settle(self.punch, now, outcome);
         self.punch = step.next;
         return instruction(step.action);
     }
@@ -878,7 +915,7 @@ test "a probe round becomes a punch the gate asks for" {
     try t.expect(std.meta.eql(Action{ .punch = 4 }, join.ready(start)));
     try t.expect(std.meta.eql(
         holepunch.Action{ .initiateNatTraversalRound = 4 },
-        (try onlyAction(holepunch.decide(join.punch, start, join.local.slice(), &.{}))),
+        try gateSays(&join, start),
     ));
 
     // The same report offered again with one address twice: `len` is what the
@@ -1011,7 +1048,7 @@ test "the advertised ceiling is refused before the gate is asked" {
     // refusal.
     try t.expect(std.meta.eql(
         holepunch.Action{ .initiateNatTraversalRound = 4 },
-        (try onlyAction(holepunch.decide(join.punch, start, join.local.slice(), &.{}))),
+        try gateSays(&join, start),
     ));
     try t.expect(std.meta.eql(
         Action{ .tooManyAddresses = holepunch.max_qnt_addresses + 1 },
@@ -1341,7 +1378,100 @@ test "a peer's record is refused what a full path table cannot hold" {
     ));
 }
 
+test "a settled Join copied afterwards answers from its own recorded set" {
+    // `Join` is a value and every set in it is its own storage, so a copy has
+    // to answer as itself. That fails the moment anything reachable from a copy
+    // still points into the `Join` it was copied from — and the gate used to
+    // keep exactly such a pointer, to the recorded candidate set it compares
+    // against. The copy then read the original's bytes with nothing to tell
+    // the two apart, so a copy asking "have my candidates moved?" was answered
+    // about the original's, and the candidate-change trigger that decides when
+    // a round runs stopped being per-peer.
+    var join: Join = .{};
+    joinWith(&join, &.{ ip(1000), ip(1001) });
+    const discovered = [_]SocketAddr{ ip(2000), ip(2001) };
+    // The peer's own candidates, so the gate's "has anything appeared?" question
+    // has both halves answered: a peer that advertised nothing now, having
+    // advertised two, is a change worth punching, and this test is about the
+    // copy, not about that rule.
+    var published = [_]addr.TransportAddr{ .{ .ip = ip(2000) }, .{ .ip = ip(2001) } };
+    _ = join.observePeer(&peerRecord(&published));
+    // Settling records the round; it owes no instruction, and the gate is what
+    // decides the next one.
+    try t.expect(join.settle(start, .{ .accepted = &discovered }) == .hold);
+
+    // Each copy writes its own storage: mutating one copy's recorded set
+    // leaves the original's bytes alone. The probe is its own copy so the one
+    // the rest of this test asks questions of still carries the real record.
+    const recorded = join.previous.items[0];
+    var diverged = join;
+    diverged.previous.items[0].port = 4242;
+    diverged.local.items[0].port = 4243;
+    try t.expectEqual(recorded, join.previous.items[0]);
+    try t.expectEqual(@as(u16, 1000), join.local.items[0].port);
+
+    var copied = join;
+    try t.expectEqual(@as(usize, 2), copied.previous.len);
+
+    // The one slice a settled `Join` still borrows is the candidate list the
+    // stack returned, and it is the caller's: `punch.last.remote` names
+    // `discovered` and neither `Join`.
+    const last = copied.punch.last.?;
+    try t.expect(last.remote.ptr == discovered[0..].ptr);
+
+    // A millisecond after the round: inside the interval, so the answer is a
+    // wakeup unless something new appeared.
+    const later = start + millis(1);
+    try t.expect(std.meta.eql(
+        Action{ .wakeAt = start + holepunch.punch_interval },
+        copied.ready(later),
+    ));
+
+    // The original moves on: a candidate its own recorded set does not carry.
+    joinWith(&join, &.{ ip(1000), ip(1001), ip(9000) });
+    try t.expect(std.meta.eql(Action{ .punch = 4 }, join.ready(later)));
+    // The copy has seen none of that, and compares against its *own* recorded
+    // set, so it is still waiting the interval out. A copy still pointing into
+    // the original's recorded set would have punched here as well.
+    try t.expect(std.meta.eql(
+        Action{ .wakeAt = start + holepunch.punch_interval },
+        copied.ready(later),
+    ));
+
+    // And the copy does punch on a change of its own, so the trigger is not
+    // merely quiet: one address its recorded set does not carry, on either
+    // family of the advertised set.
+    joinWith(&copied, &.{ ip(1000), ip(1001), ip(9001) });
+    try t.expect(std.meta.eql(Action{ .punch = 4 }, copied.ready(later)));
+}
+
+/// Give `join` exactly `socket` as its local candidates, and a client
+/// connection for the gate to punch on.
+///
+/// A folded report with no public address, so `observeReport` files `socket`
+/// and nothing else: a test that wants the local set to be the addresses it
+/// wrote does not want a probe's address mixed in.
+fn joinWith(join: *Join, socket: []const SocketAddr) void {
+    const folded: report.Report = .{};
+    join.observeReport(&folded, socket);
+    join.selectConnection(client_conns);
+}
+
 /// The one instruction the gate produced, or the failure that it produced none.
 fn onlyAction(step: holepunch.Step) !holepunch.Action {
     return step.action orelse error.NoAction;
+}
+
+/// What the gate alone would say for this `Join` at this instant.
+///
+/// A test uses it to show that `ready` passed the gate through rather than
+/// deciding anything of its own, which means asking the gate the same
+/// question with the same three sets — including the recorded one, since that
+/// is the set the comparison is against.
+fn gateSays(join: *const Join, now: Nanos) !holepunch.Action {
+    return onlyAction(holepunch.decide(join.punch, now, .{
+        .local = join.local.slice(),
+        .remote = join.remote.slice(),
+        .previous_local = join.previous.slice(),
+    }));
 }

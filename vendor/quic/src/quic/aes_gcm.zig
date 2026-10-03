@@ -123,17 +123,41 @@ fn ghashBlocks(hx: *const [pc_count]V, acc0: V, msg: []const u8, extra: ?V) V {
     }
 }
 
+/// Bytes in an AES-128-GCM authentication tag, fixed by the AEAD at 16.
 pub const tag_length = 16;
+/// Bytes in the nonce, fixed by the AEAD at 12. QUIC uses the packet number
+/// as the counter block and derives the 12 bytes above it from the IV, so a
+/// nonce is never reused under one key by a caller that follows RFC 9001 §5.3.
 pub const nonce_length = 12;
+/// Bytes in an AES-128-GCM key. `Ctx` fixes the cipher at AES-128; a 256-bit
+/// key is not a wider `Ctx`, it is a different type this module does not have.
 pub const key_length = 16;
 
+/// The per-key AEAD state: expanded key, H, and GHASH's powers, so one
+/// `Ctx` serves a whole packet-protection key's lifetime.
+///
+/// A `Ctx` is a value built by `init` and copied freely — it owns fixed-size
+/// storage, borrows nothing, holds no allocator and no capability, and has
+/// nothing to release. There is no valid zero state: `aes`, `h` and `mac` are
+/// only meaningful together, so a `Ctx` that was never initialised is not a
+/// usable key. Two `Ctx` values built from the same key are interchangeable,
+/// and a call through one does not disturb the other.
+///
+/// `encrypt` and `decrypt` take `*const Ctx` and keep no per-call state, so
+/// the same value may be used from more than one thread at once.
 pub const Ctx = struct {
+    /// The expanded encryption key schedule. Callers read it only through
+    /// `encrypt` and `decrypt`; it is present so `init` can pay for it once.
     aes: @TypeOf(Aes128.initEnc(@as([key_length]u8, undefined))),
+    /// GHASH's H, the AES encryption of an all-zero block under this key.
     h: [16]u8,
     /// GHASH keyed with H, all powers precomputed. The arm64 path only reads
     /// the powers; elsewhere this is copied per message.
     mac: Ghash,
-
+    /// Builds the state for one key. `key` is read once and not retained: the
+    /// returned `Ctx` holds its own copy and nothing else, so the caller's
+    /// bytes need not stay alive or unmodified. Computes nothing lazily —
+    /// every part of the state is ready when this returns.
     pub fn init(key: [key_length]u8) Ctx {
         const aes = Aes128.initEnc(key);
         var h: [16]u8 = undefined;
@@ -142,6 +166,18 @@ pub const Ctx = struct {
     }
 
     /// `c` and `m` may be the same buffer.
+    ///
+    /// Writes exactly `m.len` bytes of ciphertext to `c` and the tag to `tag`.
+    /// `ad` is additional authenticated data: it is covered by the tag but
+    /// not encrypted, and an empty `ad` is the ordinary QUIC case where the
+    /// header sits in `m`. The nonce is a value, not a borrow, and a nonce
+    /// reused under one key destroys the security of both messages.
+    ///
+    /// Two preconditions are asserted rather than returned, so in ReleaseFast
+    /// and ReleaseSmall they are unchecked: `c.len == m.len`, and
+    /// `m.len <= 16 * (2^32 - 2)`, the counter-block limit. Neither failure
+    /// mode can be reported, and this call never fails — there is no error
+    /// union on it. Allocates nothing and touches only `c` and `tag`.
     pub fn encrypt(self: *const Ctx, c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8) void {
         std.debug.assert(c.len == m.len);
         std.debug.assert(m.len <= 16 * ((1 << 32) - 2));
@@ -152,6 +188,18 @@ pub const Ctx = struct {
 
     /// `m` and `c` may be the same buffer. Contents of `m` are undefined if
     /// an error is returned.
+    ///
+    /// Writes exactly `c.len` bytes of plaintext to `m` only after the tag has
+    /// been checked. `tag`, `ad` and `npub` are the values `encrypt` was given
+    /// and mean the same thing; `ad` is authenticated, not encrypted.
+    ///
+    /// `error.AuthenticationFailed` is a tag mismatch, and it leaves `m`
+    /// overwritten with `undefined` rather than untouched — the check runs
+    /// before the CTR pass, so no unauthenticated plaintext is ever produced.
+    /// That is the only failure this call can return.
+    ///
+    /// `c.len == m.len` is asserted rather than returned, so it is unchecked in
+    /// ReleaseFast and ReleaseSmall. Allocates nothing and retains nothing.
     pub fn decrypt(self: *const Ctx, m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8) crypto.errors.AuthenticationError!void {
         std.debug.assert(c.len == m.len);
 
