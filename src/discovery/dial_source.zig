@@ -115,8 +115,12 @@
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
+const key = @import("../base/key.zig");
 const item = @import("item.zig");
 const resolve = @import("resolve.zig");
+const node_addr = @import("../base/node_addr.zig");
+const relay_url = @import("../base/relay_url.zig");
+const transport_addr = @import("../base/transport_addr.zig");
 const addr_map = @import("../transport/addr_map.zig");
 const dial = @import("../transport/dial.zig");
 
@@ -141,7 +145,7 @@ pub const Error = resolve.ResolveError || dial.Error;
 pub const Request = struct {
     /// The node being dialled: what every source is asked about, the pin the
     /// connection carries, and the node half of every synthetic map key.
-    node_id: addr.NodeId,
+    node_id: key.NodeId,
     /// The address the caller's own socket is bound to, which the peer will
     /// see and which only the caller knows.
     local: addr.SocketAddr,
@@ -194,7 +198,7 @@ pub const Selector = struct {
     ///
     /// Handed a list that is never empty: a winner with no address is settled
     /// before the policy is asked, because there is nothing in it to choose
-    /// from. `addr.TransportAddr.order` is the caller's to sort with.
+    /// from. `transport_addr.TransportAddr.order` is the caller's to sort with.
     ///
     /// Called once per run, synchronously, on the thread that called
     /// `dialFromSources` and before anything is dialled. `endpoint` points at
@@ -202,7 +206,10 @@ pub const Selector = struct {
     /// returns: the pointer and every slice read out of it are good for this
     /// call and not after it, and an address to keep is one to copy here.
     /// Nothing reenters the run from this callback.
-    pick: *const fn (ctx: *anyopaque, endpoint: *const addr.NodeAddr) ?addr.TransportAddr,
+    pick: *const fn (
+        ctx: *anyopaque,
+        endpoint: *const node_addr.NodeAddr,
+    ) ?transport_addr.TransportAddr,
 };
 
 /// What a run of the sources came to.
@@ -355,7 +362,7 @@ pub fn dialFromSources(
     // A winner with no address is not a service that resolved to nothing, and
     // either way there is no path to dial, so the policy is not asked about a
     // list it cannot choose from.
-    const target: ?addr.TransportAddr = if (best.endpoint.addrs.len == 0)
+    const target: ?transport_addr.TransportAddr = if (best.endpoint.addrs.len == 0)
         null
     else
         request.select.pick(request.select.ctx, &best.endpoint);
@@ -387,7 +394,6 @@ pub fn dialFromSources(
 }
 
 const t = std.testing;
-const key = @import("../base/key.zig");
 const ula = @import("../base/ula.zig");
 const dns = @import("dns.zig");
 const batch = @import("../transport/batch.zig");
@@ -526,7 +532,10 @@ fn requestAt(harness: *Harness, engine: *Prng) Request {
     };
 }
 
-fn firstAddress(_: *anyopaque, endpoint: *const addr.NodeAddr) ?addr.TransportAddr {
+fn firstAddress(
+    _: *anyopaque,
+    endpoint: *const node_addr.NodeAddr,
+) ?transport_addr.TransportAddr {
     return if (endpoint.addrs.len == 0) null else endpoint.addrs[0];
 }
 
@@ -611,7 +620,7 @@ fn countedResolve(
     // change the type every service in the tree implements.
     // ziglint-ignore: Z023
     alloc: std.mem.Allocator,
-    node_id: addr.NodeId,
+    node_id: key.NodeId,
 ) resolve.ResolveError!?resolve.Stream {
     const self: *Counted = @ptrCast(@alignCast(ctx));
     self.asked += 1;
@@ -645,7 +654,7 @@ fn refuseStart(
     // `countedResolve` above gives. Only the answer is this file's.
     // ziglint-ignore: Z023
     _: std.mem.Allocator,
-    _: addr.NodeId,
+    _: key.NodeId,
 ) resolve.ResolveError!?resolve.Stream {
     const self: *Unstartable = @ptrCast(@alignCast(ctx));
     self.asked += 1;
@@ -733,7 +742,7 @@ test "the merge chooses the address and the dial opens on it" {
     // map is what says so — the winning address, not the first one asked for.
     try t.expectEqual(ula.Path.relay, dialled.dial.route.subnet.?);
     const expected: addr_map.Key = .{ .relay = .{
-        .relay = try addr.RelayUrl.parse("https://two.example./"),
+        .relay = try relay_url.RelayUrl.parse("https://two.example./"),
         .node = peer,
     } };
     try t.expectEqual(expected, dialled.dial.route.key.?);
@@ -925,7 +934,7 @@ test "an empty result, an empty address list and a refused path are told apart" 
     try t.expectEqual(@as(usize, 0), harness.client.manager.entries.items.len);
 }
 
-fn refuseEvery(_: *anyopaque, _: *const addr.NodeAddr) ?addr.TransportAddr {
+fn refuseEvery(_: *anyopaque, _: *const node_addr.NodeAddr) ?transport_addr.TransportAddr {
     return null;
 }
 

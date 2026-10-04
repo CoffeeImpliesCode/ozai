@@ -1372,6 +1372,251 @@ test "arbitrary bytes never panic and never leave the error set" {
     }
 }
 
+test "error inventory: every declared arm is reached by concrete bytes" {
+    // `Error` has ten members and each is reached below by the bytes that name
+    // it. The count is checked against the type, so an arm added to `Error`
+    // without a case here fails the build rather than going quietly untested.
+    try testing.expectEqual(@typeInfo(Error).error_set.?.len, 10);
+
+    // `UnexpectedEnd`: an empty input, and a varint that stops one byte short
+    // of the width the type allows. Not `BadVarint`: the run is out, not over.
+    try testing.expectError(error.UnexpectedEnd, expectU16(&.{}));
+    try testing.expectError(
+        error.UnexpectedEnd,
+        expectU64(&[_]u8{0x80} ** (varintMax(u64) - 1)),
+    );
+
+    // `BadVarint`: an encoding one group past the width. No number of further
+    // bytes makes it fit, which is what separates this from the next arm.
+    try testing.expectError(error.BadVarint, expectU16(&.{ 0x80, 0x80, 0x80, 0x00 }));
+    try testing.expectError(error.BadVarint, expectU64(&[_]u8{0x80} ** varintMax(u64)));
+
+    // `ValueOutOfRange`: a legal-width varint whose last byte carries more
+    // value bits than the type has left. A number the type cannot hold, which
+    // is why this is a different member from `BadVarint`.
+    try testing.expectError(error.ValueOutOfRange, expectU16(&.{ 0xff, 0xff, 0x04 }));
+    try testing.expectError(error.ValueOutOfRange, expectU32(&.{ 0xff, 0xff, 0xff, 0xff, 0x10 }));
+    try testing.expectError(
+        error.ValueOutOfRange,
+        expectU64(&[_]u8{0xff} ** (varintMax(u64) - 1) ++ [_]u8{0x02}),
+    );
+
+    // `BadLength`: the buffer is not short, the frame claims more than it holds.
+    // Two reasons, both this arm: a count that outruns what is behind it, and —
+    // on a target whose `usize` is narrower than a `u64` — a count it cannot
+    // index with. The first is what a peer can reach on this target.
+    {
+        var reader = Reader.init(&.{ 0x05, 0x01 });
+        try testing.expectError(error.BadLength, reader.readLen());
+    }
+    {
+        // A length that is exactly what is behind it is fine, so the refusal is
+        // the count and not the field.
+        var reader = Reader.init(&.{ 0x02, 0x01, 0x02 });
+        try testing.expectEqual(@as(usize, 2), try reader.readLen());
+        _ = try reader.take(2);
+        try reader.finish();
+    }
+    {
+        // The canonical spelling of `u64.max` — nine groups of `0xff` and a
+        // `0x01` — is a legal varint on a 64-bit target, so it narrows and is
+        // then past everything remaining, which is the same refusal. Spelled
+        // with ten `0xff` it would be `BadVarint` instead: no terminator.
+        const huge = [_]u8{0xff} ** (varintMax(u64) - 1) ++ [_]u8{0x01};
+        var reader = Reader.init(&huge);
+        try testing.expectError(error.BadLength, reader.readLen());
+    }
+
+    // `BadBool` and `BadOptionTag`: one byte each, and neither 0 nor 1 is one.
+    for ([_]u8{ 0x02, 0x7f, 0x80, 0xff }) |byte| {
+        var reader = Reader.init(&.{byte});
+        try testing.expectError(error.BadBool, reader.readBool());
+        var option_reader = Reader.init(&.{byte});
+        try testing.expectError(error.BadOptionTag, option_reader.readOption());
+    }
+
+    // `UnknownVariant`: a discriminant no declared arm names, in three widths.
+    for ([_][]const u8{
+        &.{0x03},
+        &.{ 0xff, 0xff, 0x03 },
+        &.{ 0xff, 0xff, 0xff, 0xff, 0x0f },
+    }) |bytes| {
+        var reader = Reader.init(bytes);
+        try testing.expectError(error.UnknownVariant, reader.readVariant(BasicEnum));
+    }
+
+    // `InvalidUtf8`: a length that matches its payload and bytes that are not
+    // text. The same bytes are a legal byte string, which is the difference
+    // between `readStr` and `readBytes`.
+    for ([_][]const u8{
+        &.{ 0x01, 0x80 },
+        &.{ 0x02, 0xc2, 0x41 },
+        &.{ 0x02, 0xc0, 0xaf },
+        &.{ 0x03, 0xed, 0xa0, 0x80 },
+    }) |bytes| {
+        var reader = Reader.init(bytes);
+        try testing.expectError(error.InvalidUtf8, reader.readStr());
+    }
+
+    // `BufferFull`: a writer with no room, on a byte, on a varint and behind a
+    // length prefix, in the three shapes the module documents.
+    {
+        var one: [1]u8 = undefined;
+        var one_writer = Writer.init(&one);
+        try one_writer.writeU8(0x01);
+        try testing.expectError(error.BufferFull, one_writer.writeU8(0x02));
+
+        var varint_room: [1]u8 = undefined;
+        var varint_writer = Writer.init(&varint_room);
+        try testing.expectError(error.BufferFull, varint_writer.writeU16(0x1234));
+
+        var prefix_room: [3]u8 = undefined;
+        var prefix_writer = Writer.init(&prefix_room);
+        try testing.expectError(
+            error.BufferFull,
+            prefix_writer.writeBytes(&.{ 1, 2, 3, 4 }),
+        );
+    }
+
+    // `TrailingBytes`: a message read whole and one byte longer than it was.
+    {
+        var reader = Reader.init(&.{ 0x01, 0x02, 0x03 });
+        try testing.expectEqual(true, try reader.readBool());
+        try testing.expectError(error.TrailingBytes, reader.finish());
+    }
+    {
+        // And the other side of it: a reader at its end is finished by
+        // definition, so `finish` is not a length check with an off-by-one.
+        var reader = Reader.init(&.{0x01});
+        try testing.expectEqual(true, try reader.readBool());
+        try reader.finish();
+        var empty = Reader.init(&.{});
+        try empty.finish();
+    }
+}
+
+test "every width of varint agrees with the spec's last-byte rule" {
+    // `varintMax` and `varintMaxLastByte` are the two numbers the format is
+    // written from, and a codec that got either wrong would disagree with
+    // postcard on exactly the boundary values. Checked as relationships rather
+    // than as literals, so the rule is what is pinned and not the table.
+    //
+    // The relationships hold at every width `varintMax` accepts, including
+    // `u128`, which is a width no method here encodes or decodes — the two
+    // functions are public and generic, so a caller may ask about it.
+    inline for (.{ u16, u32, u64, u128 }) |width| {
+        const bits = @typeInfo(width).int.bits;
+        const max = varintMax(width);
+        const last = varintMaxLastByte(width);
+        const spare: u32 = @intCast(bits % 7);
+
+        // The widest legal encoding is the fewest groups that cover every bit.
+        try testing.expect(max * 7 >= bits);
+        try testing.expect((max - 1) * 7 < bits);
+        // The last byte carries the bits left over after the whole groups, and
+        // no more.
+        try testing.expectEqual(@as(u8, @intCast((@as(u32, 1) << spare) - 1)), last);
+    }
+
+    // The encoder's and the decoder's side of the same rule, at the three
+    // widths this module carries. The widest value encodes in exactly `max`
+    // groups and the last of them is `last`, so the two numbers are one fact
+    // seen from two ends; and one past that last byte is a value the type
+    // cannot hold, which is the refusal the rule exists for.
+    inline for (.{ u16, u32, u64 }) |width| {
+        const max = comptime varintMax(width);
+        const last = varintMaxLastByte(width);
+
+        var buffer: [max]u8 = undefined;
+        var writer = Writer.init(&buffer);
+        switch (width) {
+            u16 => try writer.writeU16(std.math.maxInt(u16)),
+            u32 => try writer.writeU32(std.math.maxInt(u32)),
+            u64 => try writer.writeU64(std.math.maxInt(u64)),
+            else => unreachable,
+        }
+        try testing.expectEqual(max, writer.finish().len);
+        try testing.expectEqual(last, writer.finish()[max - 1]);
+
+        // The canonical encoding of the widest value reads back as itself,
+        // which is the other half of the boundary.
+        var reader = Reader.init(&buffer);
+        switch (width) {
+            u16 => try testing.expectEqual(std.math.maxInt(u16), try reader.readU16()),
+            u32 => try testing.expectEqual(std.math.maxInt(u32), try reader.readU32()),
+            u64 => try testing.expectEqual(std.math.maxInt(u64), try reader.readU64()),
+            else => unreachable,
+        }
+        try reader.finish();
+
+        // One past the last byte's capacity: every earlier byte keeps its
+        // continuation bit, so the varint is still open when the last byte
+        // carries more value bits than the type has left.
+        var over: [max]u8 = undefined;
+        @memcpy(over[0 .. max - 1], buffer[0 .. max - 1]);
+        over[max - 1] = last + 1;
+        var over_reader = Reader.init(&over);
+        switch (width) {
+            u16 => try testing.expectError(error.ValueOutOfRange, over_reader.readU16()),
+            u32 => try testing.expectError(error.ValueOutOfRange, over_reader.readU32()),
+            u64 => try testing.expectError(error.ValueOutOfRange, over_reader.readU64()),
+            else => unreachable,
+        }
+    }
+}
+
+test "a length prefix at exactly the remaining bytes is legal, one over is not" {
+    // `readLen` refuses a count past the input rather than reading short, and
+    // the boundary is the one a peer is most likely to land on: a frame whose
+    // last field is the last byte of the message. Zero, the whole remainder,
+    // and one past it, over every width the codec reads lengths at.
+    inline for (.{ u16, u32, u64 }) |width| {
+        // A count of zero names an empty value, which is a legal frame and not
+        // a missing one.
+        var zero_buffer: [16]u8 = undefined;
+        var zero_writer = Writer.init(&zero_buffer);
+        switch (width) {
+            u16 => try zero_writer.writeU16(0),
+            u32 => try zero_writer.writeU32(0),
+            u64 => try zero_writer.writeU64(0),
+            else => unreachable,
+        }
+        {
+            var reader = Reader.init(zero_writer.finish());
+            try testing.expectEqual(@as(usize, 0), try reader.readLen());
+            try reader.finish();
+        }
+
+        // A count of exactly the bytes behind it is the boundary that must
+        // hold: the field ends where the message does.
+        var four_buffer: [16]u8 = undefined;
+        var four_writer = Writer.init(&four_buffer);
+        switch (width) {
+            u16 => try four_writer.writeU16(4),
+            u32 => try four_writer.writeU32(4),
+            u64 => try four_writer.writeU64(4),
+            else => unreachable,
+        }
+        const prefix = four_writer.finish();
+        var with_payload = [_]u8{ 0, 0, 0, 0, 0xde, 0xad, 0xbe, 0xef };
+        @memcpy(with_payload[0..prefix.len], prefix);
+        {
+            var reader = Reader.init(with_payload[0 .. prefix.len + 4]);
+            try testing.expectEqual(@as(usize, 4), try reader.readLen());
+            _ = try reader.take(4);
+            try reader.finish();
+        }
+
+        // One byte short of that, and the length is still the same four, so it
+        // is `BadLength` and not `UnexpectedEnd`: the buffer is not short, the
+        // frame claims more than it holds.
+        var one_short = [_]u8{ 0, 0, 0, 0, 0xde, 0xad, 0xbe };
+        @memcpy(one_short[0..prefix.len], prefix);
+        var short_reader = Reader.init(one_short[0 .. prefix.len + 3]);
+        try testing.expectError(error.BadLength, short_reader.readLen());
+    }
+}
+
 fn readOptionOnly(reader: *Reader) Error!bool {
     return reader.readOption();
 }

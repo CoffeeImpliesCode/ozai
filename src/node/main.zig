@@ -5,6 +5,10 @@
 //! its own loop until a stop is asked for — at which point it winds down
 //! through the router's ordering and exits.
 //!
+//! The grammar is `cli.zig` and `cli_values.zig`: pure parsers handed the
+//! arguments and a writer, reading nothing else. Everything below is the
+//! program edge — the runtime, the loop, and what a run reports.
+//!
 //! # What it does and what it does not
 //!
 //! It serves. The socket is real, the QUIC core is driven over it, peers are
@@ -98,14 +102,12 @@ comptime {
 
 const node_mod = ozai.node;
 const Node = node_mod.Node;
-const Peer = node_mod.Peer;
 const Stop = node_mod.Stop;
 const Instant = ozai.transport_quic_bridge.Instant;
 
-const NodeId = ozai.NodeId;
 const SecretKey = ozai.SecretKey;
-const SocketAddr = ozai.SocketAddr;
 
+const cli = @import("cli.zig");
 const Progress = @import("progress.zig").Snapshot;
 
 /// How loud this program is.
@@ -116,10 +118,6 @@ const Progress = @import("progress.zig").Snapshot;
 /// long. `std_options` in the root is what a program has to say; a library must
 /// not, because it would be deciding for every importer that imported it.
 pub const std_options: std.Options = .{ .log_level = .warn };
-
-/// Every allocation in this program is through a handle the caller handed in,
-/// and none of them is a global — `AGENTS.md` §1 by name.
-const Allocator = std.mem.Allocator;
 
 /// The stop signal, at file scope because a C signal handler is handed nothing
 /// but the signal number.
@@ -136,11 +134,6 @@ var stopped = Stop.init();
 /// supervisor's stop is a `SIGTERM` and a binary that only answers `SIGINT`
 /// has to be killed.
 const stop_signals = [_]std.posix.SIG{ .INT, .TERM };
-
-/// How long a run lasts when `--for` does not say. A binary that ran until a
-/// signal forever could not be smoke-tested from a script, and a script that
-/// cannot run it is a binary nobody runs.
-const default_run_ms: i64 = 500;
 
 /// How many datagrams a report prints, and how many bytes of each.
 ///
@@ -175,315 +168,6 @@ const max_send_passes: u64 = 20;
 /// counted acknowledgements without saying there are none would read as though
 /// the number could move. See `reportClose`.
 const closes_acknowledged: u64 = 0;
-
-/// What the command line asked for.
-const Options = struct {
-    /// Where to bind. Port zero lets the kernel choose, which is what lets two
-    /// nodes on one machine both listen.
-    listen: SocketAddr = .{
-        .ip = .{ .v4 = .{ 127, 0, 0, 1 } },
-        .port = 0,
-    },
-    /// Who to dial, in the order the flags named them.
-    peers: std.ArrayList(Peer) = .empty,
-    /// This node's identity, drawn when the caller does not supply one.
-    secret: ?SecretKey = null,
-    /// The protocol to offer, or null for the default: the gossip ALPN, or the
-    /// relay one when a relay flag below asked for a role.
-    alpn: ?[]const u8 = null,
-    /// Whether this process serves as a relay.
-    serve: bool = false,
-    /// The relay this process is a client of, if it is one.
-    relay_peer: ?RelayPeer = null,
-    /// The one datagram to put on the relay wire, if one was asked for.
-    send: ?Send = null,
-
-    /// The generator's seed. Fixed by default, so two runs of the same command
-    /// line present the same connection ids and a failure reproduces.
-    seed: u64 = 0x6f7a_69,
-    /// When to stop on our own.
-    run_ms: i64 = default_run_ms,
-    /// Emit live state changes so supervisors can wait on state rather than time.
-    progress: bool = false,
-
-    /// What the usage text says, and nothing it does not.
-    const usage =
-        \\usage: ozai-node [options]
-        \\
-        \\  --listen <ip:port>     where to bind. Port 0 lets the kernel choose.
-        \\  --peer <nodeid@ip:port>
-        \\                          dial this peer. May be repeated.
-        \\  --key-seed <base32>    this node's ed25519 seed, z-base-32. Drawn
-        \\                          when absent; the node id is printed either
-        \\                          way.
-        \\  --alpn <bytes>         the protocol to offer. Default: the gossip
-        \\                          ALPN, or the relay one when a relay flag
-        \\                          below asked for a role.
-        \\
-        \\  --relay                 serve as a relay: admit clients, and forward
-        \\                          the datagrams between them.
-        \\  --relay-peer <nodeid>@<relay-url>
-        \\                          reach this relay by URL, which is all a peer
-        \\                          holds. A host that is a name is refused:
-        \\                          nothing here resolves names.
-        \\  --send <nodeid>:<bytes>
-        \\                          put one datagram on the relay wire to this
-        \\                          peer, once the relay connection is up, and
-        \\                          offer it again while the relay says that peer
-        \\                          is not there. The gossip codec's job, done
-        \\                          here by hand.
-        \\
-        \\  --seed <u64>           the generator seed. Default: fixed, so a run
-        \\                          reproduces.
-        \\  --for <ms>             stop after this long, gracefully. Default: 500.
-        \\  --progress             flush live counter changes while running.
-        \\  --help                 print this.
-        \\
-        \\A node id is z-base-32, as `ozai-node-id` prints it.
-        \\
-    ;
-
-    /// Read the command line.
-    ///
-    /// Three answers rather than a `?Options`, because three are true: a run,
-    /// `--help`, and a rejection. The last is a different answer from the
-    /// middle one and a caller can tell them apart, which is why the exit code
-    /// can be 1 for one and 0 for the other.
-    fn parse(
-        arena: Allocator,
-        args: std.process.Args,
-        out: *std.Io.Writer,
-    ) !Parse {
-        var options: Options = .{};
-        var it = std.process.Args.iterate(args);
-        defer it.deinit();
-        _ = it.skip();
-        while (it.next()) |flag| {
-            if (std.mem.eql(u8, flag, "--help")) {
-                try out.writeAll(usage);
-                return .help;
-            }
-            if (std.mem.eql(u8, flag, "--progress")) {
-                options.progress = true;
-                continue;
-            }
-            if (std.mem.eql(u8, flag, "--relay")) {
-                options.serve = true;
-                continue;
-            }
-
-            const value = it.next() orelse {
-                try out.print("ozai-node: {s} wants a value\n", .{flag});
-                return .{ .rejected = error.FlagWithoutValue };
-            };
-            if (std.mem.eql(u8, flag, "--listen")) {
-                options.listen = parseSocket(value) catch |err| {
-                    try reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-            } else if (std.mem.eql(u8, flag, "--peer")) {
-                const peer = parsePeer(value) catch |err| {
-                    try reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-                // The arena is the process's and does not grow on its own, so
-                // this can only fail if the process is out of memory — which
-                // is propagated rather than dressed up as a bad argument.
-                try options.peers.append(arena, peer);
-            } else if (std.mem.eql(u8, flag, "--key-seed")) {
-                const seed = ozai.base32.decode(
-                    ozai.base32.z32,
-                    SecretKey.seed_length,
-                    value,
-                ) catch |err| {
-                    try reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-                options.secret = SecretKey.fromSeed(seed) catch |err| {
-                    try reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-            } else if (std.mem.eql(u8, flag, "--alpn")) {
-                options.alpn = value;
-            } else if (std.mem.eql(u8, flag, "--relay-peer")) {
-                options.relay_peer = parseRelayPeer(value) catch |err| {
-                    try reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-            } else if (std.mem.eql(u8, flag, "--send")) {
-                options.send = parseSend(value) catch |err| {
-                    try reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-            } else if (std.mem.eql(u8, flag, "--seed")) {
-                options.seed = std.fmt.parseInt(u64, value, 10) catch {
-                    try reject(out, flag, value, error.NotASeed);
-                    return .{ .rejected = error.NotASeed };
-                };
-            } else if (std.mem.eql(u8, flag, "--for")) {
-                options.run_ms = std.fmt.parseInt(i64, value, 10) catch {
-                    try reject(out, flag, value, error.NotMilliseconds);
-                    return .{ .rejected = error.NotMilliseconds };
-                };
-            } else {
-                try out.print("ozai-node: {s} is not an option\n", .{flag});
-                try out.writeAll(usage);
-                return .{ .rejected = error.NotAnOption };
-            }
-        }
-        if (try contradictions(out, options)) |refusal| return .{ .rejected = refusal };
-
-        return .{ .run = options };
-    }
-
-    /// The refusal a command line earns by naming two things one node cannot
-    /// be, and the line saying so.
-    ///
-    /// A node runs one protocol, one half of the relay handshake, and reaches
-    /// peers one way. Each arm below is a command line that named two of them,
-    /// and each is answered on its own line because a caller's mistake is
-    /// worth naming exactly rather than resolving silently: both relay roles
-    /// at once, an ALPN beside a relay role, a peer list beside a relay role,
-    /// and a datagram on a node that is not a relay's client.
-    ///
-    /// The arms run in that order and none of them is nested inside another,
-    /// because a line that is wrong twice is refused for the first reason it
-    /// can be named rather than for whichever one an arm happens to reach last.
-    /// That is why the datagram check stands on its own rather than inside the
-    /// relay arm: a node serving a relay is refused for the datagram too, and
-    /// an arm that returned early is a flag silently carried in silence.
-    ///
-    /// **The refusal comes back as a value and not as an error.** An error
-    /// returned out of `parse` is a failure of this program, and it reaches the
-    /// caller as a stack trace; a refusal is the program's own answer and has
-    /// to arrive as something `main` can print and exit 1 over. The write is
-    /// the one thing here that really can fail, and it is the only thing this
-    /// function returns as an error.
-    fn contradictions(
-        out: *std.Io.Writer,
-        options: Options,
-    ) std.Io.Writer.Error!?CliError {
-        if (options.relay_peer) |target| {
-            // `node.Role` is a union, so one process runs one half. Choosing
-            // one here would drop the other without a word.
-            if (options.serve) {
-                try reject(out, "--relay-peer", target.url, error.TwoRelayRoles);
-                return @as(?CliError, error.TwoRelayRoles);
-            }
-        }
-        if (options.serve or options.relay_peer != null) {
-            if (options.alpn) |named| {
-                try reject(out, "--alpn", named, error.RelayChoosesTheAlpn);
-                return @as(?CliError, error.RelayChoosesTheAlpn);
-            }
-            if (options.peers.items.len != 0) {
-                for (options.peers.items) |peer| try out.print(
-                    "ozai-node: --peer {f}: {t}\n",
-                    .{ peer.id, error.RelayDialsNobody },
-                );
-                return @as(?CliError, error.RelayDialsNobody);
-            }
-        }
-        // A datagram needs a relay's client, and only a client has one: the
-        // wire it goes on is the one this process holds to a relay. `--relay`
-        // is the far end of that wire rather than a peer of it, and a node
-        // with no relay flag at all is dialled at its own address and reaches
-        // nobody. Left to the loop, the second of those is a `NoRelay` out of
-        // `sendThrough` on the first pass that tried and the first is a flag
-        // that is carried in silence for the whole run — both stack traces or
-        // nothing at all for a flag that was wrong before the node was built.
-        if (options.send) |datagram| {
-            if (options.relay_peer == null) {
-                try reject(out, "--send", datagram.bytes, error.SendNeedsARelayClient);
-                return @as(?CliError, error.SendNeedsARelayClient);
-            }
-        }
-        return null;
-    }
-};
-
-/// What the command line turned out to mean.
-const Parse = union(enum) {
-    run: Options,
-    /// `--help`. Exit 0: the program was asked a question and answered it.
-    help: void,
-    /// Something it will not do. Exit 1: a caller scripting this wants a
-    /// failure and not a node that quietly ran with defaults.
-    rejected: CliError,
-};
-
-/// What this program refuses, over and above the ones `Node` publishes.
-///
-/// The two that are its own are a value the caller wrote and a flag it does
-/// not recognise, and both are answered with a line rather than a stack trace:
-/// a program's own refusals are its interface.
-/// `base32`'s and `key`'s refusals are included rather than restated, for the
-/// reason `hyparview.zig` gives for the same shape: a varint that does not end
-/// and a node id that is not on the curve are both refusals a caller can
-/// provoke, and they read better as the seam's own names.
-const CliError = ozai.base32.DecodeError || ozai.KeyError ||
-    ozai.addr.RelayUrlParseError || ozai.addr.RelayUrlResolveError || error{
-    /// A flag that is not one this program has.
-    NotAnOption,
-    /// A flag that takes a value, and the command line ended.
-    FlagWithoutValue,
-    /// An address with no port, a port that is not a number, or a host that is
-    /// neither a v4 nor a v6 literal.
-    AddressNotReachable,
-    /// A peer flag with no `@`, or an address after it that is not one.
-    PeerWithoutAddress,
-    PeerAddressUnreachable,
-    /// A relay flag with no `@`, so no node id beside the URL. The id is what
-    /// a client presents to the relay and the URL is where it is: one without
-    /// the other names nothing.
-    RelayWithoutId,
-    /// `--send` with no payload after the node id, or with a colon and nothing
-    /// behind it. A datagram of no bytes is a flag that said nothing.
-    SendWithoutBytes,
-    /// `--send` with a payload longer than `Node.max_datagram`. A relay
-    /// forwards datagrams and that is the length of one, so a longer one is a
-    /// flag asking for something this program will not send.
-    SendTooLong,
-    /// Both relay roles at once. `node.Role` is a union, so this program runs
-    /// one half of the relay handshake or the other.
-    TwoRelayRoles,
-    /// An ALPN beside a relay role. A relay node speaks the relay protocol
-    /// because it cannot also gossip, so there is nothing here to choose.
-    RelayChoosesTheAlpn,
-    /// A peer list beside a relay role. A relay reaches peers through a relay
-    /// rather than at their own addresses, so a dial list is a dial to a
-    /// protocol that would not answer.
-    RelayDialsNobody,
-    /// `--send` on a node that is not a relay's client, which is the only node
-    /// with a wire to put a datagram on.
-    SendNeedsARelayClient,
-    /// `--seed` was not a `u64`.
-    NotASeed,
-    /// `--for` was not a millisecond count.
-    NotMilliseconds,
-    /// The monotonic clock could not be read, or read a value `Instant` cannot
-    /// hold.
-    NoClock,
-};
-
-/// A relay this process reaches for, in the two spellings that matter: the URL
-/// a caller named it by, and the peer that URL resolved to.
-///
-/// Both are kept because they answer different questions and only one of them
-/// is what the dial was told. The URL is the whole of what a peer holds;
-/// `peer` is what `RelayUrl.socketAddr` made of it. A command line that named
-/// one relay and reached another is invisible if only one of the two is
-/// printed, so the banner says the first and the report says the second.
-const RelayPeer = struct {
-    url: []const u8,
-    peer: Peer,
-};
-
-/// One datagram to put on the relay wire, and the peer it is for.
-const Send = struct {
-    peer: NodeId,
-    bytes: []const u8,
-};
 
 /// What the relay was still holding when this node was asked to stop.
 ///
@@ -522,20 +206,6 @@ const Close = struct {
     datagrams: u64,
 };
 
-/// Say what was wrong with a value, and why, on one line.
-///
-/// The error is one of `CliError`'s and the only way this can fail is the
-/// write, so both are named rather than inferred: a refusal whose type is
-/// `anyerror` is a refusal that can be handed anything.
-fn reject(
-    out: *std.Io.Writer,
-    flag: []const u8,
-    value: []const u8,
-    err: CliError,
-) std.Io.Writer.Error!void {
-    try out.print("ozai-node: {s} '{s}': {t}\n", .{ flag, value, err });
-}
-
 /// A `SIGINT` or a `SIGTERM`: set the flag and return.
 ///
 /// Async-signal-safe, because `Stop.request` is one atomic store and nothing
@@ -562,13 +232,25 @@ fn watchForStop() void {
     }
 }
 
+/// What the program edge refuses on its own, over the ones the parser and
+/// `Node` publish.
+///
+/// Only the clock is here, and it is not in `cli.Error` because it is a fact
+/// about the runtime rather than about a value a caller wrote — which is the
+/// same reason a pure parser cannot raise it.
+const RuntimeError = error{
+    /// The monotonic clock could not be read, or read a value `Instant` cannot
+    /// hold.
+    NoClock,
+};
+
 /// The monotonic clock as the core is driven at, in nanoseconds.
 ///
 /// Read only here and only by the program edge: `Node.step` takes its instant
 /// as data, and this is the one place a value for it comes from. `Clock.awake`
 /// rather than `.real` because a QUIC timer must not jump because NTP moved
 /// the wall clock.
-fn nowNs(io: std.Io) CliError!Instant {
+fn nowNs(io: std.Io) RuntimeError!Instant {
     const stamp = std.Io.Clock.awake.now(io);
     return std.math.cast(Instant, stamp.nanoseconds) orelse error.NoClock;
 }
@@ -579,7 +261,11 @@ pub fn main(init: std.process.Init) !void {
     var out = std.Io.File.stdout().writerStreaming(io, &out_buffer);
     const text = &out.interface;
 
-    const options = switch (try Options.parse(init.arena.allocator(), init.minimal.args, text)) {
+    const options = switch (try cli.Options.parse(
+        init.arena.allocator(),
+        init.minimal.args,
+        text,
+    )) {
         .run => |run| run,
         .help => {
             try out.flush();
@@ -597,8 +283,8 @@ pub fn main(init: std.process.Init) !void {
 
     // Which half of the relay handshake this process runs, and the protocol
     // that half speaks. Both come from the command line and nowhere else, and
-    // `Options.contradictions` has already refused a line that asked for two
-    // of anything, so this is a choice rather than a guess.
+    // the parser has already refused a line that asked for two of anything, so
+    // this is a choice rather than a guess.
     const role: node_mod.Role = if (options.serve)
         .{ .serve = .{} }
     else if (options.relay_peer) |target|
@@ -613,7 +299,10 @@ pub fn main(init: std.process.Init) !void {
     // Drawn rather than demanded, and printed either way: a node that cannot
     // say who it is is not a node, and a caller that wants a fixed identity
     // passes `--key-seed`.
-    var secret = options.secret orelse SecretKey.generate(io);
+    //
+    // No fallback generator: `generate` draws the seed from `io.randomSecure`,
+    // and a node that cannot be given a secure identity must not run.
+    var secret = options.secret orelse try SecretKey.generate(io);
     defer secret.deinit();
 
     const node = try Node.create(init.gpa, io, .{
@@ -622,8 +311,21 @@ pub fn main(init: std.process.Init) !void {
         .peers = options.peers.items,
         .alpn = alpn,
         .relay = .{ .role = role },
-    }, options.seed);
+    });
     defer node.deinit();
+
+    // From this line the node owns an open descriptor, so every exit that is
+    // not the graceful one owes it a teardown — the banner writes included, not
+    // only the loop. Cleared on the graceful path so a normal run is wound down
+    // exactly once: `shut` below is this node's deliberate close.
+    //
+    // The close is stamped with the instant the last pass ran at, the only one
+    // true of the connections those passes built. Null until the first pass
+    // reads one, and `windDown` reads that as "no instant to stamp with" rather
+    // than as "no teardown".
+    var last: ?Instant = null;
+    var wound_down = false;
+    errdefer if (!wound_down) node.windDown(io, last);
 
     // A supervisor may signal as soon as the listening banner reaches its pipe.
     watchForStop();
@@ -633,7 +335,6 @@ pub fn main(init: std.process.Init) !void {
     try text.print("listening  {f}\n", .{node.address()});
     try text.print("alpn       {s}\n", .{alpn});
     try sayRole(text, options);
-    try text.print("seed       {d}\n", .{options.seed});
 
     if (options.peers.items.len == 0) {
         try text.writeAll("peers      none — this node answers and is ready to be asked\n");
@@ -656,7 +357,7 @@ pub fn main(init: std.process.Init) !void {
     const started = try nowNs(io);
     stopped.expireAt(started + options.run_ms * std.time.ns_per_ms);
 
-    try drive(io, node, options.send, if (options.progress) text else null);
+    try drive(io, node, options.send, if (options.progress) text else null, &last);
     // Read here, before the close that will empty both of these: see `Holding`.
     const holding: Holding = .{
         .node_ids = node.clientCount(),
@@ -666,6 +367,9 @@ pub fn main(init: std.process.Init) !void {
     // after it, for the same reason and because nothing is left to read: see
     // `shut`.
     const close = try shut(io, node, holding.connections);
+    // Cleared before the report so a failure in reporting cannot run the guard
+    // over a node that is already closed and log about a second shutdown.
+    wound_down = true;
 
     try report(text, node, holding, close);
     try out.flush();
@@ -677,7 +381,7 @@ pub fn main(init: std.process.Init) !void {
 /// socket it resolved to is in the report, and a caller who named a relay this
 /// program did not reach can see that here rather than having to trust a dial
 /// nobody outside this process can watch.
-fn sayRole(text: *std.Io.Writer, options: Options) !void {
+fn sayRole(text: *std.Io.Writer, options: cli.Options) !void {
     if (options.serve) {
         try text.print(
             "relay      serving {d} clients, {d} datagrams deep\n",
@@ -698,12 +402,21 @@ fn sayRole(text: *std.Io.Writer, options: Options) !void {
 /// passes itself, in `run`'s order, and this is `run` plus that one duty and
 /// minus its close — the close is the caller's, because the caller has to read
 /// what was still standing before it runs.
+///
+/// A failing pass leaves this loop through `main`, whose guard winds the node
+/// down — `run` can keep that guard to itself only because the close is inside
+/// it.
+///
+/// **`at` is carried out of the loop rather than read again here**, and that is
+/// the point of the local: a close stamped with a second clock read is a close
+/// on a time this process had already moved past.
 fn drive(
     io: std.Io,
     node: *Node,
-    send: ?Send,
+    send: ?cli.Send,
     progress: ?*std.Io.Writer,
-) (node_mod.Error || CliError || std.Io.Writer.Error)!void {
+    last: *?Instant,
+) (node_mod.Error || RuntimeError || std.Io.Writer.Error)!void {
     var dialled = false;
     var offered = false;
     var retried: u64 = 0;
@@ -713,6 +426,7 @@ fn drive(
     var told_gone: u64 = 0;
     while (true) {
         const at = try nowNs(io);
+        last.* = at;
         if (stopped.expired(at)) break;
         // The dials on the first pass, for `run`'s reason: a stop raised before
         // the loop is entered closes a node that never dialled.
@@ -765,7 +479,7 @@ fn shut(
     io: std.Io,
     node: *Node,
     owed: usize,
-) (node_mod.Error || CliError)!Close {
+) (node_mod.Error || RuntimeError)!Close {
     const before = node.stats.datagrams_out;
     try node.close(io, try nowNs(io), node.generator());
     return .{ .connections = owed, .datagrams = node.stats.datagrams_out - before };
@@ -998,75 +712,4 @@ fn reportInbox(text: *std.Io.Writer, node: *const Node) !void {
             },
         );
     }
-}
-
-/// `<nodeid>@<relay-url>`: who a relay is, and where it is, in the spelling a
-/// peer is handed one.
-///
-/// **The URL is the whole of what a peer holds about a relay**, so it is
-/// resolved here rather than handed over as a socket: `RelayUrl.socketAddr` is
-/// the step, and it refuses a host that is a name outright because nothing in
-/// this program resolves one. That refusal is this program's answer on a line,
-/// for the reason every other bad value here is.
-fn parseRelayPeer(text_in: []const u8) CliError!RelayPeer {
-    const at = std.mem.indexOfScalar(u8, text_in, '@') orelse
-        return error.RelayWithoutId;
-    const url = text_in[at + 1 ..];
-    // The URL's own refusals and the step that turns it into an address both
-    // keep the names the seam gives them: see `CliError`.
-    const parsed = try ozai.RelayUrl.parse(url);
-    return .{
-        .url = url,
-        .peer = .{
-            .id = try NodeId.parseZ32(text_in[0..at]),
-            .addr = .{ .ip = try parsed.socketAddr() },
-        },
-    };
-}
-
-/// `<nodeid>:<bytes>`: one datagram, and the peer it is for.
-///
-/// A node id is z-base-32 and carries no colon, so the first one separates the
-/// two and everything behind it is the payload — colons included, which is why
-/// this splits on the first and not the last. The payload is the command line's
-/// own bytes rather than a decoded form of them: a datagram is an opaque
-/// payload, and a program that cannot spell one cannot send one.
-fn parseSend(text_in: []const u8) CliError!Send {
-    const colon = std.mem.indexOfScalar(u8, text_in, ':') orelse
-        return error.SendWithoutBytes;
-    if (colon + 1 == text_in.len) return error.SendWithoutBytes;
-    const bytes = text_in[colon + 1 ..];
-    // A relay forwards datagrams and this is the length of one, so a longer
-    // payload is refused here rather than becoming a `DatagramTooLarge` out of
-    // `sendThrough` on a pass of the loop: same mistake, one line either way,
-    // and only one of them is a line.
-    if (bytes.len > node_mod.max_datagram) return error.SendTooLong;
-    return .{ .peer = try NodeId.parseZ32(text_in[0..colon]), .bytes = bytes };
-}
-
-/// `ip:port`, with an IPv6 literal written in brackets.
-fn parseSocket(text_in: []const u8) CliError!SocketAddr {
-    const colon = std.mem.lastIndexOfScalar(u8, text_in, ':') orelse
-        return error.AddressNotReachable;
-    const port = std.fmt.parseInt(u16, text_in[colon + 1 ..], 10) catch
-        return error.AddressNotReachable;
-    var host = text_in[0..colon];
-    if (std.mem.startsWith(u8, host, "[") and std.mem.endsWith(u8, host, "]")) {
-        host = host[1 .. host.len - 1];
-    }
-    return .{
-        .ip = ozai.IpAddress.parse(host) orelse return error.AddressNotReachable,
-        .port = port,
-    };
-}
-
-/// `nodeid@ip:port`: a z-base-32 node id, and where to reach it.
-///
-/// The two halves keep their own refusals: a node id that is not on the curve
-/// and an address with no port are different mistakes, and one name for both
-/// would leave the caller guessing which one it typed.
-fn parsePeer(text_in: []const u8) CliError!Peer {
-    const at = std.mem.indexOfScalar(u8, text_in, '@') orelse return error.PeerWithoutAddress;
-    const socket = parseSocket(text_in[at + 1 ..]) catch return error.PeerAddressUnreachable;
-    return .{ .id = try NodeId.parseZ32(text_in[0..at]), .addr = .{ .ip = socket } };
 }

@@ -135,6 +135,7 @@
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
+const base_relay_url = @import("../base/relay_url.zig");
 const probe = @import("probe.zig");
 const report = @import("report.zig");
 
@@ -142,7 +143,7 @@ const report = @import("report.zig");
 /// `Nanos` for the fold and `probe.zig` reuses it; a third definition of "an
 /// instant" in one layer would only invite a conversion nobody wants.
 const Nanos = report.Nanos;
-const RelayUrl = addr.RelayUrl;
+const RelayUrl = base_relay_url.RelayUrl;
 const SocketAddr = addr.SocketAddr;
 
 /// What this file refuses.

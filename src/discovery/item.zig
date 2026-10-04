@@ -26,14 +26,14 @@
 //! The second has no upstream counterpart at all and wants a bullet of its own
 //! in the same list:
 //!
-//! * The tiebreak is `base/addr.zig`'s value order — `TransportAddr.order`,
-//!   the order a `NodeAddr` list is kept in and a ticket canonicalizes its
-//!   addresses by — and not a wire format. The wire formats are another
-//!   module's business and they change; an order that moved when a ticket
-//!   encoding moved would reorder zones for a reason nobody could see, and
-//!   one that read a different order than the address lists would pick a
-//!   different relay than the list it was handed. Nothing here is ever sent
-//!   to a peer.
+//! * The tiebreak is `base/transport_addr.zig`'s value order —
+//!   `TransportAddr.order`, the order a `NodeAddr` list is kept in and a
+//!   ticket canonicalizes its addresses by — and not a wire format. The wire
+//!   formats are another module's business and they change; an order that
+//!   moved when a ticket encoding moved would reorder zones for a reason
+//!   nobody could see, and one that read a different order than the address
+//!   lists would pick a different relay than the list it was handed. Nothing
+//!   here is ever sent to a peer.
 //!
 //! The stream plumbing — the `AddressLookup` trait, the resolvers implementing
 //! it, the handle whose drop cancels them — is a later slice. What is here is
@@ -42,6 +42,10 @@
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
+const key = @import("../base/key.zig");
+const node_addr = @import("../base/node_addr.zig");
+const relay_url = @import("../base/relay_url.zig");
+const transport_addr = @import("../base/transport_addr.zig");
 
 /// Which lookup service produced an `Item`.
 ///
@@ -102,7 +106,7 @@ const tag_custom = 2;
 /// port, host length and a maximal host. A new `TransportAddr` arm that
 /// encodes longer has to raise this; the switch in `encodeAddr` is exhaustive,
 /// so such an arm cannot be added without the compiler pointing at it.
-pub const max_encoded_addr_length = 1 + 1 + 2 + 1 + addr.RelayUrl.max_host_length;
+pub const max_encoded_addr_length = 1 + 1 + 2 + 1 + relay_url.RelayUrl.max_host_length;
 
 /// Why an item cannot be written in its canonical encoding: the caller's buffer
 /// was too small for it, or one of its addresses is one no record can hold.
@@ -126,12 +130,12 @@ pub const EncodeError = error{
 /// shares that slice with the original rather than duplicating it. So an item
 /// read out of a `resolve.Stream` is valid exactly as long as that stream is,
 /// and an item to keep past it is an item to copy the addresses into. Who
-/// allocated the list, and who releases it, is `base/addr.zig`'s rule.
+/// allocated the list, and who releases it, is `base/node_addr.zig`'s rule.
 pub const Item = struct {
     /// Upstream's `endpoint_info: EndpointInfo`. ozai's `NodeAddr` carries the
     /// node id beside the paths, so the whole upstream struct is one field
     /// here, and `addrs` is sorted and duplicate-free as invariant 2 requires.
-    endpoint: addr.NodeAddr,
+    endpoint: node_addr.NodeAddr,
     /// The service that produced this item. Not a tiebreak on its own: two
     /// services reporting the same address are agreeing, not conflicting.
     provenance: Provenance,
@@ -144,7 +148,7 @@ pub const Item = struct {
     /// The caller still owns that list and still releases it, and the returned
     /// item is valid for as long as the list is.
     pub fn init(
-        endpoint: addr.NodeAddr,
+        endpoint: node_addr.NodeAddr,
         provenance: Provenance,
         last_updated: ?u64,
     ) Item {
@@ -253,7 +257,7 @@ pub const Item = struct {
     /// addresses. The encoding has no fixed length, because the address list
     /// has none, so the caller sizes the buffer and owns it.
     pub fn maxEncodedLength(addrs: usize) usize {
-        return addr.NodeId.byte_length + addrs * max_encoded_addr_length;
+        return key.NodeId.byte_length + addrs * max_encoded_addr_length;
     }
 };
 
@@ -268,7 +272,7 @@ fn orderTimestamp(a: ?u64, b: ?u64) std.math.Order {
 /// two different addresses can be walked in step without either list's shape
 /// being known in advance. Nothing compares them; see `canonicalBytes`.
 fn encodeAddr(
-    value: addr.TransportAddr,
+    value: transport_addr.TransportAddr,
     out: *[max_encoded_addr_length]u8,
 ) EncodeError![]const u8 {
     return switch (value) {
@@ -435,14 +439,13 @@ pub const Resolution = union(enum) {
 };
 
 const t = std.testing;
-const key = @import("../base/key.zig");
 
 /// Node ids from fixed seeds. A resolver hands out real keys and a `NodeId`
 /// cannot be made from arbitrary bytes, so the corpus draws from a pool of
 /// three rather than from noise. The pool is also what lets two generated
 /// items be equal in every field, which the order properties need.
-fn corpusIds() key.KeyError![3]addr.NodeId {
-    var ids: [3]addr.NodeId = undefined;
+fn corpusIds() key.KeyError![3]key.NodeId {
+    var ids: [3]key.NodeId = undefined;
     for (&ids, 1..) |*id, seed| {
         var bytes: [key.SecretKey.seed_length]u8 = undefined;
         @memset(&bytes, @intCast(seed));
@@ -455,11 +458,11 @@ const pool_length = 15;
 
 /// A small pool of addresses, so a generated item can differ from another in
 /// one field and in no other.
-fn pool() addr.RelayUrlParseError![pool_length]addr.TransportAddr {
+fn pool() relay_url.RelayUrlParseError![pool_length]transport_addr.TransportAddr {
     return .{
-        .{ .relay = try addr.RelayUrl.parse("https://use1-1.relay.iroh.network./") },
-        .{ .relay = try addr.RelayUrl.parse("https://use1-2.relay.iroh.network./") },
-        .{ .relay = try addr.RelayUrl.parse("http://relay.example./") },
+        .{ .relay = try relay_url.RelayUrl.parse("https://use1-1.relay.iroh.network./") },
+        .{ .relay = try relay_url.RelayUrl.parse("https://use1-2.relay.iroh.network./") },
+        .{ .relay = try relay_url.RelayUrl.parse("http://relay.example./") },
         .{ .ip = .{ .ip = .{ .v4 = .{ 192, 0, 2, 7 } }, .port = 7842 } },
         .{
             .ip = .{
@@ -477,15 +480,15 @@ fn pool() addr.RelayUrlParseError![pool_length]addr.TransportAddr {
         .{ .custom = .{ .id = 256, .data = &.{ 0xab, 0xcd } } },
         .{ .custom = .{ .id = 1 << 40, .data = &.{} } },
         // The same relay host over the other scheme and on another port.
-        .{ .relay = try addr.RelayUrl.parse("http://use1-1.relay.iroh.network./") },
-        .{ .relay = try addr.RelayUrl.parse("https://relay.example.:8443/") },
+        .{ .relay = try relay_url.RelayUrl.parse("http://use1-1.relay.iroh.network./") },
+        .{ .relay = try relay_url.RelayUrl.parse("https://relay.example.:8443/") },
         // Two pairs whose length order and lexical order pull in opposite
         // directions: in each the longer value is the lexically lower one, so
         // anything that reads a length prefix before the bytes ranks the pair
         // the other way round from `TransportAddr.order`. Nothing above can
         // tell the two orders apart.
-        .{ .relay = try addr.RelayUrl.parse("https://aa.example./") },
-        .{ .relay = try addr.RelayUrl.parse("https://b.example./") },
+        .{ .relay = try relay_url.RelayUrl.parse("https://aa.example./") },
+        .{ .relay = try relay_url.RelayUrl.parse("https://b.example./") },
         .{ .custom = .{ .id = 5, .data = &.{ 0x61, 0x61 } } },
         .{ .custom = .{ .id = 5, .data = &.{0x62} } },
     };
@@ -503,7 +506,7 @@ fn corpus(alloc: std.mem.Allocator, count: usize) ![]Item {
     const items = try alloc.alloc(Item, count);
     for (items[0 .. count - 2]) |*item| {
         const id = ids[random.intRangeLessThan(usize, 0, ids.len)];
-        var endpoint = addr.NodeAddr.init(id);
+        var endpoint = node_addr.NodeAddr.init(id);
         const address_count = random.intRangeLessThan(usize, 0, 4);
         for (0..address_count) |_| {
             const pick = random.intRangeLessThan(usize, 0, addresses.len);
@@ -533,12 +536,12 @@ fn freeItems(alloc: std.mem.Allocator, items: []Item) void {
 /// One address, one service, one stamp.
 fn single(
     alloc: std.mem.Allocator,
-    id: addr.NodeId,
-    transport: addr.TransportAddr,
+    id: key.NodeId,
+    transport: transport_addr.TransportAddr,
     provenance: Provenance,
     last_updated: ?u64,
 ) !Item {
-    var endpoint = addr.NodeAddr.init(id);
+    var endpoint = node_addr.NodeAddr.init(id);
     endpoint = (try endpoint.insert(alloc, transport)) orelse
         return error.TestUnexpectedResult;
     return .init(endpoint, provenance, last_updated);
@@ -628,7 +631,7 @@ test "equal timestamps fall through to the address" {
     // compared one at a time: `with_two` starts with the lower host, so it
     // loses to a one-address item that starts with the higher one, and a
     // comparator that counted first would have got this exactly backwards.
-    var grown = addr.NodeAddr.init(id);
+    var grown = node_addr.NodeAddr.init(id);
     if (try grown.insert(alloc, addresses[0])) |next| grown = next;
     if (try grown.insert(alloc, addresses[1])) |next| grown = next;
     const with_two = Item.init(grown, .pkarr, 17);
@@ -676,7 +679,7 @@ test "the tiebreak is the address value order, not the encoded record" {
 
         // The list a caller sorts with `insert` agrees, because it is the same
         // order: the address the merge picked is the one that lands last.
-        var both = addr.NodeAddr.init(id);
+        var both = node_addr.NodeAddr.init(id);
         if (try both.insert(alloc, lower)) |next| both = next;
         if (try both.insert(alloc, higher)) |next| both = next;
         try t.expectEqual(@as(usize, 2), both.addrs.len);
@@ -855,4 +858,106 @@ test "an address the encoder cannot hold still has a total order" {
     const other = try single(alloc, id, addresses[5], .pkarr, 3);
     try t.expectEqual(negate(other.order(item)), item.order(other));
     try t.expectEqual(std.math.Order.eq, item.order(item));
+}
+
+test "a buffer too small is refused before the record it could not hold" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const addresses = try pool();
+    const item = try single(alloc, (try corpusIds())[0], addresses[0], .dns, 3);
+    const host = addresses[0].relay.hostSlice();
+
+    // What a record spells for this address: the node id, then tag, scheme,
+    // port, host length and the host. `maxEncodedLength` is the bound and not
+    // the answer, so the length is stated rather than compared against it.
+    var buffer: [Item.maxEncodedLength(1)]u8 = undefined;
+    try t.expectEqual(key.NodeId.byte_length + 5 + host.len, (try item.canonicalBytes(&buffer)).len);
+
+    // Too small for the node id: refused before the first byte is written, so
+    // the buffer is not touched at all.
+    try t.expectError(
+        error.BufferTooSmall,
+        item.canonicalBytes(buffer[0 .. key.NodeId.byte_length - 1]),
+    );
+
+    // Big enough for the id and not for the record behind it: refused part
+    // way through, after the id has gone in, which is what makes this a
+    // second check rather than the first one again. A buffer refused half
+    // way holds the prefix the encoder committed to, because that is the
+    // whole of what a caller can reuse.
+    var id_only: [key.NodeId.byte_length]u8 = undefined;
+    try t.expectError(error.BufferTooSmall, item.canonicalBytes(&id_only));
+    try t.expectEqualSlices(u8, &item.endpoint.node_id.toBytes(), &id_only);
+}
+
+/// The answer `merge` returned, checked against the inputs rather than
+/// against itself.
+///
+/// Three separate claims, because a length is not any of them: the list is
+/// exactly as long as the inputs hold that many *different* answers, its head
+/// is the answer `winner` names out of the inputs, and it is strictly
+/// decreasing, which is what says it is both in `Item.order` and free of the
+/// duplicates `merge` exists to drop.
+fn expectMergeAnswered(merged: []const Item, items: []const Item) !void {
+    // Counted without sorting and without `merge`, so a list that dropped an
+    // answer or kept two of them fails here rather than agreeing with itself.
+    var distinct: usize = 0;
+    for (items, 0..) |item, at| {
+        var repeated = false;
+        for (items[0..at]) |earlier| {
+            if (earlier.eql(item)) repeated = true;
+        }
+        if (!repeated) distinct += 1;
+    }
+    try t.expectEqual(distinct, merged.len);
+    if (distinct == 0) return;
+    try t.expect(merged[0].eql(winner(items) orelse return error.TestUnexpectedResult));
+
+    var at: usize = 1;
+    while (at < merged.len) : (at += 1) {
+        try t.expectEqual(std.math.Order.gt, merged[at - 1].order(merged[at]));
+    }
+}
+
+/// One run of `merge` for `t.checkAllAllocationFailures`.
+///
+/// Two allocations stand between the inputs and the answer: the sorted copy
+/// `merge` deduplicates out of, and the array it writes. Both refusals return
+/// rather than being handled, so the sweep sees them as failures instead of
+/// as a run that recovered from one.
+///
+/// The answer is checked on the run that succeeds, and the inputs are checked
+/// on every run that does not: `merge` sorts a copy, so a refusal can hand
+/// back the sorted copy and nothing else, and every input still reads as it
+/// did when the sweep started.
+fn mergeAccounting(alloc: std.mem.Allocator, items: []const Item, before: []const Item) !void {
+    const merged = merge(alloc, items) catch |err| {
+        try t.expectEqual(error.OutOfMemory, err);
+        for (items, before) |left, right| try t.expect(left.eql(right));
+        return err;
+    };
+    try expectMergeAnswered(merged, items);
+    // A merged list owns no address and releases none, so the array is the
+    // whole of what has to come back.
+    alloc.free(merged);
+}
+
+test "every allocation a merge makes can fail on its own" {
+    const alloc = t.allocator;
+    const items = try corpus(alloc, 24);
+    defer freeItems(alloc, items);
+    // What the caller handed over, so "nothing was changed" is a claim about
+    // these items and not about a list `merge` never saw.
+    const before = try alloc.dupe(Item, items);
+    defer alloc.free(before);
+
+    try t.checkAllAllocationFailures(alloc, mergeAccounting, .{ items, before });
+
+    // The eventual consumer result, on a plain allocator: a zone reading this
+    // list gets the same answer whichever of the two allocations it did not
+    // have to pay for.
+    const merged = try merge(alloc, items);
+    defer alloc.free(merged);
+    try expectMergeAnswered(merged, items);
 }

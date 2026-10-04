@@ -342,7 +342,7 @@ fn stand(scratch: []u8, serve: node_mod.Serve) !Cast {
         .listen = loopback,
         .alpn = node_mod.relay_alpn,
         .relay = .{ .role = .{ .serve = serve } },
-    }, 0x5150);
+    });
     errdefer relay.deinit();
 
     // The step this whole file is about, done once and in one place: a relay
@@ -361,29 +361,31 @@ fn stand(scratch: []u8, serve: node_mod.Serve) !Cast {
         .listen = loopback,
         .alpn = node_mod.relay_alpn,
         .relay = .{ .role = .{ .client = route_peer[0] } },
-    }, 0xa1a1);
+    });
     errdefer first.deinit();
     const second = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0xb2),
         .listen = loopback,
         .alpn = node_mod.relay_alpn,
         .relay = .{ .role = .{ .client = route_peer[0] } },
-    }, 0xb2b2);
+    });
     errdefer second.deinit();
     return .{ .relay = relay, .first = first, .second = second, .route = route };
 }
 
 /// A node holding an existing node's identity, reached by the same URL.
 ///
-/// `seed_tag` is the identity to re-present and `generator` seeds this node's
-/// own generator, so a duplicate is not a copy of anything but its key.
-fn duplicateOf(cast: *const Cast, seed_tag: u8, generator: u64) !*Node {
+/// `seed_tag` is the identity to re-present, and it is the only thing this
+/// node shares with the client it duplicates: its generator is its own CSPRNG,
+/// drawn from `t.io` by `Node.create` like every other node's, so a duplicate
+/// is not a copy of anything but its key.
+fn duplicateOf(cast: *const Cast, seed_tag: u8) !*Node {
     return Node.create(t.allocator, t.io, .{
         .secret = try identityOf(seed_tag),
         .listen = loopback,
         .alpn = node_mod.relay_alpn,
         .relay = .{ .role = .{ .client = cast.peer() } },
-    }, generator);
+    });
 }
 
 /// The relay URL that names `socket`, spelled the way a peer is handed one.
@@ -552,7 +554,7 @@ test "a repeated handshake makes no second entry, and every departure is reporte
     // same certificate, so the relay sees the same node id over a second
     // connection. It is given the URL's socket and the node id, exactly as the
     // first was, and it binds its own socket and dials the relay itself.
-    const again = try duplicateOf(&cast, 0xa1, 0xa1a2);
+    const again = try duplicateOf(&cast, 0xa1);
     cast.again = again;
 
     // ── admitted again, and no second entry ──
@@ -656,13 +658,9 @@ test "a control frame gets through a data queue that is at its whole capacity" {
     // flood takes seven and refuses one — so the split is this count and not
     // the queue's depth.
     const filled_before_top_up = cast.relay.stats.relay_forwarded;
-    // A fourth node presenting the *second* node's identity, so the connection
-    // it displaces is the one whose data queue is at capacity. Its generator
-    // seed is deliberately *not* the second node's: two nodes drawing from one
-    // generator pick the same connection ids, collide in the relay's CID map,
-    // and neither handshake finishes. That is a collision in the fixture, not
-    // a finding about the relay.
-    const again = try duplicateOf(&cast, 0xb2, 0xb3b3);
+    // The duplicate identity gets an independent CSPRNG, not the same
+    // predictable connection-ID sequence as the displaced client.
+    const again = try duplicateOf(&cast, 0xb2);
     cast.again = again;
     // The loop's condition is the **relay's** counter, not the client's, and
     // that is load-bearing twice over. `relay_told_displaced` moves in the same

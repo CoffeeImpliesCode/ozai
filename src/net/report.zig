@@ -24,8 +24,9 @@
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
+const base_relay_url = @import("../base/relay_url.zig");
 
-const RelayUrl = addr.RelayUrl;
+const RelayUrl = base_relay_url.RelayUrl;
 const SocketAddr = addr.SocketAddr;
 
 /// Nanoseconds on a monotonic timeline the caller owns.

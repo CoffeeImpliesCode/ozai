@@ -35,8 +35,12 @@ would break if it moved.
 
 Wire codecs and network state machines consume caller-supplied bytes, state,
 time and entropy. They do not fetch a clock, environment or hidden allocator.
-`SecretKey.generate` is an explicit entropy edge. It borrows `std.Io` rather
-than hiding a process random source.
+`SecretKey.generate` is an explicit entropy edge: it borrows the caller's
+`std.Io` rather than hiding a process random source. That is an ownership
+property, not a strength one — the draw is `Io.random`, which Zig 0.16.0
+documents as seeded by `Io.randomSecure` *or by a less secure mechanism when
+that fails* (`lib/std/Io.zig:2462-2469`). A caller that needs the guarantee
+passes an `Io` whose `random` is `randomSecure`.
 
 The socket and node drivers borrow `std.Io` per operation. Its backend and
 userdata must outlive the operation and any task that uses them.
@@ -44,8 +48,18 @@ Runtime owners keep their allocator, but pure actions keep no socket handle.
 See [`DECISIONS/0002`](DECISIONS/0002-async-substrate.md) for the runtime choice.
 
 The current Linux driver uses `Io.Threaded`. `Io.Uring` cannot send a UDP
-datagram in Zig 0.16.0, and `Io.Evented` uses Uring on Linux.
-Neither runtime owns this stack's send path.
+datagram in Zig 0.16.0 (`lib/std/Io/Uring.zig:5042-5054`), and `Io.Evented` is
+`Io.Uring` on Linux (`lib/std/Io.zig:31-37`). Neither runtime owns this stack's
+send path.
+
+**One boundary the runtime still violates.** `Node.create` initializes
+`std.Random.DefaultPrng` from a `u64` the caller passes, and `ozai-node` passes
+the fixed public constant `0x6f7a_69`. That generator reaches the TLS
+handshake's ephemeral scalars, the relay admission challenges and the QUIC
+connection-id and path-validation draws, so the production randomness is
+predictable even though `ozai.base`'s seam is not. Identity keys do not come
+from it. This is the first Wave 0 repair in [`PLAN.md`](PLAN.md) and it is not
+yet made.
 
 ## Module tree
 
@@ -130,7 +144,9 @@ prevents, and each belongs in a test.
    corrupts the GSO path.
 8. **Version negotiation is `max()`, not first-match**, and both v1 and v2 frames
    are emittable. `Health` (v1) and `Status` (v2) are the same semantic event in
-   different encodings; the server translates.
+   different encodings; the server translates. The codec can negotiate and emit
+   both today; no production server performs that translation, because there is
+   no standard carrier to perform it on.
 9. **Two queues per relay connection**, data and control. Merged, a `Status` can
    sit behind a 512-deep datagram backlog.
 10. **Admit once, report disconnect exactly once.** In Zig this is a guard handle
@@ -169,7 +185,11 @@ prevents, and each belongs in a test.
     to know calls `close` itself.
 20. **The TLS verifier and session-store identities must be stable** across every
     client-config construction, or 0-RTT silently stops working. In Zig this means
-    one long-lived config object, not a value rebuilt per call.
+    one long-lived config object, not a value rebuilt per call. The vendored
+    core's pinned-client resumption currently asks for a fresh client
+    certificate after PSK selection and fails closed; that is a recorded RFC
+    8446 deviation and an added compatibility limitation, not a guard to
+    preserve and not an identity bypass.
 
 ## Divergences from upstream, in one place
 
@@ -276,3 +296,9 @@ prevents, and each belongs in a test.
   the two directions as the same decision. They are not — a client verifies who
   it connected to, a server decides who to let in — and one field cannot carry
   both without a comment explaining which is which at every use.
+- **The relay carrier is private QUIC, and it is not upstream's.** Upstream's
+  relay is reached over an HTTP upgrade to RFC 6455 WebSocket; the carrier in
+  this tree is the private QUIC ALPN `/iroh-relay/1`. Nothing below the frame
+  codec changes because of it, and nothing about interoperability survives it:
+  the standard carrier, its TLS seam, the `iroh-relay-v1|v2` negotiation and
+  the inner-QUIC egress rewrite are Wave 2 work.

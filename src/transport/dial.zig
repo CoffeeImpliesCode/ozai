@@ -179,6 +179,8 @@ const quic = @import("quic");
 // module's own vocabulary as declarations and a parameter may not shadow one.
 const base_key = @import("../base/key.zig");
 const base_addr = @import("../base/addr.zig");
+const base_relay_url = @import("../base/relay_url.zig");
+const base_transport_addr = @import("../base/transport_addr.zig");
 const base_ula = @import("../base/ula.zig");
 const addr_map = @import("addr_map.zig");
 const batch = @import("batch.zig");
@@ -187,7 +189,7 @@ const quic_bridge = @import("quic_bridge.zig");
 const NodeId = base_key.NodeId;
 const SecretKey = base_key.SecretKey;
 const SocketAddr = base_addr.SocketAddr;
-const TransportAddr = base_addr.TransportAddr;
+const TransportAddr = base_transport_addr.TransportAddr;
 const CustomAddr = base_addr.CustomAddr;
 
 const Bridge = quic_bridge.Bridge;
@@ -731,7 +733,7 @@ const direct_addr: SocketAddr = .{ .ip = .{ .v4 = .{ 192, 0, 2, 7 } }, .port = 7
 /// Parsed rather than written out. `RelayUrl.host` is a 253-byte array with a
 /// length beside it, and a hand-built one is a second way to spell a URL.
 fn relayTarget() !TransportAddr {
-    return .{ .relay = try base_addr.RelayUrl.parse("https://relay.example.com") };
+    return .{ .relay = try base_relay_url.RelayUrl.parse("https://relay.example.com") };
 }
 
 /// Hand every datagram `conn` produced to `into`, and say whether it produced
@@ -874,6 +876,7 @@ fn exchange(
 /// it, and the tests that dial a relay path would be asserting nothing if the
 /// same map did not stand behind both.
 const Pair = struct {
+    gpa: std.mem.Allocator,
     dialer_secret: SecretKey,
     server_secret: SecretKey,
     dialer_bridge: *Bridge,
@@ -882,6 +885,8 @@ const Pair = struct {
     map: addr_map.MappedAddrs,
     engine: Prng,
 
+    /// The fixture over `t.allocator`, which is every test that only reads
+    /// what a dial built.
     fn init(
         self: *Pair,
         dialer_seed: [SecretKey.seed_length]u8,
@@ -890,7 +895,34 @@ const Pair = struct {
         engine_seed: u64,
         require_peer_pin: bool,
     ) !void {
+        return self.initOn(
+            t.allocator,
+            dialer_seed,
+            server_seed_,
+            expect_peer,
+            engine_seed,
+            require_peer_pin,
+        );
+    }
+
+    /// The same fixture over a caller-chosen allocator.
+    ///
+    /// One allocator runs the whole pair — the two bridges, the dialer and the
+    /// map — because a dialer and a bridge have to agree on theirs: the bridge
+    /// is what frees the dialled connections. A test that refuses allocations
+    /// needs to hand this the allocator it is refusing, and a fixture split
+    /// across two would let a dial allocate where the sweep is not looking.
+    fn initOn(
+        self: *Pair,
+        gpa: std.mem.Allocator,
+        dialer_seed: [SecretKey.seed_length]u8,
+        server_seed_: [SecretKey.seed_length]u8,
+        expect_peer: ?NodeId,
+        engine_seed: u64,
+        require_peer_pin: bool,
+    ) !void {
         self.* = .{
+            .gpa = gpa,
             .dialer_secret = try SecretKey.fromSeed(dialer_seed),
             .server_secret = try SecretKey.fromSeed(server_seed_),
             .dialer_bridge = undefined,
@@ -901,20 +933,20 @@ const Pair = struct {
         };
         errdefer self.dialer_secret.deinit();
         errdefer self.server_secret.deinit();
-        errdefer self.map.deinit(t.allocator);
-        self.dialer_bridge = try Bridge.create(t.allocator, t.io, .{
+        errdefer self.map.deinit(gpa);
+        self.dialer_bridge = try Bridge.create(gpa, t.io, .{
             .secret = self.dialer_secret,
             .expect_peer = expect_peer,
             .alpn = alpn,
         }, self.engine.random());
         errdefer self.dialer_bridge.destroy();
-        self.server_bridge = try Bridge.create(t.allocator, t.io, .{
+        self.server_bridge = try Bridge.create(gpa, t.io, .{
             .secret = self.server_secret,
             .expect_peer = self.dialer_secret.nodeId(),
             .alpn = alpn,
         }, self.engine.random());
         errdefer self.server_bridge.destroy();
-        self.dialer = try Dialer.create(t.allocator, self.dialer_bridge, .{
+        self.dialer = try Dialer.create(gpa, self.dialer_bridge, .{
             .secret = self.dialer_secret,
             .alpn = alpn,
             .require_peer_pin = require_peer_pin,
@@ -949,7 +981,7 @@ const Pair = struct {
         );
         self.dialer_bridge.destroy();
         self.server_bridge.destroy();
-        self.map.deinit(t.allocator);
+        self.map.deinit(self.gpa);
         self.dialer_secret.deinit();
         self.server_secret.deinit();
 
@@ -1554,4 +1586,304 @@ test "destroy wipes every retained secret copy before releasing its storage" {
     const erased_seed: [seed_length]u8 = @splat(0);
     try t.expectEqualSlices(u8, &erased_secret, backing[secret_start..][0..erased_secret.len]);
     try t.expectEqualSlices(u8, &erased_seed, backing[seed_start..][0..erased_seed.len]);
+}
+
+/// The identity a dialer's TLS configurations borrow, checked as ownership
+/// and not as contents alone.
+///
+/// `create` puts the dialer on the heap so that the chain, the ALPN list and
+/// the seed the configurations point at would not move, and `tlsConfigFor`
+/// hands the caller a view over them. A dialer whose configuration pointed at
+/// a block a refused `create` had left behind, or at one it had freed, would
+/// still answer with the right bytes here for exactly as long as nothing
+/// reused that memory — so the aliasing is the invariant, and the bytes only
+/// say which identity is being presented and which peer is being pinned.
+fn expectDialerOwnsItsTlsConfig(dialer: *const Dialer, pin: NodeId) !void {
+    const tls = dialer.tlsConfigFor(pin);
+    try t.expectEqual(@as(usize, 1), tls.alpn.len);
+    try t.expectEqual(@intFromPtr(&dialer.alpn_list), @intFromPtr(tls.alpn.ptr));
+    try t.expectEqualStrings(alpn, tls.alpn[0]);
+    const certificate = tls.client_certificate orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(usize, 1), certificate.cert_chain_der.len);
+    try t.expectEqual(@intFromPtr(&dialer.cert_chain), @intFromPtr(certificate.cert_chain_der.ptr));
+    try t.expectEqualSlices(u8, dialer.spki[0..], certificate.cert_chain_der[0]);
+    try t.expectEqualSlices(
+        u8,
+        &tls13.ed25519Spki(&dialer.node_id.toBytes()),
+        certificate.cert_chain_der[0],
+    );
+    try t.expectEqual(
+        @intFromPtr(dialer.seed[0..].ptr),
+        @intFromPtr(certificate.private_key_bytes.ptr),
+    );
+    try t.expectEqualStrings(default_server_name, tls.server_name.?);
+    try t.expectEqual(pin.toBytes(), tls.expect_peer_node_id.?);
+    // A client carries no server-side pin block, so there is no second copy of
+    // the pin here for a refusal to leave pointing somewhere else.
+    try t.expect(tls.client_auth == null);
+}
+
+test "a refused dialer leaves no identity storage behind it" {
+    // One allocation and no other, which is the claim this test exists for:
+    // `create` allocates the dialer and copies a config into it, and nothing
+    // on the path reaches the allocator again. Refusing the one boundary there
+    // is, and finding no second one to refuse, is what turns the claim into an
+    // observation.
+    var secret = try SecretKey.fromSeed(client_seed);
+    defer secret.deinit();
+    var peer_secret = try SecretKey.fromSeed(server_seed);
+    defer peer_secret.deinit();
+    const client_node = secret.nodeId();
+    var engine = Prng.init(91);
+
+    // A fixed backing array is what makes "nothing was kept" exact: its end
+    // index counts every byte handed out, so the dialer's absence is the
+    // bridge's alone rather than "no leak was noticed once the run was over".
+    const alignment = @max(@alignOf(Bridge), @alignOf(Dialer));
+    var backing: [@sizeOf(Bridge) + @sizeOf(Dialer)]u8 align(alignment) = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+
+    const bridge = try Bridge.create(fixed.allocator(), t.io, .{
+        .secret = peer_secret,
+        .alpn = alpn,
+    }, engine.random());
+    defer bridge.destroy();
+
+    var refusing = t.FailingAllocator.init(fixed.allocator(), .{ .fail_index = 0 });
+    try t.expectError(
+        error.OutOfMemory,
+        Dialer.create(refusing.allocator(), bridge, .{ .secret = secret, .alpn = alpn }),
+    );
+    try t.expect(refusing.has_induced_failure);
+    try t.expectEqual(@sizeOf(Bridge), fixed.end_index);
+
+    // And the same allocator answers a whole dialer, at the first byte behind
+    // the bridge, whose configurations borrow the dialer's own storage: a
+    // refusal that had kept identity storage would have left something behind
+    // for this one to sit behind, and one that had freed storage a
+    // configuration still pointed at would answer with reused bytes.
+    const dialer = try Dialer.create(fixed.allocator(), bridge, .{
+        .secret = secret,
+        .alpn = alpn,
+    });
+    try t.expect(@intFromPtr(dialer) - @intFromPtr(&backing) >= @sizeOf(Bridge));
+    const block: []u8 = @as([*]u8, @ptrCast(dialer))[0..@sizeOf(Dialer)];
+    try t.expect(fixed.isLastAllocation(block));
+    try expectDialerOwnsItsTlsConfig(dialer, peer_secret.nodeId());
+
+    try dialer.destroy();
+    // The caller's key is still the caller's: `create` copied it and `destroy`
+    // erased only the copy, so this node's own id still comes out of the
+    // caller's key afterwards. A dialer that had taken a pointer to it would
+    // have zeroed it here.
+    try t.expectEqual(client_node.toBytes(), secret.nodeId().toBytes());
+}
+
+/// How many allocating boundaries one pass's dial reached, in the allocator's
+/// own two counters: a growth it asked for in place, and a block it asked for
+/// whole.
+const DialPass = struct { allocs: usize, resizes: usize };
+
+/// Every connection a bridge's manager still holds must be one the manager can
+/// route to, and one this process can still read.
+///
+/// This is what a leaked partial connection looks like from the outside: an
+/// entry the table carries but no CID reaches, or an entry whose connection
+/// was freed with the entry still in the table. Reading `is_server` and the
+/// CID out of a freed connection is the second case — the allocator has
+/// already taken the bytes back, and it says so.
+fn expectEveryEntryRoutable(bridge: *Bridge) !void {
+    const manager = &bridge.manager;
+    try t.expect(manager.connectionCount() > 0);
+    for (manager.entries.items) |entry| {
+        try t.expect(!entry.conn.is_server);
+        try t.expect(entry.id < manager.next_entry_id);
+        const scid = CidKey.fromSlice(entry.conn.scid[0..entry.conn.scid_len]);
+        try t.expect(manager.cid_map.get(scid).? == entry);
+        try t.expect(manager.findByDcid(entry.conn.scid[0..entry.conn.scid_len]).? == entry);
+    }
+}
+
+/// One refused or served dial, over an allocator the caller arms, and the
+/// state a refused one has to leave behind.
+///
+/// Everything this node already had is built first and on the same allocator:
+/// a dialer, a bridge, one live connection in the manager's table with the CID
+/// that routes to it, and one synthetic address the map handed out. The dial
+/// under test names a *second* peer, so it has to allocate a route as well as
+/// a connection, and a refused one is caught both half-recording an address
+/// and disturbing the first one.
+///
+/// Every refusal is answered on the boundary the caller armed rather than on a
+/// fixed index, and what each refusal has to preserve is read back afterwards:
+/// the entry and its id, its state, its routing key, the address the map owns,
+/// the pin the live connection runs on, and the borrowed ALPN, SNI and token
+/// slices every configuration on this dialer points at.
+fn dialPass(failing: *t.FailingAllocator, refusal: t.FailingAllocator.Config) !DialPass {
+    var pair: Pair = undefined;
+    try pair.initOn(failing.allocator(), client_seed, server_seed, null, 33, true);
+    defer pair.deinit();
+    const manager = &pair.dialer_bridge.manager;
+    const target = try relayTarget();
+    const held_peer = pair.server_secret.nodeId();
+    var stranger = try SecretKey.fromSeed(stranger_seed);
+    defer stranger.deinit();
+    const fresh_peer = stranger.nodeId();
+
+    const first = try pair.dialer.dial(
+        target,
+        held_peer,
+        client_addr,
+        &pair.map,
+        start,
+        pair.engine.random(),
+    );
+    const held = first.conn.entry;
+    const held_id = held.id;
+    const held_state = held.conn.state;
+    const held_scid = CidKey.fromSlice(held.conn.scid[0..held.conn.scid_len]);
+    const held_key = first.route.key orelse return error.TestUnexpectedResult;
+    const held_socket = first.route.socket;
+    const routes_before = pair.map.by_key.count();
+    const addresses_before = pair.map.by_addr.count();
+    const routed_before = manager.cid_map.count();
+    try expectEveryEntryRoutable(pair.dialer_bridge);
+
+    const allocs_before = failing.alloc_index;
+    const resizes_before = failing.resize_index;
+    failing.fail_index = refusal.fail_index;
+    failing.resize_fail_index = refusal.resize_fail_index;
+    const outcome = pair.dialer.dial(
+        target,
+        fresh_peer,
+        client_addr,
+        &pair.map,
+        start,
+        pair.engine.random(),
+    );
+    const passed: DialPass = .{
+        .allocs = failing.alloc_index - allocs_before,
+        .resizes = failing.resize_index - resizes_before,
+    };
+
+    if (outcome) |fresh| {
+        // The pass that refused a growth in place fell back to a fresh block
+        // and the dial went through, so the answer is the one a caller gets
+        // when nothing refuses: a second connection, a second address, and the
+        // first of both exactly as they were.
+        try t.expectEqual(@as(usize, 2), manager.entries.items.len);
+        try t.expect(manager.entries.items[0] == held);
+        try t.expect(held.id == held_id and held.conn.state == held_state);
+        try t.expect(manager.cid_map.get(held_scid).? == held);
+        try t.expectEqual(routed_before + 1, manager.cid_map.count());
+        try expectEveryEntryRoutable(pair.dialer_bridge);
+        try t.expectEqual(routes_before + 1, pair.map.by_key.count());
+        try t.expectEqual(addresses_before + 1, pair.map.by_addr.count());
+        try t.expectEqual(fresh.route.key.?, ownerOf(&pair.map, fresh.route.socket).?);
+        try t.expectEqual(held_key, ownerOf(&pair.map, held_socket).?);
+        try expectDialerOwnsItsTlsConfig(pair.dialer, fresh_peer);
+        return passed;
+    } else |err| {
+        try t.expectEqual(error.OutOfMemory, err);
+        // This pass's own allocator refused, and it refused on the boundary
+        // rather than somewhere in the setup above it.
+        try t.expect(failing.has_induced_failure);
+    }
+
+    // One connection, the one this node already had, and it is the same
+    // connection: a refused dial that had swapped, duplicated or dropped an
+    // entry answers with a length or a pointer that is not what it was.
+    try t.expectEqual(@as(usize, 1), manager.entries.items.len);
+    try t.expect(manager.entries.items[0] == held);
+    try t.expectEqual(held_id, held.id);
+    try t.expectEqual(held_state, held.conn.state);
+    try t.expectEqual(routed_before, manager.cid_map.count());
+    try t.expect(manager.cid_map.get(held_scid).? == held);
+    try expectEveryEntryRoutable(pair.dialer_bridge);
+
+    // Route ownership: the first address still belongs to the first key, and
+    // the second one was recorded in neither direction. `MappedAddrs.insert`
+    // takes the reverse index first and takes it back out on failure
+    // (`addr_map.zig`), so a half-recorded route would answer as a count that
+    // grew, or as an address resolving to a key the map never handed out.
+    try t.expectEqual(routes_before, pair.map.by_key.count());
+    try t.expectEqual(addresses_before, pair.map.by_addr.count());
+    try t.expectEqual(held_key, ownerOf(&pair.map, held_socket).?);
+
+    // Pin state: the connection this node already had still runs on the pin it
+    // was dialled with, and the dialer still hands out a configuration pinning
+    // whichever peer it is asked about — both the one behind the refused dial
+    // and the one behind the connection that is live.
+    const handshake = held.conn.tls13_hs orelse return error.TestUnexpectedResult;
+    try t.expectEqual(held_peer.toBytes(), handshake.config.expect_peer_node_id.?);
+    try expectDialerOwnsItsTlsConfig(pair.dialer, held_peer);
+    try expectDialerOwnsItsTlsConfig(pair.dialer, fresh_peer);
+    try t.expect(pair.dialer.config.initial_token == null);
+
+    // And the retry is the whole of what the contract promises: nothing to
+    // clean up, and a connection that was never registered in the first place.
+    // Both dials stand at the end — one refused, one served, two entries.
+    const retry = try pair.dialer.dial(
+        target,
+        fresh_peer,
+        client_addr,
+        &pair.map,
+        start,
+        pair.engine.random(),
+    );
+    try t.expectEqual(@as(usize, 2), manager.entries.items.len);
+    try t.expect(retry.conn.entry != held);
+    const retry_handshake = retry.conn.entry.conn.tls13_hs orelse
+        return error.TestUnexpectedResult;
+    try t.expectEqual(fresh_peer.toBytes(), retry_handshake.config.expect_peer_node_id.?);
+    try expectEveryEntryRoutable(pair.dialer_bridge);
+    try t.expectEqual(routes_before + 1, pair.map.by_key.count());
+    try t.expectEqual(addresses_before + 1, pair.map.by_addr.count());
+    try t.expectEqual(retry.route.key.?, ownerOf(&pair.map, retry.route.socket).?);
+    return passed;
+}
+
+/// Refuse every allocating boundary a dial makes, one at a time, from the
+/// first to the run nothing is refused on.
+///
+/// `t.checkAllAllocationFailures` counts `alloc` and not `resize`, and a dial
+/// makes both: `ArrayList.ensureTotalCapacity` and `HashMapUnmanaged` ask the
+/// allocator to grow in place and allocate only where it will not
+/// (`std/array_list.zig`), so a sweep over the allocation counter alone would
+/// cover whichever half the allocator happened to take. This walks the two
+/// counters together.
+///
+/// A refused resize is not a refusal at all: the same code falls back to a
+/// fresh allocation, which succeeds, and the dial completes. Those passes are
+/// kept because a relocation has to reach the same answers a growth in place
+/// would, and because they are the passes that take the free-and-copy path
+/// rather than the in-place one.
+fn sweepDialAllocations() !void {
+    var counting = t.FailingAllocator.init(t.allocator, .{});
+    const total = try dialPass(&counting, .{});
+    // Every pass below refuses one boundary; a dial that asked for nothing
+    // would pass all of them without having tried anything.
+    try t.expect(total.allocs + total.resizes > 0);
+
+    var boundary: usize = 0;
+    while (boundary < total.allocs + total.resizes) : (boundary += 1) {
+        const config: t.FailingAllocator.Config = if (boundary < total.allocs)
+            .{ .fail_index = boundary }
+        else
+            .{ .resize_fail_index = boundary - total.allocs };
+        // Constructed unarmed: the setup and the first dial below happen
+        // before `dialPass` arms the allocator, so an allocator armed at
+        // construction would refuse inside the fixture instead of inside the
+        // dial this sweep is about.
+        var refusing = t.FailingAllocator.init(t.allocator, .{});
+        // The pass reads and writes the same bridge, dialer and map as the
+        // counting one and refuses one boundary in the middle of it, so what
+        // it finds afterwards is the answer to "what does a refused dial
+        // leave", not a different dial that happens to look like this one.
+        _ = try dialPass(&refusing, config);
+    }
+}
+
+test "every allocation a dial makes can be refused on its own" {
+    try sweepDialAllocations();
 }

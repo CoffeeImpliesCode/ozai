@@ -2,7 +2,7 @@
 
 Dial a node by its id, not its address.
 
-ozai is a from-scratch Zig 0.16 reimplementation of the [iroh] P2P stack — the
+ozai is a from-scratch Zig 0.16.0 implementation of the [iroh] P2P stack — the
 part that makes a device reachable by a 32-byte public key across hostile
 networks, and the protocols built on top of it. It is not a binding, a
 translation, or a wrapper. Where iroh's shape fits Zig, ozai keeps it; where it
@@ -12,23 +12,41 @@ does not, ozai says so and diverges on the record.
 
 ## Status
 
-**Milestones 1–11 are built.** `test/loopback_test.zig` verifies peer identity
-from the certificate, moves bytes both ways, and carries ECN over a real socket.
+**Milestones 1–11 shipped primitives, not finished protocols.** Several
+production drivers are absent, so this is neither feature-complete nor
+release-ready. `test/loopback_test.zig` verifies peer identity from the
+certificate, moves bytes both ways, and carries ECN over a real socket;
 `test/relay_wire_test.zig` and `test/two_process_test.zig` exercise relay
-forwarding, payload delivery, and independent shutdown on loopback.
+forwarding, payload delivery, and independent shutdown on loopback. That is
+self-interoperation over one private carrier.
 
-External iroh interoperability and node-level 0-RTT remain open. The gossip
-state machines run, but the node does not yet encode their messages on the
-wire.
+| Gap | State |
+|---|---|
+| Production randomness | Repaired in Wave 0: `Node.create` draws a 32-byte secret seed from `io.randomSecure` into a `Csprng` (ChaCha) and erases the temporary with `secureZero`. `ozai-node` dropped `--seed`; no caller-chosen generator seed remains in production paths. |
+| iroh interoperability | No Rust exchange has run. The vendored TLS writes 44-byte Ed25519 SPKI certificates but negotiates no RFC 7250 certificate type, so a real peer is expected to refuse the handshake before the certificate is accepted. |
+| Standard relay carrier | The carrier in tree is the private QUIC `/iroh-relay/1`, not RFC 6455 WebSocket over an HTTP upgrade with TLS. No exporter authentication, ping driver, reconnect or access policy. |
+| Relay routing | Relayed inner QUIC is not routed: `drain` hands `Egress.to` straight to UDP. |
+| Blobs | Request framing and range algebra only. No Bao tree, proof or root verifier, store, provider or getter, so no getter verifies content. |
+| Gossip | Pure state machines with captured Rust neighbour, convergence and broadcast expectations. No production codec and no peer-ID connection index; the test-only encoder inverts the `DeliveryScope` tags, and `plumtree.max_content` is 1024 against upstream's 4096. |
+| Discovery | TXT and pkarr codecs plus pure resolvers. No A/AAAA path, no TCP retry on the TC bit, no live pkarr HTTP transport and no node caller; `lookup_live.zig` has only its own tests as callers. |
+| Probes | Every probe transport in the tree is a test fake. |
+| Holepunching | The gate and its error classification are pure and tested. Three of the seven inputs have producers, four do not, and no action can start a real QNT round. |
+| Resumption and 0-RTT | The core requests a client certificate after PSK selection and fails closed. That is a recorded RFC 8446 deviation, not an identity bypass; the standards-compatible replacement is Wave 4. |
 
-### Current native gate record
+The ordered plan, the owners and the acceptance for what remains are in
+[`docs/PLAN.md`](docs/PLAN.md); the near-term checklist is
+[`TODO.md`](TODO.md).
 
-Direct invocations of the pinned Zig 0.16.0 compiler on native x86-64 Linux.
-The gate entry point does not run in this environment and was not used: its
-`anyzig` shim re-downloads the pinned toolchain and fails to extract it, which
-[`0004`](docs/DECISIONS/0004-vendored-core-contracts.md) records. No global
-tool, sandbox or launcher was repaired, and nothing in the table below is a
-cross-platform, iroh-interoperability or performance result.
+### Gate record
+
+Two records, kept apart because they measure different trees.
+
+**The audit snapshot** is a read-only audit of commit `8b8bcd96`, run against
+the pinned Zig 0.16.0 compiler directly on native x86-64 Linux. It did not use
+the house `zig-gate` wrapper: that wrapper resolves its toolchain through the
+`anyzig` shim, which re-downloads the pinned release and fails to extract it
+here, which [`0004`](docs/DECISIONS/0004-vendored-core-contracts.md) records.
+No global tool, sandbox or launcher was repaired to work around it.
 
 | Section | Command | Result |
 |---|---|---|
@@ -36,54 +54,95 @@ cross-platform, iroh-interoperability or performance result.
 | Build, ReleaseSafe | `zig build -Doptimize=ReleaseSafe` | exit 0; 5/5 build steps |
 | Tests, Debug | `zig build test quic-test -Doptimize=Debug` | exit 0; 22/22 steps; 1159/1159 tests |
 | Tests, ReleaseSafe | `zig build test quic-test -Doptimize=ReleaseSafe` | exit 0; 22/22 steps; 1159/1159 tests |
+| Portable root | `zig build test-portable`, Debug and ReleaseSafe | 503/503 each. It overlaps the package tests and adds no unique test |
 | Format | `zig fmt --check .` | exit 0, no output |
-| Syntax | `zig ast-check`: 74 Zig files, 3 rechecks, 5 final-comment rechecks; manifest parsed separately | 82 source checks + 1 manifest parse, all exit 0 |
-| Lint | `zlint -c zlint.json -f json -S` | exit 0; 0 errors; 24 vendored warnings |
-| Static analysis | `zwanzig --threads 2` over 42 non-vendored changed files, 21 rules | exit 0; No issues found |
-| Fuzz | `zig build fuzz --fuzz=10000` | exit 0; 15/15 steps; 7/7 targets, at least 10 000 new runs each, no crash |
+| Syntax | `zig ast-check` over all 90 Zig files | 90/90 exit 0 |
+| Lint | `zlint -c zlint.json -f json -S`, the same 90 files | exit 0; 0 errors; 24 vendored warnings |
+| Static analysis | `zwanzig`, 57 non-vendored files, 21 rules | exit 0; no issues |
+| Lint | `ziglint`, 57 non-vendored files | exit 1; four findings — `node.zig:4798` Z004, `socket.zig:1138/1195/1235` Z023 |
+| Static analysis | `zbc`, 57 non-vendored files | exit 1; 25 flags, each individually classified as a source-proven false positive or a justified panic; 1764 unresolved import lookups still limit the analysis |
+| Fuzz | `zig build fuzz --fuzz=10000` | exit 0; 15/15 steps; seven targets, each advancing at least 10 000 runs |
 
-**1159/1159 tests over 22 build steps** is the current figure, the same in both
-modes. It is **599 package tests — 562 in the main test root plus 37 across
-seven smaller integration and gate steps — and 560 in the separately built
-vendored core** (`zig build quic-test`). No step reported a leak under the
-test allocator.
+**1159/1159 tests over 22 build steps** is the suite figure and it is the same
+in both modes: 599 package tests across the package roots, plus 560 from the
+separately built vendored core (`zig build quic-test`). The portable root's 503
+overlap those package tests and are counted separately, never added to them. No
+step reported a leak under the test allocator.
 
 The lint run is **0 errors and 24 warnings**, and every warning is under
 `vendor/quic`: 16 `avoid-as` findings and 8 `suppressed-errors` findings on
 bounded or deliberately best-effort core paths. No non-vendored finding was
 reported. They are not described as zero lint findings.
 
-`-S` is a valid invocation, and the file list went over stdin in the shape it
-asks for: 74 changed Zig paths, one per line. An earlier retained run that
-answered `WriteFailed` handed the same list as one JSON array, so a single line
-of 2267 bytes overran the tool's fixed 1024-byte line reader; the same command
-with one path from that list exits 0 and reports that file's own four
-findings. Those runs are trace history for a caller that sent the wrong shape,
-and they are lint evidence in neither direction.
+`ziglint` and `zbc` both exit 1, and neither is a pass. `zlint`'s `-S` takes
+the file list over stdin, one path per line; an earlier retained run handed the
+same list as one JSON array, and a single line of 2267 bytes overran the tool's
+fixed 1024-byte line reader and answered `WriteFailed`. Those runs are trace
+history for a caller that sent the wrong shape, and they are lint evidence in
+neither direction.
 
-Each of the seven decoder fuzz targets advanced by at least 10 000 new runs;
-the largest advance is 10 213. The `Runs:` counters those reports print are
-cumulative across the retained corpus and earlier runs, so a counter is not
-this invocation's work and the per-target advance is what the bound covers.
+Each of the seven fuzz targets in that snapshot advanced by at least 10 000 new
+runs; the largest advance is 10 213. The `Runs:` counters those reports print are
+cumulative across the retained corpus and earlier runs, so a counter is not one
+invocation's work and the per-target advance is what the bound covers.
 
-### The actual CLI
+**The working tree**, measured through the repository's own gate, which is the
+same driver CI runs (`.github/workflows/gates.yml`, one job per group):
 
-Six real `ozai-node` processes — a relay, a receiver and a sender in each of
-Debug and ReleaseSafe — carried exactly the 21-byte payload
-`api-cutover-live-wire` through the relay in both modes. Each sender reports
-`relay out: sent 1`, each relay reports `forwarded 1`, and each receiver's
-inbox holds one datagram of `bytes 21`, hex
-`6170692d6375746f7665722d6c6976652d77697265`, from that sender's node id. All
-six exited 0 after SIGTERM, each reporting `shutdown: closed` and a closed
-socket. Their seeds were 401, 402 and 403: the CLI's fixed default is a replay
-aid, not independent entropy for several processes.
+| Command | Result |
+|---|---|
+| `zig run scripts/gate.zig -- --group {compiler,fmt,ast,refdecls,compile-all,build,test,portable,fuzz,lint,static}` | **exit 0; 160 recorded steps over 139 source files** |
+| `zig build test -Doptimize=Debug` | 24/24 steps; 681/681 tests |
+| `zig build test -Doptimize=ReleaseSafe` | 24/24 steps; 681/681 tests |
+| `zig build test -Dcoverage=true` + `zig-cov report --format=summary` | 681/681; 47.0% lines (14 596/31 026), 41.7% blocks; **no file under `src/` at 0%** |
+
+`lint:zlint` and `lint:ziglint` pass with no findings, `lint:zwanzig` reports
+none, and `static:zbc-triage` accepts **50 findings, 0 rejected, 0 dispositions
+unused** — each one individually dispositioned with the source lines it rests
+on, in `scripts/gate_zbc_dispositions.zig`, keyed by file, line, column and rule
+and pinned to a whole-file digest so a disposition cannot outlive the code it
+describes. `zbc` itself still exits 1 over those 50 findings; that step is
+non-binding by design and the triage beside it is the verdict.
+
+`static:zbc` also reports **2 493 unresolved import lookups**, and the gate says
+so rather than rounding it away: `zbc` writes that count to stderr and not into
+its report, so this run's import coverage is unproven and the record does not
+claim otherwise.
+
+The `fuzz` group runs **12 decoder targets**, each past 10 000 new mutations in
+one pass. Its step captures the run's output, because a run step that fails
+under `--fuzz=N` does **not** reach `zig build`'s own exit status: the fuzzer
+reports the crashing input and the build still exits 0. Without that capture the
+group would record a decoder crash as a pass.
+
+Two defects this audit found were in the vendored core rather than in this
+project, and both are recorded in `vendor/quic/VENDORED.md`: a `PADDING` frame
+that reported itself as zero octets wide, so a packet payload beginning `40 00`
+looped forever (§9), and the ServerHello `key_share` bound being taken against
+the extension block rather than the extension itself.
+
+### The CLI, in the audit snapshot
+
+Three `ozai-node` processes in each of Debug and ReleaseSafe — a relay, a
+receiver and a sender — delivered the exact 24-byte payload
+`audit-private-relay-wire`, hex
+`61756469742d707269766174652d72656c61792d77697265`, through the relay. All six
+processes exited 0 and reported a closed shutdown.
+
+That exchange rides the private QUIC carrier `/iroh-relay/1`. It is not a
+standard iroh relay exchange, not a gossip exchange and not a verified blob
+transfer, and it discharges none of the carrier parity requirements above.
+
+An earlier tree carried the 21-byte payload `api-cutover-live-wire` the same
+way, with seeds 401, 402 and 403: the CLI's fixed default is a replay aid, not
+independent entropy for several processes.
 
 ### The out-of-tree consumer
 
-Six programs built against the registered package modules: contract, TLS,
-decoder, cancellation, core-wire and package-state consumers. All six passed
-in Debug and ReleaseSafe, **18/18 build steps** in each mode. The two added
-consumers exercise ownership, state transitions and decoded wire values,
+Six programs built in an earlier run against the registered package modules —
+contract, TLS, decoder, cancellation, core-wire and package-state consumers. All
+six passed in Debug and ReleaseSafe, **18/18 build steps** in each mode. The two
+added consumers exercise ownership, state transitions and decoded wire values,
 not source text or counter percentages.
 
 The 18 build steps, six programs and 50 000 decoder cases per mode are
@@ -147,9 +206,12 @@ Fetching the working directory itself returned `error.IllegalFileTypeInPackage`.
 The archive follows `build.zig.zon.paths` and excludes local environment and
 cache artifacts. No user environment file was removed to make the fetch pass.
 
-### Current coverage measurement
+### Coverage measurement
 
-One instrumented run measured this source. `zig build test quic-test
+**Not re-measured.** The figures below are the retained earlier record, and the
+source has changed since they were taken.
+
+One instrumented run measured the tree it ran on. `zig build test quic-test
 -Doptimize=Debug -Dcoverage=true -Dcoverage-rt=<zig-cov-rt.o>` exited 0 at
 22/22 steps and 1159/1159 tests — 599 package tests with their matching
 `ozai-node` children, and 560 in the separately built vendored core, which ran
@@ -171,7 +233,8 @@ files. It reports **20 142 / 36 814 attributed source lines (54.71 %)** and
 figure is 20 130 / 36 789 (54.72 %). Function counters are absent.
 These are not branch or path measurements.
 
-For added or replaced nonblank, non-comment lines in 74 changed Zig files,
+For added or replaced nonblank, non-comment lines in the 74 files that record
+counted as changed,
 1 946 have positive attribution, 2 338 have zero attribution, and 1 827 have
 no report row. An absent row does not prove that the compiler emitted no code.
 The pinned compiler's AST places 2 084 zero rows inside test declarations.
@@ -205,7 +268,9 @@ The cross-platform survey and its toolchain limits are reported by
 `cross-test` below and by
 [`0004`](docs/DECISIONS/0004-vendored-core-contracts.md). No iroh
 interoperability, no performance number and no node-level authenticated
-0-RTT is claimed.
+0-RTT is claimed, and no Rust iroh exchange has been run at all. The
+cross-platform counts below belong to an older root; no current
+cross-platform survey has been executed, and a build-only row is not a pass.
 
 ### Earlier records, kept as dated history
 
@@ -240,7 +305,7 @@ CLI refusal guards were separately smoke-tested; no duplicate tests were added
 to inflate counters. Two pre-existing map allocation-fault gaps and their
 triggers are in [`TODO.md`](TODO.md). These historical lists apply only to
 their named runs. The current measurement is under
-[*Current coverage measurement*](#current-coverage-measurement).
+[*Coverage measurement*](#coverage-measurement).
 
 After the portability fixes, `zig-gate --no-cross --cov` passed all nine local
 sections with zero lint/static findings. Native Debug and ReleaseSafe passed
@@ -305,12 +370,22 @@ left behind, and every patch ozai applies.
 ```sh
 direnv allow          # once
 zig build             # static library + the node binary, both installed
-zig build test        # unit + integration tests
+zig build test        # package unit + integration tests
+zig build quic-test   # the vendored core's own suite, built separately
 zig build test-portable # socket-free protocol and state-machine tests
+zig build compile-all # every test root, compiled and not run
+zig build verdict-test # the expected-log runner's verdict regressions
+zig build fuzz --fuzz=10000 # the decoder fuzz targets, bounded
 zig build run-ozai-node-id
-devenv shell -- gate  # fmt, build, test, ast-check, ziglint, zlint, zbc, zwanzig, cross-test
-devenv shell -- gate-strict  # same gate without zbc, plus coverage
+devenv shell -- gate  # the whole gate, both safety modes, with receipts
+devenv shell -- gate-design # every group except the static-analysis one
 ```
+
+`test`, `quic-test` and `test-portable` are three separate roots and three
+separate counts. The portable root's tests are also reached from the package
+roots, so its total is never added to theirs. `zig build verdict-test` runs the
+expected-log runner's own verdict regressions, which the `test` step runs too;
+its two fixture executables are compiled and deliberately never run.
 
 `zig build run-ozai-node-id` prints this machine's node id in every form ozai
 puts on the wire, and signs the rendered address to prove the text form is
@@ -322,40 +397,78 @@ can wait for a connection, delivery, or departure before sending SIGTERM.
 Without `--progress`, the node prints only its banner and final report.
 The SIGINT/SIGTERM handlers are installed before the listening banner is published.
 
-`devenv shell -- gate` needs the pinned toolchain in `~/.local/bin` and the
-shared devenv sandbox it wraps; both `nix` and the wrapper resolve to that one
-sandbox. Where it is absent, run the driver with the exclusions spelled out by
-hand, because `GATE_EXCLUDE` is what makes it the same gate, `.envrc` does not
-set it, and the driver takes no other source for it:
+### The gate
+
+`devenv shell -- gate` runs this repository's own driver, `scripts/gate.zig`.
+The compiler is data, not a wrapper decision: `--zig PATH` if the caller named
+one, else `OZAIGATE_ZIG`, else whatever `zig` resolves to. The driver installs
+nothing, replaces nothing and touches no global wrapper; it cross-checks that
+compiler's reported version against `.minimum_zig_version` in `build.zig.zon`
+before it runs anything, and the receipt names and hashes the file it resolved.
 
 ```sh
-GATE_EXCLUDE='^[.]/vendor/ /[.]zig-cache/ /zig-out/ /zig-cache/ /zig-global-cache/' zig-gate
+zig run scripts/gate.zig -- --scratch DIR [--zig PATH] [--group NAME]... \
+  [--fuzz-runs N] [--receipts PATH] [--prefix DIR] [--list]
 ```
 
-A bare `zig-gate` is not that configuration. With those exclusions it is the
-whole of `scripts.gate.exec` bar the version cross-check, which is one `zig
-version` against `.minimum_zig_version`.
+The groups are `compiler`, `fmt`, `ast`, `refdecls`, `compile-all`, `build`,
+`test`, `portable`, `fuzz`, `lint` and `static`. Every group runs unless the
+arguments name a subset, and one run reports every group rather than stopping at
+the first failure, because the receipt is the evidence. `refdecls` checks that
+each named sweep root still carries its `refAllDecls`, because a root that
+dropped it still compiles, still runs and still exits 0. `test` is the package
+suite plus the vendored core; `portable` is the socket-free root that overlaps
+`test` and is labelled separately for exactly that reason; `fuzz` is bounded by
+`--fuzz-runs`. Receipts land in `<scratch>/receipts.json` and carry the
+compiler, every command, the file list each scoped command was given, the
+digests of all three, and the values of the cache and scratch variables the run
+inherited. Nothing a gate run writes is inside the repository.
 
-The driver runs the sections in the order above and prints one line for each:
-`OK`, or a count beside the tool's exit status. Any section that finds
-something marks the whole run failed — `zbc` is the one exception, advisory
-unless `ZBC_STRICT=1` — and the driver ends on `GATE FAILED` and exit 1. The
-section output names each failure; the exit status reports overall failure, not
-a standing claim that the tree is clean.
+A required tool that is not installed is recorded `not_available` and fails the
+run: an absent linter is not a clean tree, and no flag turns it into one.
+`zlint` and `ziglint` are required; `zwanzig` is optional, so its absence is
+recorded absent and is not a pass, and its findings bind when it ran; `zippy`
+and the sanitizers have no configured invocation in this repository and are
+recorded `not_configured`. `zbc` is required, but its exit status is not its
+verdict: it exits 1 over findings that are each individually classified, so the
+triage binds instead, and a diagnostic outside the classified set fails the
+gate.
 
-`gate-strict` is that gate with exactly two changes: `--no-zbc` drops the `zbc`
-section and nothing else, so fmt, build, test, ast-check, ziglint, zlint,
-zwanzig and cross-test all still run, and `--cov` adds coverage on top, which
-is advisory until `ZIG_COV_FAIL_UNDER` is set. It is a design pass that a
-failing zbc advisory cannot block, not a cheaper gate.
+The driver refuses before it spawns a child. `--scratch` is required and names
+the approved local root; `--prefix` and `--receipts` are honoured only inside
+it and default to `<scratch>/build` and `<scratch>/receipts.json`. An unset
+`TMPDIR`, `TMP`, `TEMP`, `ZIG_GLOBAL_CACHE_DIR` or `ZIG_LOCAL_CACHE_DIR` is a
+refusal rather than a warning, and so is a scratch root inside this repository,
+outside the approved root, under `/tmp` or `/var/tmp`, or on a network mount —
+`nfs`, `nfs4`, `nfsd`, `9p`, `cifs`, `smb3`, `smbfs`, `sshfs` or `ceph`. Where
+the machine exports `HOST_SCRATCH_ROOT`, nothing the run writes may sit outside
+it. The devenv scripts pass `${OZAIGATE_SCRATCH:-$TMPDIR/gate}`, which is
+`$TMPDIR/gate` under this project's environment, and CI gives each matrix leg
+`$RUNNER_TEMP/ozai-gate/<group>/scratch`.
 
-`GATE_EXCLUDE` names what is not this project's source: `vendor/quic`, plus
-`.zig-cache/`, `zig-out/`, `zig-cache/` and `zig-global-cache/`. It overrides
-the driver's built-in default rather than adding to it, which is why the
-default's patterns are spelled out here. `vendor/quic` is excluded on purpose
-and pays that back through `zig build quic-test`; the cache roots are there
-because a lint section reports whatever the file list hands it, and build
-output is not a defect.
+`gate-design` is that gate with exactly one change: the `static` group is left
+out, so `zbc` does not run and its triage does not bind. It is a design pass in
+which a static-analysis finding cannot block — not cheaper, and not stricter
+than the gate it drops a group from, which is why it is not called `strict`.
+Coverage is not part of either script; the instrumented run is still `zig-cov
+test` with `-Dcoverage-rt`.
+
+The vendored tree is compiled and tested like everything else and is excluded
+only from the *text* linters. `scripts/gate_scope.zig` walks the working
+directory once and hands every scoped command the same list, so "which files" is
+an answer the receipt carries rather than one each tool re-derives: `zlint` gets
+every `.zig` file, `ziglint`, `zwanzig` and `zbc` get the same list without
+`vendor/`. The exclusion is paid back by `zig build quic-test` and by
+`test/vendored_invariants.zig`, which fails if a socket, a clock, a global
+entropy source or a libc call returns to the vendored tree.
+
+CI is `.github/workflows/gates.yml`: one job per group over the same driver, and
+a scheduled bounded-fuzz job. The file names the groups and nothing else, so a
+CI job cannot drift from the documented gate.
+
+`cross-test` is not part of this gate. It is a portability survey over foreign
+targets driven by `cross-test.profile.sh`, and it stays the separate documented
+command below.
 
 ### Consume as a package
 
@@ -477,11 +590,10 @@ including 32-bit, big-endian, GNU/musl ABI variants and WASI. Another
 
 Those failing rows remain in the survey rather than being silently dropped.
 They are toolchain-side outcomes, and the 53/37/18 split above belongs to the
-29-module, 438-test root. It is not a survey of the 32-module, 463-test
-source: that expanded root has since been executed at **463/463 in Debug** in
-isolation on this host, 3/3 build steps and exit 0, and its execute,
-build-only and SDK-failure split across the 108 rows is not recorded here
-until the full survey is rerun against it.
+29-module, 438-test root. It is not a survey of the 32-module root: that root
+has been run natively at 503/503 in Debug and ReleaseSafe in the audit snapshot,
+and its executed, build-only and SDK-failure split across the 108 rows is not
+recorded here, because no survey has been run against it.
 
 The live gate excludes n32 and x32 because the pinned standard library does
 not compile for them, and Hexagon because its full Debug build crashes the
@@ -563,15 +675,28 @@ src/root.zig            public surface
 src/base/               identity, addressing and an explicit entropy edge
 src/examples/           runnable proofs
 test/                   integration tests, outside src/ so they are reachable
+scripts/                the gate driver and its receipt, scope and triage
+.github/workflows/      the same gate as CI, one job per group
 docs/                   plan, architecture, decision records
 ```
 
 `src/base` never touches a socket, a clock, or an allocator it was not handed.
 That is not a style preference: it is what lets a state machine be driven by a
 test instead of by a network. The one seam is `SecretKey.generate`, which takes
-the caller's `std.Io` for entropy, never stores it and never reaches for a
-global source; every other value in the module is a plain value with an `Io`
-parameter at most on the call that needs one.
+the caller's `std.Io` for entropy, never stores it and never reads an ambient
+source; every other value in the module is a plain value with an `Io` parameter
+at most on the call that needs one. That is an ownership claim, not a strength
+claim: the draw is `Io.random`, which the standard library documents as seeded by
+`Io.randomSecure` *or by a less secure mechanism when that fails*.
+
+The node's runtime generator is a different seam, and it is the open safety
+item. `Node.create` initializes `std.Random.DefaultPrng` from a `u64` the caller
+passes, and `ozai-node` passes the fixed public constant `0x6f7a_69` by default;
+that generator supplies the TLS ephemeral scalars, the relay admission
+challenges and the QUIC connection-id and path-validation draws. Identity keys
+do not come from it, so it is a predictable-key defect and not a demonstrated
+identity bypass. Replacing it is the first repair in
+[`docs/PLAN.md`](docs/PLAN.md).
 
 ## Reference material
 

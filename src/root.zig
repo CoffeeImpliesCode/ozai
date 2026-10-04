@@ -14,6 +14,9 @@ const std = @import("std");
 pub const base32 = @import("base/base32.zig");
 pub const key = @import("base/key.zig");
 pub const addr = @import("base/addr.zig");
+pub const relay_url = @import("base/relay_url.zig");
+pub const transport_addr = @import("base/transport_addr.zig");
+pub const node_addr = @import("base/node_addr.zig");
 pub const ula = @import("base/ula.zig");
 pub const postcard = @import("wire/postcard.zig");
 pub const net_report = @import("net/report.zig");
@@ -49,6 +52,7 @@ pub const range_spec = @import("blobs/range_spec.zig");
 pub const blobs_protocol = @import("blobs/protocol.zig");
 pub const endpoint_ticket = @import("ticket/endpoint_ticket.zig");
 pub const blob_ticket = @import("ticket/blob_ticket.zig");
+pub const ticket_codec = @import("ticket/ticket_codec.zig");
 
 pub const gossip_hyparview = @import("gossip/hyparview.zig");
 pub const gossip_plumtree = @import("gossip/plumtree.zig");
@@ -61,10 +65,10 @@ pub const KeyError = key.KeyError;
 
 pub const IpAddress = addr.IpAddress;
 pub const SocketAddr = addr.SocketAddr;
-pub const RelayUrl = addr.RelayUrl;
+pub const RelayUrl = relay_url.RelayUrl;
 pub const CustomAddr = addr.CustomAddr;
-pub const TransportAddr = addr.TransportAddr;
-pub const NodeAddr = addr.NodeAddr;
+pub const TransportAddr = transport_addr.TransportAddr;
+pub const NodeAddr = node_addr.NodeAddr;
 
 /// The fake address a path is reached at, or the path's own address when it
 /// already has one. See `base/ula.zig` for what is and is not pure here.
@@ -77,6 +81,9 @@ test {
     std.testing.refAllDecls(base32);
     std.testing.refAllDecls(key);
     std.testing.refAllDecls(addr);
+    std.testing.refAllDecls(relay_url);
+    std.testing.refAllDecls(transport_addr);
+    std.testing.refAllDecls(node_addr);
     std.testing.refAllDecls(ula);
     std.testing.refAllDecls(net_report);
     std.testing.refAllDecls(holepunch);
@@ -106,6 +113,7 @@ test {
     std.testing.refAllDecls(router);
     std.testing.refAllDecls(endpoint_ticket);
     std.testing.refAllDecls(blob_ticket);
+    std.testing.refAllDecls(ticket_codec);
     std.testing.refAllDecls(gossip_hyparview);
     std.testing.refAllDecls(gossip_plumtree);
     std.testing.refAllDecls(node);

@@ -344,11 +344,31 @@ pub const FrameType = enum(u8) {
     /// `Status` is v2 only, and they are one semantic event in two encodings:
     /// upstream's `relay.rs:441` and `relay.rs:468` reject each in the version
     /// that replaced it, and a v2 server talks to a v1 client by translating.
+    ///
+    /// **Every arm is named and the switch has no `else`.** `FrameType` is a
+    /// closed domain — `fromInt` answers null for a number outside 0 through
+    /// 13, so every value of the type is one of the fourteen below — and a
+    /// fifteenth frame type cannot be added without deciding here whether it
+    /// is in one version or both. A default arm would answer that question
+    /// silently and put a frame on the wire the far end has agreed not to
+    /// understand.
     pub fn allowedIn(frame_type: FrameType, version: ProtocolVersion) bool {
         return switch (frame_type) {
             .health => version == .v1,
             .status => version == .v2,
-            else => true,
+            .server_challenge,
+            .client_auth,
+            .server_confirms_auth,
+            .server_denies_auth,
+            .client_to_relay_datagram,
+            .client_to_relay_datagram_batch,
+            .relay_to_client_datagram,
+            .relay_to_client_datagram_batch,
+            .endpoint_gone,
+            .ping,
+            .pong,
+            .restarting,
+            => true,
         };
     }
 
@@ -357,10 +377,29 @@ pub const FrameType = enum(u8) {
     /// The one predicate the batch invariant is written in terms of, and the only
     /// place in the module that has to know which of the four datagram types are
     /// batches.
+    ///
+    /// **Every arm is named and the switch has no `else`**, for the reason
+    /// `allowedIn` gives: this is the closed `FrameType` domain, and a new
+    /// frame type has to say whether it carries a segment size rather than
+    /// inherit "no" from a default. A frame type that turned out to be a batch
+    /// and read as a non-batch is rule 7 broken in the one function every
+    /// caller of the invariant asks.
     pub fn isDatagramBatch(frame_type: FrameType) bool {
         return switch (frame_type) {
             .client_to_relay_datagram_batch, .relay_to_client_datagram_batch => true,
-            else => false,
+            .server_challenge,
+            .client_auth,
+            .server_confirms_auth,
+            .server_denies_auth,
+            .client_to_relay_datagram,
+            .relay_to_client_datagram,
+            .endpoint_gone,
+            .ping,
+            .pong,
+            .health,
+            .restarting,
+            .status,
+            => false,
         };
     }
 
@@ -2533,5 +2572,559 @@ test "codec: a single-datagram tag cannot discard a batch boundary" {
             try std_testing.expectError(error.InvalidFrame, encode(message, version, &out));
             try std_testing.expectEqualSlices(u8, &untouched, &out);
         }
+    }
+}
+
+/// A valid value for `frame_type`, so the sweep below is a sweep over the
+/// closed domain rather than over hand-picked vectors.
+///
+/// The `Datagrams` it carries agrees with the tag: a batch tag names a segment
+/// size and a single tag does not, which is rule 7 and what `encode` checks
+/// before it writes a byte.
+fn sampleFor(frame_type: FrameType, node_id: NodeId, signature: Signature) !Message {
+    const datagrams: Datagrams = .{
+        .ecn = .ce,
+        .segment_size = if (FrameType.isDatagramBatch(frame_type)) 6 else null,
+        .contents = hello_world,
+    };
+    return switch (frame_type) {
+        .server_challenge => .{ .server_challenge = .{ .challenge = [_]u8{0x11} ** 16 } },
+        .client_auth => .{ .client_auth = .{ .node_id = node_id, .signature = signature } },
+        .server_confirms_auth => .{ .server_confirms_auth = {} },
+        .server_denies_auth => .{ .server_denies_auth = .{ .reason = "no" } },
+        .client_to_relay_datagram,
+        .client_to_relay_datagram_batch,
+        .relay_to_client_datagram,
+        .relay_to_client_datagram_batch,
+        => try datagramMessage(frame_type, .{ .node_id = node_id, .datagrams = datagrams }),
+        .endpoint_gone => .{ .endpoint_gone = node_id },
+        .ping => .{ .ping = [_]u8{0x22} ** 8 },
+        .pong => .{ .pong = [_]u8{0x33} ** 8 },
+        .health => .{ .health = "a problem" },
+        .restarting => .{ .restarting = .{ .reconnect_in_ms = 10, .try_for_ms = 20 } },
+        .status => .{ .status = .rate_limited },
+    };
+}
+
+test "domain sweep: every frame type, every version, one value each" {
+    // The closed domain swept against itself: `std.enums.values(FrameType)` is
+    // every value the type can hold, so this cannot go stale the way a
+    // hand-written table can, and both predicates and both halves of the codec
+    // are asked about each one.
+    var secret = try captureKey();
+    defer secret.deinit();
+    const node_id = secret.nodeId();
+    const signature = secret.sign("a message no peer has sent");
+    var out: [scratch_len]u8 = undefined;
+    var again_out: [scratch_len]u8 = undefined;
+
+    var seen: usize = 0;
+    inline for (std.enums.values(FrameType)) |frame_type| {
+        seen += 1;
+        const message = try sampleFor(frame_type, node_id, signature);
+
+        // The tag the value carries is the frame type it was built for. A value
+        // that named another tag would make every assertion below about a
+        // different frame than the one the sweep is on.
+        try std_testing.expectEqual(frame_type, std.meta.activeTag(message));
+        try std_testing.expectEqual(frame_type, FrameType.fromInt(@intFromEnum(frame_type)).?);
+        try std_testing.expectEqual(@as(usize, 1), frame_type.encodedLen());
+
+        // `isDatagramBatch` agrees with the payload, which is the half of rule 7
+        // that does not need a wire.
+        if (datagramFrameOf(message)) |frame| {
+            try std_testing.expectEqual(
+                frame.datagrams.isBatch(),
+                FrameType.isDatagramBatch(frame_type),
+            );
+        } else {
+            try std_testing.expect(!FrameType.isDatagramBatch(frame_type));
+        }
+
+        for ([_]ProtocolVersion{ .v1, .v2 }) |version| {
+            const allowed = frame_type.allowedIn(version);
+            if (!allowed) {
+                // Refused before the writer exists, so the caller's buffer is
+                // exactly as it was handed over.
+                var refused: [scratch_len]u8 = @splat(0x5a);
+                const untouched: [scratch_len]u8 = @splat(0x5a);
+                try std_testing.expectError(
+                    error.FrameNotAllowedInVersion,
+                    encode(message, version, &refused),
+                );
+                try std_testing.expectEqualSlices(u8, &untouched, &refused);
+                // The other version accepts the same value, so the refusal is
+                // the version rule and not the frame.
+                const other: ProtocolVersion = if (version == .v1) .v2 else .v1;
+                if (frame_type.allowedIn(other)) {
+                    _ = try encode(message, other, &out);
+                }
+                continue;
+            }
+
+            const written = try encode(message, version, &out);
+            try std_testing.expectEqual(encodedLen(message), written.len);
+            // The first byte is the frame type, because every type in the table
+            // is below 64 and a QUIC varint that small is one raw byte.
+            try std_testing.expectEqual(@intFromEnum(frame_type), written[0]);
+
+            const decoded = try decode(written, version);
+            try std_testing.expectEqual(frame_type, std.meta.activeTag(decoded));
+            try std_testing.expect(eql(message, decoded));
+
+            // And the encoding of the decoded value is the same bytes, so each
+            // value in this sweep is a fixed point of its own round trip.
+            const recoded = try decode(written, version);
+            try std_testing.expectEqualSlices(u8, written, try encode(recoded, version, &again_out));
+
+            // The same bytes under the version that does not define this type
+            // are refused on the type alone.
+            const other: ProtocolVersion = if (version == .v1) .v2 else .v1;
+            if (!frame_type.allowedIn(other)) {
+                try std_testing.expectError(
+                    error.FrameNotAllowedInVersion,
+                    decode(written, other),
+                );
+            }
+        }
+    }
+    try std_testing.expectEqual(@as(usize, 14), seen);
+}
+
+test "domain sweep: the batch predicate is exactly the four datagram tags" {
+    // Stated over `std.enums.values(FrameType)` rather than over a hand-written
+    // list, so the predicate and the payload table cannot drift apart. A frame
+    // type either carries a `Datagrams` or it carries no segment size at all,
+    // and both questions are asked of the same value here.
+    var secret = try captureKey();
+    defer secret.deinit();
+    const node_id = secret.nodeId();
+    const signature = secret.sign("a message no peer has sent");
+
+    inline for (std.enums.values(FrameType)) |frame_type| {
+        // `sampleFor` builds a payload that agrees with the tag, so asking which
+        // arms carry datagrams is asking about the values themselves.
+        const message = try sampleFor(frame_type, node_id, signature);
+        if (datagramFrameOf(message)) |frame| {
+            // Both halves of rule 7 as one fact about a value about to go on the
+            // wire: the field is set exactly when the tag is a batch one.
+            try std_testing.expectEqual(
+                FrameType.isDatagramBatch(frame_type),
+                frame.datagrams.isBatch(),
+            );
+            // The other two datagram tags are the non-batch ones, so "carries
+            // datagrams" and "is a batch" are not the same question.
+            try std_testing.expect(FrameType.isDatagramBatch(frame_type) or
+                frame_type == .client_to_relay_datagram or
+                frame_type == .relay_to_client_datagram);
+        } else {
+            try std_testing.expect(!FrameType.isDatagramBatch(frame_type));
+        }
+    }
+}
+
+test "domain sweep: direction chooses the tag, and the tag chooses the direction" {
+    // Two directions times two batch shapes is the whole of the four datagram
+    // tags, and each is produced by exactly one `(direction, is_batch)` pair.
+    // That is what makes the mapping a bijection rather than a lookup that
+    // happens to agree with itself, so the round trip is checked too: the tag
+    // read back off the decoded value names the direction it came from.
+    const node_id = try captureId();
+    var out: [scratch_len]u8 = undefined;
+    inline for (std.enums.values(Direction)) |direction| {
+        inline for ([_]bool{ false, true }) |batch| {
+            const datagrams: Datagrams = .{
+                .ecn = .ect1,
+                .segment_size = if (batch) 1200 else null,
+                .contents = hello_world,
+            };
+            const frame: DatagramFrame = .{ .node_id = node_id, .datagrams = datagrams };
+            const tag = datagrams.frameType(direction);
+
+            try std_testing.expectEqual(batch, FrameType.isDatagramBatch(tag));
+            try std_testing.expectEqual(batch, datagrams.isBatch());
+
+            const back: Direction = if (tag == .client_to_relay_datagram or
+                tag == .client_to_relay_datagram_batch)
+                .client_to_relay
+            else
+                .relay_to_client;
+            try std_testing.expectEqual(direction, back);
+
+            const message = try datagramMessage(tag, frame);
+            const written = try encode(message, .v2, &out);
+            const decoded = try decode(written, .v2);
+            try std_testing.expectEqual(tag, std.meta.activeTag(decoded));
+            const decoded_datagrams = try datagramsOf(decoded);
+            try std_testing.expectEqual(tag, decoded_datagrams.frameType(back));
+            try std_testing.expectEqual(datagrams.ecn, decoded_datagrams.ecn);
+            try std_testing.expectEqualSlices(u8, datagrams.contents, decoded_datagrams.contents);
+        }
+    }
+}
+
+/// The `DatagramFrame` of whichever of the four datagram frames this is, or
+/// null for the other ten. The answer is a property of the tag, which is why
+/// the sweep above can ask it of every arm without a payload per arm.
+fn datagramFrameOf(message: Message) ?DatagramFrame {
+    return switch (std.meta.activeTag(message)) {
+        .client_to_relay_datagram => message.client_to_relay_datagram,
+        .client_to_relay_datagram_batch => message.client_to_relay_datagram_batch,
+        .relay_to_client_datagram => message.relay_to_client_datagram,
+        .relay_to_client_datagram_batch => message.relay_to_client_datagram_batch,
+        else => null,
+    };
+}
+
+test "segmentation metadata: a batch tag with a null segment size is refused" {
+    // The half of the batch invariant `encode` decides after the writer exists.
+    // `checkEncodable` bounds the payload and refuses a segment size on a
+    // single-datagram tag, but a *batch* tag whose `segment_size` is null is
+    // the other half: the tag says a segment size is there and the value says
+    // it is not, which names no datagram at all.
+    //
+    // `Datagrams.frameType` never builds this shape — it picks a batch tag only
+    // when the field is set — so this is a hand-built value, and a hand-built
+    // value is what the check is for. `error.ZeroSegmentSize` is the answer
+    // under both spellings, null and zero.
+    const node_id = try captureId();
+    inline for (.{
+        FrameType.client_to_relay_datagram_batch,
+        FrameType.relay_to_client_datagram_batch,
+    }) |tag| {
+        const message: Message = @unionInit(Message, @tagName(tag), DatagramFrame{
+            .node_id = node_id,
+            .datagrams = .{ .ecn = null, .segment_size = null, .contents = hello_world },
+        });
+        var out: [scratch_len]u8 = @splat(0x3c);
+        try std_testing.expectError(error.ZeroSegmentSize, encode(message, .v2, &out));
+        // Found after the frame type is written, so the buffer holds a partial
+        // frame: the header and no payload. A caller must discard the buffer on
+        // any `encode` error, which is what this one is documented to need.
+        try std_testing.expectEqual(@intFromEnum(tag), out[0]);
+    }
+}
+
+test "segmentation metadata: a decoded batch keeps the size its type declares" {
+    // The invariant from the other end. A batch frame that names a segment size
+    // wider than its payload, or carries no payload at all, still decodes as a
+    // batch with that size: nothing here rounds the size to the payload or
+    // invents one from the payload's length, and `takeSegments` is where a size
+    // is given up.
+    var out: [scratch_len]u8 = undefined;
+    const node_id = try captureId();
+    const cases = [_]struct { segment_size: u16, contents: []const u8 }{
+        // Two datagrams of six bytes, the captured pair.
+        .{ .segment_size = 6, .contents = hello_world },
+        // Fewer than one segment: one datagram that says it is several.
+        .{ .segment_size = 1024, .contents = "\xde\xad\xbe\xef" },
+        // Exactly one segment, which is also fewer than the size declares.
+        .{ .segment_size = 6, .contents = "Hello " },
+        // No contents at all, which names no datagram.
+        .{ .segment_size = 6, .contents = "" },
+        // The widest a `u16` carries.
+        .{ .segment_size = std.math.maxInt(u16), .contents = hello_world },
+    };
+    for (cases) |case| {
+        const message = try datagramMessage(.relay_to_client_datagram_batch, .{
+            .node_id = node_id,
+            .datagrams = .{
+                .ecn = .ect0,
+                .segment_size = case.segment_size,
+                .contents = case.contents,
+            },
+        });
+        const written = try encode(message, .v2, &out);
+        const decoded = try decode(written, .v2);
+        const back = try datagramsOf(decoded);
+
+        // Both halves of rule 7 survive the wire, whatever the payload held.
+        try std_testing.expectEqual(
+            @as(FrameType, .relay_to_client_datagram_batch),
+            std.meta.activeTag(decoded),
+        );
+        try std_testing.expect(back.isBatch());
+        try std_testing.expectEqual(@as(?u16, case.segment_size), back.segment_size);
+        try std_testing.expectEqualSlices(u8, case.contents, back.contents);
+        try std_testing.expectEqual(encodedLen(message), written.len);
+        // The value round-trips to the same bytes: a batch's segment size is a
+        // value on the wire, not a length `decode` recomputes from the payload.
+        var again: [scratch_len]u8 = undefined;
+        try std_testing.expectEqualSlices(u8, written, try encode(decoded, .v2, &again));
+    }
+}
+
+test "unknown flags: an ECN byte above the field reduces to its low two bits" {
+    // Upstream masks with `0b11` (`shared.rs:193`), so the byte has four
+    // distinct answers across all 256 values, not 256. Swept over every byte,
+    // because a byte a peer can send that is never asked about is a byte whose
+    // reading was never pinned — and every one of them goes on the wire here,
+    // where the frame decodes to that codepoint and re-encodes to the canonical
+    // spelling, which is `0x00` for an absent one.
+    const node_id = try captureId();
+    var out: [scratch_len]u8 = undefined;
+    const ecn_at = 1 + NodeId.byte_length;
+    var wire = [_]u8{0} ** (ecn_at + 2);
+    wire[0] = @intFromEnum(FrameType.relay_to_client_datagram);
+    @memcpy(wire[1..ecn_at], &node_id.toBytes());
+    wire[ecn_at + 1] = 0xff;
+
+    for (0..256) |value| {
+        const byte: u8 = @intCast(value);
+        const expected: ?Ecn = switch (byte & 0b11) {
+            0b01 => .ect1,
+            0b10 => .ect0,
+            0b11 => .ce,
+            else => null,
+        };
+        try std_testing.expectEqual(expected, Ecn.fromBits(byte));
+        if (expected) |codepoint| {
+            try std_testing.expectEqual(byte & 0b11, codepoint.toBits());
+        }
+
+        wire[ecn_at] = byte;
+        const decoded = try decode(&wire, .v2);
+        const datagrams = try datagramsOf(decoded);
+        try std_testing.expectEqual(expected, datagrams.ecn);
+        // The contents behind the byte are untouched by the byte in front of it.
+        try std_testing.expectEqualSlices(u8, wire[ecn_at + 1 ..], datagrams.contents);
+        const canonical = try encode(decoded, .v2, &out);
+        const expected_bits: u8 = if (expected) |ecn| ecn.toBits() else 0;
+        try std_testing.expectEqual(expected_bits, canonical[ecn_at]);
+    }
+}
+
+test "unknown flags: every status byte is kept, named or not" {
+    // `Status.fromBits`/`toBits` claims `toBits(fromBits(bits)) == bits` for all
+    // 256, which is what makes the status frame the one frame here whose
+    // re-encode is always the same byte. Upstream's forward-compatibility arm
+    // (`relay.rs:142`) is why the other 253 are kept rather than refused, so
+    // all 256 go on the wire: each decodes, each re-encodes to itself, and the
+    // three named conditions are exactly 0, 1 and 2.
+    var out: [4]u8 = undefined;
+    for (0..256) |value| {
+        const byte: u8 = @intCast(value);
+        const wire = [_]u8{ @intFromEnum(FrameType.status), byte };
+        const decoded = try decode(&wire, .v2);
+        try std_testing.expectEqual(@as(FrameType, .status), std.meta.activeTag(decoded));
+        try std_testing.expectEqual(byte, decoded.status.toBits());
+        // And the arm a byte names, which is the three-way split the union says.
+        switch (decoded.status) {
+            .healthy => try std_testing.expectEqual(@as(u8, 0), byte),
+            .same_endpoint_id_connected => try std_testing.expectEqual(@as(u8, 1), byte),
+            .rate_limited => try std_testing.expectEqual(@as(u8, 2), byte),
+            .unknown => |bits| try std_testing.expectEqual(byte, bits),
+        }
+        try expectHex(&wire, try encode(decoded, .v2, &out));
+    }
+}
+
+test "error inventory: every declared arm is reached by concrete bytes" {
+    // `Error` has thirteen members and this walks each one with an input that
+    // names it. The list is checked against the type rather than trusted, so an
+    // arm added to `Error` without a case here fails the build rather than
+    // quietly going untested — and an arm listed that `Error` does not declare
+    // fails the same way, which is the direction that matters for a list meant
+    // to be exhaustive.
+    const arms = [_]Error{
+        error.UnexpectedEnd,
+        error.BadVarint,
+        error.ValueOutOfRange,
+        error.BadLength,
+        error.InvalidUtf8,
+        error.UnknownFrameType,
+        error.FrameNotAllowedInVersion,
+        error.InvalidFrame,
+        error.InvalidNodeId,
+        error.FrameTooLarge,
+        error.ZeroSegmentSize,
+        error.TextTooLong,
+        error.BufferFull,
+    };
+    try std_testing.expectEqual(@typeInfo(Error).error_set.?.len, arms.len);
+
+    var scratch: [scratch_len]u8 = undefined;
+    var out: [scratch_len]u8 = undefined;
+    const node_id = try captureId();
+
+    // The four that `fromPostcard` carries across from a denial's postcard
+    // length, each with the bytes that produce it.
+    const denials = [_]struct { hex: []const u8, expected: Error }{
+        // A length of 0x7f with one byte behind it: the buffer is not short, so
+        // this is a frame claiming more than it holds.
+        .{ .hex = "03 7f", .expected = error.BadLength },
+        // Eleven groups of 0x80 and a terminator: longer than a `u64` is wide,
+        // so no number of further bytes makes it fit.
+        .{ .hex = "03 80808080808080808080 00", .expected = error.BadVarint },
+        // Ten groups whose last carries two value bits more than a `u64` has.
+        .{ .hex = "03 ffffffffffffffffff 7f", .expected = error.ValueOutOfRange },
+        // A length that fits and bytes that are not UTF-8.
+        .{ .hex = "03 01 ff", .expected = error.InvalidUtf8 },
+    };
+    for (denials) |denial| {
+        try std_testing.expectError(
+            denial.expected,
+            decode(try parseHex(&scratch, denial.hex), .v2),
+        );
+    }
+
+    // `TrailingBytes` under a denial is this frame's own `InvalidFrame`: the
+    // length named four bytes, the text is "nome", and the fifth is a byte
+    // behind the message that belongs to nothing.
+    try std_testing.expectError(
+        error.InvalidFrame,
+        decode(try parseHex(&scratch, "03 04 6e6f6d65 ff"), .v2),
+    );
+
+    // No bytes at all, and a header that has not finished arriving.
+    try std_testing.expectError(error.UnexpectedEnd, decode("", .v2));
+    try std_testing.expectError(
+        error.UnexpectedEnd,
+        decode(try parseHex(&scratch, "40"), .v2),
+    );
+
+    // A type this build has no arm for, in every width a QUIC varint has.
+    for ([_][]const u8{ "0e 00", "3f", "40 0e", "c0 00 00 00 00 00 00 0e" }) |hex| {
+        try std_testing.expectError(
+            error.UnknownFrameType,
+            decode(try parseHex(&scratch, hex), .v2),
+        );
+    }
+
+    // The version rule: a v1 `Health` frame under v2, and a v2 `Status` under
+    // v1. Both are refused on the type alone, before the payload is read.
+    try std_testing.expectError(
+        error.FrameNotAllowedInVersion,
+        decode(try parseHex(&scratch, "0b 48656c6c6f21"), .v2),
+    );
+    try std_testing.expectError(
+        error.FrameNotAllowedInVersion,
+        decode(try parseHex(&scratch, "0d 01"), .v1),
+    );
+
+    // `InvalidFrame` is the width a fixed payload does not have. A ping of nine
+    // bytes, a status of two, a restarting of one `u32`, and an endpoint-gone
+    // of 33 bytes, all four payload widths the codec owns.
+    for ([_][]const u8{
+        "09 2a2a2a2a2a2a2a2a2a",
+        "0d 01 ff",
+        "0c 0000000a",
+        "08 " ++ id_hex ++ " ff",
+    }) |hex| {
+        try std_testing.expectError(
+            error.InvalidFrame,
+            decode(try parseHex(&scratch, hex), .v2),
+        );
+    }
+
+    // 32 bytes that are not a canonical ed25519 point: a different rule from
+    // "too short", so a different error.
+    try std_testing.expectError(
+        error.InvalidNodeId,
+        decode(try parseHex(&scratch, "08 " ++ non_canonical_id_hex), .v2),
+    );
+
+    // `FrameTooLarge` is the payload measured against `max_packet_size`, and it
+    // is measured on the way out too.
+    {
+        const alloc = std_testing.allocator;
+        const bytes = try alloc.alloc(u8, max_packet_size + 2);
+        defer alloc.free(bytes);
+        @memset(bytes, 0xff);
+        bytes[0] = @intFromEnum(FrameType.ping);
+        try std_testing.expectError(error.FrameTooLarge, decode(bytes, .v2));
+
+        const contents = try alloc.alloc(u8, max_packet_size);
+        defer alloc.free(contents);
+        @memset(contents, 0x5a);
+        try std_testing.expectError(
+            error.FrameTooLarge,
+            encode(.{ .client_to_relay_datagram = .{
+                .node_id = node_id,
+                .datagrams = .{ .ecn = null, .segment_size = null, .contents = contents },
+            } }, .v2, &out),
+        );
+    }
+
+    // `ZeroSegmentSize` on the way in and on the way out, under both spellings:
+    // a zero in the frame, and a zero and a null in a value.
+    try std_testing.expectError(
+        error.ZeroSegmentSize,
+        decode(try parseHex(&scratch, "07 " ++ id_hex ++ " 03 0000 00"), .v2),
+    );
+    try std_testing.expectError(
+        error.ZeroSegmentSize,
+        encode(.{ .relay_to_client_datagram_batch = .{
+            .node_id = node_id,
+            .datagrams = .{ .ecn = null, .segment_size = 0, .contents = hello_world },
+        } }, .v2, &out),
+    );
+    try std_testing.expectError(
+        error.ZeroSegmentSize,
+        encode(@unionInit(Message, "relay_to_client_datagram_batch", DatagramFrame{
+            .node_id = node_id,
+            .datagrams = .{ .ecn = null, .segment_size = null, .contents = hello_world },
+        }), .v2, &out),
+    );
+
+    // `TextTooLong` is relay-authored text past `max_text_length`, and it is
+    // refused rather than shortened. The buffer is checked afterwards, because
+    // a caller that keeps a partial denial cannot tell it from a real one.
+    {
+        const alloc = std_testing.allocator;
+        const long = try alloc.alloc(u8, max_text_length + 1);
+        defer alloc.free(long);
+        @memset(long, 'x');
+        @memset(&out, 0xff);
+        try std_testing.expectError(
+            error.TextTooLong,
+            encode(.{ .server_denies_auth = .{ .reason = long } }, .v2, &out),
+        );
+        for (out) |byte| try std_testing.expectEqual(@as(u8, 0xff), byte);
+    }
+
+    // `BufferFull` is a writer with no room, on a fixed payload and through the
+    // postcard writer a denial borrows.
+    {
+        var narrow: [8]u8 = undefined;
+        try std_testing.expectError(
+            error.BufferFull,
+            encode(.{ .ping = [_]u8{42} ** 8 }, .v2, &narrow),
+        );
+        try std_testing.expectError(
+            error.BufferFull,
+            encode(.{ .server_denies_auth = .{ .reason = "too long for here" } }, .v2, &narrow),
+        );
+    }
+}
+
+test "segmentation metadata: a segment count too large to multiply takes what is there" {
+    // `takeSegments` multiplies the segment size by the count and this runs on
+    // every datagram a relay forwards, so the multiply saturates rather than
+    // being checked: a `num_segments` a caller can name is no reason for the
+    // hot path to trap. The saturation is invisible because the result is
+    // clamped to the contents, so a caller asking for more segments than the
+    // payload holds gets the whole payload and not a wrapped byte count.
+    inline for ([_]u16{ 1, 6, 1200, std.math.maxInt(u16) }) |segment_size| {
+        var batch: Datagrams = .{
+            .ecn = .ce,
+            .segment_size = segment_size,
+            .contents = hello_world,
+        };
+        const taken = batch.takeSegments(std.math.maxInt(usize));
+
+        // Everything that was there, once, and nothing invented.
+        try std_testing.expectEqualStrings(hello_world, taken.contents);
+        try std_testing.expectEqual(@as(usize, 0), batch.contents.len);
+        // And the tail is not a batch: one datagram's worth or less is left,
+        // so it goes out as a single datagram and not as a batch of one.
+        try std_testing.expectEqual(@as(?u16, null), batch.segment_size);
+        try std_testing.expect(!batch.isBatch());
+
+        // The handed-back value keeps a segment size only because it really
+        // holds more than one segment: twelve bytes at a size of one or six,
+        // and one datagram at any size above that.
+        const expected: ?u16 = if (segment_size < hello_world.len) segment_size else null;
+        try std_testing.expectEqual(expected, taken.segment_size);
     }
 }

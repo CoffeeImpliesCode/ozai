@@ -36,10 +36,12 @@
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
+const base_relay_url = @import("../base/relay_url.zig");
 const report = @import("report.zig");
+const transport_addr = @import("../base/transport_addr.zig");
 
 const SocketAddr = addr.SocketAddr;
-const TransportAddr = addr.TransportAddr;
+const TransportAddr = transport_addr.TransportAddr;
 
 /// Nanoseconds on a monotonic timeline the caller owns.
 ///
@@ -839,7 +841,7 @@ test "a refused round does not move the interval" {
 }
 
 test "a selected relay path does not suppress a punch" {
-    const relay_url = try addr.RelayUrl.parse("https://use1-1.relay.iroh.network./");
+    const relay_url = try base_relay_url.RelayUrl.parse("https://use1-1.relay.iroh.network./");
     const local = [_]SocketAddr{ip(1000)};
     const remote = [_]SocketAddr{ip(2000)};
     const last: Attempt = .{ .when = 1_000, .remote = &.{} };
@@ -1003,7 +1005,7 @@ test "a table that is entirely unusable keeps the ceiling worth keeping" {
 }
 
 test "relay paths are neither counted nor pruned" {
-    const relay_url = try addr.RelayUrl.parse("https://use1-1.relay.iroh.network./");
+    const relay_url = try base_relay_url.RelayUrl.parse("https://use1-1.relay.iroh.network./");
 
     // Thirty-five direct paths against four relay ones, so the non-relay count
     // is over the ceiling on its own and the prune has something to do.

@@ -3,8 +3,9 @@
 //! Ported from `n0-computer/iroh-blobs` `src/ticket.rs` and `src/hash.rs`, at
 //! commit `e82cbdcbdac9a78033174aad55e3199b2cf4c0dc`, fetched 2026-09-30 — the
 //! same commit `blobs/range_spec.zig` cites. The shared text form, the RFC
-//! 4648 alphabet and the field writers live in `endpoint_ticket.zig`, which
-//! is where upstream's `Ticket` trait lives; see that file for why.
+//! 4648 alphabet and the address field writers live in `ticket_codec.zig`,
+//! which is the half of upstream's `Ticket` trait that is not a kind; see that
+//! file for why.
 //!
 //! # Variant 0 is a projection, and this module says so
 //!
@@ -46,29 +47,20 @@
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
+const codec = @import("ticket_codec.zig");
 const key = @import("../base/key.zig");
+const node_addr = @import("../base/node_addr.zig");
 const postcard = @import("../wire/postcard.zig");
-const shared = @import("endpoint_ticket.zig");
+const relay_url = @import("../base/relay_url.zig");
+const transport_addr = @import("../base/transport_addr.zig");
 
 const Allocator = std.mem.Allocator;
-
-pub const NodeId = key.NodeId;
-pub const NodeAddr = addr.NodeAddr;
-pub const TransportAddr = addr.TransportAddr;
-pub const SocketAddr = addr.SocketAddr;
-pub const RelayUrl = addr.RelayUrl;
-
-const writeNodeId = shared.writeNodeId;
-const readNodeId = shared.readNodeId;
-const writeRelayUrl = shared.writeRelayUrl;
-const readRelayUrl = shared.readRelayUrl;
-const writeSocketAddr = shared.writeSocketAddr;
-const readSocketAddr = shared.readSocketAddr;
-const canonicalizeAddrs = shared.canonicalizeAddrs;
-
-pub const TextError = shared.TextError;
-pub const BodyError = shared.BodyError;
-pub const DecodeError = shared.DecodeError;
+const CustomAddr = addr.CustomAddr;
+const NodeAddr = node_addr.NodeAddr;
+const NodeId = key.NodeId;
+const RelayUrl = relay_url.RelayUrl;
+const SocketAddr = addr.SocketAddr;
+const TransportAddr = transport_addr.TransportAddr;
 
 /// 32 bytes, the hash a blob is named by.
 ///
@@ -263,15 +255,15 @@ pub const BlobTicket = struct {
     pub fn encode(self: BlobTicket, out: []u8) postcard.Error!Encoded {
         var writer = postcard.Writer.init(out);
         try writer.writeVariant(WireVariant.variant0);
-        try writeNodeId(&writer, self.addr.node_id);
+        try codec.writeNodeId(&writer, self.addr.node_id);
 
         const relay = firstRelay(self.addr.addrs);
         try writer.writeOption(relay != null);
-        if (relay) |url| try writeRelayUrl(&writer, url);
+        if (relay) |url| try codec.writeRelayUrl(&writer, url);
 
         try writer.writeLen(directCount(self.addr.addrs));
         for (self.addr.addrs) |one| {
-            if (one == .ip) try writeSocketAddr(&writer, one.ip);
+            if (one == .ip) try codec.writeSocketAddr(&writer, one.ip);
         }
 
         try writer.writeVariant(self.format);
@@ -286,7 +278,7 @@ pub const BlobTicket = struct {
             1 + // the ticket discriminant
             key.NodeId.byte_length +
             1 + // the relay option tag
-            postcard.varintMax(u64) + shared.relay_url_text_max +
+            postcard.varintMax(u64) + codec.relay_url_text_max +
             postcard.varintMax(u64) + // the direct address count
             postcard.varintMax(u32) + // the format
             hash_length;
@@ -300,7 +292,7 @@ pub const BlobTicket = struct {
     }
 
     /// The canonical text form of `encoded.bytes`, which must be what `encode`
-    /// produced. `shared.textLength(kind, …)` sizes `out`.
+    /// produced. `codec.textLength(kind, …)` sizes `out`.
     ///
     /// The text returned is the prefix of `out` that was filled and not a copy
     /// of it, so `out` must stay alive and unwritten for as long as it is read,
@@ -310,38 +302,38 @@ pub const BlobTicket = struct {
         self: BlobTicket,
         encoded: Encoded,
         out: []u8,
-    ) TextError![]const u8 {
+    ) codec.TextError![]const u8 {
         _ = self;
-        return shared.encodeText(kind, encoded.bytes, out);
+        return codec.encodeText(kind, encoded.bytes, out);
     }
 
     /// postcard bytes to a ticket. The address list comes from `alloc`; see
     /// `deinit`.
-    pub fn decodeBytes(alloc: Allocator, bytes: []const u8) DecodeError!BlobTicket {
+    pub fn decodeBytes(alloc: Allocator, bytes: []const u8) codec.DecodeError!BlobTicket {
         var reader = postcard.Reader.init(bytes);
         if (try reader.readU32() != @intFromEnum(WireVariant.variant0)) {
             return error.UnknownTicketVariant;
         }
-        const id = try readNodeId(&reader);
+        const id = try codec.readNodeId(&reader);
 
         var addrs: std.ArrayList(TransportAddr) = .empty;
         errdefer addrs.deinit(alloc);
         // The relay goes in first, and relay sorts before ip, so appending in
         // wire order already lands in `TransportAddr.order`. A peer is free to
         // send the direct addresses in another order, or the same one twice,
-        // and upstream's `BTreeSet` would absorb both; `canonicalizeAddrs`
+        // and upstream's `BTreeSet` would absorb both; `codec.canonicalizeAddrs`
         // does the same and is why the re-encode of a decoded ticket is
         // postcard's canonical spelling rather than the one that was sent.
         if (try reader.readOption()) {
-            try addrs.append(alloc, .{ .relay = try readRelayUrl(&reader) });
+            try addrs.append(alloc, .{ .relay = try codec.readRelayUrl(&reader) });
         }
         const count = try reader.readLen();
-        for (0..count) |_| try addrs.append(alloc, .{ .ip = try readSocketAddr(&reader) });
+        for (0..count) |_| try addrs.append(alloc, .{ .ip = try codec.readSocketAddr(&reader) });
 
         const format = try reader.readVariant(BlobFormat);
         const hash = try reader.readArray(hash_length);
         try reader.finish();
-        addrs.items = canonicalizeAddrs(addrs.items);
+        addrs.items = codec.canonicalizeAddrs(addrs.items);
 
         return .{
             .addr = .{ .node_id = id, .addrs = try addrs.toOwnedSlice(alloc) },
@@ -352,11 +344,11 @@ pub const BlobTicket = struct {
 
     /// A ticket's text form to a ticket. The base32 body is decoded through a
     /// fresh allocation, because its length is whatever the text said it was.
-    pub fn decodeString(alloc: Allocator, text: []const u8) DecodeError!BlobTicket {
-        const symbols = try shared.splitBody(kind, text);
-        const raw = try alloc.alloc(u8, shared.byteLength(symbols.len));
+    pub fn decodeString(alloc: Allocator, text: []const u8) codec.DecodeError!BlobTicket {
+        const symbols = try codec.splitBody(kind, text);
+        const raw = try alloc.alloc(u8, codec.byteLength(symbols.len));
         defer alloc.free(raw);
-        try shared.decodeBase32(symbols, raw);
+        try codec.decodeBase32(symbols, raw);
         return decodeBytes(alloc, raw);
     }
 };
@@ -486,7 +478,7 @@ test "the text form is a fixed point" {
     const again = try twice.encodeString(try twice.encode(&body), &second);
 
     try t.expectEqualStrings(once, again);
-    try t.expectEqual(shared.textLength(BlobTicket.kind, encoded.bytes.len), once.len);
+    try t.expectEqual(codec.textLength(BlobTicket.kind, encoded.bytes.len), once.len);
 }
 
 test "a ticket with no custom transport round trips through variant 0 unchanged" {
@@ -553,7 +545,7 @@ test "variant 0 drops a custom transport, and the ticket says so" {
         try NodeId.parseHex(golden_id_hex),
         try RelayUrl.parse("https://relay.example/"),
     );
-    const custom = try addr.CustomAddr.parse("2a_abab", &storage);
+    const custom = try CustomAddr.parse("2a_abab", &storage);
     address = (try address.insert(alloc, .{ .custom = custom })) orelse
         return error.TestUnexpectedResult;
 
@@ -682,6 +674,76 @@ test "a format this build has no arm for is refused" {
     try t.expectError(error.UnknownVariant, BlobTicket.decodeBytes(alloc, bytes[0..68]));
 }
 
+/// The socket address's family, with two discriminants this build writes no arm
+/// for: the one immediately past the last arm, and one that needs two varint
+/// bytes. `postcard.Writer.writeVariant` takes an enum rather than a number,
+/// so a byte no declared arm names can only be produced by declaring the arm.
+const UnwrittenIpFamily = enum(u32) { v4 = 0, v6 = 1, next = 2, far = 128 };
+
+/// A blob ticket body naming one direct address whose family discriminant is
+/// `family`, with the address bytes written only for the two families this
+/// build has arms for. Variant 0's direct addresses are bare `SocketAddr`s
+/// with no transport tag in front, which is what places `family` there.
+fn directAddrBody(family: UnwrittenIpFamily) !struct { body: [128]u8, len: usize } {
+    const v4_octets: [4]u8 = .{ 127, 0, 0, 1 };
+    const v6_octets: [16]u8 = [_]u8{ 0x20, 0x01 } ** 8;
+    var body: [128]u8 = undefined;
+    var writer = postcard.Writer.init(&body);
+    try writer.writeVariant(WireVariant.variant0);
+    try codec.writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
+    try writer.writeOption(false);
+    try writer.writeLen(1);
+    try writer.writeVariant(family);
+    switch (family) {
+        .v4 => try writer.writeArray(4, &v4_octets),
+        .v6 => try writer.writeArray(16, &v6_octets),
+        // Refused at the discriminant, so there is nothing behind it.
+        .next, .far => {},
+    }
+    try writer.writeU16(1234);
+    try writer.writeVariant(BlobFormat.raw);
+    try writer.writeArray(hash_length, &try parseHashHex(golden_hash_hex));
+    return .{ .body = body, .len = writer.finish().len };
+}
+
+test "both ip families decode through variant 0, and neither discriminant past them does" {
+    const alloc = t.allocator;
+    const v4_octets: [4]u8 = .{ 127, 0, 0, 1 };
+    const v6_octets: [16]u8 = [_]u8{ 0x20, 0x01 } ** 8;
+
+    const v4 = try directAddrBody(.v4);
+    const from_v4 = try BlobTicket.decodeBytes(alloc, v4.body[0..v4.len]);
+    defer from_v4.deinit(alloc);
+    try t.expectEqual(@as(usize, 1), from_v4.addr.addrs.len);
+    try t.expectEqual(@as(u16, 1234), from_v4.addr.addrs[0].ip.port);
+    switch (from_v4.addr.addrs[0].ip.ip) {
+        .v4 => |octets| try t.expectEqualSlices(u8, &v4_octets, &octets),
+        .v6 => return error.TestUnexpectedResult,
+    }
+
+    const v6 = try directAddrBody(.v6);
+    const from_v6 = try BlobTicket.decodeBytes(alloc, v6.body[0..v6.len]);
+    defer from_v6.deinit(alloc);
+    try t.expectEqual(@as(usize, 1), from_v6.addr.addrs.len);
+    try t.expectEqual(@as(u16, 1234), from_v6.addr.addrs[0].ip.port);
+    switch (from_v6.addr.addrs[0].ip.ip) {
+        .v6 => |octets| try t.expectEqualSlices(u8, &v6_octets, &octets),
+        .v4 => return error.TestUnexpectedResult,
+    }
+
+    // The same boundary `endpoint_ticket` pins, reached through the other
+    // kind's decoder because both read their socket addresses through the one
+    // codec. It is refused by the discriminant rather than by running out of
+    // address bytes, which is the distinction a truncation cannot make.
+    for ([_]UnwrittenIpFamily{ .next, .far }) |family| {
+        const refused = try directAddrBody(family);
+        try t.expectError(
+            error.UnknownVariant,
+            BlobTicket.decodeBytes(alloc, refused.body[0..refused.len]),
+        );
+    }
+}
+
 test "a wire variant this build has no arm for is refused" {
     const alloc = t.allocator;
     var bytes: [golden_hex.len / 2]u8 = undefined;
@@ -703,7 +765,7 @@ test "a relay url the address layer will not take is refused" {
     var body: [128]u8 = undefined;
     var writer = postcard.Writer.init(&body);
     try writer.writeVariant(WireVariant.variant0);
-    try writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
+    try codec.writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
     try writer.writeOption(true);
     try writer.writeStr("ftp://example.com./");
     try writer.writeLen(0);
@@ -730,12 +792,12 @@ test "a direct address sent twice is one address" {
     var body: [128]u8 = undefined;
     var writer = postcard.Writer.init(&body);
     try writer.writeVariant(WireVariant.variant0);
-    try writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
+    try codec.writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
     try writer.writeOption(false);
     try writer.writeLen(2);
     const ip: SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1234 };
-    try writeSocketAddr(&writer, ip);
-    try writeSocketAddr(&writer, ip);
+    try codec.writeSocketAddr(&writer, ip);
+    try codec.writeSocketAddr(&writer, ip);
     try writer.writeVariant(BlobFormat.raw);
     try writer.writeArray(hash_length, &try parseHashHex(golden_hash_hex));
 
@@ -767,4 +829,117 @@ test "the hash round trips through hex" {
     try t.expectError(error.BadLength, parseHashHex("0b84"));
     const not_hex = golden_hash_hex[0 .. golden_hash_hex.len - 1] ++ "z";
     try t.expectError(error.NotHex, parseHashHex(not_hex));
+}
+
+/// A provider body carrying one relay and three direct addresses, written in
+/// an order canonicalization has to change: the v6 socket first and the
+/// higher v4 before the lower one. A decode that appended in wire order would
+/// answer with a list this body did not name. Three of them also grow the
+/// address list more than once, which is where most of the refusals are.
+fn providerBody() !struct { body: [256]u8, len: usize } {
+    var body: [256]u8 = undefined;
+    var writer = postcard.Writer.init(&body);
+    try writer.writeVariant(WireVariant.variant0);
+    try codec.writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
+    try writer.writeOption(true);
+    try writer.writeStr("https://relay.example./");
+    try writer.writeLen(3);
+    const v6: SocketAddr = .{ .ip = .{ .v6 = [_]u8{ 0x20, 0x01 } ** 8 }, .port = 443 };
+    const far: SocketAddr = .{ .ip = .{ .v4 = .{ 192, 0, 2, 7 } }, .port = 41641 };
+    const near: SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1234 };
+    try codec.writeSocketAddr(&writer, v6);
+    try codec.writeSocketAddr(&writer, far);
+    try codec.writeSocketAddr(&writer, near);
+    try writer.writeVariant(BlobFormat.hash_seq);
+    try writer.writeArray(hash_length, &try parseHashHex(golden_hash_hex));
+    return .{ .body = body, .len = writer.finish().len };
+}
+
+/// Whether `pointer` names a byte inside `region`. A decoded ticket's address
+/// list is an allocation of its own, so one pointing back into the frame the
+/// caller is about to reuse is a borrow `deinit` would then free.
+fn insideRegion(region: []const u8, pointer: anytype) bool {
+    const at = @intFromPtr(pointer);
+    const low = @intFromPtr(region.ptr);
+    return at >= low and at < low + region.len;
+}
+
+/// The ticket a decode of `providerBody` owes its caller: the captured id and
+/// hash, the format, the relay, and the three direct addresses in
+/// `SocketAddr.order` rather than in the order the body sent them.
+///
+/// This is the half of the sweep a balance cannot do. A decode that dropped
+/// the relay, kept a socket twice, or appended in wire order still balances
+/// its books exactly the same way.
+fn expectDecodedProvider(ticket: *const BlobTicket, frame: []const u8) !void {
+    try t.expectEqualStrings(golden_id_hex, ticket.addr.node_id.toHex()[0..]);
+    try t.expectEqual(BlobFormat.hash_seq, ticket.format);
+    try t.expectEqualStrings(golden_hash_hex, &hashToHex(ticket.hash));
+    try t.expectEqual(@as(usize, 4), ticket.addr.addrs.len);
+    try t.expectEqual(@as(usize, 1), ticket.addr.relayCount());
+
+    try t.expectEqual(TransportAddr.relay, std.meta.activeTag(ticket.addr.addrs[0]));
+    try t.expectEqualStrings("relay.example.", ticket.addr.addrs[0].relay.hostSlice());
+    try t.expectEqual(RelayUrl.default_https_port, ticket.addr.addrs[0].relay.port);
+    // v4 before v6, and the two v4s by their own bytes: the list is the
+    // canonical one whatever order the peer wrote it in.
+    const ports = [_]u16{ 1234, 41641, 443 };
+    for (ports, ticket.addr.addrs[1..]) |port, one| {
+        try t.expectEqual(TransportAddr.ip, std.meta.activeTag(one));
+        try t.expectEqual(port, one.ip.port);
+    }
+    try t.expect(!insideRegion(frame, ticket.addr.addrs.ptr));
+}
+
+/// One run of `decodeBytes` for `t.checkAllAllocationFailures`: the answer is
+/// checked and released, so a refusal in the relay slot, in the direct
+/// addresses, or in the list they share has to hand all of it back.
+fn blobBytesAccounting(alloc: Allocator, bytes: []const u8) !void {
+    const decoded = try BlobTicket.decodeBytes(alloc, bytes);
+    try expectDecodedProvider(&decoded, bytes);
+    decoded.deinit(alloc);
+}
+
+/// The same run through the text form, which allocates the base32 body before
+/// it decodes anything and so stands one allocation further along.
+fn blobTextAccounting(alloc: Allocator, text: []const u8) !void {
+    const decoded = try BlobTicket.decodeString(alloc, text);
+    try expectDecodedProvider(&decoded, text);
+    // Releasing it under the testing allocator is the ownership check the
+    // pointer comparison above cannot be: a list pointing into the buffer
+    // `decodeString` allocated and released on the way out would be freed
+    // twice here, and the allocator says so by name.
+    decoded.deinit(alloc);
+}
+
+test "every allocation a blob ticket decode makes can fail on its own" {
+    const alloc = t.allocator;
+    const made = try providerBody();
+    const body = made.body[0..made.len];
+
+    try t.checkAllAllocationFailures(alloc, blobBytesAccounting, .{body});
+
+    // And through the text form, which is one allocation further along because
+    // the base32 body is decoded through a buffer of its own.
+    var text: [512]u8 = undefined;
+    const written = try codec.encodeText(BlobTicket.kind, body, &text);
+    try t.checkAllAllocationFailures(alloc, blobTextAccounting, .{written});
+
+    // The eventual consumer result, on a plain allocator: the same provider
+    // and the same canonical list, however the body ordered it.
+    const decoded = try BlobTicket.decodeBytes(alloc, body);
+    defer decoded.deinit(alloc);
+    try expectDecodedProvider(&decoded, body);
+    try t.expect(decoded.loss().isEmpty());
+
+    // And the fixed point the wire order made worth checking: what a decode
+    // writes is the canonical spelling, so decoding those bytes answers the
+    // same ticket again and re-encoding it changes nothing.
+    var canonical_buffer: [256]u8 = undefined;
+    const canonical = (try decoded.encode(&canonical_buffer)).bytes;
+    const again = try BlobTicket.decodeBytes(alloc, canonical);
+    defer again.deinit(alloc);
+    try expectDecodedProvider(&again, canonical);
+    var third: [256]u8 = undefined;
+    try t.expectEqualSlices(u8, canonical, (try again.encode(&third)).bytes);
 }

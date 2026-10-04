@@ -1943,6 +1943,469 @@ test "decode is total: the real frames first, then a mutation sweep" {
     try testing.expect(items > 0);
 }
 
+test "domain sweep: every request discriminant decides its own framing" {
+    // The ten arms of `RequestType` are a closed domain with two destinations:
+    // four carry a request and six are reserved, and each of the ten reaches
+    // `Request.read` with a different answer. Swept over
+    // `std.enums.values(RequestType)` rather than over the numbers written here,
+    // so an arm added upstream has to be placed in one of the two groups before
+    // this test can pass: the `switch` below names all ten, so a new one fails
+    // to compile rather than falling through to a default.
+    inline for (std.enums.values(RequestType)) |arm| {
+        // A one-byte stream never carries a whole request, so the refusal is
+        // always about the body — or, for a reserved slot, about the tag alone.
+        // The two groups are named rather than inferred from a range, so a
+        // reserved slot cannot pass by accident: upstream rejects every one of
+        // them by name, and a decoder that skipped one would answer a question
+        // the peer never asked.
+        const expected: Error = switch (arm) {
+            .get, .observe, .push, .get_many => error.UnexpectedEnd,
+            .slot2, .slot3, .slot4, .slot5, .slot6, .slot7 => error.ReservedSlot,
+        };
+
+        var buffer: [1]u8 = .{@intFromEnum(arm)};
+        var reader = postcard.Reader.init(&buffer);
+        var room: Room = .{};
+        var storage = room.storage();
+        try testing.expectError(expected, Request.read(&reader, &storage));
+
+        // And the reader is left on the discriminant and nowhere past it, so a
+        // refusal to serve a reserved slot never consumed the bytes behind it.
+        try testing.expectEqual(@as(usize, 1), reader.offset);
+    }
+
+    // And the ten arms are exactly the ten numbers, in the order upstream
+    // demands: "it must contain the request types in the same order as the full
+    // requests" (`src/protocol.rs:435`).
+    try testing.expectEqual(@as(usize, 10), std.enums.values(RequestType).len);
+    const by_value = [_]RequestType{
+        .get,   .observe, .slot2, .slot3, .slot4,
+        .slot5, .slot6,   .slot7, .push,  .get_many,
+    };
+    for (by_value, 0..) |arm, index| {
+        try testing.expectEqual(arm, @as(RequestType, @enumFromInt(@as(u8, @intCast(index)))));
+    }
+    // Every discriminant is below 128, so the raw byte upstream reads and
+    // postcard's `varint(u32)` for a discriminant are the same bytes — which is
+    // what lets the reader be a byte at all. A byte with the top bit set is
+    // therefore a discriminant this build does not have and not a truncated
+    // varint, and `readRequestType` answers `error.UnknownVariant` for it.
+    inline for (std.enums.values(RequestType)) |arm| {
+        try testing.expect(@intFromEnum(arm) < 0x80);
+        var high: [1]u8 = .{@intFromEnum(arm) | 0x80};
+        var high_reader = postcard.Reader.init(&high);
+        var high_room: Room = .{};
+        var high_storage = high_room.storage();
+        try testing.expectError(
+            error.UnknownVariant,
+            Request.read(&high_reader, &high_storage),
+        );
+    }
+}
+
+test "domain sweep: the two framings carry exactly the request types they own" {
+    // `EofFraming` carries three arms and `LengthPrefixedFraming` one, and the
+    // two sets are disjoint. Asked of every arm of both, because a framing that
+    // carried a type it does not own is how a `push` payload gets swallowed
+    // into a request body.
+    inline for (std.enums.values(RequestType)) |arm| {
+        var room: Room = .{};
+        var storage = room.storage();
+
+        // A `push` is the only length-prefixed one, so it is the only arm the
+        // EOF framing refuses with `WrongFraming`.
+        const eof_expected: Error = if (arm == .push)
+            error.WrongFraming
+        else if (@intFromEnum(arm) >= 2 and @intFromEnum(arm) <= 7)
+            error.ReservedSlot
+        else
+            // The three real EOF arms on an empty body, which is `UnexpectedEnd`
+            // from the body and never from the discriminant.
+            error.UnexpectedEnd;
+        var eof_reader = postcard.Reader.init("");
+        try testing.expectError(
+            eof_expected,
+            EofFraming.read(arm, &eof_reader, &storage),
+        );
+
+        // And everything but `push` is refused by the length-prefixed framing,
+        // on the tag alone, before a byte of body is read.
+        const framed_expected: Error = if (arm == .push)
+            error.UnexpectedEnd // no length prefix at all
+        else
+            error.WrongFraming;
+        var framed_reader = postcard.Reader.init("");
+        try testing.expectError(
+            framed_expected,
+            LengthPrefixedFraming.read(arm, &framed_reader, &storage),
+        );
+    }
+}
+
+test "domain sweep: Closed is three codes, and a fourth is refused" {
+    // `Closed` has three arms and upstream's `Closed` (`src/protocol.rs:667`)
+    // has three, so the enum is the whole of the namespace rather than a
+    // sample of it. `std.enums.values` is the table, which means a fourth arm
+    // would have to be placed here rather than inherit an answer from a default.
+    inline for (std.enums.values(Closed)) |arm| {
+        // Each code is a QUIC varint beside the stream and never a byte in it,
+        // so it round-trips through its own varint spelling.
+        const code = arm.toVarInt();
+        try testing.expectEqual(arm, try Closed.fromVarInt(code));
+        // All three are below 64, and a QUIC varint that small is one raw byte
+        // holding the value — which is why upstream's `toVarInt` is a cast and
+        // not a length calculation.
+        try testing.expect(code < 64);
+        // And a reason, which is what a caller logs. Every arm names a
+        // different one, so a reason cannot be mistaken for another's.
+        try testing.expect(arm.reason().len > 0);
+    }
+    // The three reasons are distinct, checked as values rather than as
+    // counts: a copy-paste that gave two codes one reason would pass a count.
+    const reasons = [_][]const u8{
+        Closed.stream_dropped.reason(),
+        Closed.provider_terminating.reason(),
+        Closed.request_received.reason(),
+    };
+    for (reasons, 0..) |reason, index| {
+        for (reasons[index + 1 ..]) |other| {
+            try testing.expect(!std.mem.eql(u8, reason, other));
+        }
+    }
+
+    // A code this build has no arm for is named rather than defaulted, because
+    // a default arm would report a close nobody sent. Three is the first gap,
+    // and past `u16` is the other end of the same rule.
+    for ([_]u64{ 3, 4, 255, 65_535, 65_536, std.math.maxInt(u64) }) |code| {
+        try testing.expectError(error.UnknownClose, Closed.fromVarInt(code));
+    }
+    // And the code is never in the payload: a response is whatever the provider
+    // wrote, so a stream code is not a byte of one.
+    {
+        const code_bytes = [_]u8{@intCast(Closed.request_received.toVarInt())};
+        var reader = postcard.Reader.init(&code_bytes);
+        const answer = BaoResponse.read(&reader);
+        try testing.expectEqualSlices(u8, &code_bytes, answer.bytes);
+        // That byte is a length prefix of one with nothing behind it, so a
+        // provider that wrote it as a payload did not write a complete answer.
+        try testing.expect(!answer.isEof());
+    }
+}
+
+test "error inventory: every declared arm is refused by a concrete frame" {
+    // `Error` is `postcard.Error` plus four arms of this module's own. The
+    // postcard members are reached through the same request paths, so this
+    // names all of them together rather than assuming another module's sweep
+    // covers the ones a blobs frame can reach.
+    //
+    // The count is checked against the type rather than trusted, so an arm added
+    // to `Error` without a case here fails the build rather than going quietly
+    // untested.
+    try testing.expectEqual(@typeInfo(Error).error_set.?.len, 14);
+
+    var scratch: [256]u8 = undefined;
+
+    // The module's own four. `ReservedSlot` and `MessageTooLarge` come through
+    // `Request.read`; `WrongFraming` cannot, because `Request.read` picks the
+    // framing from the tag and so never hands a request to the wrong one — it is
+    // reachable only by a caller reaching for the wrong framing directly, which
+    // is exactly what the two cases below are.
+    try expectRequestErrorHex("02", error.ReservedSlot);
+    try expectRequestErrorHex("08" ++ "ffffffff01", error.MessageTooLarge);
+    {
+        var reader = postcard.Reader.init("");
+        var room: Room = .{};
+        var storage = room.storage();
+        try testing.expectError(
+            error.WrongFraming,
+            EofFraming.read(.push, &reader, &storage),
+        );
+    }
+    {
+        var reader = postcard.Reader.init("");
+        var room: Room = .{};
+        var storage = room.storage();
+        try testing.expectError(
+            error.WrongFraming,
+            LengthPrefixedFraming.read(.get, &reader, &storage),
+        );
+    }
+    try testing.expectError(error.UnknownClose, Closed.fromVarInt(3));
+
+    // The postcard members a request can reach: a discriminant this build has
+    // no arm for, a truncated frame, a varint too long and one too wide, a
+    // length that cannot be true, bytes behind a whole message, and a count
+    // the caller's storage could not hold.
+    try expectRequestErrorHex("0a", error.UnknownVariant);
+    try expectRequestErrorHex("00" ++ "da" ** 8, error.UnexpectedEnd);
+    try expectRequestErrorHex(
+        "00" ++ "da" ** 32 ++ "01" ++ "00" ++ "80" ** 10,
+        error.BadVarint,
+    );
+    try expectRequestErrorHex(
+        "00" ++ "da" ** 32 ++ "01" ++ "00" ++ "80" ** 9 ++ "02",
+        error.ValueOutOfRange,
+    );
+    // A `get_many` naming five hashes behind four the caller's storage holds,
+    // and a count the bytes could have carried: the buffer is big enough and
+    // the storage is not, which is `BufferFull` and not `BadLength`.
+    try expectRequestErrorHex("09" ++ "05" ++ "da" ** 32 ++ "0000", error.BufferFull);
+    try expectRequestErrorHex(
+        "00" ++ "da" ** 32 ++ "01000100" ++ "00",
+        error.TrailingBytes,
+    );
+    // `BadLength` is a length the remaining input cannot satisfy, and a `push`
+    // body read as a `get` body is the case that reaches it: the length byte
+    // shifts the hash by one and the sequence's element count lands on a `0xda`.
+    {
+        const push_body = "26" ++ "da" ** 32 ++ "020001000100";
+        var reader = postcard.Reader.init(try parseHex(&scratch, push_body));
+        var room: Room = .{};
+        var storage = room.storage();
+        try testing.expectError(error.BadLength, GetRequest.parse(&reader, &storage));
+    }
+
+    // The three arms no blobs request can reach, and why each is here rather
+    // than missing: `Error` is `postcard.Error` joined with this module's four,
+    // so a caller matching on it sees all thirteen and two of the four real
+    // requests it has never heard of. The join is deliberate — it lets a request
+    // name "a varint that cannot fit" without a caller unwrapping a type that
+    // does not depend on the frame it was in — and it means three arms are
+    // unreachable from here.
+    //
+    // - `BadBool`: no request field is a `bool`. The request types are a hash
+    //   (`[u8; 32]`), a count, a `RangeSpec`/`RangeSpecSeq` of `varint(u64)`
+    //   widths and deltas, and a discriminant byte. Nothing calls `readBool`.
+    // - `BadOptionTag`: no request field is an `Option`. Nothing calls
+    //   `readOption`, and no request carries a presence flag.
+    // - `InvalidUtf8`: no request field is a `String`. `GetRequest`'s only
+    //   non-numeric field is the 32 raw hash bytes, which `readArray` copies
+    //   without validating. Nothing calls `readStr`.
+    //
+    // Each is a precondition of the *format* rather than of this decoder: a
+    // future request type with a string, a bool or an option in it would make
+    // them reachable again, and the count above is what notices.
+    //
+    // The disposition is a claim about which reader this module calls, so what
+    // is asserted here is the negative one that can be asserted without reading
+    // the source: every request this module can express round-trips, so none of
+    // the three ever fired on the path that would reach them.
+    for ([_]Request{
+        .{ .to_eof = .{ .get = GetRequest.blob(da_hash) } },
+        .{ .to_eof = .{ .get_many = .{ .hashes = &two_hashes, .ranges = .empty } } },
+        .{ .to_eof = .{ .observe = .{ .hash = da_hash, .ranges = .empty } } },
+        .{ .length_prefixed = .{ .request = .{ .get = GetRequest.blob(da_hash) } } },
+    }) |request| {
+        var buffer: [256]u8 = undefined;
+        var body: [2048]u8 = undefined;
+        var writer = postcard.Writer.init(&buffer);
+        try request.write(&writer, &body);
+        var room: Room = .{};
+        var storage = room.storage();
+        var reader = postcard.Reader.init(writer.finish());
+        const decoded = try Request.read(&reader, &storage);
+        try reader.finish();
+        try testing.expect(decoded.eql(request));
+    }
+}
+
+test "accepted blobs re-encode the value and the framing that decoded them" {
+    // A decode that succeeds has to be a fixed point of its own round trip, and
+    // the framing is part of the value here rather than a detail of it: a
+    // `push` and a `get` with the same body are different frames, and the
+    // re-encode has to preserve which one it was. `BaoResponse` is the one half
+    // that carries no error arm — missing data is the end of the stream, not a
+    // value — so its re-encode is the bytes themselves.
+    const requests = [_]Request{
+        .{ .to_eof = .{ .get = GetRequest.blob(da_hash) } },
+        .{ .to_eof = .{ .get = GetRequest.all(da_hash) } },
+        .{ .to_eof = .{ .get = .{ .hash = zero_hash, .ranges = .empty } } },
+        .{ .to_eof = .{ .get_many = .{
+            .hashes = &two_hashes,
+            .ranges = .{ .items = &blob_ranges },
+        } } },
+        .{ .to_eof = .{ .observe = .{
+            .hash = da_hash,
+            .ranges = range_spec.RangeSpec.all,
+        } } },
+        .{ .length_prefixed = .{ .request = .{ .get = GetRequest.blob(da_hash) } } },
+        .{ .length_prefixed = .{ .request = PushRequest.new(
+            da_hash,
+            .{ .items = &push_ranges },
+        ) } },
+    };
+    for (requests) |request| {
+        try expectRequestFixedPoint(request);
+    }
+
+    // The framing is a function of the tag and not of the body, so the same
+    // body under the other framing is a *different* frame rather than the same
+    // frame read twice. `GetRequest.blob`'s bytes and `PushRequest`'s bytes
+    // differ by the discriminant and the length prefix and nothing else.
+    {
+        var get_frame: [128]u8 = undefined;
+        var push_frame: [128]u8 = undefined;
+        var body: [2048]u8 = undefined;
+        var get_writer = postcard.Writer.init(&get_frame);
+        try (Request{ .to_eof = .{ .get = GetRequest.blob(da_hash) } }).write(&get_writer, &body);
+        var push_writer = postcard.Writer.init(&push_frame);
+        try (Request{ .length_prefixed = .{ .request = .{ .get = GetRequest.blob(da_hash) } } })
+            .write(&push_writer, &body);
+
+        // Same body, different discriminant and a length in front of it.
+        const get_bytes = get_writer.finish();
+        const push_bytes = push_writer.finish();
+        try testing.expect(!std.mem.eql(u8, get_bytes, push_bytes));
+        try testing.expectEqual(@as(u8, 0), get_bytes[0]);
+        try testing.expectEqual(@as(u8, 8), push_bytes[0]);
+        // The `push` body is the `get` body: the length covers the hash and the
+        // sequence and neither the discriminant nor what follows.
+        try testing.expectEqualSlices(u8, get_bytes[1..], push_bytes[2..]);
+
+        // And the two decode to values that are not equal, because the framing
+        // is part of what a `Request` is.
+        var get_room: Room = .{};
+        var get_storage = get_room.storage();
+        var get_reader = postcard.Reader.init(get_bytes);
+        const decoded_get = try Request.read(&get_reader, &get_storage);
+        try get_reader.finish();
+
+        var push_room: Room = .{};
+        var push_storage = push_room.storage();
+        var push_reader = postcard.Reader.init(push_bytes);
+        const decoded_push = try Request.read(&push_reader, &push_storage);
+        try push_reader.finish();
+
+        // The framings are not interchangeable, so `Request.eql` says no in
+        // both directions — the refusal is symmetric rather than a lookup that
+        // happens to be false one way round.
+        try testing.expect(!decoded_get.eql(decoded_push));
+        try testing.expect(!decoded_push.eql(decoded_get));
+        // The bodies are the same request and the inner values compare equal
+        // by content — `GetRequest.eql` compares the borrowed ranges by value,
+        // which is what makes this true across two different storages.
+        try testing.expect(
+            GetRequest.blob(da_hash).eql(decoded_get.to_eof.get),
+        );
+        try testing.expect(
+            GetRequest.blob(da_hash).eql(decoded_push.length_prefixed.request.get),
+        );
+    }
+
+    // `BaoResponse` has no decode to be a fixed point of, because there is
+    // nothing in its bytes to decode. What it does have is two states, and they
+    // are decided by the length and nothing else: a provider that ended the
+    // stream without writing, and a provider that wrote something. Both are
+    // ordinary values here, so the assertion is that the same bytes always give
+    // the same answer and that only the empty one is EOF.
+    {
+        for ([_][]const u8{ "", "\x00", "\xde\xad", "\x00" ** 64 }) |bytes| {
+            var reader = postcard.Reader.init(bytes);
+            const answer = BaoResponse.read(&reader);
+            try testing.expectEqual(bytes.len == 0, answer.isEof());
+            try testing.expectEqualSlices(u8, bytes, answer.bytes);
+            // Reading it twice gives the same answer, because `read` consumes
+            // nothing: the response is a cursor over what is left.
+            const again = BaoResponse.read(&reader);
+            try testing.expectEqual(answer.isEof(), again.isEof());
+        }
+    }
+}
+
+test "a response's length prefix is read as a varint, at every boundary" {
+    // The `push` body and each observe item are both length-prefixed, and the
+    // prefix is postcard's `varint(u64)`. Its four refusals are four different
+    // rules, and the boundary between them is what a peer is most likely to
+    // land on: a length of exactly `max_message_size`, one over it, and the two
+    // varint failures either side.
+    {
+        // A length one over the cap is `MessageTooLarge`, whatever is behind it.
+        try expectRequestErrorHex("08" ++ "ffffffff01", error.MessageTooLarge);
+        // Exactly the cap, with nothing behind it, is not the cap's refusal: the
+        // frame is inside the cap and simply does not hold what it promised.
+        try expectRequestErrorHex("08" ++ "808040", error.UnexpectedEnd);
+        // A length whose last group carries more value bits than a `u64` has is
+        // a number, not an encoding, so it is `ValueOutOfRange`.
+        try expectRequestErrorHex("08" ++ "ffffffffffffffffff02", error.ValueOutOfRange);
+        // Ten groups with nothing to terminate them cannot be fixed by more
+        // bytes, so it is `BadVarint`.
+        try expectRequestErrorHex("08" ++ "80808080808080808080", error.BadVarint);
+    }
+    // The same rules on an observe item, which is the other length-prefixed
+    // shape in this protocol: the prefix is read the same way.
+    {
+        var room: Room = .{};
+        var storage = room.storage();
+        var scratch: [64]u8 = undefined;
+
+        // A length of one over the cap on an item.
+        const over = try parseHex(&scratch, "ffffffff01");
+        var reader = postcard.Reader.init(over);
+        var run = ObserveResponse.read(&reader, &storage);
+        try testing.expectError(error.MessageTooLarge, run.next());
+
+        // An item whose length names more than the run holds, which is a stream
+        // that stopped *inside* an item rather than between two.
+        const inside = try parseHex(&scratch, "05" ++ "00" ++ "00" ++ "00");
+        var inside_reader = postcard.Reader.init(inside);
+        var inside_run = ObserveResponse.read(&inside_reader, &storage);
+        try testing.expectError(error.UnexpectedEnd, inside_run.next());
+
+        // And a run that ends between items is `null` rather than either error,
+        // which is the distinction the module comment draws.
+        var empty_reader = postcard.Reader.init("");
+        var empty_run = ObserveResponse.read(&empty_reader, &storage);
+        try testing.expect(try empty_run.next() == null);
+    }
+}
+
+test "a reserved slot is a refusal, not a body decoded from the wrong bytes" {
+    // Upstream calls these `Slot2` through `Slot7` and rejects every one rather
+    // than skipping it, so a reserved slot is a request this build will not
+    // serve. What it must not become is a *value*: a decoder that skipped a
+    // reserved discriminant would read the bytes behind it as some other
+    // request, and the peer would get an answer to a question it never asked.
+    inline for (std.enums.values(RequestType)) |arm| {
+        const reserved = @intFromEnum(arm) >= 2 and @intFromEnum(arm) <= 7;
+        if (!reserved) continue;
+
+        // With a well-formed body behind it, so the only thing that could be
+        // read is the discriminant itself.
+        const hex = switch (arm) {
+            .slot2 => "02",
+            .slot3 => "03",
+            .slot4 => "04",
+            .slot5 => "05",
+            .slot6 => "06",
+            .slot7 => "07",
+            else => unreachable,
+        };
+        try expectRequestErrorHex(hex, error.ReservedSlot);
+
+        // And with a whole `get` body behind it, which is the shape a peer would
+        // send if it thought the slot were live.
+        var scratch: [128]u8 = undefined;
+        var reader = postcard.Reader.init(
+            try parseHex(&scratch, hex ++ "00" ++ "da" ** 32 ++ "020001000100"),
+        );
+        var room: Room = .{};
+        var storage = room.storage();
+        try testing.expectError(error.ReservedSlot, Request.read(&reader, &storage));
+
+        // The reserved arm is refused by the EOF framing directly too, on the
+        // tag alone and before a byte of body is read.
+        var direct = postcard.Reader.init(
+            try parseHex(&scratch, "00" ++ "da" ** 32 ++ "020001000100"),
+        );
+        var direct_room: Room = .{};
+        var direct_storage = direct_room.storage();
+        try testing.expectError(
+            error.ReservedSlot,
+            EofFraming.read(arm, &direct, &direct_storage),
+        );
+    }
+}
+
 /// Decode `bytes` as a whole request, and if it decodes assert that it is a
 /// fixed point. Returns whether it decoded.
 fn expectTotalRequest(bytes: []const u8) !usize {

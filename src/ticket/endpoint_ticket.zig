@@ -33,14 +33,14 @@
 //! case, so the only lower casing that can happen is the one over the whole
 //! string, and that is the one the tests pin.
 //!
-//! # Shared scaffolding
+//! # What is shared, and where it lives
 //!
-//! Upstream puts the prefix, the base32 and the error set in the `Ticket`
-//! trait and lets each kind supply only `KIND`, `encode_bytes` and
-//! `decode_bytes`. Zig has no traits, and ozai has no module to put the trait
-//! in, so they live here and `blob_ticket.zig` imports them. That is why this
-//! file, which is otherwise about one ticket kind, also knows how a relay URL
-//! and a socket address are written: those are the fields the two kinds share.
+//! The prefix, the base32 and the error set upstream keeps in the `Ticket`
+//! trait are in `ticket_codec.zig`, together with the postcard encoding of
+//! the address fields both kinds share. Zig has no traits, so the trait's own
+//! half needs a module rather than one kind's module answering for the other;
+//! what is left here is what each kind alone supplies — `KIND`, the field
+//! order, and the two decode entry points.
 //!
 //! # Purity
 //!
@@ -52,408 +52,22 @@
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
+const codec = @import("ticket_codec.zig");
 const key = @import("../base/key.zig");
+const node_addr = @import("../base/node_addr.zig");
 const postcard = @import("../wire/postcard.zig");
+const relay_url = @import("../base/relay_url.zig");
+const transport_addr = @import("../base/transport_addr.zig");
 
 const Allocator = std.mem.Allocator;
-
-pub const NodeId = key.NodeId;
-pub const NodeAddr = addr.NodeAddr;
-pub const TransportAddr = addr.TransportAddr;
-pub const SocketAddr = addr.SocketAddr;
-pub const RelayUrl = addr.RelayUrl;
-pub const CustomAddr = addr.CustomAddr;
-
-// -- The text form -----------------------------------------------------------
-
-/// RFC 4648 base32, the alphabet `data_encoding::BASE32_NOPAD` emits.
-///
-/// Upper case, and *not* either of the alphabets in `base/base32.zig`: those
-/// are sized at comptime, which a node id wants and a ticket cannot use, since
-/// the body of a ticket is however many bytes the address list made it. This
-/// is the same bit packer with the length as a value.
-pub const rfc4648 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-
-/// Everything the canonical text form refuses.
-///
-/// Named per rule rather than per symptom, the way `postcard.Error` is. A
-/// caller needs to tell "this is not one of mine" from "this is one of mine
-/// and I could not read the body", because those are different things to say
-/// to a person who pasted the wrong string.
-pub const TextError = error{
-    /// The text does not begin with this kind's prefix. Upstream
-    /// `ParseError::Kind`, and the one case where a ticket is simply not a
-    /// ticket of this kind rather than a damaged one.
-    UnknownKind,
-    /// The base32 body is a symbol count no encoder produces: the text is
-    /// complete, it just does not name a whole number of bytes. Upstream
-    /// `data_encoding::DecodeKind::Length`, and deliberately not
-    /// `UnexpectedEnd` — the input is not short.
-    BadBase32Length,
-    /// A byte in the body is not in the alphabet. Upstream
-    /// `DecodeKind::Symbol`.
-    BadBase32Symbol,
-    /// The last symbol carried value below the byte boundary. `data-encoding`
-    /// checks trailing bits, so an iroh peer rejects this too, and an encoder
-    /// that emits it would be giving one ticket two spellings.
-    NonZeroBase32Padding,
-    /// The caller's buffer cannot hold what was asked for. `postcard.Writer`
-    /// reports the same thing for the same reason, so the two are one word.
-    BufferFull,
-};
-
-/// Everything a ticket body refuses, over and above `postcard.Error`.
-pub const BodyError = error{
-    /// The 32 bytes where an endpoint id belongs are not a canonical ed25519
-    /// point. Upstream puts this in `ParseError::Verify`.
-    NotANodeId,
-    /// A relay URL the address layer will not accept. Upstream hands the same
-    /// text to `url::Url::parse`, which is more permissive; see the
-    /// divergence in the module report.
-    BadRelayUrl,
-    /// A custom transport payload longer than `addr.max_inline_length`.
-    /// ozai's `CustomAddr` is a fixed 30-byte inline value and upstream's is
-    /// inline-or-heap with no limit, so a ticket naming a longer one is a
-    /// ticket this build cannot represent.
-    CustomAddrTooLong,
-    /// The wire discriminant names a ticket layout this build has no arm for.
-    /// Upstream `ParseError::Verify`; postcard's own `UnknownVariant` covers
-    /// the same ground for a field that is not the ticket discriminator.
-    UnknownTicketVariant,
-};
-
-/// Everything a ticket can refuse, from the text in to the value out.
-pub const DecodeError = TextError || BodyError || postcard.Error || Allocator.Error;
-
-/// Symbols in the base32 of `byte_length` bytes. Neither base32 pads.
-pub fn base32Length(byte_length: usize) usize {
-    return (byte_length * 8 + 4) / 5;
-}
-
-/// Bytes in the base32 of `symbol_count` symbols, floored: the last symbol
-/// carries bits below the byte boundary, and `decodeBase32` is what decides
-/// whether they are zero.
-pub fn byteLength(symbol_count: usize) usize {
-    return @divFloor(symbol_count * 5, 8);
-}
-
-/// Length of the text form of a `byte_length`-byte body. The size a caller
-/// has to hand `encodeText`.
-pub fn textLength(comptime kind: []const u8, byte_length: usize) usize {
-    return kind.len + base32Length(byte_length);
-}
-
-/// The base32 body of a ticket of kind `kind`, or the reason `text` is not
-/// one.
-///
-/// Nothing is decoded here. This is the only step that can fail on the prefix,
-/// and it is separate so that sizing a decode buffer does not mean trusting a
-/// prefix that has not been checked.
-pub fn splitBody(comptime kind: []const u8, text: []const u8) TextError![]const u8 {
-    if (!std.mem.startsWith(u8, text, kind)) return error.UnknownKind;
-    return text[kind.len..];
-}
-
-/// `kind` followed by unpadded RFC 4648 base32 of `body`, with the whole
-/// string lower cased **after** the two are concatenated.
-///
-/// The prefix is required to be lower case already, at compile time. That is
-/// what makes the single lower casing pass unambiguous: there is nothing else
-/// in the function that could have lower cased anything, so the body comes
-/// out lower case because the concatenation happened first, and a ticket that
-/// came out with an upper case body was built in the other order.
-///
-/// The text returned is the prefix of `out` that was filled and not a copy of
-/// it, so `out` must stay alive and unwritten for as long as the string is
-/// read, and a later write through `out` invalidates it. An `out` shorter than
-/// `textLength(kind, body.len)` is `error.BufferFull` and writes nothing,
-/// because the length is checked before the first byte is copied.
-pub fn encodeText(
-    comptime kind: []const u8,
-    body: []const u8,
-    out: []u8,
-) TextError![]const u8 {
-    comptime for (kind) |c| {
-        if (!std.ascii.isLower(c)) {
-            @compileError("a ticket kind prefix is lower case ascii");
-        }
-    };
-    const need = textLength(kind, body.len);
-    if (out.len < need) return error.BufferFull;
-    @memcpy(out[0..kind.len], kind);
-    encodeBase32(body, out[kind.len..need]);
-    // Over the whole string, and after the concatenation above. base32 emits
-    // upper case; this is the only step that makes it lower.
-    for (out[0..need]) |*c| c.* = std.ascii.toLower(c.*);
-    return out[0..need];
-}
-
-/// The postcard bytes a ticket's text form names, into `out`.
-///
-/// `out` may be longer than the answer; the returned slice is the prefix that
-/// was filled. This is `splitBody` then `decodeBase32`, and it exists so a
-/// caller that already sized a buffer does not have to allocate one.
-pub fn decodeText(
-    comptime kind: []const u8,
-    text: []const u8,
-    out: []u8,
-) TextError![]const u8 {
-    const symbols = try splitBody(kind, text);
-    const length = byteLength(symbols.len);
-    if (out.len < length) return error.BufferFull;
-    try decodeBase32(symbols, out[0..length]);
-    return out[0..length];
-}
-
-/// Unpadded RFC 4648 base32 of `body` into `out`, which must be
-/// `base32Length(body.len)` long.
-///
-/// The same loop `base/base32.zig` runs, with the length as a value instead of
-/// a type parameter.
-pub fn encodeBase32(body: []const u8, out: []u8) void {
-    std.debug.assert(out.len == base32Length(body.len));
-    var accumulator: u32 = 0;
-    var bits: u4 = 0;
-    var index: usize = 0;
-
-    for (body) |byte| {
-        accumulator = (accumulator << 8) | byte;
-        bits += 8;
-        while (bits >= 5) {
-            bits -= 5;
-            out[index] = rfc4648[@intCast((accumulator >> bits) & 0x1f)];
-            index += 1;
-        }
-        accumulator &= (@as(u32, 1) << bits) - 1;
-    }
-    // Fewer than five bits are left, and they are left aligned with zero
-    // below. `decodeBase32` rejects a non-zero pad, which is what keeps one
-    // ticket from having two spellings.
-    if (bits > 0) {
-        out[index] = rfc4648[@intCast((accumulator << @intCast(5 - bits)) & 0x1f)];
-        index += 1;
-    }
-    std.debug.assert(index == out.len);
-}
-
-/// Unpadded RFC 4648 base32 of `symbols` into `out`, which must be
-/// `byteLength(symbols.len)` long.
-///
-/// Either case decodes. `data_encoding` is upper case only, and upstream
-/// upper-cases the body before handing it over
-/// (`data_encoding::BASE32_NOPAD.decode(rest.to_ascii_uppercase()…)`), so
-/// every ticket upstream accepts is one this accepts, and the lower case
-/// spelling our own encoder emits is the same value.
-pub fn decodeBase32(symbols: []const u8, out: []u8) TextError!void {
-    const length = byteLength(symbols.len);
-    if (out.len < length) return error.BufferFull;
-    // A symbol count no encoder produces. Not `BufferFull`: the text is whole
-    // and names a byte count the alphabet cannot spell.
-    if (base32Length(length) != symbols.len) return error.BadBase32Length;
-    const bytes = out[0..length];
-
-    var accumulator: u32 = 0;
-    var bits: u4 = 0;
-    var index: usize = 0;
-
-    for (symbols) |c| {
-        const symbol = symbolOf(c) orelse return error.BadBase32Symbol;
-        accumulator = (accumulator << 5) | symbol;
-        bits += 5;
-        if (bits >= 8) {
-            bits -= 8;
-            bytes[index] = @truncate(accumulator >> bits);
-            index += 1;
-        }
-        accumulator &= (@as(u32, 1) << bits) - 1;
-    }
-
-    std.debug.assert(bits < 8);
-    if (bits > 0 and accumulator != 0) return error.NonZeroBase32Padding;
-    std.debug.assert(index == bytes.len);
-}
-
-fn symbolOf(c: u8) ?u5 {
-    // Folded to the alphabet's own case rather than the alphabet folded to
-    // the input's: `rfc4648` is the table, so folding it would be a 32-entry
-    // fold to do once instead of once per symbol.
-    const upper = std.ascii.toUpper(c);
-    inline for (rfc4648, 0..) |symbol, i| {
-        if (upper == symbol) return @intCast(i);
-    }
-    return null;
-}
-
-// -- The fields both kinds share ---------------------------------------------
-
-/// The longest text `RelayUrl.format` can produce: the longest scheme, an RFC
-/// 1035 host at its limit, the longest port, and the trailing slash
-/// invariant 4 requires.
-pub const relay_url_text_max = "https://".len + addr.RelayUrl.max_host_length + ":65535".len + 1;
+const CustomAddr = addr.CustomAddr;
+const NodeAddr = node_addr.NodeAddr;
+const NodeId = key.NodeId;
+const RelayUrl = relay_url.RelayUrl;
+const SocketAddr = addr.SocketAddr;
+const TransportAddr = transport_addr.TransportAddr;
 
 const WireVariant = enum(u32) { variant1 = 0 };
-
-const TransportTag = enum(u32) { relay = 0, ip = 1, custom = 2 };
-
-/// postcard's `SocketAddr`: an externally tagged family, the address, the
-/// port. `std::net::SocketAddr` serialises the two fields of a struct and
-/// postcard writes a struct as its fields, so the family byte is the only
-/// tag there is.
-const IpFamily = enum(u32) { v4 = 0, v6 = 1 };
-
-/// A node id, inline: 32 raw bytes and no length prefix.
-///
-/// `PublicKey::serialize` sends `self.0.as_bytes().serialize(…)` when the
-/// serializer is not human readable, and postcard is not, and a `[u8; 32]`
-/// is a tuple of 32 `u8`s. The `00` in front of the 32 bytes in upstream's own
-/// vector is the ticket variant, not a length.
-pub fn writeNodeId(writer: *postcard.Writer, id: NodeId) postcard.Error!void {
-    try writer.writeArray(key.NodeId.byte_length, &id.toBytes());
-}
-
-/// 32 raw bytes as a `NodeId`. The bytes are checked, so a well-formed
-/// encoding of a non-point is `error.NotANodeId` rather than a value.
-pub fn readNodeId(reader: *postcard.Reader) (postcard.Error || BodyError)!NodeId {
-    const bytes = try reader.readArray(key.NodeId.byte_length);
-    return NodeId.fromBytes(bytes) catch error.NotANodeId;
-}
-
-/// A relay URL, as its canonical text: a length prefix and the bytes.
-///
-/// Invariant 4 is why this is a rendering and not a structured value. The URL
-/// goes on the wire as the text a human would write, trailing slash and all,
-/// and a different spelling is a different relay to a peer.
-pub fn writeRelayUrl(writer: *postcard.Writer, url: RelayUrl) postcard.Error!void {
-    var scratch: [relay_url_text_max]u8 = undefined;
-    var out = std.Io.Writer.fixed(&scratch);
-    // Unreachable for any `RelayUrl.parse` accepted: every term of
-    // `relay_url_text_max` is a field bound and `format` writes one of each.
-    url.format(&out) catch return error.BufferFull;
-    try writer.writeBytes(scratch[0..out.end]);
-}
-
-/// A relay URL from its length-prefixed text. The text is validated UTF-8 by
-/// `readStr` and then by `RelayUrl.parse`, so both a malformed encoding and a
-/// URL this build will not accept are refused — the latter as
-/// `error.BadRelayUrl`.
-pub fn readRelayUrl(reader: *postcard.Reader) (postcard.Error || BodyError)!RelayUrl {
-    const text = try reader.readStr();
-    return RelayUrl.parse(text) catch error.BadRelayUrl;
-}
-
-/// A socket address: the family as a `varint(u32)`, then the address bytes and
-/// the port. An exhaustive family enum, so a family byte this build has no arm
-/// for is `error.UnknownVariant`.
-pub fn writeSocketAddr(writer: *postcard.Writer, value: SocketAddr) postcard.Error!void {
-    switch (value.ip) {
-        .v4 => |octets| {
-            try writer.writeVariant(IpFamily.v4);
-            try writer.writeArray(octets.len, &octets);
-        },
-        .v6 => |octets| {
-            try writer.writeVariant(IpFamily.v6);
-            try writer.writeArray(octets.len, &octets);
-        },
-    }
-    try writer.writeU16(value.port);
-}
-
-/// A socket address read back. The value owns its bytes and borrows nothing;
-/// the reader is left on the first byte after the port.
-pub fn readSocketAddr(reader: *postcard.Reader) postcard.Error!SocketAddr {
-    const family = try reader.readVariant(IpFamily);
-    return .{
-        .ip = switch (family) {
-            .v4 => .{ .v4 = try reader.readArray(4) },
-            .v6 => .{ .v6 = try reader.readArray(16) },
-        },
-        .port = try reader.readU16(),
-    };
-}
-
-fn writeTransportAddr(writer: *postcard.Writer, one: TransportAddr) postcard.Error!void {
-    switch (one) {
-        .relay => |url| {
-            try writer.writeVariant(TransportTag.relay);
-            try writeRelayUrl(writer, url);
-        },
-        .ip => |socket| {
-            try writer.writeVariant(TransportTag.ip);
-            try writeSocketAddr(writer, socket);
-        },
-        .custom => |custom| {
-            try writer.writeVariant(TransportTag.custom);
-            try writer.writeU64(custom.id);
-            try writer.writeBytes(custom.data);
-        },
-    }
-}
-
-/// One address off the wire, with a custom payload still borrowing the
-/// reader's input. `decodeBytes` copies the payload after the list is
-/// canonical, so a value this returns is only meaningful while `bytes`
-/// is alive.
-fn readTransportAddr(reader: *postcard.Reader) (postcard.Error || BodyError)!TransportAddr {
-    return switch (try reader.readVariant(TransportTag)) {
-        .relay => .{ .relay = try readRelayUrl(reader) },
-        .ip => .{ .ip = try readSocketAddr(reader) },
-        .custom => try readCustomAddr(reader),
-    };
-}
-
-fn readCustomAddr(reader: *postcard.Reader) (postcard.Error || BodyError)!TransportAddr {
-    const id = try reader.readU64();
-    const data = try reader.readBytes();
-    if (data.len > addr.max_inline_length) return error.CustomAddrTooLong;
-    return .{ .custom = .{ .id = id, .data = data } };
-}
-
-fn maxTransportAddrLength(one: TransportAddr) usize {
-    return switch (one) {
-        .relay => 1 + postcard.varintMax(u64) * 2 + relay_url_text_max,
-        .ip => 1 + 1 + 16 + postcard.varintMax(u16),
-        .custom => |custom| 1 + postcard.varintMax(u64) * 2 + custom.data.len,
-    };
-}
-
-/// Sort an address list into `TransportAddr.order` and drop duplicates.
-/// Returns the surviving prefix, which is shorter than the input exactly when
-/// the input held a duplicate.
-///
-/// postcard reads a `BTreeSet` by inserting, so upstream's own decoder
-/// collapses duplicates and imposes the set's order on whatever order the
-/// bytes arrived in. Appending would do neither, and a `NodeAddr` whose list
-/// is neither sorted nor unique breaks invariant 2 — which is what makes a
-/// ticket an identifier rather than a fresh value on every send, and what
-/// makes the bytes a function of the value rather than of the encoding.
-///
-/// Every ticket upstream writes is already in this order, so in practice this
-/// is one comparison pass; the sort is what makes the guarantee hold for a
-/// peer that sends the same address twice, or out of order.
-///
-/// Nothing is allocated and nothing is freed: a duplicate is dropped as a
-/// value, so a caller whose list holds *owned* custom payloads must free the
-/// dropped one itself, and a caller whose payloads are borrows must not. Both
-/// decoders here sidestep the question by collapsing duplicates while the
-/// payloads still borrow the frame; see `EndpointTicket.decodeBytes`.
-pub fn canonicalizeAddrs(addrs: []TransportAddr) []TransportAddr {
-    var out = addrs;
-    std.mem.sort(TransportAddr, out, {}, lessTransportAddr);
-    var kept: usize = 0;
-    // Writes land at or behind the read cursor, so nothing is overwritten
-    // before it is read.
-    for (out) |one| {
-        if (kept != 0 and out[kept - 1].order(one) == .eq) continue;
-        out[kept] = one;
-        kept += 1;
-    }
-    out.len = kept;
-    return out;
-}
-
-fn lessTransportAddr(_: void, a: TransportAddr, b: TransportAddr) bool {
-    return a.order(b) == .lt;
-}
 
 // -- The endpoint ticket -----------------------------------------------------
 
@@ -506,9 +120,9 @@ pub const EndpointTicket = struct {
     pub fn encode(self: EndpointTicket, out: []u8) postcard.Error![]const u8 {
         var writer = postcard.Writer.init(out);
         try writer.writeVariant(WireVariant.variant1);
-        try writeNodeId(&writer, self.addr.node_id);
+        try codec.writeNodeId(&writer, self.addr.node_id);
         try writer.writeLen(self.addr.addrs.len);
-        for (self.addr.addrs) |one| try writeTransportAddr(&writer, one);
+        for (self.addr.addrs) |one| try codec.writeTransportAddr(&writer, one);
         return writer.finish();
     }
 
@@ -516,7 +130,7 @@ pub const EndpointTicket = struct {
     /// the length without producing them.
     pub fn maxEncodedLength(self: EndpointTicket) usize {
         var total: usize = 1 + key.NodeId.byte_length + postcard.varintMax(u64);
-        for (self.addr.addrs) |one| total += maxTransportAddrLength(one);
+        for (self.addr.addrs) |one| total += codec.maxTransportAddrLength(one);
         return total;
     }
 
@@ -531,9 +145,9 @@ pub const EndpointTicket = struct {
         self: EndpointTicket,
         body: []const u8,
         out: []u8,
-    ) TextError![]const u8 {
+    ) codec.TextError![]const u8 {
         _ = self;
-        return encodeText(kind, body, out);
+        return codec.encodeText(kind, body, out);
     }
 
     /// postcard bytes to a ticket.
@@ -548,7 +162,7 @@ pub const EndpointTicket = struct {
     /// body, a `TransportAddr` this build refuses, or an allocation that
     /// fails part way through the copies — frees the payloads copied so far
     /// and the list, and returns nothing.
-    pub fn decodeBytes(alloc: Allocator, bytes: []const u8) DecodeError!Decoded {
+    pub fn decodeBytes(alloc: Allocator, bytes: []const u8) codec.DecodeError!Decoded {
         var reader = postcard.Reader.init(bytes);
         // The ticket discriminant is read as a number rather than through
         // `readVariant`, because a wrong one is not an unknown enum arm: it is
@@ -559,7 +173,7 @@ pub const EndpointTicket = struct {
             return error.UnknownTicketVariant;
         }
 
-        const id = try readNodeId(&reader);
+        const id = try codec.readNodeId(&reader);
         // `readLen` has already refused a count the remaining bytes cannot
         // satisfy, and a `TransportAddr` is at least one byte, so the loop
         // below is bounded by the size of the input.
@@ -570,12 +184,12 @@ pub const EndpointTicket = struct {
         // another before either is copied.
         var addrs: std.ArrayList(TransportAddr) = .empty;
         errdefer addrs.deinit(alloc);
-        for (0..count) |_| try addrs.append(alloc, try readTransportAddr(&reader));
+        for (0..count) |_| try addrs.append(alloc, try codec.readTransportAddr(&reader));
         try reader.finish();
         // The wire order is upstream's `BTreeSet` order, which a peer is free
         // to ignore, and the set collapses a repeated address on the way in.
-        // Both happen here; see `canonicalizeAddrs`.
-        addrs.items = canonicalizeAddrs(addrs.items);
+        // Both happen here; see `ticket_codec.canonicalizeAddrs`.
+        addrs.items = codec.canonicalizeAddrs(addrs.items);
 
         // The list is final, so the copies are the ones that survive. A
         // payload freed below is one this call allocated and nothing else
@@ -601,11 +215,11 @@ pub const EndpointTicket = struct {
 
     /// A ticket's text form to a ticket. The base32 body is decoded through a
     /// fresh allocation, because its length is whatever the text said it was.
-    pub fn decodeString(alloc: Allocator, text: []const u8) DecodeError!Decoded {
-        const symbols = try splitBody(kind, text);
-        const raw = try alloc.alloc(u8, byteLength(symbols.len));
+    pub fn decodeString(alloc: Allocator, text: []const u8) codec.DecodeError!Decoded {
+        const symbols = try codec.splitBody(kind, text);
+        const raw = try alloc.alloc(u8, codec.byteLength(symbols.len));
         defer alloc.free(raw);
-        try decodeBase32(symbols, raw);
+        try codec.decodeBase32(symbols, raw);
         return decodeBytes(alloc, raw);
     }
 };
@@ -758,7 +372,7 @@ test "the text form is a fixed point" {
     const again = try twice.ticket.encodeString(try twice.ticket.encode(&body), &second);
 
     try t.expectEqualStrings(once, again);
-    try t.expectEqual(textLength(EndpointTicket.kind, bytes.len), once.len);
+    try t.expectEqual(codec.textLength(EndpointTicket.kind, bytes.len), once.len);
 }
 
 test "the lower casing happens after the prefix, not before it" {
@@ -772,9 +386,6 @@ test "the lower casing happens after the prefix, not before it" {
     var text: [128]u8 = undefined;
     const written = try ticket.encodeString(bytes, &text);
 
-    // base32 is upper case, and it is what lands in the buffer first. The
-    // digits are in neither case, so the claim is about the letters.
-    for (rfc4648) |c| try t.expect(!std.ascii.isLower(c));
     // The prefix is byte-identical to the kind and is in front.
     try t.expectEqualStrings(EndpointTicket.kind, written[0..EndpointTicket.kind.len]);
     // Nothing in the result is upper case, so the lower casing covered the
@@ -855,8 +466,8 @@ test "bytes below the boundary are refused" {
     var buffer: [128]u8 = undefined;
     const body = bytes[0..59];
     @memcpy(buffer[0..EndpointTicket.kind.len], EndpointTicket.kind);
-    const symbols = buffer[EndpointTicket.kind.len..][0..base32Length(body.len)];
-    encodeBase32(body, symbols);
+    const symbols = buffer[EndpointTicket.kind.len..][0..codec.base32Length(body.len)];
+    codec.encodeBase32(body, symbols);
     const text = buffer[0 .. EndpointTicket.kind.len + symbols.len];
     try t.expectEqual(@as(usize, 95), symbols.len);
 
@@ -917,6 +528,143 @@ test "a wire variant this build has no arm for is refused" {
     try t.expectError(error.UnknownTicketVariant, EndpointTicket.decodeBytes(alloc, &body));
 }
 
+/// `codec.TransportTag` with two discriminants this build writes no arm for:
+/// the one immediately past the last arm, and one that needs two varint bytes.
+/// `postcard.Writer.writeVariant` takes an enum rather than a number, so a
+/// byte no declared arm names can only be produced by declaring the arm — the
+/// wire has no such bound, which is the whole reason the decoder needs one.
+const UnwrittenTransportTag = enum(u32) { relay = 0, ip = 1, custom = 2, next = 3, far = 128 };
+
+/// The socket address's family, widened the same way. It is not the codec's
+/// own enum: that one is private, because writing a family goes through
+/// `writeSocketAddr`, and a test that has to name a discriminant no arm
+/// covers needs an enum with that arm declared.
+const UnwrittenIpFamily = enum(u32) { v4 = 0, v6 = 1, next = 2, far = 128 };
+
+/// An endpoint ticket body naming one address under `tag`, with the rest of
+/// that address written only for the tags this build has arms for. The two
+/// unwritten tags therefore name a discriminant with nothing behind it, and
+/// what a decode says about them cannot be a report of running out of bytes.
+fn taggedAddrBody(tag: UnwrittenTransportTag) !struct { body: [128]u8, len: usize } {
+    const socket: SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1024 };
+    var body: [128]u8 = undefined;
+    var writer = postcard.Writer.init(&body);
+    try writer.writeVariant(WireVariant.variant1);
+    try codec.writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
+    try writer.writeLen(1);
+    try writer.writeVariant(tag);
+    switch (tag) {
+        .relay => try codec.writeRelayUrl(&writer, try RelayUrl.parse("https://r.example./")),
+        .ip => try codec.writeSocketAddr(&writer, socket),
+        .custom => {
+            try writer.writeU64(0x2a);
+            try writer.writeBytes(&[_]u8{ 0xab, 0xab });
+        },
+        .next, .far => {},
+    }
+    return .{ .body = body, .len = writer.finish().len };
+}
+
+/// An endpoint ticket body naming one socket address whose family
+/// discriminant is `family`, with the address bytes written only for the two
+/// families this build has arms for.
+fn socketAddrBody(family: UnwrittenIpFamily) !struct { body: [128]u8, len: usize } {
+    const v4_octets: [4]u8 = .{ 127, 0, 0, 1 };
+    const v6_octets: [16]u8 = [_]u8{ 0x20, 0x01 } ** 8;
+    var body: [128]u8 = undefined;
+    var writer = postcard.Writer.init(&body);
+    try writer.writeVariant(WireVariant.variant1);
+    try codec.writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
+    try writer.writeLen(1);
+    try writer.writeVariant(codec.TransportTag.ip);
+    try writer.writeVariant(family);
+    switch (family) {
+        .v4 => try writer.writeArray(4, &v4_octets),
+        .v6 => try writer.writeArray(16, &v6_octets),
+        .next, .far => {},
+    }
+    try writer.writeU16(1024);
+    return .{ .body = body, .len = writer.finish().len };
+}
+
+test "every transport tag decodes to its own address, and every other one is refused by name" {
+    const alloc = t.allocator;
+
+    // The three tags `codec.TransportTag` names, each read back through a real
+    // ticket decode and compared against the value it was written from.
+    const relay = try taggedAddrBody(.relay);
+    const from_relay = try EndpointTicket.decodeBytes(alloc, relay.body[0..relay.len]);
+    defer from_relay.deinit(alloc);
+    try t.expectEqual(@as(usize, 1), from_relay.ticket.addr.addrs.len);
+    try t.expectEqual(TransportAddr.relay, std.meta.activeTag(from_relay.ticket.addr.addrs[0]));
+    try t.expectEqualStrings("r.example.", from_relay.ticket.addr.addrs[0].relay.hostSlice());
+
+    const ip = try taggedAddrBody(.ip);
+    const from_ip = try EndpointTicket.decodeBytes(alloc, ip.body[0..ip.len]);
+    defer from_ip.deinit(alloc);
+    try t.expectEqual(@as(usize, 1), from_ip.ticket.addr.addrs.len);
+    try t.expectEqual(TransportAddr.ip, std.meta.activeTag(from_ip.ticket.addr.addrs[0]));
+    try t.expectEqual(@as(u16, 1024), from_ip.ticket.addr.addrs[0].ip.port);
+
+    const custom = try taggedAddrBody(.custom);
+    const from_custom = try EndpointTicket.decodeBytes(alloc, custom.body[0..custom.len]);
+    defer from_custom.deinit(alloc);
+    try t.expectEqual(@as(usize, 1), from_custom.ticket.addr.addrs.len);
+    try t.expectEqual(TransportAddr.custom, std.meta.activeTag(from_custom.ticket.addr.addrs[0]));
+    try t.expectEqual(@as(u64, 0x2a), from_custom.ticket.addr.addrs[0].custom.id);
+    try t.expectEqualSlices(u8, &[_]u8{ 0xab, 0xab }, from_custom.ticket.addr.addrs[0].custom.data);
+
+    // `next` is the first discriminant past the last arm and `far` is two
+    // varint bytes wide, so between them they cover the whole of what a peer
+    // may legally name. Both are refused at the discriminant, before the
+    // decoder knows how long the address is, which is the boundary a
+    // truncation test cannot see.
+    for ([_]UnwrittenTransportTag{ .next, .far }) |tag| {
+        const refused = try taggedAddrBody(tag);
+        try t.expectError(
+            error.UnknownVariant,
+            EndpointTicket.decodeBytes(alloc, refused.body[0..refused.len]),
+        );
+    }
+}
+
+test "every ip family decodes to its own address bytes, and every other one is refused by name" {
+    const alloc = t.allocator;
+    const v4_octets: [4]u8 = .{ 127, 0, 0, 1 };
+    const v6_octets: [16]u8 = [_]u8{ 0x20, 0x01 } ** 8;
+
+    const v4 = try socketAddrBody(.v4);
+    const from_v4 = try EndpointTicket.decodeBytes(alloc, v4.body[0..v4.len]);
+    defer from_v4.deinit(alloc);
+    try t.expectEqual(@as(usize, 1), from_v4.ticket.addr.addrs.len);
+    try t.expectEqual(@as(u16, 1024), from_v4.ticket.addr.addrs[0].ip.port);
+    switch (from_v4.ticket.addr.addrs[0].ip.ip) {
+        .v4 => |octets| try t.expectEqualSlices(u8, &v4_octets, &octets),
+        .v6 => return error.TestUnexpectedResult,
+    }
+
+    const v6 = try socketAddrBody(.v6);
+    const from_v6 = try EndpointTicket.decodeBytes(alloc, v6.body[0..v6.len]);
+    defer from_v6.deinit(alloc);
+    try t.expectEqual(@as(usize, 1), from_v6.ticket.addr.addrs.len);
+    try t.expectEqual(@as(u16, 1024), from_v6.ticket.addr.addrs[0].ip.port);
+    switch (from_v6.ticket.addr.addrs[0].ip.ip) {
+        .v6 => |octets| try t.expectEqualSlices(u8, &v6_octets, &octets),
+        .v4 => return error.TestUnexpectedResult,
+    }
+
+    // Same boundary as the transport tag: the family is an exhaustive enum, so
+    // the discriminant past `v6` is refused rather than read as a length that
+    // happens to be short.
+    for ([_]UnwrittenIpFamily{ .next, .far }) |family| {
+        const refused = try socketAddrBody(family);
+        try t.expectError(
+            error.UnknownVariant,
+            EndpointTicket.decodeBytes(alloc, refused.body[0..refused.len]),
+        );
+    }
+}
+
 test "an address list longer than the body is refused" {
     const alloc = t.allocator;
     var body: [golden_hex.len / 2]u8 = undefined;
@@ -970,9 +718,9 @@ test "a custom payload longer than a CustomAddr holds is refused" {
     var body: [128]u8 = undefined;
     var writer = postcard.Writer.init(&body);
     try writer.writeVariant(WireVariant.variant1);
-    try writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
+    try codec.writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
     try writer.writeLen(1);
-    try writer.writeVariant(TransportTag.custom);
+    try writer.writeVariant(codec.TransportTag.custom);
     try writer.writeU64(1);
     try writer.writeBytes(&[_]u8{0xaa} ** (addr.max_inline_length + 1));
 
@@ -984,9 +732,9 @@ test "a relay url the address layer will not take is refused" {
     var body: [128]u8 = undefined;
     var writer = postcard.Writer.init(&body);
     try writer.writeVariant(WireVariant.variant1);
-    try writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
+    try codec.writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
     try writer.writeLen(1);
-    try writer.writeVariant(TransportTag.relay);
+    try writer.writeVariant(codec.TransportTag.relay);
     try writer.writeStr("not a url");
 
     try t.expectError(error.BadRelayUrl, EndpointTicket.decodeBytes(alloc, writer.finish()));
@@ -1048,14 +796,14 @@ test "a decoded address list is sorted and duplicate-free whatever order it arri
     var body: [128]u8 = undefined;
     var writer = postcard.Writer.init(&body);
     try writer.writeVariant(WireVariant.variant1);
-    try writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
+    try codec.writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
     try writer.writeLen(4);
     const ip: SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1024 };
     const relay: RelayUrl = try RelayUrl.parse("http://derp.me./");
-    try writeTransportAddr(&writer, .{ .ip = ip });
-    try writeTransportAddr(&writer, .{ .relay = relay });
-    try writeTransportAddr(&writer, .{ .relay = relay });
-    try writeTransportAddr(&writer, .{ .ip = ip });
+    try codec.writeTransportAddr(&writer, .{ .ip = ip });
+    try codec.writeTransportAddr(&writer, .{ .relay = relay });
+    try codec.writeTransportAddr(&writer, .{ .relay = relay });
+    try codec.writeTransportAddr(&writer, .{ .ip = ip });
 
     const decoded = try EndpointTicket.decodeBytes(alloc, writer.finish());
     defer decoded.deinit(alloc);
@@ -1074,10 +822,10 @@ fn duplicateCustomBody(copies: usize) !struct { body: [256]u8, len: usize } {
     var body: [256]u8 = undefined;
     var writer = postcard.Writer.init(&body);
     try writer.writeVariant(WireVariant.variant1);
-    try writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
+    try codec.writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
     try writer.writeLen(copies);
     for (0..copies) |_| {
-        try writeTransportAddr(&writer, .{ .custom = .{ .id = 42, .data = "duplicate" } });
+        try codec.writeTransportAddr(&writer, .{ .custom = .{ .id = 42, .data = "duplicate" } });
     }
     return .{ .body = body, .len = writer.finish().len };
 }
@@ -1125,15 +873,8 @@ test "a malformed body copies nothing, and every allocation index frees what it 
     // Three distinct custom addresses, so a successful decode holds three
     // payload copies and a failure part way through the copies has something
     // to hand back.
-    var body: [256]u8 = undefined;
-    var writer = postcard.Writer.init(&body);
-    try writer.writeVariant(WireVariant.variant1);
-    try writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
-    try writer.writeLen(3);
-    try writeTransportAddr(&writer, .{ .custom = .{ .id = 1, .data = "first" } });
-    try writeTransportAddr(&writer, .{ .custom = .{ .id = 2, .data = "second" } });
-    try writeTransportAddr(&writer, .{ .custom = .{ .id = 3, .data = "third" } });
-    const whole = writer.finish();
+    const made = try threeCustomBody();
+    const whole = made.body[0..made.len];
 
     // Truncated inside the third address. The payload copies come after the
     // whole body is read, so this fails having allocated only the address
@@ -1147,5 +888,98 @@ test "a malformed body copies nothing, and every allocation index frees what it 
     // And a body that would otherwise succeed, at every allocation index: the
     // copies are the last thing a decode does, so these are the indices where
     // one, two or three payloads have already been taken.
-    try t.checkAllAllocationFailures(alloc, decodeAccounting, .{whole});
+    try t.checkAllAllocationFailures(alloc, threePayloadsAccounting, .{whole});
+}
+
+/// An endpoint ticket body whose address list is three distinct custom
+/// transports, so a decode that succeeds holds three payload copies and a
+/// refusal part way through the copies has something to hand back. The same
+/// shape as `duplicateCustomBody`, with the ids differing so no two entries
+/// are duplicates.
+fn threeCustomBody() !struct { body: [256]u8, len: usize } {
+    var body: [256]u8 = undefined;
+    var writer = postcard.Writer.init(&body);
+    try writer.writeVariant(WireVariant.variant1);
+    try codec.writeNodeId(&writer, try NodeId.parseHex(golden_id_hex));
+    try writer.writeLen(3);
+    try codec.writeTransportAddr(&writer, .{ .custom = .{ .id = 1, .data = "first" } });
+    try codec.writeTransportAddr(&writer, .{ .custom = .{ .id = 2, .data = "second" } });
+    try codec.writeTransportAddr(&writer, .{ .custom = .{ .id = 3, .data = "third" } });
+    return .{ .body = body, .len = writer.finish().len };
+}
+
+/// Whether `pointer` names a byte inside `region`. A payload a decode copied
+/// is its own allocation, so one pointing into the frame it was read out of
+/// is a borrow a `Decoded` would later hand back as an owned copy.
+fn insideRegion(region: []const u8, pointer: anytype) bool {
+    const at = @intFromPtr(pointer);
+    const low = @intFromPtr(region.ptr);
+    return at >= low and at < low + region.len;
+}
+
+/// The ticket a decode of `threeCustomBody` owes its caller: the captured id,
+/// three custom entries in id order, each payload equal to the bytes the body
+/// named and copied out of the frame rather than borrowed from it.
+///
+/// This is the half of the sweep a balance cannot do. A decode that handed
+/// back fewer payload copies, borrowed them, or reordered them still balances
+/// its books exactly the same way, and this is what tells those three apart.
+fn expectThreeCustomPayloads(decoded: *const Decoded, frame: []const u8) !void {
+    try t.expectEqualStrings(golden_id_hex, decoded.ticket.addr.node_id.toHex()[0..]);
+    try t.expectEqual(@as(usize, 3), decoded.ticket.addr.addrs.len);
+    const wanted = [_]struct { id: u64, data: []const u8 }{
+        .{ .id = 1, .data = "first" },
+        .{ .id = 2, .data = "second" },
+        .{ .id = 3, .data = "third" },
+    };
+    for (wanted, 0..) |want, at| {
+        const one = decoded.ticket.addr.addrs[at];
+        try t.expectEqual(TransportAddr.custom, std.meta.activeTag(one));
+        try t.expectEqual(want.id, one.custom.id);
+        try t.expectEqualSlices(u8, want.data, one.custom.data);
+        try t.expect(!insideRegion(frame, one.custom.data.ptr));
+    }
+}
+
+/// One run of `decodeBytes` for `t.checkAllAllocationFailures`: the answer is
+/// checked and released, so a refusal anywhere in the address list or in the
+/// payload copies has to hand all of it back before it returns.
+fn threePayloadsAccounting(alloc: Allocator, bytes: []const u8) !void {
+    const decoded = try EndpointTicket.decodeBytes(alloc, bytes);
+    try expectThreeCustomPayloads(&decoded, bytes);
+    decoded.deinit(alloc);
+}
+
+/// The same run through the text form, which allocates the base32 body before
+/// it decodes anything and so stands one allocation further along.
+fn threePayloadsTextAccounting(alloc: Allocator, text: []const u8) !void {
+    const decoded = try EndpointTicket.decodeString(alloc, text);
+    try expectThreeCustomPayloads(&decoded, text);
+    // Releasing it under the testing allocator is the ownership check the
+    // pointer comparison above cannot be: a payload pointing into the buffer
+    // `decodeString` allocated and released on the way out would be freed
+    // twice here, and the allocator says so by name.
+    decoded.deinit(alloc);
+}
+
+test "every allocation a ticket's text decode makes can fail on its own" {
+    const alloc = t.allocator;
+    const made = try threeCustomBody();
+    const whole = made.body[0..made.len];
+    var text: [512]u8 = undefined;
+    const written = try codec.encodeText(EndpointTicket.kind, whole, &text);
+
+    // One allocation more than the binary form: the base32 body is decoded
+    // through a fresh buffer, so the sweep runs over it and over everything
+    // the binary sweep already reaches, and ends on the run nothing is
+    // refused on.
+    try t.checkAllAllocationFailures(alloc, threePayloadsTextAccounting, .{written});
+
+    // The eventual consumer result: the text form names the same ticket the
+    // bytes did, to the value and not merely to a length.
+    const decoded = try EndpointTicket.decodeString(alloc, written);
+    defer decoded.deinit(alloc);
+    try expectThreeCustomPayloads(&decoded, written);
+    var again: [128]u8 = undefined;
+    try t.expectEqualSlices(u8, whole, try decoded.ticket.encode(&again));
 }

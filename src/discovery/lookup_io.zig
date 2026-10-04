@@ -946,6 +946,11 @@ const Scripted = struct {
     /// deadline that was actually threaded down.
     deadline_ms: ?i32 = null,
     cancel_during_receive: ?resolve.Cancellation = null,
+    /// Refusals the socket reports instead of doing its work. One per call and
+    /// one per arm of `SocketError`, so every arm of the seam's own error set
+    /// has a call that produces it rather than a mapping nobody took.
+    refuse_send: bool = false,
+    refuse_receive: bool = false,
 
     fn send(
         ctx: *anyopaque,
@@ -958,6 +963,7 @@ const Scripted = struct {
         bytes: []const u8,
     ) SocketError!void {
         const self: *Scripted = @ptrCast(@alignCast(ctx));
+        if (self.refuse_send) return error.Refused;
         if (bytes.len > self.sent.len) return error.Refused;
         @memcpy(self.sent[0..bytes.len], bytes);
         self.sent_len = bytes.len;
@@ -977,6 +983,7 @@ const Scripted = struct {
     ) SocketError!Datagram.Reply {
         const self: *Scripted = @ptrCast(@alignCast(ctx));
         self.deadline_ms = deadline_ms;
+        if (self.refuse_receive) return error.Refused;
         if (self.cancel_during_receive) |cancellation| {
             cancellation.fire();
             return error.Empty;
@@ -1594,3 +1601,700 @@ fn expectHex(expected: []const u8, actual: []const u8) !void {
 /// How much of a mismatch is printed, and the buffer it is printed into.
 const max_dumped_bytes = 48;
 const dump_bytes = 2 * (4 + 2 * max_dumped_bytes) + 8;
+
+// The section rule is 77 columns wide, which is the width this file is held
+// to; Z024 counts UTF-8 bytes, and the box-drawing glyphs are three each.
+// ziglint-ignore: Z024
+// ─────────────────────────────────── shapes, arms, and every allocation index
+
+/// The name the messages below are read under.
+///
+/// Spelled out rather than drawn from a node id: what these shapes are about
+/// is which records belong to the name a question asked about, not about whose
+/// node id that label spells.
+const sweep_name = "_iroh.example.";
+
+/// What `sweptAnswer` publishes: three records, the character strings of each
+/// TXT record joined with nothing between them and the records separated from
+/// each other by one NUL.
+const swept_records =
+    "relay=https://use1-1.relay.iroh.network./\x00" ++
+    "addr=192.168.96.145:60165\x00" ++
+    "addr=213.208.157.87:60165\x00";
+
+/// The first record's two character strings, which join into the first record
+/// of `swept_records` and are the joining RFC 1035 §3.3.14 allows.
+const swept_first_strings =
+    [_][]const u8{ "relay=https://use1-1.", "relay.iroh.network./" };
+
+/// A message assembled in a test's own buffer.
+///
+/// The vectors elsewhere in this file are captured or printed. This is for the
+/// shapes there is no capture of, and it names every field it writes so a
+/// change to a header layout does not move every expectation with it.
+const Message = struct {
+    bytes: []u8,
+    at: usize = 0,
+
+    fn init(bytes: []u8) Message {
+        @memset(bytes, 0);
+        return .{ .bytes = bytes, .at = header_length };
+    }
+
+    fn header(self: *Message, id: u16, flags: u16, qd: u16, an: u16, ns: u16, ar: u16) void {
+        put16(self.bytes, 0, id);
+        put16(self.bytes, 2, flags);
+        put16(self.bytes, 4, qd);
+        put16(self.bytes, 6, an);
+        put16(self.bytes, 8, ns);
+        put16(self.bytes, 10, ar);
+    }
+
+    fn octet(self: *Message, value: u8) void {
+        self.bytes[self.at] = value;
+        self.at += 1;
+    }
+
+    fn pair(self: *Message, value: u16) void {
+        put16(self.bytes, self.at, value);
+        self.at += 2;
+    }
+
+    fn slice(self: *Message, value: []const u8) void {
+        @memcpy(self.bytes[self.at..][0..value.len], value);
+        self.at += value.len;
+    }
+
+    /// One label, which is its length octet and then its octets.
+    fn label(self: *Message, value: []const u8) void {
+        self.octet(@intCast(value.len));
+        self.slice(value);
+    }
+
+    /// A presentation name with its trailing dot, written as labels and the
+    /// root's terminator.
+    fn name(self: *Message, value: []const u8) void {
+        var labels = std.mem.splitScalar(u8, value, '.');
+        while (labels.next()) |part| {
+            if (part.len == 0) continue;
+            self.label(part);
+        }
+        self.octet(0);
+    }
+
+    /// RFC 1035 §4.1.4's pointer to an offset this message already holds.
+    fn pointer(self: *Message, target: usize) void {
+        self.octet(name_pointer | @as(u8, @intCast(target >> 8)));
+        self.octet(@intCast(target & 0xff));
+    }
+
+    /// One record's `TYPE`, `CLASS`, `TTL` and `RDLENGTH`, then its `RDATA`.
+    fn record(self: *Message, kind: u16, class: u16, ttl: u32, rdata: []const u8) void {
+        const fixed = self.at;
+        self.at += 10;
+        const start = self.at;
+        self.slice(rdata);
+        put16(self.bytes, fixed, kind);
+        put16(self.bytes, fixed + 2, class);
+        put32(self.bytes, fixed + 4, ttl);
+        put16(self.bytes, fixed + 8, @intCast(self.at - start));
+    }
+
+    /// One TXT record's character strings, RFC 1035 §3.3.14's "one or more":
+    /// a length octet each and nothing between them. The owner name goes on
+    /// first, and a compression pointer counts as a name.
+    fn txt(self: *Message, strings: []const []const u8) void {
+        const fixed = self.at;
+        self.at += 10;
+        const start = self.at;
+        for (strings) |string| {
+            self.octet(@intCast(string.len));
+            self.slice(string);
+        }
+        put16(self.bytes, fixed, type_txt);
+        put16(self.bytes, fixed + 2, class_in);
+        put32(self.bytes, fixed + 4, 30);
+        put16(self.bytes, fixed + 8, @intCast(self.at - start));
+    }
+};
+
+/// A built answer, and the two offsets a test cuts it at.
+const Swept = struct {
+    bytes: []u8,
+    /// Where the alias record begins, which is after three records have already
+    /// been copied out.
+    alias_at: usize,
+    /// Where the additional section begins.
+    additional_at: usize,
+};
+
+/// The answer every sweep below runs against.
+///
+/// One question, then four answer records: three TXT records under the name
+/// asked about — the first spelling that name out and the next two reaching it
+/// through a compression pointer, which is what a real server does with a name
+/// the message already holds — and one TXT record under a name this question
+/// did not ask about. Then the two records it does not get: the same TXT shape
+/// under this name again, but in the authority section, and an OPT record in
+/// the additional section.
+///
+/// An alias is skipped rather than refused, and a TXT record in somebody
+/// else's authority section is walked without being read, so both of them are
+/// answers to something other than this question and neither may reach it.
+fn sweptAnswer(buffer: []u8) Swept {
+    var message = Message.init(buffer);
+    message.header(0, flag_response, 1, 4, 1, 1);
+    message.name(sweep_name);
+    message.pair(type_txt);
+    message.pair(class_in);
+
+    message.name(sweep_name);
+    message.txt(&swept_first_strings);
+    message.pointer(header_length);
+    message.txt(&.{"addr=192.168.96.145:60165"});
+    message.pointer(header_length);
+    message.txt(&.{ "addr=213.208.157.87:", "60165" });
+
+    const alias_start = message.at;
+    message.name("other.example.");
+    message.txt(&.{"relay=https://elsewhere.example./"});
+
+    message.name(sweep_name);
+    message.txt(&.{"addr=203.0.113.9:41601"});
+
+    const additional_at = message.at;
+    message.octet(0);
+    message.record(type_opt, 0, 0, "");
+
+    return .{
+        .bytes = buffer[0..message.at],
+        .alias_at = alias_start,
+        .additional_at = additional_at,
+    };
+}
+
+test "three TXT records become exactly the records they carried" {
+    var buffer: [reply_length]u8 = undefined;
+    const built = sweptAnswer(&buffer);
+    var owner: [max_name_length]u8 = undefined;
+
+    const answer = try readAnswer(t.allocator, built.bytes, sweep_name, 0, &owner);
+    defer answer.deinit(t.allocator);
+    const records = switch (answer) {
+        .records => |set| set,
+        else => return error.ExpectedRecords,
+    };
+    try t.expectEqualStrings(swept_records, records.bytes);
+
+    // Owned, not borrowed: the bytes a socket wrote are dead the moment the
+    // next receive overwrites them, which is the fourth of this seam's four
+    // things. Overwriting the message leaves the records reading the same.
+    try t.expect(@intFromPtr(records.bytes.ptr) != @intFromPtr(built.bytes.ptr));
+    @memset(&buffer, 0xaa);
+    try t.expectEqualStrings(swept_records, records.bytes);
+
+    // And each of them reads back through `RecordSet` as one value, which is
+    // the shape `discovery/resolve.zig`'s `parseTxt` is handed.
+    var set = records;
+    try t.expectEqualStrings("relay=https://use1-1.relay.iroh.network./", set.next().?);
+    try t.expectEqualStrings("addr=192.168.96.145:60165", set.next().?);
+    try t.expectEqualStrings("addr=213.208.157.87:60165", set.next().?);
+    try t.expect(set.next() == null);
+}
+
+test "the trailing sections are walked, and none of them is this question's answer" {
+    var buffer: [reply_length]u8 = undefined;
+    const built = sweptAnswer(&buffer);
+    var owner: [max_name_length]u8 = undefined;
+
+    // The authority section holds a TXT record under the name this question
+    // asked about, and it is still not one of its records: a record answers
+    // because of the section it is in, and only the answer section answers.
+    const answer = try readAnswer(t.allocator, built.bytes, sweep_name, 0, &owner);
+    defer answer.deinit(t.allocator);
+    try t.expectEqualStrings(swept_records, switch (answer) {
+        .records => |set| set.bytes,
+        else => return error.ExpectedRecords,
+    });
+
+    // Cut inside the additional record, at both ends of its fixed part. Walking
+    // that section is the only way to know the message was not cut short
+    // inside one, so both are refused rather than read up to the cut.
+    try t.expectError(
+        error.ShortMessage,
+        readAnswer(
+            t.allocator,
+            built.bytes[0 .. built.additional_at + 1],
+            sweep_name,
+            0,
+            &owner,
+        ),
+    );
+    try t.expectError(
+        error.ShortMessage,
+        readAnswer(
+            t.allocator,
+            built.bytes[0 .. built.additional_at + 9],
+            sweep_name,
+            0,
+            &owner,
+        ),
+    );
+    // And the whole of it: the fixed part read in full with empty `RDATA` is a
+    // complete record, so the same three records come out as before.
+    const whole = try readAnswer(
+        t.allocator,
+        built.bytes[0 .. built.additional_at + 11],
+        sweep_name,
+        0,
+        &owner,
+    );
+    defer whole.deinit(t.allocator);
+    try t.expectEqualStrings(swept_records, switch (whole) {
+        .records => |set| set.bytes,
+        else => return error.ExpectedRecords,
+    });
+}
+
+/// How many allocations one answer of these shapes takes.
+///
+/// Discovered by walking the failure index up until one index reaches no
+/// allocation at all, rather than written down as a count: a sweep bounded by
+/// a number in the test stops covering the decoder the first time it allocates
+/// one thing more than it used to, and that is exactly the change a sweep is
+/// for.
+fn answerAllocations(message: []const u8, expected: []const u8) !usize {
+    var index: usize = 0;
+    while (index < allocation_ceiling) : (index += 1) {
+        const refusal = try answerAtIndex(message, index, expected);
+        if (refusal == null) return index;
+    }
+    return error.MoreAllocationsThanTheCeilingAllows;
+}
+
+/// The ceiling on an answer sweep, so that one cannot run forever: an answer is
+/// at most `reply_length` octets and holds at most `max_section_records`
+/// records, and an `ArrayList` that grows to that is a handful of
+/// reallocations. Sixty-four is well past it.
+const allocation_ceiling = 64;
+
+/// One `readAnswer` at a fixed allocation index, and the exact bytes it
+/// published if it published any.
+///
+/// `expected` is the record block an accepted message must produce, and null
+/// for a message this decoder refuses: a refusal that reached `expected` would
+/// have published a partial answer, which is the one thing no error path may
+/// do. The balance is checked at every index, so a refusal that skipped its
+/// `defer` shows up on its own line rather than as a leak the suite's
+/// allocator reports somewhere later.
+fn answerAtIndex(
+    message: []const u8,
+    fail_index: usize,
+    expected: ?[]const u8,
+) !?Error {
+    var failing = t.FailingAllocator.init(t.allocator, .{
+        .fail_index = fail_index,
+        .resize_fail_index = fail_index,
+    });
+    var owner: [max_name_length]u8 = undefined;
+    var refusal: ?Error = null;
+    if (readAnswer(failing.allocator(), message, sweep_name, 0, &owner)) |answer| {
+        defer answer.deinit(failing.allocator());
+        const wanted = expected orelse return error.RefusedMessagePublished;
+        const records = switch (answer) {
+            .records => |set| set.bytes,
+            else => return error.ExpectedRecords,
+        };
+        try t.expectEqualStrings(wanted, records);
+    } else |err| {
+        refusal = err;
+    }
+    try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    return refusal;
+}
+
+test "every allocation index of a multi-record answer hands back exactly these bytes" {
+    var buffer: [reply_length]u8 = undefined;
+    const built = sweptAnswer(&buffer);
+    const allocations = try answerAllocations(built.bytes, swept_records);
+    // More than one, or there was nothing to sweep, and the count belongs to
+    // the decoder rather than to this test.
+    try t.expect(allocations > 1);
+
+    for (0..allocations) |index| {
+        const refusal = (try answerAtIndex(built.bytes, index, swept_records)) orelse
+            return error.AnswerSucceededBelowItsOwnAllocationCount;
+        try t.expectEqual(error.OutOfMemory, refusal);
+    }
+}
+
+test "a message cut after three records were copied out publishes nothing at any index" {
+    var buffer: [reply_length]u8 = undefined;
+    const built = sweptAnswer(&buffer);
+    const allocations = try answerAllocations(built.bytes, swept_records);
+
+    // Cut inside the alias record, which is the fourth answer record: three
+    // records have been copied into the list by then, and a refusal that did
+    // not release them would leak exactly what an answer had published.
+    const cut = built.bytes[0 .. built.alias_at + 6];
+    try t.expect(cut.len < built.bytes.len);
+
+    for (0..allocations) |index| {
+        if ((try answerAtIndex(cut, index, null)) == null)
+            return error.RefusedMessagePublishedPartialRecords;
+    }
+    // And with nothing failing, the refusal names what it could not read.
+    var owner: [max_name_length]u8 = undefined;
+    try t.expectError(error.ShortMessage, readAnswer(t.allocator, cut, sweep_name, 0, &owner));
+}
+
+/// Every arm of the wire's closed error set, and what provokes it.
+///
+/// The set is closed and this table is held to it at comptime, so an arm added
+/// to `WireError` without a message that produces it is a compile error rather
+/// than a gap somebody notices later. The other direction is what the test
+/// below checks: a witness whose arm has moved fails on its own line, naming
+/// the one that moved.
+const wire_arms = [_]struct { tag: WireError, fault: WireFault }{
+    .{ .tag = error.BufferTooSmall, .fault = .short_output },
+    .{ .tag = error.LabelTooLong, .fault = .overlong_label },
+    .{ .tag = error.EmptyLabel, .fault = .doubled_dot },
+    .{ .tag = error.UnterminatedName, .fault = .no_root_dot },
+    .{ .tag = error.ShortMessage, .fault = .shorter_than_a_header },
+    .{ .tag = error.BadName, .fault = .reserved_lead },
+    .{ .tag = error.NotAResponse, .fault = .question_not_answer },
+    .{ .tag = error.ForeignTransaction, .fault = .another_id },
+    .{ .tag = error.ForeignSource, .fault = .another_server },
+    .{ .tag = error.MalformedResponse, .fault = .{ .response_code = 1 } },
+    .{ .tag = error.ServiceFailure, .fault = .{ .response_code = 2 } },
+    .{ .tag = error.NameError, .fault = .{ .response_code = 3 } },
+    .{ .tag = error.Unimplemented, .fault = .{ .response_code = 4 } },
+    .{ .tag = error.ServiceRefused, .fault = .{ .response_code = 5 } },
+    .{ .tag = error.UnknownResponseCode, .fault = .{ .response_code = 9 } },
+    .{ .tag = error.Truncated, .fault = .truncated_bit },
+};
+
+/// What one arm of the wire's closed error set is provoked by.
+const WireFault = union(enum) {
+    /// A query into a buffer too small for what it was handed.
+    short_output,
+    /// A label over RFC 1035 §2.3.4's 63 octets.
+    overlong_label,
+    /// An empty label between two dots.
+    doubled_dot,
+    /// A name whose trailing dot is missing.
+    no_root_dot,
+    /// Fewer bytes than a header.
+    shorter_than_a_header,
+    /// A name lead octet of `01` or `10`, the two encodings §4.1.4 reserves.
+    reserved_lead,
+    /// `QR` clear: a question where an answer was wanted.
+    question_not_answer,
+    /// An `ID` that is not the one this question was asked under.
+    another_id,
+    /// A datagram from a server other than the one asked.
+    another_server,
+    /// `RCODE` 1..5, and the reserved range above them.
+    response_code: u16,
+    /// The `TC` bit.
+    truncated_bit,
+};
+
+comptime {
+    if (wire_arms.len != @typeInfo(WireError).error_set.?.len) {
+        @compileError("a WireError arm has no witness, or a witness is for an arm that is gone");
+    }
+    for (wire_arms, 0..) |arm, index| {
+        for (wire_arms[index + 1 ..]) |later| {
+            if (arm.tag == later.tag) @compileError("two witnesses name one WireError arm");
+        }
+    }
+}
+
+test "every arm of the wire's closed error set has a message that produces it" {
+    inline for (wire_arms) |arm| {
+        var owner: [max_name_length]u8 = undefined;
+        switch (arm.fault) {
+            .short_output => {
+                var out: [asked_bytes]u8 = undefined;
+                try t.expectError(arm.tag, writeQuery("a.b.", .{ .id = 0 }, out[0..4]));
+            },
+            .overlong_label => {
+                const long = "a." ++ "x" ** (max_label_length + 1) ++ ".example.com.";
+                var out: [queryLength(long)]u8 = undefined;
+                try t.expectError(arm.tag, writeQuery(long, .{ .id = 0 }, &out));
+            },
+            .doubled_dot => {
+                var out: [asked_bytes]u8 = undefined;
+                try t.expectError(arm.tag, writeQuery("a..b.", .{ .id = 0 }, &out));
+            },
+            .no_root_dot => {
+                var out: [asked_bytes]u8 = undefined;
+                try t.expectError(arm.tag, writeQuery("example.com", .{ .id = 0 }, &out));
+            },
+            .shorter_than_a_header => {
+                var message: [header_length - 1]u8 = @splat(0);
+                try t.expectError(
+                    arm.tag,
+                    readAnswer(t.allocator, &message, sweep_name, 0, &owner),
+                );
+            },
+            .reserved_lead => {
+                var message: [header_length + 1]u8 = @splat(0);
+                put16(&message, 2, flag_response);
+                put16(&message, 6, 1);
+                message[header_length] = 0x40;
+                try t.expectError(
+                    arm.tag,
+                    readAnswer(t.allocator, &message, sweep_name, 0, &owner),
+                );
+            },
+            .question_not_answer => {
+                var message: [header_length]u8 = @splat(0);
+                try t.expectError(
+                    arm.tag,
+                    readAnswer(t.allocator, &message, sweep_name, 0, &owner),
+                );
+            },
+            .another_id => {
+                var message: [header_length]u8 = @splat(0);
+                put16(&message, 2, flag_response);
+                try t.expectError(
+                    arm.tag,
+                    readAnswer(t.allocator, &message, sweep_name, 1, &owner),
+                );
+            },
+            .another_server => {
+                var engine: Prng = Prng.init(31);
+                var script: Scripted = .{ .from = elsewhere };
+                var retrieval = Retrieval.begin(script.datagram(), nameserver, engine.random());
+                var message: [header_length]u8 = @splat(0);
+                put16(&message, 0, retrieval.id);
+                put16(&message, 2, flag_response);
+                var wire: [asked_bytes]u8 = undefined;
+                var reply: [reply_length]u8 = undefined;
+                script.reply = &message;
+                try t.expectError(arm.tag, retrieval.ask(t.allocator, t.io, .{
+                    .name = sweep_name,
+                    .wire = &wire,
+                    .reply = &reply,
+                    .deadline_ms = 1000,
+                }));
+            },
+            .response_code => |code| {
+                var message: [header_length]u8 = @splat(0);
+                put16(&message, 2, flag_response | code);
+                try t.expectError(
+                    arm.tag,
+                    readAnswer(t.allocator, &message, sweep_name, 0, &owner),
+                );
+            },
+            .truncated_bit => {
+                var message: [header_length]u8 = @splat(0);
+                put16(&message, 2, flag_response | flag_truncated);
+                try t.expectError(
+                    arm.tag,
+                    readAnswer(t.allocator, &message, sweep_name, 0, &owner),
+                );
+            },
+        }
+    }
+}
+
+/// The three arms of the socket seam's closed error set, and the call that
+/// produces each. Two arms have two producers each and both are listed: a
+/// refusal is what a send and a failed read look like, and a stop is what a
+/// caller gave up before I/O and what one gave up during a wait look like.
+const socket_arms = [_]struct { tag: SocketError, fault: SocketFault }{
+    .{ .tag = error.Refused, .fault = .send_refused },
+    .{ .tag = error.Refused, .fault = .receive_refused },
+    .{ .tag = error.Empty, .fault = .deadline },
+    .{ .tag = error.Canceled, .fault = .stopped_before_io },
+    .{ .tag = error.Canceled, .fault = .stopped_during_receive },
+};
+
+/// What one arm of the socket seam's closed error set is provoked by.
+const SocketFault = enum {
+    send_refused,
+    receive_refused,
+    deadline,
+    stopped_before_io,
+    stopped_during_receive,
+};
+
+comptime {
+    var covered = [_]bool{false} ** @typeInfo(SocketError).error_set.?.len;
+    for (socket_arms) |row| {
+        for (@typeInfo(SocketError).error_set.?, 0..) |member, index| {
+            if (row.tag == @field(SocketError, member.name)) covered[index] = true;
+        }
+    }
+    for (covered) |seen| {
+        if (!seen) @compileError("a SocketError arm has no call that produces it");
+    }
+}
+
+test "every arm of the socket seam's closed error set has a call that produces it" {
+    inline for (socket_arms) |row| {
+        var engine: Prng = Prng.init(37);
+        var script: Scripted = .{ .from = nameserver };
+        var retrieval = Retrieval.begin(script.datagram(), nameserver, engine.random());
+        var wire: [asked_bytes]u8 = undefined;
+        var reply: [reply_length]u8 = undefined;
+        const request: Request = .{
+            .name = sweep_name,
+            .wire = &wire,
+            .reply = &reply,
+            .deadline_ms = 1000,
+        };
+        switch (row.fault) {
+            .send_refused => {
+                script.refuse_send = true;
+                try t.expectError(row.tag, retrieval.ask(t.allocator, t.io, request));
+                // Nothing went out, which is what a refused send means.
+                try t.expectEqual(@as(u32, 0), script.sends);
+            },
+            .receive_refused => {
+                script.refuse_receive = true;
+                try t.expectError(row.tag, retrieval.ask(t.allocator, t.io, request));
+                try t.expectEqual(@as(u32, 1), script.sends);
+            },
+            .deadline => {
+                // The seam's `Empty` is the deadline, and what it looks like on
+                // the way out is the third answer rather than an error: a
+                // caller that read it as a refusal would be telling the world
+                // this node published nothing, having learned nothing at all.
+                try t.expectEqual(Answer.timeout, try retrieval.ask(t.allocator, t.io, request));
+                try t.expectEqual(@as(?i32, 1000), script.deadline_ms);
+            },
+            .stopped_before_io => {
+                retrieval.cancellation().fire();
+                try t.expectError(row.tag, retrieval.ask(t.allocator, t.io, request));
+                // A stopped retrieval does not ask again, so nothing is sent.
+                try t.expectEqual(@as(u32, 0), script.sends);
+            },
+            .stopped_during_receive => {
+                script.cancel_during_receive = retrieval.cancellation();
+                try t.expectError(row.tag, retrieval.ask(t.allocator, t.io, request));
+                try t.expectEqual(@as(u32, 1), script.sends);
+                try t.expectEqual(@as(u32, 1), script.stops);
+            },
+        }
+    }
+}
+
+test "truncated, empty and a deadline are three answers, and truncation publishes nothing" {
+    var buffer: [reply_length]u8 = undefined;
+    const built = sweptAnswer(&buffer);
+    var owner: [max_name_length]u8 = undefined;
+
+    // A message that had three records in it and says it did not fit. `TC` is
+    // read before any count, so nothing is walked and nothing is published.
+    var truncated: [reply_length]u8 = undefined;
+    @memcpy(truncated[0..built.bytes.len], built.bytes);
+    put16(truncated[0..], 2, flag_response | flag_truncated);
+    try t.expectError(
+        error.Truncated,
+        readAnswer(t.allocator, truncated[0..built.bytes.len], sweep_name, 0, &owner),
+    );
+
+    // And it stays its own error beside every other thing a header can say: a
+    // message that is truncated *and* names a code *and* claims more records
+    // than one datagram could hold is still the answer a TCP retry is for, not
+    // a name that does not exist and not a header to refuse.
+    var header_only: [header_length]u8 = @splat(0);
+    put16(&header_only, 2, flag_response | flag_truncated | 3);
+    put16(&header_only, 6, max_section_records + 1);
+    try t.expectError(
+        error.Truncated,
+        readAnswer(t.allocator, &header_only, sweep_name, 0, &owner),
+    );
+
+    // The name exists and published nothing, which is a fact about the world.
+    var empty: [header_length]u8 = @splat(0);
+    put16(&empty, 2, flag_response);
+    const nothing = try readAnswer(t.allocator, &empty, sweep_name, 0, &owner);
+    try t.expectEqual(Answer.nothing, nothing);
+
+    // A deadline is the question asked and nothing answered inside it.
+    var engine: Prng = Prng.init(29);
+    var script: Scripted = .{ .from = nameserver };
+    var retrieval = Retrieval.begin(script.datagram(), nameserver, engine.random());
+    var wire: [asked_bytes]u8 = undefined;
+    var reply: [reply_length]u8 = undefined;
+    const late = try retrieval.ask(t.allocator, t.io, .{
+        .name = sweep_name,
+        .wire = &wire,
+        .reply = &reply,
+        .deadline_ms = 1,
+    });
+
+    // Three, and a caller reading one as another tells the world something it
+    // does not know: a node that published nothing, and a node nobody reached.
+    try t.expectEqual(.nothing, std.meta.activeTag(nothing));
+    try t.expectEqual(.timeout, std.meta.activeTag(late));
+    try t.expect(!nothing.hasRecords());
+    try t.expect(!late.hasRecords());
+}
+
+test "the copied-out answer is what the resolver reads, and stopping it keeps its own error" {
+    var engine: Prng = Prng.init(41);
+    var buffer: [reply_length]u8 = undefined;
+    const built = sweptAnswer(&buffer);
+    var script: Scripted = .{ .from = nameserver };
+    var retrieval = Retrieval.begin(script.datagram(), nameserver, engine.random());
+
+    // The socket's own copy has to be a heap buffer of its own: `Scripted`
+    // borrows `script.reply` for the call and the answer outlives it.
+    const scripted = try t.allocator.dupe(u8, built.bytes);
+    defer t.allocator.free(scripted);
+    put16(scripted, 0, retrieval.id);
+    script.reply = scripted;
+
+    var wire: [asked_bytes]u8 = undefined;
+    var reply: [reply_length]u8 = undefined;
+    const answer = try retrieval.ask(t.allocator, t.io, .{
+        .name = sweep_name,
+        .wire = &wire,
+        .reply = &reply,
+        .deadline_ms = 1000,
+    });
+    defer answer.deinit(t.allocator);
+    const records = switch (answer) {
+        .records => |set| set,
+        else => return error.ExpectedRecords,
+    };
+
+    // `discovery/dns.zig` borrows what it is handed, and the buffer it borrows
+    // is this call's: the datagram the socket wrote is dead now, and only the
+    // copy survives to be read as records. The item below comes out of the
+    // stream's own arena, so it is not that copy either.
+    var service = dns.DnsAddressLookup.init(records, retrieval.cancellation());
+    const id = try key.NodeId.parseHex(upstream_id);
+    var stream = (try service.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
+    defer stream.deinit();
+    const first = stream.next() orelse return error.TestUnexpectedResult;
+    const value = switch (first) {
+        .item => |item_value| item_value,
+        .failed => |failure| return failure.reason,
+    };
+    try t.expectEqual(id, value.endpoint.node_id);
+    try t.expectEqual(@as(usize, 3), value.endpoint.addrs.len);
+    try t.expect(stream.next() == null);
+    try t.expectEqual(@as(?usize, 1), stream.finish().itemCount());
+
+    // Closing the stream fires the retrieval's own handle, so the query behind
+    // it stops rather than the stream stopping alone. And the error that
+    // retrieval answers with afterwards is its own: not a deadline, which is
+    // what a socket with nothing to say reports, and not a refusal.
+    stream.deinit();
+    try t.expectEqual(@as(u32, 1), script.stops);
+    try t.expectError(error.Canceled, retrieval.ask(t.allocator, t.io, .{
+        .name = sweep_name,
+        .wire = &wire,
+        .reply = &reply,
+        .deadline_ms = 1000,
+    }));
+    try t.expectEqual(@as(u32, 1), script.sends);
+}

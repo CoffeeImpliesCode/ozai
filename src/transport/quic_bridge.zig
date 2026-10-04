@@ -102,6 +102,7 @@ const quic = @import("quic");
 // module's own vocabulary as declarations and a parameter may not shadow one.
 const base_key = @import("../base/key.zig");
 const base_addr = @import("../base/addr.zig");
+const base_relay_url = @import("../base/relay_url.zig");
 const base_ula = @import("../base/ula.zig");
 const addr_map = @import("addr_map.zig");
 const batch = @import("batch.zig");
@@ -1586,7 +1587,7 @@ test "an address that arrived off the wire is the path it stands for" {
     var map = addr_map.MappedAddrs.init();
     defer map.deinit(t.allocator);
     var map_engine = Prng.init(14);
-    const relay = try base_addr.RelayUrl.parse("https://relay.example.com");
+    const relay = try base_relay_url.RelayUrl.parse("https://relay.example.com");
     const owned: addr_map.Key = .{ .relay = .{ .relay = relay, .node = server_secret.nodeId() } };
     const allocated = try map.get(t.allocator, owned, map_engine.random());
 
@@ -1669,6 +1670,92 @@ test "a transport key the caller supplied is used, and one it did not is drawn f
     try t.expect(!std.mem.eql(u8, &supplied, &drawn_a.manager.retry_token_key));
 }
 
+/// The identity storage a live bridge's TLS configuration points at, checked
+/// as ownership and not as contents alone.
+///
+/// `create` put the bridge on the heap precisely so that these pointers would
+/// not move, and `tlsConfig` hands the caller a view over them. A bridge whose
+/// configuration pointed at a block a refused `create` had left behind, or at
+/// one it had freed, would still answer with the right bytes here for exactly
+/// as long as nothing reused that memory — so the aliasing is the invariant,
+/// and the bytes only say which identity is being presented.
+fn expectBridgeOwnsItsTlsConfig(bridge: *const Bridge, node: NodeId, pin: NodeId) !void {
+    const tls = bridge.tlsConfig();
+    try t.expectEqual(@as(usize, 1), tls.cert_chain_der.len);
+    try t.expectEqual(@as(usize, 1), tls.alpn.len);
+    try t.expectEqual(@intFromPtr(&bridge.cert_chain), @intFromPtr(tls.cert_chain_der.ptr));
+    try t.expectEqual(@intFromPtr(&bridge.alpn_list), @intFromPtr(tls.alpn.ptr));
+    try t.expectEqualSlices(u8, bridge.spki[0..], tls.cert_chain_der[0]);
+    try t.expectEqualSlices(u8, &tls13.ed25519Spki(&node.toBytes()), tls.cert_chain_der[0]);
+    try t.expectEqualStrings(alpn, tls.alpn[0]);
+    try t.expectEqual(
+        @intFromPtr(bridge.seed[0..].ptr),
+        @intFromPtr(tls.private_key_bytes.ptr),
+    );
+    // The peer pin lives in the bridge too and is the block the core reads, so
+    // a dangling one is a pin that verifies nothing at all.
+    const auth = tls.client_auth orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@intFromPtr(&bridge.client_auth), @intFromPtr(auth));
+    try t.expectEqual(pin.toBytes(), auth.expect_node_id.?);
+    try t.expectEqual(tls13.ClientAuth.Mode.required, auth.mode);
+    // One node id, presented and pinned, read off the bridge rather than
+    // restated from the config the caller handed in.
+    try t.expectEqual(node.toBytes(), bridge.nodeId().toBytes());
+}
+
+test "a refused bridge leaves no identity storage behind it" {
+    // One allocation and no other, which is the claim this test exists for:
+    // `create` allocates the bridge, `drawKey` draws through the caller's
+    // `std.Io` rather than through the allocator, and `ConnectionManager.init`
+    // documents that it "performs no allocation or I/O"
+    // (`connection_manager.zig:313`). Refusing the one boundary there is, and
+    // finding no second one to refuse, is what turns the claim into an
+    // observation.
+    var server_key = try SecretKey.fromSeed(server_seed);
+    defer server_key.deinit();
+    var peer_key = try SecretKey.fromSeed(client_seed);
+    defer peer_key.deinit();
+    var engine = Prng.init(29);
+
+    // A fixed backing array is what makes "nothing was kept" exact: its end
+    // index counts every byte handed out, so zero is zero rather than "no leak
+    // was noticed once the run was over".
+    var backing: [@sizeOf(Bridge)]u8 align(@alignOf(Bridge)) = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+
+    var refusing = t.FailingAllocator.init(fixed.allocator(), .{ .fail_index = 0 });
+    try t.expectError(
+        error.OutOfMemory,
+        Bridge.create(refusing.allocator(), t.io, .{
+            .secret = server_key,
+            .expect_peer = peer_key.nodeId(),
+            .alpn = alpn,
+        }, engine.random()),
+    );
+    try t.expect(refusing.has_induced_failure);
+    // Not a balance at the end of a run: not one byte was ever handed out, so
+    // the block a bridge would have occupied is still the caller's to give to
+    // the next one. A `create` that allocated and then failed could not give
+    // an end index back.
+    try t.expectEqual(@as(usize, 0), fixed.end_index);
+
+    // And the same allocator answers a whole bridge, at the first byte of that
+    // same array, whose configuration borrows the bridge's own storage. A
+    // refusal that had kept identity storage would have left something behind
+    // for this one to sit behind, and one that had freed storage a
+    // configuration still pointed at would answer with reused bytes.
+    const bridge = try Bridge.create(fixed.allocator(), t.io, .{
+        .secret = server_key,
+        .expect_peer = peer_key.nodeId(),
+        .alpn = alpn,
+    }, engine.random());
+    defer bridge.destroy();
+    try t.expectEqual(@sizeOf(Bridge), fixed.end_index);
+    const block: []u8 = @as([*]u8, @ptrCast(bridge))[0..@sizeOf(Bridge)];
+    try t.expect(fixed.isLastAllocation(block));
+    try expectBridgeOwnsItsTlsConfig(bridge, server_key.nodeId(), peer_key.nodeId());
+}
+
 test "an allocator that refuses the sink leaves every byte pending for the next pass" {
     // A stream is the one thing in this file a test can drive without a
     // peer: the core hands out a receive half, and a STREAM frame is all it
@@ -1693,6 +1780,138 @@ test "an allocator that refuses the sink leaves every byte pending for the next 
     try t.expect(try stream.drain(t.allocator, &sink));
     try t.expectEqualStrings(message, sink.items);
     try t.expect(!try stream.drain(t.allocator, &sink));
+}
+
+/// The largest contiguous run the core hands back from a single read
+/// (`FrameSorter.MAX_COALESCED`, `stream.zig:105`), which it does not export.
+///
+/// Two whole runs of this size are what give a drain two allocating
+/// boundaries rather than one: the frame behind a full run cannot coalesce
+/// onto it (`stream.zig:256`), so the two stand as separate runs and the sink
+/// is asked for room twice. One run's worth is not enough on its own, because
+/// `ArrayList` over-allocates by half and a second run half the size of the
+/// first fits in what the first ask already left.
+const run_ceiling = 64 * 1024;
+
+/// A stream carrying `head` and `tail` as two separate runs, built in place
+/// because the caller holds a borrow of it for the whole pass.
+fn queueTwoRuns(core: *quic_stream.Stream, head: []const u8, tail: []const u8) !void {
+    errdefer core.deinit();
+    core.* = quic_stream.Stream.init(t.allocator, 0);
+    try core.recv.handleStreamFrame(0, head, false);
+    try core.recv.handleStreamFrame(head.len, tail, false);
+}
+
+/// What a completed drain has to leave in the sink: the peer's two runs, in
+/// order, once each.
+fn expectWholePayload(sink: *const std.ArrayList(u8), head: []const u8, tail: []const u8) !void {
+    try t.expectEqual(head.len + tail.len, sink.items.len);
+    try t.expectEqualSlices(u8, head, sink.items[0..head.len]);
+    try t.expectEqualSlices(u8, tail, sink.items[head.len..]);
+}
+
+/// What a refusal has to leave: a prefix of the peer's bytes and nothing
+/// else, so the retry carries the rest of them and none of them twice. A drain
+/// that had consumed a run before the reserve refused would leave a gap here
+/// instead, and one that had taken the run twice would leave a repeat.
+fn expectPayloadPrefix(sink: *const std.ArrayList(u8), head: []const u8, tail: []const u8) !void {
+    try t.expect(sink.items.len <= head.len + tail.len);
+    const head_part = @min(sink.items.len, head.len);
+    try t.expectEqualSlices(u8, head[0..head_part], sink.items[0..head_part]);
+    if (sink.items.len > head.len) {
+        const tail_part = sink.items.len - head.len;
+        try t.expectEqualSlices(u8, tail[0..tail_part], sink.items[head.len..]);
+    }
+}
+
+/// Refuse every allocating boundary a drain of two queued runs makes, one at a
+/// time, from the first to the run nothing is refused on.
+///
+/// `t.checkAllAllocationFailures` counts `alloc` and not `resize`, and this
+/// path makes both: `ArrayList.ensureTotalCapacity` asks the allocator to grow
+/// the sink in place and allocates only where it will not
+/// (`std/array_list.zig`), so a sweep over the allocation counter alone would
+/// cover whichever half the allocator happened to take and would report a
+/// pass over boundaries it never reached. This walks the two counters
+/// together.
+///
+/// A refused resize is not a refusal at all: the same function falls back to a
+/// fresh allocation, which succeeds, and the drain completes. Those passes
+/// are kept because a relocation has to deliver exactly the bytes a growth in
+/// place would, and because they are the passes that exercise the free-and-
+/// copy path rather than the in-place one.
+fn sweepStreamDrain(head: []const u8, tail: []const u8) !void {
+    // What a full drain asks for, counted rather than guessed.
+    var counting = t.FailingAllocator.init(t.allocator, .{});
+    var count_core: quic_stream.Stream = undefined;
+    try queueTwoRuns(&count_core, head, tail);
+    defer count_core.deinit();
+    var count_sink: std.ArrayList(u8) = .empty;
+    defer count_sink.deinit(t.allocator);
+    var counted: Stream = .{ .entry = &count_core };
+    try t.expect(try counted.drain(counting.allocator(), &count_sink));
+    try expectWholePayload(&count_sink, head, tail);
+    const allocs = counting.alloc_index;
+    const resizes = counting.resize_index;
+    // Every pass below refuses one boundary; a drain that asked for nothing
+    // would pass all of them without having tried anything.
+    try t.expect(allocs + resizes > 0);
+
+    var boundary: usize = 0;
+    while (boundary < allocs + resizes) : (boundary += 1) {
+        const config: t.FailingAllocator.Config = if (boundary < allocs)
+            .{ .fail_index = boundary }
+        else
+            .{ .resize_fail_index = boundary - allocs };
+        var refusing = t.FailingAllocator.init(t.allocator, config);
+
+        var core: quic_stream.Stream = undefined;
+        try queueTwoRuns(&core, head, tail);
+        defer core.deinit();
+        var sink: std.ArrayList(u8) = .empty;
+        defer sink.deinit(t.allocator);
+        var stream: Stream = .{ .entry = &core };
+
+        var refused = false;
+        if (stream.drain(refusing.allocator(), &sink)) |moved| {
+            try t.expect(moved);
+            try expectWholePayload(&sink, head, tail);
+        } else |err| {
+            try t.expectEqual(error.OutOfMemory, err);
+            // This pass's own allocator refused, and it refused on the
+            // boundary rather than somewhere in the setup above it.
+            try t.expect(refusing.has_induced_failure);
+            refused = true;
+            try expectPayloadPrefix(&sink, head, tail);
+        }
+        // Cumulative bytes, in the one direction a refusal can move them:
+        // every byte *this pass* was handed went back with it. A run the peer
+        // will never retransmit — because it was received — is not sitting in
+        // a chunk this pass dropped on the floor.
+        try t.expect(refusing.freed_bytes >= sink.items.len);
+        // And whatever the refusal did not take is still queued, in order: the
+        // retry carries the rest of it and the drain after that says there is
+        // nothing left.
+        if (refused) {
+            try t.expect(try stream.drain(t.allocator, &sink));
+            try expectWholePayload(&sink, head, tail);
+        }
+        try t.expect(!try stream.drain(t.allocator, &sink));
+    }
+}
+
+test "every allocation a drain of two queued runs makes can be refused on its own" {
+    // Two whole runs of peer bytes in two fills no other pair of runs in this
+    // file shares, so a sink holding either of them twice, or the wrong one
+    // first, cannot pass for a sink holding both once.
+    const head = try t.allocator.alloc(u8, run_ceiling);
+    defer t.allocator.free(head);
+    @memset(head, 0xa5);
+    const tail = try t.allocator.alloc(u8, run_ceiling);
+    defer t.allocator.free(tail);
+    @memset(tail, 0x5a);
+
+    try sweepStreamDrain(head, tail);
 }
 
 test "no egress room leaves the flight unsent, and the retry after it emits the flight" {

@@ -191,18 +191,22 @@ pub const SecretKey = struct {
     /// The 32-byte half that is the actual entropy source.
     pub const seed_length = Ed25519.KeyPair.seed_length;
 
-    /// A key drawn from `io`'s randomness.
-    ///
-    /// `io` is used for that draw and for nothing else: it must be live for
-    /// this call, it is not retained, and the key holds no reference to it — so
-    /// the `Io` may be released the moment this returns. No allocator is
-    /// involved. The returned key owns its secret bytes by value and exposes
-    /// no caller-managed seed.
-    ///
+    /// Entropy refusal, cancellation, or a seed that cannot sign.
+    pub const GenerateError = std.Io.RandomSecureError || error{DegenerateSeed};
+
+    /// Creates an owned key from `io.randomSecure`, without retries or weak fallback.
+    /// The secure draw can block. Entropy and cancellation errors propagate unchanged.
+    /// `io` is borrowed only for this call. The returned key retains no capability.
+    /// The temporary seed is wiped, including after a partially completed refused draw.
     /// Call `deinit` once per retained key value before its storage is reused.
-    ///
-    pub fn generate(io: std.Io) SecretKey {
-        return .{ .key = Ed25519.KeyPair.generate(io).secret_key };
+    pub fn generate(io: std.Io) GenerateError!SecretKey {
+        var seed: [seed_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
+        try io.randomSecure(&seed);
+        return fromSeed(seed) catch |err| switch (err) {
+            error.DegenerateSeed => return error.DegenerateSeed,
+            error.NotOnCurve, error.BadSignature => unreachable,
+        };
     }
 
     /// Derive a key deterministically. Used by tests and by anyone restoring a
@@ -434,4 +438,149 @@ test "secret key zeroes itself on deinit" {
 
     secret.deinit();
     try t.expect(std.mem.allEqual(u8, &secret.toBytes(), 0));
+}
+
+// --- which entropy source a generated identity came from --------------------
+
+/// Both of `std.Io`'s entropy sources, scripted apart from one another.
+///
+/// `std.Io.random` and `std.Io.randomSecure` are not the same source. The std
+/// docs are explicit that `random` "is seeded by `randomSecure`, or a less
+/// secure mechanism upon failure", while `randomSecure` "does not have any
+/// fallback mechanisms" and answers `error.EntropyUnavailable` or
+/// `error.Canceled` instead. An identity key is worth a full-strength seed, so
+/// a test has to be able to say which of the two a key was drawn from: each
+/// source answers with bytes no seed here shares, so a key taken from the
+/// wrong one is not the key the secure seed derives.
+const ScriptedEntropy = struct {
+    /// What `randomSecure` answers, byte for byte.
+    secure_seed: [SecretKey.seed_length]u8,
+    /// What `random` answers. Not one byte equal to `secure_seed`, so a key
+    /// taken from the wrong source is visibly this one and not a near miss.
+    weak_seed: [SecretKey.seed_length]u8,
+    /// The refusal `randomSecure` gives instead of an answer, or null when it
+    /// answers.
+    secure_refusal: ?std.Io.RandomSecureError,
+    /// Bytes the secure source handed out, however many draws it took. This is
+    /// what "the whole seed came from the secure source" is measured in; a
+    /// count of calls would be measuring call granularity, which is not a
+    /// thing a caller can observe.
+    secure_bytes: usize = 0,
+
+    /// Fill `buffer` from `seed`, cycling when the draw is wider than a seed,
+    /// so a draw of any width shows in the bytes it left behind.
+    fn fill(seed: [SecretKey.seed_length]u8, buffer: []u8) void {
+        for (buffer, 0..) |*byte, index| byte.* = seed[index % seed.len];
+    }
+
+    /// The `std.Io` answering out of this state. The state has to outlive
+    /// every call made through the handle this returns, which is why each test
+    /// below keeps it in its own frame.
+    fn asIo(self: *ScriptedEntropy) std.Io {
+        return .{ .userdata = self, .vtable = &scripted_vtable };
+    }
+};
+
+/// `std.Io.failing` with both entropy sources scripted.
+///
+/// A file-scope constant rather than a copy made per call: a `std.Io` holds a
+/// *pointer* to its vtable, so one built on the stack hands the caller a
+/// pointer to a frame that has already returned.
+const scripted_vtable: std.Io.VTable = blk: {
+    var vtable = std.Io.failing.vtable.*;
+    vtable.random = struct {
+        fn draw(ctx: ?*anyopaque, buffer: []u8) void {
+            // A handle carrying no state has no answer to give, which is the
+            // answer `std.Io.failing` gives for every source it has none of.
+            if (ctx == null) return;
+            const entropy: *ScriptedEntropy = @ptrCast(@alignCast(ctx));
+            ScriptedEntropy.fill(entropy.weak_seed, buffer);
+        }
+    }.draw;
+    vtable.randomSecure = struct {
+        fn draw(ctx: ?*anyopaque, buffer: []u8) std.Io.RandomSecureError!void {
+            if (ctx == null) return error.EntropyUnavailable;
+            const entropy: *ScriptedEntropy = @ptrCast(@alignCast(ctx));
+            entropy.secure_bytes += buffer.len;
+            if (entropy.secure_refusal) |refusal| return refusal;
+            ScriptedEntropy.fill(entropy.secure_seed, buffer);
+        }
+    }.draw;
+    break :blk vtable;
+};
+
+/// A state whose secure source answers `secure_seed` and whose weak source
+/// answers `0xa5` in every byte — a byte neither seed below carries.
+fn answering(secure_seed: [SecretKey.seed_length]u8) ScriptedEntropy {
+    return .{
+        .secure_seed = secure_seed,
+        .weak_seed = @splat(0xa5),
+        .secure_refusal = null,
+    };
+}
+
+/// Two seeds differing in every byte.
+const first_seed: [SecretKey.seed_length]u8 = @splat(0x2a);
+const other_seed: [SecretKey.seed_length]u8 = @splat(0x2b);
+
+test "a generated identity is the key the secure seed derives" {
+    var entropy = answering(first_seed);
+    var secret = try SecretKey.generate(entropy.asIo());
+    defer secret.deinit();
+
+    var expected = try SecretKey.fromSeed(first_seed);
+    defer expected.deinit();
+
+    try t.expectEqual(expected.nodeId(), secret.nodeId());
+
+    // The std ed25519 secret encoding is the 32-byte seed followed by the
+    // public half, so the seed the key was made from is readable back out of
+    // the key itself. These are all 32 bytes: not truncated, not a hash of
+    // them, and not a seed the implementation found somewhere else.
+    const encoded = secret.toBytes();
+    try t.expectEqualSlices(u8, &first_seed, encoded[0..SecretKey.seed_length]);
+}
+
+test "the whole seed comes from the secure source" {
+    var entropy = answering(first_seed);
+    var secret = try SecretKey.generate(entropy.asIo());
+    defer secret.deinit();
+
+    // Every byte of the seed is fresh entropy from the one source with no
+    // fallback behind it. A narrower draw would leave an identity resting on
+    // less entropy than the type is worth, and the rest of the seed would have
+    // come from somewhere this test cannot see.
+    try t.expectEqual(@as(usize, SecretKey.seed_length), entropy.secure_bytes);
+}
+
+test "a refused secure draw is propagated and never made up from the weaker one" {
+    for ([_]std.Io.RandomSecureError{ error.EntropyUnavailable, error.Canceled }) |refusal| {
+        var entropy = answering(first_seed);
+        entropy.secure_refusal = refusal;
+
+        // The refusal arrives as itself, at the call site, with nothing between
+        // it and the caller. What it must not arrive as is a key: the weaker
+        // source is right there answering bytes, and a key built from them
+        // would be visibly not a node this call could vouch for.
+        try t.expectError(refusal, SecretKey.generate(entropy.asIo()));
+    }
+}
+
+test "the identity follows the secure seed and nothing else" {
+    var first_entropy = answering(first_seed);
+    var first = try SecretKey.generate(first_entropy.asIo());
+    defer first.deinit();
+    var repeat_entropy = answering(first_seed);
+    var repeated = try SecretKey.generate(repeat_entropy.asIo());
+    defer repeated.deinit();
+    var other_entropy = answering(other_seed);
+    var other = try SecretKey.generate(other_entropy.asIo());
+    defer other.deinit();
+
+    // Same seed, same identity: whatever else the process was doing, it
+    // added no entropy of its own to the key.
+    try t.expectEqual(first.nodeId(), repeated.nodeId());
+    // A different seed is a different identity, so the secure seed decides the
+    // key rather than decorating it.
+    try t.expect(first.nodeId().order(other.nodeId()) != .eq);
 }

@@ -18,8 +18,10 @@
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
+const key = @import("../base/key.zig");
 const resolve = @import("resolve.zig");
 const item = @import("item.zig");
+const transport_addr = @import("../base/transport_addr.zig");
 
 /// The origin n0 operates for production. `iroh-dns/src/dns.rs:36`.
 ///
@@ -53,7 +55,7 @@ pub const NameError = error{
 
 /// Buffer size `queryName` needs for an origin of this length.
 pub fn queryNameLength(origin: []const u8) usize {
-    return resolve.iroh_txt_name.len + 1 + addr.NodeId.z32_length + 1 + origin.len;
+    return resolve.iroh_txt_name.len + 1 + key.NodeId.z32_length + 1 + origin.len;
 }
 
 /// The name to query for a node: `_iroh.<z32>.<origin>`.
@@ -66,7 +68,7 @@ pub fn queryNameLength(origin: []const u8) usize {
 /// The name is written into caller storage and the result borrows it, for
 /// invariant 6's reason: a name handed back out of a dead frame is a name the
 /// query sends from freed memory.
-pub fn queryName(out: []u8, node_id: addr.NodeId, origin: []const u8) []const u8 {
+pub fn queryName(out: []u8, node_id: key.NodeId, origin: []const u8) []const u8 {
     std.debug.assert(out.len >= queryNameLength(origin));
     const label = node_id.toZ32();
     var at: usize = 0;
@@ -87,7 +89,7 @@ pub fn queryName(out: []u8, node_id: addr.NodeId, origin: []const u8) []const u8
 /// two labels, the first must be `_iroh`, the second is the z32 node id, and
 /// every label after that is ignored — which is what lets the same code read a
 /// bare `_iroh.<z32>` and a fully qualified `_iroh.<z32>.dns.iroh.link.`.
-pub fn endpointIdFromName(name: []const u8) NameError!addr.NodeId {
+pub fn endpointIdFromName(name: []const u8) NameError!key.NodeId {
     // Upstream counts the labels before it looks at any of them
     // (`name.split(".").count() < 2`), so a name with no dot is `NumLabels`
     // however it is spelled, and not `NotAnIrohRecord`.
@@ -97,7 +99,7 @@ pub fn endpointIdFromName(name: []const u8) NameError!addr.NodeId {
     }
     const rest = name[first_dot + 1 ..];
     const second_dot = std.mem.indexOfScalar(u8, rest, '.') orelse rest.len;
-    return addr.NodeId.parseZ32(rest[0..second_dot]) catch error.BadNodeId;
+    return key.NodeId.parseZ32(rest[0..second_dot]) catch error.BadNodeId;
 }
 
 /// `DnsAddressLookup`: a resolver over one injected TXT answer.
@@ -179,7 +181,7 @@ const DnsState = struct {
     /// second label, so upstream's node id and this one are the same value by
     /// construction; keeping it here states that, and `endpointIdFromName` is
     /// the function that checks the two ends of it agree.
-    node_id: addr.NodeId,
+    node_id: key.NodeId,
     /// The service's answer set, by value: two resolves against one service
     /// each get their own position in the buffer.
     answers: resolve.RecordSet,
@@ -204,9 +206,14 @@ fn dnsResolve(
     // service in the tree implements is fixed there rather than here.
     // ziglint-ignore: Z023
     alloc: std.mem.Allocator,
-    node_id: addr.NodeId,
+    node_id: key.NodeId,
 ) resolve.ResolveError!?resolve.Stream {
     const self: *DnsAddressLookup = @ptrCast(@alignCast(ctx));
+    // Ownership leaves this function with the `Stream` it returns: the vtable
+    // below names `dnsDestroy`, which calls `alloc.destroy` on this pointer,
+    // and the `errdefer` after it covers the paths that fail before that. The
+    // engine does not follow a pointer handed back to a caller.
+    // zwanzig-disable-next-line: store-violations-engine
     const state = try alloc.create(DnsState);
     errdefer alloc.destroy(state);
     state.* = .{
@@ -277,7 +284,6 @@ fn dnsDestroy(state: *anyopaque, alloc: std.mem.Allocator) void {
 }
 
 const t = std.testing;
-const key = @import("../base/key.zig");
 
 /// The name and the node of upstream's own `test_from_txt_lookup`, copied from
 /// `iroh-dns/src/endpoint_info.rs` at 187f59e80afdae6bd9866002b33d3365c00b06d8.
@@ -432,4 +438,270 @@ test "an empty answer is a node that published nothing" {
     try t.expectEqual(id, first.item.endpoint.node_id);
     try t.expect(stream.next() == null);
     try t.expectEqual(@as(?usize, 1), stream.finish().itemCount());
+}
+
+/// The answer set the ownership checks below run against.
+///
+/// A relay, two socket addresses and one custom transport address: the last
+/// is the only record kind whose payload is not the address itself, so it is
+/// the one that has to be copied out of the answer and owned by the stream
+/// that produced the item.
+const sweep_records =
+    "relay=https://euw1-1.relay.iroh.network./\x00" ++
+    "addr=192.168.96.145:60165\x00" ++
+    "addr=213.208.157.87:60165\x00" ++
+    "addr=2a_abab\x00";
+
+/// How many addresses one item over `sweep_records` carries.
+const sweep_addresses = 4;
+
+/// The ceiling on a resolve sweep, so that one cannot run forever. A resolve
+/// allocates the stream state, the arena behind it and inside that arena the
+/// address list and the copied custom payload, so a handful of allocations;
+/// sixty-four is well past it.
+const allocation_ceiling = 64;
+
+/// What one stream over one answer set must produce: an item carrying this
+/// many addresses, or a failure carrying exactly that reason.
+const Outcome = union(enum) {
+    item: usize,
+    refused: resolve.Reason,
+};
+
+/// One resolve at a fixed allocation index, and every byte it took and gave
+/// back.
+///
+/// Both outcomes are measured. Whether the resolve produced an item or ran out
+/// of memory, the stream state and everything its arena holds came back, so
+/// the balance is checked before the result is raised rather than after it: a
+/// failing allocation is one of the outcomes this sweep is for, and it must
+/// leave as little behind as a successful one does.
+fn resolveAtIndex(
+    fail_index: usize,
+    records: []const u8,
+    expect: Outcome,
+) !?anyerror {
+    var failing = t.FailingAllocator.init(t.allocator, .{
+        .fail_index = fail_index,
+        .resize_fail_index = fail_index,
+    });
+    const outcome = oneStream(failing.allocator(), records, expect);
+    try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    if (outcome) |_| {
+        return null;
+    } else |err| {
+        return @as(?anyerror, err);
+    }
+}
+
+/// One resolve over one answer set, and what it produced.
+///
+/// The stream is released on every path out of here, which is what lets the
+/// caller check a balance afterwards rather than trust a `defer` it did not
+/// write.
+fn oneStream(alloc: std.mem.Allocator, records: []const u8, expect: Outcome) !void {
+    const id = try key.NodeId.parseHex(upstream_id);
+    var service = DnsAddressLookup.init(.init(records), null);
+    var stream = (try service.lookup().resolve(alloc, id)) orelse
+        return error.TestUnexpectedResult;
+    defer stream.deinit();
+
+    switch (expect) {
+        .item => |wanted| {
+            const first = stream.next() orelse return error.TestUnexpectedResult;
+            switch (first) {
+                // Nothing partial survives a failure: this answer is gone and
+                // the stream carries on, so a pull that came back this way is
+                // the refusal and not a half-built endpoint.
+                .failed => |failure| return failure.reason,
+                .item => |value| try expectAddresses(value, wanted),
+            }
+        },
+        .refused => |reason| {
+            const first = stream.next() orelse return error.TestUnexpectedResult;
+            switch (first) {
+                .item => return error.ItemWhereARefusalWasNamed,
+                .failed => |failure| {
+                    try t.expectEqual(item.Provenance.dns, failure.provenance);
+                    // An allocator with nothing left refuses too, and this
+                    // function does not tell the two apart: below the count
+                    // what came back is the allocation, and at or past it what
+                    // came back is the answer set. The caller knows which,
+                    // because it is the caller that chose the index.
+                    if (reason != failure.reason) return failure.reason;
+                },
+            }
+        },
+    }
+    // Upstream's DNS resolve is one `once_future`, so there is no second pull
+    // and `finish` is the whole of what the lookup came to.
+    try t.expect(stream.next() == null);
+    const resolution = stream.finish();
+    const wanted: ?usize = if (std.meta.activeTag(expect) == .item) 1 else 0;
+    try t.expectEqual(wanted, resolution.itemCount());
+}
+
+/// The addresses one item carries, in the order invariant 2 holds a `NodeAddr`
+/// to: relay, then sockets by address, then custom transports. The answer
+/// listed the two sockets the other way round on purpose, so a list that was
+/// not sorted by the one that owns it would show up here.
+fn expectAddresses(value: item.Item, wanted: usize) !void {
+    try t.expectEqual(item.Provenance.dns, value.provenance);
+    const addrs = value.endpoint.addrs;
+    try t.expectEqual(wanted, addrs.len);
+    if (wanted != sweep_addresses) return;
+    try t.expectEqual(transport_addr.TransportAddr.relay, std.meta.activeTag(addrs[0]));
+    try t.expectEqual(transport_addr.TransportAddr.ip, std.meta.activeTag(addrs[1]));
+    try t.expectEqual(transport_addr.TransportAddr.ip, std.meta.activeTag(addrs[2]));
+    try t.expectEqual(transport_addr.TransportAddr.custom, std.meta.activeTag(addrs[3]));
+    try t.expectEqual(
+        addr.SocketAddr{ .ip = .{ .v4 = .{ 192, 168, 96, 145 } }, .port = 60165 },
+        addrs[1].ip,
+    );
+    try t.expectEqual(
+        addr.SocketAddr{ .ip = .{ .v4 = .{ 213, 208, 157, 87 } }, .port = 60165 },
+        addrs[2].ip,
+    );
+    try t.expectEqual(@as(u64, 0x2a), addrs[3].custom.id);
+    try t.expectEqualSlices(u8, &[_]u8{ 0xab, 0xab }, addrs[3].custom.data);
+    // And the payload is a copy the stream owns rather than a window into the
+    // answer set the service borrows: `parseTxt` copies it because a
+    // `NodeAddr` has nowhere to keep the bytes a custom address points at.
+    try t.expect(
+        @intFromPtr(addrs[3].custom.data.ptr) != @intFromPtr(sweep_records.ptr),
+    );
+}
+
+/// Every allocation index over an answer set this resolver refuses on its own
+/// terms, and what must come out of each one.
+///
+/// The point is that a refusal is a refusal at every index: an answer set that
+/// is not records never publishes an item, whether the run got far enough to
+/// find that out or ran out of memory first.
+fn resolveRefusalSweep(records: []const u8, reason: resolve.Reason) !void {
+    const named: anyerror = reason;
+    var index: usize = 0;
+    while (index < allocation_ceiling) : (index += 1) {
+        // A null outcome is the refusal coming out as it was asked for, so
+        // there is nothing left to say about this index.
+        const outcome = try resolveAtIndex(index, records, .{ .refused = reason });
+        if (outcome == null) continue;
+        // Publishing an item is the one defect this sweep is for: the answer
+        // set is not records, so there was nothing there to publish.
+        if (outcome.? == error.ItemWhereARefusalWasNamed) {
+            return error.RefusedAnswerSetPublishedAnItem;
+        }
+        // Below the count the run could not finish because an allocation
+        // failed, and at or past it the answer set itself is what was refused.
+        try t.expect(outcome.? == named or outcome.? == error.OutOfMemory);
+    }
+}
+
+test "every allocation index of a DNS resolve hands back what it took" {
+    // The success path first, and the count is discovered rather than written
+    // down: a sweep bounded by a number in this test stops covering the
+    // resolver the first time it allocates one thing more than it used to.
+    var index: usize = 0;
+    while (index < allocation_ceiling) : (index += 1) {
+        const refusal = try resolveAtIndex(
+            index,
+            sweep_records,
+            .{ .item = sweep_addresses },
+        );
+        if (refusal == null) break;
+        try t.expect(refusal.? == error.OutOfMemory);
+    } else return error.MoreAllocationsThanTheCeilingAllows;
+    try t.expect(index > 0);
+
+    // And every index below it, where the failure lands somewhere in the
+    // stream state, the arena behind it, the address list inside that arena or
+    // the custom payload copied beside it.
+    for (0..index) |failing| {
+        const refusal = try resolveAtIndex(
+            failing,
+            sweep_records,
+            .{ .item = sweep_addresses },
+        );
+        if (refusal == null) return error.ResolveSucceededBelowItsOwnAllocationCount;
+        try t.expect(refusal.? == error.OutOfMemory);
+    }
+
+    // A record that is not a record at all is a different refusal, and it
+    // happens before the arena takes anything, so it is a different set of
+    // indices entirely.
+    try resolveRefusalSweep("hostname=x\x00", error.MalformedRecord);
+}
+
+test "two streams over one answer set each own their own item" {
+    const id = try key.NodeId.parseHex(upstream_id);
+    var service = DnsAddressLookup.init(.init(sweep_records), null);
+
+    var first = (try service.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
+    var second = (try service.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
+
+    // Both are live at once, so both items are readable at once: each resolve
+    // walked the borrowed record set from its own position and built its item
+    // in its own arena, and neither is a second handle onto the other.
+    const left = switch (first.next() orelse return error.TestUnexpectedResult) {
+        .item => |value| value,
+        .failed => |failure| return failure.reason,
+    };
+    const right = switch (second.next() orelse return error.TestUnexpectedResult) {
+        .item => |value| value,
+        .failed => |failure| return failure.reason,
+    };
+    try expectAddresses(left, sweep_addresses);
+    try expectAddresses(right, sweep_addresses);
+    try t.expect(
+        @intFromPtr(left.endpoint.addrs.ptr) != @intFromPtr(right.endpoint.addrs.ptr),
+    );
+    try t.expect(
+        @intFromPtr(left.endpoint.addrs[3].custom.data.ptr) !=
+            @intFromPtr(right.endpoint.addrs[3].custom.data.ptr),
+    );
+
+    // And releasing one leaves the other's item standing, which is the whole
+    // of what owning the item separately means: `Stream.deinit` frees one
+    // arena and nothing that belongs to the other.
+    first.deinit();
+    try t.expectEqual(@as(usize, sweep_addresses), right.endpoint.addrs.len);
+    try t.expectEqualSlices(u8, &[_]u8{ 0xab, 0xab }, right.endpoint.addrs[3].custom.data);
+    second.deinit();
+}
+
+test "a DNS answer that is not records fails the lookup at every allocation index" {
+    // `discovery/resolve.zig`'s `parseTxt` fails a DNS answer two ways: a
+    // record that is not a `key=value` under one of the three iroh attributes,
+    // and an allocator with nothing left. They are separate reasons because a
+    // caller reads them differently — the first is a publisher to fix and the
+    // second is this lookup's own fault — and a sweep is what holds the first
+    // one in place while the second one is being provoked.
+    try resolveRefusalSweep("hostname=x\x00", error.MalformedRecord);
+    try resolveRefusalSweep(
+        "relay=https://relay.example./\x00hostname=x\x00",
+        error.MalformedRecord,
+    );
+
+    // And a record whose value does not parse is not a refusal at all: it is
+    // dropped and the records behind it are kept, which is the one place the
+    // answer's own bytes decide the shape of the item.
+    const id = try key.NodeId.parseHex(upstream_id);
+    var service = DnsAddressLookup.init(
+        .init("addr=not-an-address\x00relay=https://relay.example./\x00"),
+        null,
+    );
+    var stream = (try service.lookup().resolve(t.allocator, id)) orelse
+        return error.TestUnexpectedResult;
+    defer stream.deinit();
+    const value = switch (stream.next() orelse return error.TestUnexpectedResult) {
+        .item => |item_value| item_value,
+        .failed => |failure| return failure.reason,
+    };
+    try t.expectEqual(@as(usize, 1), value.endpoint.addrs.len);
+    try t.expectEqual(
+        transport_addr.TransportAddr.relay,
+        std.meta.activeTag(value.endpoint.addrs[0]),
+    );
 }

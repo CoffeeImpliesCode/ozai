@@ -6,19 +6,29 @@ what "next" means.
 
 ## Done
 
+What exists, not what is finished. Four of these milestones are partial and
+the missing half is under **Next** or **Open** below.
+
 - **M1 — identity and addressing.** `src/base/`. Pinned against iroh's
   published vectors.
 - **M2 — wire codecs.** `src/wire/postcard.zig`, `src/blobs/range_spec.zig`,
-  and seven decoder fuzz targets.
+  and the decoder fuzz targets the `fuzz` step declares in `build.zig`.
 - **M3 — tickets and discovery records.** `src/ticket/`, `src/discovery/pkarr.zig`.
-- **M4 — relay wire protocol.** `src/relay/frame.zig`, `client.zig`, `server.zig`.
-- **M5 — address lookup.** `src/discovery/item.zig`, `resolve.zig`, `dns.zig`,
-  and `dial_source.zig`, which asks every resolver, merges with `item.merge`,
-  takes `item.winner` and dials what the merge picked. It fetches nothing
-  itself; the answers arrive as values.
+- **M4 — the relay wire protocol, below the carrier.** `src/relay/frame.zig`,
+  `client.zig`, `server.zig`: the frame codec, the signed challenge, the
+  registry, the two queues and exact-once disconnect. The carrier above them
+  is the private QUIC `/iroh-relay/1`, not RFC 6455 WebSocket over an HTTP
+  upgrade with TLS.
+- **M5 — address lookup, as pure values.** `src/discovery/item.zig`,
+  `resolve.zig`, `dns.zig`, and `dial_source.zig`, which asks every resolver,
+  merges with `item.merge`, takes `item.winner` and dials what the merge
+  picked. It fetches nothing itself; the answers arrive as values. `dns.zig`
+  builds the TXT query only: there is no A/AAAA path, and `error.Truncated`
+  is the RFC 1035 TC bit, not an empty answer.
 - **M6 — net report and NAT classification.** `src/net/report.zig`, and
   `probe_run.zig`, which executes a probe `Step` against an injected transport
-  and folds what it measured.
+  and folds what it measured. Every transport it is given in this tree is a
+  test fake.
 - **M7 — the transport seam.** `src/base/ula.zig` (the synthetic-ULA
   construction, vector-pinned), `src/transport/addr_map.zig` (the memoised
   allocation, entropy injected), and `src/transport/socket.zig` (the
@@ -35,8 +45,11 @@ what "next" means.
   query on a `transport/socket.zig` datagram and the answer off it — and its
   only callers are its own tests. See **Next** for what is still missing.
 - **M10 — the holepunch gate, and the join that feeds it.**
-  `src/net/holepunch.zig` and `holepunch_run.zig`.
-- **M11 — gossip and blobs.** `src/gossip/`, `src/blobs/protocol.zig`.
+  `src/net/holepunch.zig` and `holepunch_run.zig`. The gate is pure; the punch
+  itself is absent.
+- **M11 — gossip state machines and blob framing.** `src/gossip/`,
+  `src/blobs/protocol.zig`. No production gossip codec, no Bao verifier, store,
+  provider or getter.
 - **A program.** `src/node/` — owns sockets, drives its own loop, performs
   every `Action` the endpoint owes a caller, runs the relay, and winds down in
   the router's order. `zig build run-ozai-node`.
@@ -59,6 +72,27 @@ what "next" means.
 - **The relay's outbound frame bound.** `relay/frame.zig` owns the text bound
   and rejects an oversized frame before writing it. The node checks its frame
   room against that bound at comptime.
+
+- **Production randomness.** Repaired: `Node.create` draws 32 bytes from
+  `io.randomSecure` into an owned `Csprng` (ChaCha) and zeroes the seed buffer
+  with `std.crypto.secureZero`. `ozai-node` dropped `--seed` and no longer takes
+  a caller-chosen generator seed. Explicit `std.Random` injection remains for
+  deterministic test simulation.
+- **Protected driver wind-down.** Repaired: `src/node/main.zig` wraps execution
+  with an `errdefer` invoking `node.windDown(io, last)`, preserving original
+  driver errors while ensuring graceful closure and descriptor release.
+- **Connection ID reaping on completion.** Repaired: `src/node/node.zig`'s
+  `expire()` calls `_ = self.offered.remove(conn.id())` when connections finish,
+  ensuring bounded sequential connection churn without unbounded map growth.
+- **No RFC 7250 negotiation.** The vendored TLS writes 44-byte Ed25519 SPKI
+  certificates but negotiates no client/server certificate type, and
+  upstream's raw-key resolver and verifier require that negotiation. Repair
+  the ClientHello offers and the TLS 1.3 EncryptedExtensions selections — not
+  ServerHello, not CertificateRequest — with fail-closed parsing and captured
+  wire vectors, then prove both directions against a live Rust peer.
+- **Relayed inner QUIC is not routed.** `drain` hands `Egress.to` straight to
+  UDP, and the node already names the missing mapping. The private-carrier
+  datagram exchange establishes no end-to-end QUIC session through a relay.
 
 ## Next
 
@@ -96,20 +130,30 @@ bottom of this file.
   changed in this repair. Add the sweep before the next map allocation or
   storage-layout change; do not grow this two-seam debt.
 
-## Open, and not yet closable here
+## Open
 
-- **0-RTT.** `session_ticket` and `ticket_key` carry it and the certificate
-  patch did not discharge it. `0001` records it as open.
-- **Interop.** The requirement that this stack talks to more than one
-  implementation is undischarged, and there are two independent blockers.
-  Upstream's matrix is not reproducible from this repository — its runner is
-  a submodule outside the published package — so it has to be
-  re-established against this fork. And it cannot be run on this node at
-  all: `docker` and `quic-network-simulator` are both absent (`podman`
-  too), while `tshark` is present. So the matrix needs a node that has the
-  toolchain, and until one does, nothing here has spoken to an
-  implementation that is not its own test suite.
-- **Willow and docs** stay out of scope, as the plan says.
+- **Authenticated resumption and 0-RTT.** `session_ticket` and `ticket_key`
+  carry them and the certificate patch did not discharge them. The core's
+  pinned-client resumption currently requests a fresh client certificate
+  *after* PSK selection and fails closed through `serverIdentityEstablished`:
+  a recorded RFC 8446 deviation and an added compatibility limitation, not a
+  live identity bypass. The replacement is an RFC-compatible authenticated
+  design, or a full-handshake fallback while a pin is required. It must never
+  drop the certificate request and accept an unbound ticket, and it lands only
+  after a session store with proven ownership exists.
+- **Interop.** No Rust iroh exchange has run, and self-interoperation proves
+  nothing about one. Two things are separable. Upstream's full matrix needs
+  `docker`, `quic-network-simulator` (both absent, `podman` too) and a runner
+  that is a submodule outside the published package, so it is not reproducible
+  from this repository and needs a node that has the toolchain. The first
+  native partner leg, locked to iroh 1.3.0, needs none of those: Rustc and
+  Cargo 1.98.1 work with the configured root, and the earlier "no default
+  toolchain" answer came from a wrong inherited `RUSTUP_HOME` rather than a
+  missing install.
+- **Willow and docs stay excluded**, not deferred. `iroh-docs` is signed-entry
+  range-based reconciliation, not a Loro-backed implementation, and
+  `iroh-willow`'s Rust generation is not the current Willow spec's default
+  group choice. Neither enters this project without a later user decision.
 
 ## Standing constraints
 
@@ -119,28 +163,35 @@ bottom of this file.
   read-only. Never edit them, never commit them, never add agent rules to them.
   **They are not present on this node** — every vector in this tree was
   captured from GitHub primary source with `gh api` and pinned by SHA.
-- `zig-gate` binaries live in `~/.local/bin` and are version-pinned. They are
-  not taken from `devenv` `packages`, and `zig` is not either.
-- `vendor/quic` is upstream code and is excluded on purpose from every gate
-  section that reads the tree as text — `fmt`, `ast-check`, `ziglint`,
-  `zlint`, `zbc`, `zwanzig` — by the one `GATE_EXCLUDE` pattern, so the list
-  never has to be kept in step with the driver's sections.
-  `test/vendored_invariants.zig` is what pays that exclusion back: it fails if
-  a socket, a clock, a global entropy source or a libc call returns to the
-  vendored tree.
+- The house `zig-gate`, `cross-test` and lint binaries live in `~/.local/bin`
+  and are version-pinned; they are not taken from `devenv` `packages`, and
+  `zig` is not either. This repository's gate is `scripts/gate.zig`, reached
+  through `devenv shell -- gate`, which names its compiler explicitly instead
+  of resolving one through the `anyzig` shim.
+- `vendor/quic` is upstream code. It is excluded on purpose from the gate
+  commands that read the tree as text — `ziglint`, `zlint`, `zbc`, `zwanzig` —
+  by being left out of `scripts/gate_scope.zig`'s first-party list, so the
+  list never has to be kept in step with the driver's sections. `fmt` and
+  `ast-check` see the whole tree, because the vendored code is compiled and
+  checked like everything else. `test/vendored_invariants.zig` is what pays
+  that exclusion back: it fails if a socket, a clock, a global entropy source
+  or a libc call returns to the vendored tree.
 - Cross-validation separates the full Linux socket/process suite in
-  `cross-test.profile.sh` from 463 tests in 32 pure project modules across all
+  `cross-test.profile.sh` from 503 tests in 32 pure project modules across all
   108 pinned compiler libc ABI targets in `cross-test.portable.profile.sh`.
   The 32 are the previous 29 plus the QUIC bridge, the dial path and the
   discovery driver, pure for the same reason as the rest; the three
-  socket-owning live roots stay out. 463/463 is what the expanded root measures
-  in isolation under Debug, not a cross-target result. The last 108-target
-  portable survey — 53 run, 37 build-only, 18 SDK failures — predates those
-  three modules and describes the older 29-module root, so it has to be rerun
-  before its counts describe this one. The vendored sans-IO core, 467 tests,
-  uses the same matrix with `--step quic-test`; its canonical row is likewise
-  still being measured, and the earlier one predates the pure-address and
-  fixture corrections. Core path addresses stay pure values; kernel conversion
+  socket-owning live roots stay out. 503/503 is what the expanded root measures
+  natively in Debug and ReleaseSafe, and those tests are also reached from the
+  package roots, so the portable total is never added to the package suite's.
+  The last 108-target portable survey — 53 run, 37 build-only, 18 SDK
+  failures — predates those three modules and describes the older 29-module,
+  438-test root, so it has to be rerun before its counts describe this one.
+  The vendored sans-IO core, 560 tests, is a separate step
+  (`zig build quic-test`) and is not part of that portable matrix; its canonical
+  cross row is likewise still being measured, and the earlier one predates the
+  pure-address and fixture corrections.
+  Core path addresses stay pure values; kernel conversion
   stays in the socket seam. Emulation budgets do not replace payload, order or
   virtual-time checks. Exact executed/build-only/failed counts, toolchain
   limits, native coverage and accepted cold regions are in

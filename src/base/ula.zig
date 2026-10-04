@@ -24,9 +24,13 @@
 
 const std = @import("std");
 const addr = @import("addr.zig");
+const base_key = @import("key.zig");
+const base_relay_url = @import("relay_url.zig");
+const base_transport_addr = @import("transport_addr.zig");
+const base_node_addr = @import("node_addr.zig");
 
 const SocketAddr = addr.SocketAddr;
-const TransportAddr = addr.TransportAddr;
+const TransportAddr = base_transport_addr.TransportAddr;
 
 /// RFC 4193 /l — the first octet of every synthetic address.
 pub const prefix_l: u8 = 0xfd;
@@ -313,7 +317,7 @@ test "every transport variant maps to a socket address" {
     // slipping through unmapped.
     const transport_tag = @typeInfo(TransportAddr).@"union".tag_type.?;
     const transports = [_]TransportAddr{
-        .{ .relay = try addr.RelayUrl.parse("https://use1-1.relay.iroh.network./") },
+        .{ .relay = try base_relay_url.RelayUrl.parse("https://use1-1.relay.iroh.network./") },
         .{ .ip = .{ .ip = .{ .v4 = .{ 192, 0, 2, 7 } }, .port = 7842 } },
         .{ .custom = .{ .id = 0x2a, .data = &.{} } },
     };
@@ -335,10 +339,10 @@ test "two paths to one peer never alias" {
     // addresses. Injecting the same host bits for all three makes the claim
     // stronger, not weaker: the subnet discriminator is then the only thing
     // left that could separate them, and it has to.
-    var peer = try addr.NodeAddr.withRelay(
+    var peer = try base_node_addr.NodeAddr.withRelay(
         t.allocator,
-        try addr.NodeId.fromBytes([_]u8{1} ** 32),
-        try addr.RelayUrl.parse("https://use1-1.relay.iroh.network./"),
+        try base_key.NodeId.fromBytes([_]u8{1} ** 32),
+        try base_relay_url.RelayUrl.parse("https://use1-1.relay.iroh.network./"),
     );
     defer peer.deinit(t.allocator);
     peer = (try peer.insert(t.allocator, .{ .ip = .{

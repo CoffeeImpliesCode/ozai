@@ -389,10 +389,15 @@ pub const Frame = union(FrameType) {
         const frame_type = try packet.readVarInt(reader);
 
         return switch (frame_type) {
-            // padding
+            // padding. §16 lets a frame type occupy more than one octet, so a
+            // PADDING run is the type code plus the zeros behind it, not the
+            // zeros at offset zero: `80 00 00 00` is a four-octet PADDING
+            // frame, and counting from zero made it zero octets wide. A caller
+            // walking a coalesced packet advanced by that width and re-read the
+            // same type code forever.
             0x00 => .{
                 .padding = blk: {
-                    const len = paddingLen(bytes);
+                    const len = stream.seek + paddingLen(bytes[stream.seek..]);
                     stream.seek = len;
                     break :blk len;
                 },

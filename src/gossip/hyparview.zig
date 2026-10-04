@@ -1775,13 +1775,13 @@ pub const TopicState = struct {
         };
 
         for (membership.slice()) |produced| {
-            self.stats.messages_sent += @intFromBool(produced == .send_message);
             try appendMembership(out, produced);
+            self.stats.messages_sent += @intFromBool(produced == .send_message);
         }
         for ([_][]const plumtree.OutEvent{ payload.slice(), topology.slice() }) |list| {
             for (list) |produced| {
-                self.stats.messages_sent += @intFromBool(produced == .send_message);
                 try appendPayload(out, produced);
+                self.stats.messages_sent += @intFromBool(produced == .send_message);
             }
         }
     }
@@ -2729,6 +2729,141 @@ fn newMembership(index: u8, config: Config, seed: u64) (Error || key.KeyError)!S
     return State.init(try sim.nodeIdFor(index), null, config, .init(seed));
 }
 
+/// How many allocations `run` makes. The error the probe saw is dropped on
+/// purpose: the count is what this is for, and every sweep below re-runs each
+/// boundary and asserts the error it gets there.
+///
+/// `resize_fail_index` is pinned at zero. A growth the backing allocator can
+/// satisfy in place goes through `resize` rather than `alloc`, consumes no
+/// allocation index, and is a boundary no `fail_index` can reach — the sweep
+/// would step over it and the case would look complete while a growth went
+/// untested. Refusing every resize routes each growth through `alloc`.
+///
+/// Plumtree has its own copy of this, because a private declaration in one
+/// module is not a declaration the other can see, and a shared test helper is
+/// not worth making public for.
+fn boundariesOf(comptime run: anytype, args: anytype) !usize {
+    var probe = t.FailingAllocator.init(t.allocator, .{ .resize_fail_index = 0 });
+    // Bound and dropped by name rather than swallowed by `catch {}`: the error
+    // is the measurement's companion, not a surprise, and the sweep below
+    // re-runs each boundary and asserts the error it gets there.
+    _ = @call(.auto, run, .{probe.allocator()} ++ args) catch |probe_error| {
+        std.mem.doNotOptimizeAway(&probe_error);
+    };
+    return probe.alloc_index;
+}
+
+/// Live bytes a refused `handle` left behind that `out` does not account for.
+///
+/// `Actions` owns its list and nothing else, and every view, claim set and
+/// contact table in a `State` is inline in the value, so the caller's own
+/// container is the only thing that can hold memory at the end of a refused
+/// call. A sweep that moved an address list onto the heap, or freed the
+/// container's buffer under it, would not come out as zero here.
+fn liveIn(
+    out: anytype,
+    failing: *const t.FailingAllocator,
+) usize {
+    const Element = std.meta.Elem(@TypeOf(out.items.items));
+    return failing.allocated_bytes - failing.freed_bytes -
+        out.items.capacity * @sizeOf(Element);
+}
+
+/// One published action, without the slices in it: which kind it is and the
+/// peer or timer it names. That is the whole of what a caller acts on, and so
+/// the whole of what a restored-and-retried run has to reproduce.
+const Action = struct {
+    tag: std.meta.Tag(SwarmOutEvent),
+    to: NodeId,
+    /// How many nodes a `ShuffleReply` offered, and zero for every other kind.
+    listed: u8,
+};
+
+/// The largest action list any case below reaches. A join that evicts a peer
+/// publishes eleven and the quit drain nine, so sixteen leaves room without
+/// being a bound the code has to agree with.
+const max_actions = 16;
+
+fn describe(out: *const Actions(SwarmOutEvent), me: NodeId) ![max_actions]Action {
+    var described: [max_actions]Action = undefined;
+    std.debug.assert(out.count() <= max_actions);
+    for (out.slice(), 0..) |produced, index| described[index] = switch (produced) {
+        .send_message => |send| switch (send.message) {
+            .shuffle_reply => |reply| .{
+                .tag = .send_message,
+                .to = send.to,
+                .listed = reply.nodes.count,
+            },
+            else => .{ .tag = .send_message, .to = send.to, .listed = 0 },
+        },
+        .schedule_timer => |schedule| .{
+            .tag = .schedule_timer,
+            .to = switch (schedule.timer) {
+                .do_shuffle => me,
+                .pending_neighbor_request => |peer| peer,
+            },
+            .listed = 0,
+        },
+        .disconnect_peer => |peer| .{ .tag = .disconnect_peer, .to = peer, .listed = 0 },
+        .emit_event => |change| .{
+            .tag = .emit_event,
+            .to = switch (change) {
+                .neighbor_up => |peer| peer,
+                .neighbor_down => |peer| peer,
+            },
+            .listed = 0,
+        },
+        .peer_data => |data| .{ .tag = .peer_data, .to = data.peer, .listed = 0 },
+    };
+    return described;
+}
+
+/// Two action lists publish the same thing: same count, same kinds, same
+/// recipients, same node-list lengths.
+fn expectSameActions(
+    got: *const Actions(SwarmOutEvent),
+    want: *const Actions(SwarmOutEvent),
+    me: NodeId,
+) !void {
+    try t.expectEqual(want.count(), got.count());
+    const left_actions = try describe(want, me);
+    const right_actions = try describe(got, me);
+    for (left_actions[0..want.count()], right_actions[0..got.count()]) |a, b| {
+        try t.expectEqual(a.tag, b.tag);
+        try t.expect(sameNode(a.to, b.to));
+        try t.expectEqual(a.listed, b.listed);
+    }
+}
+
+/// Two membership states describe the same swarm: the same views, the same
+/// claims, the same contact data and the same latches. This is what a snapshot
+/// restore has to achieve, and it is why the recovery below is compared
+/// against a copy rather than against a count.
+fn expectSameMembership(got: *const State, want: *const State) !void {
+    try t.expectEqual(want.activeView().len, got.activeView().len);
+    for (want.activeView(), got.activeView()) |a, b| try t.expect(sameNode(a, b));
+    try t.expectEqual(want.passiveView().len, got.passiveView().len);
+    for (want.passiveView(), got.passiveView()) |a, b| try t.expect(sameNode(a, b));
+    try t.expectEqual(
+        want.pending_neighbor_requests.slice().len,
+        got.pending_neighbor_requests.slice().len,
+    );
+    for (want.pending_neighbor_requests.slice(), got.pending_neighbor_requests.slice()) |a, b| {
+        try t.expect(sameNode(a, b));
+    }
+    try t.expectEqual(
+        want.alive_disconnect_peers.slice().len,
+        got.alive_disconnect_peers.slice().len,
+    );
+    for (want.alive_disconnect_peers.slice(), got.alive_disconnect_peers.slice()) |a, b| {
+        try t.expect(sameNode(a, b));
+    }
+    try t.expectEqual(want.peer_data.len, got.peer_data.len);
+    try t.expectEqual(want.left, got.left);
+    try t.expectEqual(want.shuffle_scheduled, got.shuffle_scheduled);
+    try t.expectEqual(want.stats.total_connections, got.stats.total_connections);
+}
+
 // The deviation, first half: a `ForwardJoin` that has run out of walk sends a
 // `Neighbor` and inserts nothing.
 //
@@ -3235,57 +3370,192 @@ test "a quit drops the rest of the topic and leaves the state inert" {
     try t.expectEqual(@as(usize, 0), state.activeView().len);
 }
 
+/// Contact data a neighbour brought with it, as a driver would hand it over.
+/// Distinct per peer, so the tables a partial drain must not have cleared are
+/// observable and a published shuffle reply names the right bytes.
+fn peerContact(index: u8) []const u8 {
+    return switch (index) {
+        2 => "contact-two",
+        3 => "contact-three",
+        4 => "contact-four",
+        5 => "contact-five",
+        6 => "contact-six",
+        7 => "contact-seven",
+        else => "contact-other",
+    };
+}
+
+/// Three neighbours, each with contact data, and the shuffle timer already out
+/// of the way by `prime`.
+fn joinedThree(state: *State, out: *Actions(SwarmOutEvent)) !void {
+    for ([_]u8{ 2, 3, 4 }) |index| {
+        try state.handle(.{ .recv_message = .{
+            .from = try sim.nodeIdFor(index),
+            .message = .{ .neighbor = .{ .priority = .high, .data = peerContact(index) } },
+        } }, out);
+    }
+}
+
+fn quitOnce(alloc: std.mem.Allocator) !void {
+    var state: State = try newMembership(1, .{}, 43);
+    var warm: Actions(SwarmOutEvent) = .init(t.allocator);
+    defer warm.deinit();
+    try prime(&state, &warm);
+    try joinedThree(&state, &warm);
+    var out: Actions(SwarmOutEvent) = .init(alloc);
+    defer out.deinit();
+    try state.handle(.quit, &out);
+}
+
 // The drain a quit does is the one place a leaving node writes to the wire for
 // every peer it had, so it is the one place a refused append can forget a peer
 // outright. A peer taken out of the active view before its `Disconnect` was
 // published is unreachable by the retry the doc offers, and the caller is left
 // holding a neighbour it never told, which is exactly the belief
-// `handleQuit`'s rationale says must not survive.
-test "a disconnect that could not be published leaves the peer in the active view" {
-    const first = try sim.nodeIdFor(2);
-    const second = try sim.nodeIdFor(3);
-    var state: State = try newMembership(1, .{}, 43);
-    var out: Actions(SwarmOutEvent) = .init(t.allocator);
-    defer out.deinit();
-    try prime(&state, &out);
+// `handleQuit`'s rationale says must not survive. Three peers and every
+// boundary, because the residue a refusal leaves is a property of *where* in
+// a peer's three appends it landed, and the first-append case cannot see the
+// other two.
+test "a refused quit drains what it reached and forgets none of it" {
+    // The reference drain: three appends per peer, in the active view's own
+    // order. Every boundary below is compared against this rather than
+    // against a position someone wrote down.
+    var drain_order: [3]NodeId = undefined;
+    {
+        var state: State = try newMembership(1, .{}, 43);
+        var out: Actions(SwarmOutEvent) = .init(t.allocator);
+        defer out.deinit();
+        try prime(&state, &out);
+        try joinedThree(&state, &out);
+        try t.expectEqual(@as(usize, 3), state.activeView().len);
+        out.clear();
+        try state.handle(.quit, &out);
+        try t.expectEqual(@as(usize, 9), out.count());
+        // Indexed rather than a pointer capture over the array: this is the one
+        // write, and the oracle below reads all three entries back.
+        for (0..3) |index| {
+            drain_order[index] = out.at(index * 3).send_message.to;
+        }
+    }
 
-    try state.handle(.{ .recv_message = .{ .from = first, .message = .{ .neighbor = .{
-        .priority = .high,
-        .data = null,
-    } } } }, &out);
-    try state.handle(.{ .recv_message = .{ .from = second, .message = .{ .neighbor = .{
-        .priority = .high,
-        .data = null,
-    } } } }, &out);
-    try t.expectEqual(@as(usize, 2), state.activeView().len);
+    const boundaries = try boundariesOf(quitOnce, .{});
+    try t.expect(boundaries > 1);
 
-    // A fresh container, because `clear` keeps its capacity and a container
-    // that already has room would not allocate at all. The first append a quit
-    // makes is the shuffle reply that opens the first peer's farewell, so this
-    // refusal lands on the first peer of the drain.
-    var failing = std.testing.FailingAllocator.init(t.allocator, .{});
-    var refusing: Actions(SwarmOutEvent) = .init(failing.allocator());
-    defer refusing.deinit();
-    failing.fail_index = failing.alloc_index;
-    try t.expectError(error.OutOfMemory, state.handle(.quit, &refusing));
+    for (0..boundaries) |refused| {
+        var state: State = try newMembership(1, .{}, 43);
+        var warm: Actions(SwarmOutEvent) = .init(t.allocator);
+        defer warm.deinit();
+        try prime(&state, &warm);
+        try joinedThree(&state, &warm);
+        var failing = t.FailingAllocator.init(t.allocator, .{
+            .fail_index = refused,
+            .resize_fail_index = 0,
+        });
+        const alloc = failing.allocator();
 
-    // Nothing was told and nothing forgotten, so the quit committed no part of
-    // itself: both peers are still neighbours to retry from.
-    try t.expectEqual(@as(usize, 0), refusing.count());
-    try t.expectEqual(@as(usize, 2), state.activeView().len);
-    try t.expect(!state.left);
+        const published: usize = blk: {
+            var out: Actions(SwarmOutEvent) = .init(alloc);
+            defer out.deinit();
+            try t.expectError(error.OutOfMemory, state.handle(.quit, &out));
+            // A prefix of the reference, and within each peer the order the
+            // farewell is built in: the shuffle reply first, then the
+            // disconnect, then the teardown.
+            for (out.slice(), 0..) |produced, index| {
+                const peer = drain_order[index / 3];
+                switch (index % 3) {
+                    0 => {
+                        try t.expect(produced == .send_message);
+                        try t.expect(sameNode(produced.send_message.to, peer));
+                        try t.expect(produced.send_message.message == .shuffle_reply);
+                    },
+                    1 => {
+                        try t.expect(produced == .send_message);
+                        try t.expect(sameNode(produced.send_message.to, peer));
+                        try t.expect(produced.send_message.message == .disconnect);
+                    },
+                    else => {
+                        try t.expect(produced == .disconnect_peer);
+                        try t.expect(sameNode(produced.disconnect_peer, peer));
+                    },
+                }
+            }
+            try t.expectEqual(@as(usize, 0), liveIn(&out, &failing));
+            break :blk out.count();
+        };
 
-    // So the retry reaches both of them, and only then is the node gone.
-    failing.fail_index = std.math.maxInt(usize);
-    try state.handle(.quit, &refusing);
-    try t.expect(state.left);
-    try t.expectEqual(@as(usize, 0), state.activeView().len);
-    var disconnects: usize = 0;
-    for (refusing.slice()) |produced| switch (produced) {
-        .send_message => |send| disconnects += @intFromBool(send.message == .disconnect),
-        else => {},
-    };
-    try t.expectEqual(@as(usize, 2), disconnects);
+        // Told first, forgotten second. A peer leaves the active view only
+        // once its whole farewell has been published, so the peers the refusal
+        // did not finish are exactly the peers still in the view, and the
+        // retry can reach every one of them.
+        try t.expectEqual(3 - published / 3, state.activeView().len);
+        try t.expect(sameNode(state.activeView()[0], drain_order[published / 3]));
+        // And the quit has committed none of itself: the node has not left,
+        // and the contact data every published shuffle reply named is still on
+        // record for the peers that are left to be told.
+        try t.expect(!state.left);
+        try t.expectEqual(@as(usize, 3), state.peer_data.len);
+
+        // The retry the doc offers: finish the drain from where it stopped.
+        const remaining = state.activeView().len;
+        const interrupted = state.activeView()[0];
+        var replies_after: usize = 0;
+        var disconnects_after: usize = 0;
+        var teardowns_after: usize = 0;
+        {
+            failing.fail_index = std.math.maxInt(usize);
+            var out: Actions(SwarmOutEvent) = .init(alloc);
+            defer out.deinit();
+            try state.handle(.quit, &out);
+            try t.expectEqual(3 * remaining, out.count());
+            for (out.slice()) |produced| switch (produced) {
+                .send_message => |send| {
+                    if (!sameNode(send.to, interrupted)) continue;
+                    switch (send.message) {
+                        .shuffle_reply => replies_after += 1,
+                        .disconnect => disconnects_after += 1,
+                        else => {},
+                    }
+                },
+                .disconnect_peer => |peer| {
+                    teardowns_after += @intFromBool(sameNode(peer, interrupted));
+                },
+                else => {},
+            };
+            // Every peer still in the view was told, and told exactly once by
+            // this call: the residue is only ever a duplicate node list.
+            try t.expectEqual(@as(usize, 1), replies_after);
+            try t.expectEqual(@as(usize, 1), disconnects_after);
+        }
+
+        // Counted across both calls, the interrupted peer is told to go, once,
+        // and is offered a node list once per attempt that reached it. That is
+        // `handleQuit`'s named residue and it is the price of a retry here.
+        try t.expectEqual(
+            1 + @as(usize, @intFromBool(published % 3 >= 1)),
+            @as(usize, @intFromBool(published % 3 >= 1)) + replies_after,
+        );
+        try t.expectEqual(
+            1 + @as(usize, @intFromBool(published % 3 >= 2)),
+            @as(usize, @intFromBool(published % 3 >= 2)) + disconnects_after,
+        );
+        try t.expectEqual(
+            @as(usize, 1),
+            teardowns_after,
+        );
+
+        // The drain finished, so everything a quit drops is dropped: the view,
+        // the claims, the contact table the shuffle replies above were built
+        // from, and the timer, because a node that has left does not shuffle.
+        try t.expect(state.left);
+        try t.expectEqual(@as(usize, 0), state.activeView().len);
+        try t.expectEqual(@as(usize, 0), state.passiveView().len);
+        try t.expectEqual(@as(usize, 0), state.pending_neighbor_requests.count());
+        try t.expectEqual(@as(usize, 0), state.alive_disconnect_peers.count());
+        try t.expectEqual(@as(usize, 0), state.peer_data.len);
+        try t.expect(!state.shuffle_scheduled);
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 // The wire payload a committed quit produced before the peer was told it was
@@ -4042,5 +4312,402 @@ test "every simulated node has its own identity" {
             if (other == index) continue;
             try t.expect(!sameNode(mine, try sim.nodeIdFor(other)));
         }
+    }
+}
+
+/// Five neighbours, each with contact data, so the next `Join` has to make
+/// room and the eviction it causes is observable.
+fn joinedFive(state: *State, out: *Actions(SwarmOutEvent)) !void {
+    for ([_]u8{ 2, 3, 4, 5, 6 }) |index| {
+        try state.handle(.{ .recv_message = .{
+            .from = try sim.nodeIdFor(index),
+            .message = .{ .neighbor = .{ .priority = .high, .data = peerContact(index) } },
+        } }, out);
+    }
+}
+
+/// A direct `Join`, which the paper admits eagerly: it evicts a neighbour,
+/// tells that neighbour it is going with a three-part farewell, inserts the
+/// joiner, asks it to be a neighbour, and then fans the join out to every peer
+/// left standing. Eleven actions, and one boundary in every three of them.
+fn joinEvent(from: u8) !SwarmInEvent {
+    return .{ .recv_message = .{
+        .from = try sim.nodeIdFor(from),
+        .message = .{ .join = peerContact(from) },
+    } };
+}
+
+fn joinOnce(alloc: std.mem.Allocator) !void {
+    var state: State = try newMembership(1, .{}, 43);
+    var warm: Actions(SwarmOutEvent) = .init(t.allocator);
+    defer warm.deinit();
+    try prime(&state, &warm);
+    try joinedFive(&state, &warm);
+    var out: Actions(SwarmOutEvent) = .init(alloc);
+    defer out.deinit();
+    try state.handle(try joinEvent(7), &out);
+}
+
+// The event above is the busiest one in this layer: it evicts a peer, tells
+// that peer in three appends, inserts the joiner, asks it to be a neighbour,
+// and forwards the join to four more peers. Every one of those is an allocating
+// boundary, and the state is committed in the middle of them rather than at
+// the end — which is what makes this the case where the documented recovery
+// has to be shown rather than asserted.
+test "a refused join is recovered by restoring the snapshot and delivering it again" {
+    const me = try sim.nodeIdFor(1);
+    const joiner = try sim.nodeIdFor(7);
+
+    // The reference run, so the recovery below is compared against what this
+    // event does rather than against a count someone wrote down.
+    var reference_actions: Actions(SwarmOutEvent) = .init(t.allocator);
+    defer reference_actions.deinit();
+    var reference_state: State = undefined;
+    {
+        var state: State = try newMembership(1, .{}, 43);
+        var warm: Actions(SwarmOutEvent) = .init(t.allocator);
+        defer warm.deinit();
+        try prime(&state, &warm);
+        try joinedFive(&state, &warm);
+        try t.expectEqual(@as(usize, 5), state.activeView().len);
+        warm.clear();
+        try state.handle(try joinEvent(7), &reference_actions);
+        reference_state = state;
+        try t.expectEqual(@as(usize, 11), reference_actions.count());
+    }
+    const evicted = reference_state.passiveView()[0];
+
+    const boundaries = try boundariesOf(joinOnce, .{});
+    try t.expect(boundaries > 1);
+
+    for (0..boundaries) |refused| {
+        var state: State = try newMembership(1, .{}, 43);
+        var warm: Actions(SwarmOutEvent) = .init(t.allocator);
+        defer warm.deinit();
+        try prime(&state, &warm);
+        try joinedFive(&state, &warm);
+        const snapshot = state;
+        var failing = t.FailingAllocator.init(t.allocator, .{
+            .fail_index = refused,
+            .resize_fail_index = 0,
+        });
+        const alloc = failing.allocator();
+
+        {
+            var out: Actions(SwarmOutEvent) = .init(alloc);
+            defer out.deinit();
+            try t.expectError(error.OutOfMemory, state.handle(try joinEvent(7), &out));
+            const published = out.count();
+            try t.expect(published <= reference_actions.count());
+            try t.expectEqual(@as(usize, 0), liveIn(&out, &failing));
+
+            // What the event had committed when the refusal landed, read off
+            // the state rather than off the list. The contact table gains the
+            // joiner as soon as its `peer_data` action was published. The
+            // active view loses one peer and gains one: the eviction happens
+            // once the first action is out of the way and before the evicted
+            // peer's farewell starts, and the joiner is inserted before its
+            // `neighbor_up` — so the view is full, then short, then full
+            // again, and where the refusal landed is what decides which. The
+            // claim the neighbour request makes is withdrawn by
+            // `sendNeighbor`'s own `errdefer` when the request itself could
+            // not be published, which is what keeps a slot from being spent
+            // for good.
+            try t.expectEqual(
+                5 + @as(usize, @intFromBool(published >= 1)),
+                state.peer_data.len,
+            );
+            try t.expectEqual(
+                5 - @as(usize, @intFromBool(published >= 1)) +
+                    @as(usize, @intFromBool(published >= 5)),
+                state.activeView().len,
+            );
+            try t.expectEqual(state.active_view.contains(joiner), published >= 5);
+            try t.expectEqual(state.pending_neighbor_requests.contains(joiner), published >= 7);
+            try t.expectEqual(state.passive_view.contains(evicted), published >= 5);
+            try t.expectEqual(state.alive_disconnect_peers.contains(evicted), published >= 5);
+            try t.expect(!state.left);
+            try t.expect(state.shuffle_scheduled);
+
+            // The recovery `State.handle` names, in the order it names it. The
+            // snapshot goes back first because the value is plain and carries
+            // its own storage, so it restores the generator as well as the
+            // views; `out` was empty when the call started, so clearing it is
+            // the whole undo — `Actions` cannot truncate to a saved length.
+            try t.expectEqual(published, out.count());
+            out.clear();
+            try t.expectEqual(@as(usize, 0), out.count());
+            state = snapshot;
+            failing.fail_index = std.math.maxInt(usize);
+            try state.handle(try joinEvent(7), &out);
+
+            // And the second run is the first run: same actions in the same
+            // order to the same peers, and the same swarm afterwards. That is
+            // what makes this a recovery rather than a second chance.
+            try expectSameActions(&out, &reference_actions, me);
+            try expectSameMembership(&state, &reference_state);
+        }
+
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+/// A node with no neighbours yet, which is the state `TopicState` is handed to
+/// in the cases below.
+fn newTopic() (Error || key.KeyError)!TopicState {
+    return TopicState.init(try sim.nodeIdFor(1), null, .{}, .init(9));
+}
+
+/// One `Neighbor` from a peer that is not connected yet, as the topic layer
+/// receives it: the membership layer answers it, the broadcast layer is told
+/// about the neighbour, and both layers' output is lifted into one list.
+fn neighborEvent(from: u8) !InEvent {
+    return .{ .recv_message = .{
+        .from = try sim.nodeIdFor(from),
+        .message = .{ .swarm = .{ .neighbor = .{
+            .priority = .high,
+            .data = peerContact(from),
+        } } },
+    } };
+}
+
+fn topicOnce(alloc: std.mem.Allocator) !void {
+    var state: TopicState = try newTopic();
+    var out: Actions(OutEvent) = .init(alloc);
+    defer out.deinit();
+    try state.handle(try neighborEvent(2), 0, &out);
+}
+
+/// One topic action without the slices in it: which kind it is and the peer or
+/// timer it names.
+const TopicAction = struct {
+    tag: std.meta.Tag(OutEvent),
+    to: NodeId,
+    /// Which layer a `send_message` belongs to, and zero for every other kind.
+    layer: u8,
+};
+
+fn describeTopic(out: *const Actions(OutEvent), me: NodeId) ![max_actions]TopicAction {
+    var described: [max_actions]TopicAction = undefined;
+    std.debug.assert(out.count() <= max_actions);
+    for (out.slice(), 0..) |produced, index| described[index] = switch (produced) {
+        .send_message => |send| .{
+            .tag = .send_message,
+            .to = send.to,
+            .layer = switch (send.message) {
+                .swarm => 1,
+                .gossip => 2,
+            },
+        },
+        .schedule_timer => |schedule| .{
+            .tag = .schedule_timer,
+            .to = switch (schedule.timer) {
+                .swarm => |inner| switch (inner) {
+                    .do_shuffle => me,
+                    .pending_neighbor_request => |peer| peer,
+                },
+                .gossip => |inner| switch (inner) {
+                    .dispatch_lazy_push, .evict_cache => me,
+                    .send_graft => me,
+                },
+            },
+            .layer = 0,
+        },
+        .disconnect_peer => |peer| .{ .tag = .disconnect_peer, .to = peer, .layer = 0 },
+        .emit_event => |change| .{
+            .tag = .emit_event,
+            .to = switch (change) {
+                .neighbor_up => |peer| peer,
+                .neighbor_down => |peer| peer,
+                .received => me,
+            },
+            .layer = 0,
+        },
+        .peer_data => |data| .{ .tag = .peer_data, .to = data.peer, .layer = 0 },
+    };
+    return described;
+}
+
+fn expectSameTopicActions(
+    got: *const Actions(OutEvent),
+    want: *const Actions(OutEvent),
+    me: NodeId,
+) !void {
+    try t.expectEqual(want.count(), got.count());
+    const left_actions = try describeTopic(want, me);
+    const right_actions = try describeTopic(got, me);
+    for (left_actions[0..want.count()], right_actions[0..got.count()]) |a, b| {
+        try t.expectEqual(a.tag, b.tag);
+        try t.expect(sameNode(a.to, b.to));
+        try t.expectEqual(a.layer, b.layer);
+    }
+}
+
+/// Two topic states carry the same membership and the same broadcast tree,
+/// which together are what a snapshot restore has to put back.
+fn expectSameTopic(got: *const TopicState, want: *const TopicState) !void {
+    try expectSameMembership(&got.swarm, &want.swarm);
+    try t.expectEqual(want.gossip.started, got.gossip.started);
+    try t.expectEqual(want.gossip.left, got.gossip.left);
+    try t.expectEqual(want.gossip.cache.count(), got.gossip.cache.count());
+    try t.expectEqual(want.gossip.received_messages.count(), got.gossip.received_messages.count());
+    try t.expectEqual(want.gossip.missing_messages_len, got.gossip.missing_messages_len);
+    try t.expectEqual(want.gossip.lazy_push_queue_len, got.gossip.lazy_push_queue_len);
+    try t.expectEqual(
+        want.gossip.dispatch_timer_scheduled,
+        got.gossip.dispatch_timer_scheduled,
+    );
+    try t.expectEqual(want.gossip.eagerPeers().len, got.gossip.eagerPeers().len);
+    try t.expectEqual(want.gossip.lazyPeers().len, got.gossip.lazyPeers().len);
+    for (want.gossip.eagerPeers(), got.gossip.eagerPeers()) |a, b| {
+        try t.expect(sameNode(a, b));
+    }
+    try t.expectEqual(want.stats.messages_sent, got.stats.messages_sent);
+    try t.expectEqual(want.stats.messages_received, got.stats.messages_received);
+    try t.expectEqual(want.left, got.left);
+}
+
+// The topic layer is where the two passes live: the membership layer and the
+// broadcast layer fill scratch containers this function owns, and only the
+// passes at the end copy them into the caller's list. So a refusal can land
+// inside a layer, where the caller's list is untouched and both layers have
+// advanced, or inside a pass, where the list holds the entries copied before
+// it. Both are the same from outside — a prefix and a moved state — and this
+// walks every boundary to prove it, and then shows the documented recovery
+// putting the topic back exactly where it was.
+test "a refused topic event publishes a prefix and is recovered by a restore" {
+    const me = try sim.nodeIdFor(1);
+
+    var reference_actions: Actions(OutEvent) = .init(t.allocator);
+    defer reference_actions.deinit();
+    var reference_state: TopicState = undefined;
+    {
+        var state: TopicState = try newTopic();
+        try state.handle(try neighborEvent(2), 0, &reference_actions);
+        reference_state = state;
+        // Four membership actions and the broadcast layer's entry sweep.
+        try t.expectEqual(@as(usize, 5), reference_actions.count());
+    }
+
+    const boundaries = try boundariesOf(topicOnce, .{});
+    try t.expect(boundaries > 1);
+
+    for (0..boundaries) |refused| {
+        var state: TopicState = try newTopic();
+        const snapshot = state;
+        var failing = t.FailingAllocator.init(t.allocator, .{
+            .fail_index = refused,
+            .resize_fail_index = 0,
+        });
+        const alloc = failing.allocator();
+
+        {
+            var out: Actions(OutEvent) = .init(alloc);
+            defer out.deinit();
+            try t.expectError(error.OutOfMemory, state.handle(try neighborEvent(2), 0, &out));
+            const published = out.count();
+            try t.expect(published <= reference_actions.count());
+            try t.expectEqual(@as(usize, 0), liveIn(&out, &failing));
+
+            // `Stats.messages_sent` counts what this call appended to `out` and
+            // nothing else, so a refusal cannot have counted an action the
+            // caller never received or lost one it did. It is the counter a
+            // driver reports from, which is why it is checked against the
+            // list itself rather than against a number.
+            var sent: usize = 0;
+            for (out.slice()) |produced| sent += @intFromBool(produced == .send_message);
+            try t.expectEqual(@as(u64, sent), state.stats.messages_sent);
+            // A received frame is counted whatever the refusal did to the rest.
+            try t.expectEqual(@as(u64, 1), state.stats.messages_received);
+
+            // The recovery `TopicState.handle` names: both layers inline in the
+            // value, so one copy restores the views, the broadcast tree and the
+            // generator, and the caller's list was empty on entry so clearing
+            // it is the whole undo.
+            try t.expectEqual(published, out.count());
+            out.clear();
+            state = snapshot;
+            failing.fail_index = std.math.maxInt(usize);
+            try state.handle(try neighborEvent(2), 0, &out);
+
+            try expectSameTopicActions(&out, &reference_actions, me);
+            try expectSameTopic(&state, &reference_state);
+        }
+
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+// The other half of the recovery `State.handle` offers, and the one a driver
+// reaches when it cannot keep a copy: treat the refused event as the end of
+// this peer's run. What has to hold for that to be a decision rather than a
+// mess is that the state is still a `State` — every mutation checked, nothing
+// half-written — so a *different* event is still answered correctly on top of
+// it. This walks every boundary of the join above and then sends an event the
+// protocol has no excuse to mishandle because of where the last one stopped.
+test "a state refused part way through a join still answers the next event" {
+    const boundaries = try boundariesOf(joinOnce, .{});
+    try t.expect(boundaries > 1);
+
+    for (0..boundaries) |refused| {
+        var state: State = try newMembership(1, .{}, 43);
+        var warm: Actions(SwarmOutEvent) = .init(t.allocator);
+        defer warm.deinit();
+        try prime(&state, &warm);
+        try joinedFive(&state, &warm);
+        var failing = t.FailingAllocator.init(t.allocator, .{
+            .fail_index = refused,
+            .resize_fail_index = 0,
+        });
+        const alloc = failing.allocator();
+
+        {
+            var refused_out: Actions(SwarmOutEvent) = .init(alloc);
+            defer refused_out.deinit();
+            try t.expectError(
+                error.OutOfMemory,
+                state.handle(try joinEvent(7), &refused_out),
+            );
+            try t.expectEqual(@as(usize, 0), liveIn(&refused_out, &failing));
+            // The frame was received and counted before the first append, so
+            // the counter moved even though the refusal did not: this is a
+            // receive counter and not a delivery counter.
+            try t.expectEqual(@as(u64, 6), state.stats.total_connections);
+            try t.expect(!state.left);
+        }
+
+        // The abandonment: no snapshot, no retry, this peer's run ends here.
+        // What makes that a decision rather than a mess is that the state is
+        // still a `State` — every mutation checked, nothing half-written — so
+        // the claims it is holding can still be given up, one timer at a time,
+        // as they would have been on a state that had never been refused. The
+        // list is copied out first, because firing a timer withdraws the very
+        // claim the loop would otherwise walk next.
+        var owed: [max_active]NodeId = undefined;
+        const owed_count = state.pending_neighbor_requests.count();
+        try t.expect(owed_count > 0);
+        for (state.pending_neighbor_requests.slice(), 0..) |peer, index| {
+            owed[index] = peer;
+        }
+        {
+            var after: Actions(SwarmOutEvent) = .init(alloc);
+            defer after.deinit();
+            for (owed[0..owed_count]) |peer| {
+                try state.handle(.{ .timer_expired = .{ .pending_neighbor_request = peer } }, &after);
+            }
+            // Every claim was given up, so none is pending a timer that was
+            // never queued.
+            try t.expectEqual(@as(usize, 0), state.pending_neighbor_requests.count());
+            // The active view is still a set of peers inside the configured
+            // capacity, and the shuffle timer the node already held is still
+            // held rather than waiting on an append that never happened.
+            try t.expect(state.activeView().len <= state.config.active_view_capacity);
+            try t.expect(state.shuffle_scheduled);
+        }
+
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
 }

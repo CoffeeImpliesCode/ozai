@@ -1324,3 +1324,287 @@ test "a socket has to be asked for the codepoint on both families" {
     // it, the way noq sets `UDP_SEGMENT` back to zero after probing.
     try std_testing.expect(!socketOptions(.v4, false)[1].value);
 }
+
+test "domain sweep: every Probe pair answers a Capability" {
+    // `Probe` has two arms and `capability` takes two of them, so the whole
+    // function is four calls. Swept rather than sampled, because the two sides
+    // are probed independently and a capability that coupled them would answer
+    // three of the four correctly.
+    const table = [_]struct { send: Probe, recv: Probe, expected: Capability }{
+        .{
+            .send = .accepted,
+            .recv = .accepted,
+            .expected = .{
+                .max_send_segments = max_segments_linux,
+                .max_recv_segments = max_gro_segments_linux,
+            },
+        },
+        .{
+            .send = .accepted,
+            .recv = .unsupported,
+            .expected = .{
+                .max_send_segments = max_segments_linux,
+                .max_recv_segments = 1,
+            },
+        },
+        .{
+            .send = .unsupported,
+            .recv = .accepted,
+            .expected = .{
+                .max_send_segments = 1,
+                .max_recv_segments = max_gro_segments_linux,
+            },
+        },
+        .{
+            .send = .unsupported,
+            .recv = .unsupported,
+            .expected = Capability.none,
+        },
+    };
+    for (table) |row| {
+        const got = capability(row.send, row.recv);
+        try std_testing.expectEqual(row.expected, got);
+        // Each side reads off its own probe and only its own, which is what
+        // makes a kernel that coalesces on a driver that cannot segment a real
+        // answer rather than a contradiction.
+        try std_testing.expectEqual(
+            row.send == .accepted,
+            got.supportsSegmentation(),
+        );
+        try std_testing.expectEqual(row.recv == .accepted, got.supportsCoalescing());
+    }
+    // And the two hand-written capabilities are the two of those four a probe
+    // actually produces on this platform, so a probe cannot invent a fifth.
+    try std_testing.expectEqual(
+        capability(.accepted, .accepted),
+        Capability.linux_full,
+    );
+    try std_testing.expectEqual(capability(.unsupported, .unsupported), Capability.none);
+}
+
+test "domain sweep: every Family and Refused pair answers a Report" {
+    // Two families times three refusals is the whole of `report`, and each cell
+    // says something different: an unknown control message drops the codepoint
+    // on IPv4 and nothing on IPv6, and a refused segmentation degrades only a
+    // batch. Swept over `std.enums.values` so neither enum can grow an arm
+    // without this failing to compile.
+    const payload = [_]u8{0x5a} ** 20;
+    const shapes = [_]struct { send: Send, degraded: bool }{
+        // One datagram: a refusal to segment has nothing to degrade.
+        .{ .send = Send.single(&payload, .ce), .degraded = false },
+        // Two: the run goes out one `sendmsg` each and the report says so.
+        .{ .send = try Send.batch(&payload, 10, .ce), .degraded = true },
+    };
+
+    inline for (std.enums.values(Family)) |family| {
+        for (shapes) |shape| {
+            // Nothing refused: the run went out as handed over and the
+            // codepoint is the one the caller asked for.
+            const clean = report(shape.send, family, .none);
+            try std_testing.expectEqual(shape.send.ecn, clean.carried);
+            try std_testing.expect(clean.ecnSurvived());
+            try std_testing.expect(!clean.degraded);
+
+            // An unknown control message: dropped on IPv4, kept on IPv6. Only
+            // the IPv4 answer loses anything, which is why `Refused`'s own
+            // comment says noq guards only the IPv4 tos.
+            const unknown = report(shape.send, family, .unknown_control_message);
+            try std_testing.expectEqual(shape.send.ecn, unknown.wanted);
+            try std_testing.expectEqual(
+                if (family == .v4) @as(?Ecn, null) else shape.send.ecn,
+                unknown.carried,
+            );
+            try std_testing.expectEqual(family == .v6, unknown.ecnSurvived());
+            try std_testing.expect(!unknown.degraded);
+
+            // A refused segmentation is a fact about the run, not about the
+            // codepoint: it degrades a batch of more than one datagram and
+            // leaves a single datagram alone, because one is one `sendmsg`
+            // either way.
+            const segmented = report(shape.send, family, .segmentation);
+            try std_testing.expectEqual(shape.degraded, segmented.degraded);
+            try std_testing.expectEqual(shape.send.ecn, segmented.carried);
+            try std_testing.expect(segmented.ecnSurvived());
+
+            // Every cell agrees that what the caller wanted is what the report
+            // says was asked for, on every arm and both families.
+            try std_testing.expectEqual(shape.send.ecn, clean.wanted);
+            try std_testing.expectEqual(shape.send.ecn, segmented.wanted);
+        }
+    }
+}
+
+test "error inventory: every declared arm is refused by a concrete value" {
+    // Three arms, and each is reachable from more than one entry point, so each
+    // is walked from every place that raises it. `std_testing.expectError` is
+    // the assertion: the point is that the named error is what came back rather
+    // than a different one or a panic.
+    const alloc = std_testing.allocator;
+    const bytes = try alloc.alloc(u8, 4096);
+    defer alloc.free(bytes);
+    @memset(bytes, 0x5a);
+    const full = Capability.linux_full;
+
+    // `ZeroSegmentSize`: a zero segment size and a zero receive stride both
+    // name no datagram, and each is refused by every function that divides by
+    // it or names datagrams with it.
+    try std_testing.expectError(error.ZeroSegmentSize, Send.batch(bytes, 0, null));
+    try std_testing.expectError(error.ZeroSegmentSize, full.maxRunDatagrams(0));
+    try std_testing.expectError(error.ZeroSegmentSize, Recv.init(bytes, 0, null));
+    // An empty buffer with no stride is a zero stride, and is refused with it.
+    try std_testing.expectError(error.ZeroSegmentSize, Recv.init(&.{}, null, null));
+    // A hand-built value with a zero is the shape no constructor can reach.
+    try std_testing.expectError(
+        error.ZeroSegmentSize,
+        Runs.init(.{ .ecn = null, .contents = bytes, .segment_size = 0 }, full),
+    );
+
+    // `SegmentSizeTooLarge`: a size `UDP_SEGMENT` cannot carry, and a size no
+    // datagram may carry at all. Both are refused rather than divided into zero
+    // datagrams, which is the hazard the two checks exist for.
+    try std_testing.expectError(
+        error.SegmentSizeTooLarge,
+        Send.batch(bytes, @as(usize, std.math.maxInt(u16)) + 1, null),
+    );
+    try std_testing.expectError(
+        error.SegmentSizeTooLarge,
+        full.maxRunDatagrams(max_send_payload + 1),
+    );
+    try std_testing.expectError(
+        error.SegmentSizeTooLarge,
+        Runs.init(try Send.batch(bytes, max_send_payload + 1, null), full),
+    );
+
+    // `StrideExceedsBuffer`: a datagram cannot be bigger than the bytes that
+    // hold it, so a stride past the buffer describes nothing on the wire.
+    try std_testing.expectError(
+        error.StrideExceedsBuffer,
+        Recv.init(bytes[0..16], 17, null),
+    );
+    try std_testing.expectError(
+        error.StrideExceedsBuffer,
+        Recv.init(bytes[0..16], bytes.len, null),
+    );
+}
+
+test "every segmented run's bytes fit one sendmsg, at every capability" {
+    // The property both send constraints exist for, swept over the capabilities
+    // a probe can produce rather than over the two named ones: whatever the
+    // count says, a run's bytes are one message's worth, and the runs put the
+    // batch back together byte for byte. A capability that could raise the
+    // count without lowering the payload ratio would break this, and the walk
+    // would hand a socket a run `EMSGSIZE`s.
+    const alloc = std_testing.allocator;
+    const sizes = [_]usize{ 1, 64, 576, 1023, 1024, 1200, 1452, 9000 };
+    const counts = [_]usize{ 1, 2, 7, 54, 55, 63, 64, 65, 200 };
+    const caps = [_]Capability{
+        Capability.none,
+        Capability.linux_full,
+        .{ .max_send_segments = 3, .max_recv_segments = 1 },
+        .{ .max_send_segments = max_segments_linux + 1, .max_recv_segments = 1 },
+    };
+    for (caps) |caps_value| {
+        for (sizes) |size| {
+            for (counts) |count| {
+                const bytes = try alloc.alloc(u8, size * count);
+                defer alloc.free(bytes);
+                @memset(bytes, 0x5a);
+                const send = if (count == 1)
+                    Send.single(bytes, null)
+                else
+                    try Send.batch(bytes, size, null);
+                var runs = try Runs.init(send, caps_value);
+                const promised = runs.count();
+                var taken: usize = 0;
+                var rejoined: usize = 0;
+                while (runs.next()) |run| {
+                    taken += 1;
+                    rejoined += run.contents.len;
+                    try std_testing.expect(run.contents.len <= max_send_payload);
+                    // No run is cut inside a datagram, and a run that carries a
+                    // segment size carries more than one datagram.
+                    try std_testing.expectEqual(@as(usize, 0), run.contents.len % size);
+                    if (run.segment_size) |value| {
+                        try std_testing.expectEqual(@as(usize, @intCast(value)), size);
+                        try std_testing.expect(run.contents.len > size);
+                    } else {
+                        try std_testing.expectEqual(@as(usize, 1), run.datagramCount());
+                    }
+                }
+                try std_testing.expectEqual(promised, taken);
+                try std_testing.expectEqual(bytes.len, rejoined);
+                // And the count the bound produced is the smaller of the two
+                // constraints, which is what stops it ever being read off one.
+                if (count > 1) {
+                    try std_testing.expectEqual(
+                        try caps_value.maxRunDatagrams(size),
+                        runs.max_datagrams,
+                    );
+                }
+            }
+        }
+    }
+}
+
+test "a receive buffer's datagrams put it back together, at every stride" {
+    // The mirror of the send-side property, and the one that matters for a
+    // caller reading a coalesced read: every datagram is whole except the last,
+    // concatenating them in index order reproduces the buffer byte for byte,
+    // and the count is the number of datagrams `datagram` will hand out. A
+    // stride wider than the buffer is refused rather than clamped, so the
+    // stride here is always one the buffer can hold.
+    const alloc = std_testing.allocator;
+    const lengths = [_]usize{ 1, 2, 7, 16, 64, 100 };
+    const strides = [_]usize{ 1, 3, 8, 64, 100 };
+    for (lengths) |len| {
+        for (strides) |stride| {
+            if (stride > len) continue;
+            const bytes = try alloc.alloc(u8, len);
+            defer alloc.free(bytes);
+            for (bytes, 0..) |*byte, index| byte.* = @truncate(index);
+            const joined = try alloc.alloc(u8, len);
+            defer alloc.free(joined);
+
+            const recv = try Recv.init(bytes, stride, null);
+            try std_testing.expectEqual(stride, recv.stride);
+            var filled: usize = 0;
+            var index: usize = 0;
+            while (recv.datagram(index)) |datagram| {
+                // Every datagram but the last is exactly one stride, and the
+                // last is short rather than absent.
+                try std_testing.expect(datagram.len == stride or
+                    filled + datagram.len == len);
+                @memcpy(joined[filled..][0..datagram.len], datagram);
+                filled += datagram.len;
+                index += 1;
+            }
+            try std_testing.expectEqual(recv.datagramCount(), index);
+            try std_testing.expectEqualSlices(u8, bytes, joined[0..filled]);
+            // And one past the last is null rather than a wrap: this is the
+            // index that would overflow the byte offset.
+            try std_testing.expect(recv.datagram(index) == null);
+        }
+    }
+}
+
+test "a null stride and a full-buffer stride are the same read" {
+    // The property that makes `Recv.init`'s null arm safe, stated over every
+    // length a coalesced read can arrive at: a control message that never came
+    // and one that named the buffer's own length are the same value, because
+    // noq initialises the stride to the length and overwrites it only when one
+    // arrives (`noq-udp/src/unix.rs:700`).
+    const alloc = std_testing.allocator;
+    for ([_]usize{ 1, 2, 7, 64, 1200, 4096 }) |len| {
+        const bytes = try alloc.alloc(u8, len);
+        defer alloc.free(bytes);
+        @memset(bytes, 0x5a);
+        const uncoalesced = try Recv.init(bytes, null, .ect0);
+        const coalesced = try Recv.init(bytes, len, .ect0);
+        try std_testing.expectEqual(uncoalesced.stride, coalesced.stride);
+        try std_testing.expectEqual(uncoalesced.datagramCount(), coalesced.datagramCount());
+        try std_testing.expectEqual(@as(usize, 1), uncoalesced.datagramCount());
+        try std_testing.expectEqualSlices(u8, bytes, uncoalesced.datagram(0).?);
+        try std_testing.expectEqualSlices(u8, bytes, coalesced.datagram(0).?);
+        try std_testing.expect(coalesced.datagram(1) == null);
+    }
+}

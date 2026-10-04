@@ -10,7 +10,7 @@
 const std = @import("std");
 const ozai = @import("ozai");
 const blob_ticket = ozai.blob_ticket;
-const endpoint_ticket = ozai.endpoint_ticket;
+const ticket_codec = ozai.ticket_codec;
 const t = std.testing;
 
 const BlobTicket = blob_ticket.BlobTicket;
@@ -54,7 +54,7 @@ const input_buffer_len = 128;
 const reencode_len = input_buffer_len * 2;
 
 /// `textLength` of the widest body `reencode_len` can hold.
-const text_len = BlobTicket.kind.len + endpoint_ticket.base32Length(reencode_len);
+const text_len = BlobTicket.kind.len + ticket_codec.base32Length(reencode_len);
 
 comptime {
     // A seed longer than the window the fuzzer reads into would be cut short on

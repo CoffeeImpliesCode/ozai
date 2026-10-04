@@ -12,7 +12,7 @@ pub fn main(init: std.process.Init) !void {
     var out_buffer: [512]u8 = undefined;
     var out = std.Io.File.stdout().writerStreaming(io, &out_buffer);
 
-    var secret = ozai.SecretKey.generate(io);
+    var secret = try ozai.SecretKey.generate(io);
     defer secret.deinit();
 
     const node_id = secret.nodeId();

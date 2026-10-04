@@ -18,8 +18,10 @@ demands. The plan front-loads that half and defers the half that needs QUIC.
    server and no raw-key certificate support. M8 is built on a recorded
    decision with a recorded price
    ([`DECISIONS/0001`](DECISIONS/0001-transport-substrate.md)), so this is a
-   known cost rather than an open risk — with interop and 0-RTT named as still
-   open under M8.
+   known cost rather than an open risk. It is still partial, though: the
+   vendored TLS negotiates no RFC 7250 certificate type, no external exchange
+   has run, the bridge exposes bidirectional streams only and does not enable
+   DATAGRAM, and the node has no authenticated 0-RTT.
 2. **The TLS handshake is not a detail.** iroh's peer authentication *is* TLS 1.3
    with raw Ed25519 public keys: the certificate is a 44-byte DER
    `SubjectPublicKeyInfo` wrapping the 32-byte node id, in both directions, and
@@ -100,7 +102,7 @@ dependency to adopt; it is a byte format to reproduce. In scope:
   `"3:seqi{ts}e1:v{n}:" ++ dns`, not the raw bytes. Signing raw bytes produces
   packets no pkarr implementation accepts.
 
-### M4 — relay wire protocol
+### M4 — relay wire protocol, the part below the carrier
 
 The relay is HTTP/1.1 → WebSocket → `[varint frame type][payload]`, derived from
 tailscale DERP. Everything below the WebSocket is pure and testable now:
@@ -123,6 +125,13 @@ tailscale DERP. Everything below the WebSocket is pure and testable now:
   separate queues per connection so a `Status` cannot sit behind a datagram
   backlog.
 
+**Built: the codec and both state machines. Not built: the carrier.** What
+carries this in the tree is the private QUIC ALPN `/iroh-relay/1`, not RFC 6455
+WebSocket over an HTTP/1.1 upgrade with TLS. There is no production version and
+Health/Status translation, no exporter authentication, no ping driver, no
+reconnect, no policy ACL or rate limiter, and synthetic relay egress is handed
+to UDP rather than routed through the carrier.
+
 ### M5 — address lookup
 
 `AddressLookup` is a two-method trait where `resolve` returns a **stream**, and
@@ -137,6 +146,11 @@ implementations of the same interface.
 Ordering: timestamp, node id, address value via `TransportAddr.order`, then
 provenance. A total order prevents arrival-dependent results.
 
+Built as codecs and pure resolvers. Not built: the A/AAAA path, the TCP retry
+the TC bit calls for, the live pkarr HTTP transport, the publication timer, or
+any production source fan-in. A timeout is not an empty answer, and
+`error.Truncated` is the RFC 1035 TC bit rather than either of them.
+
 ### M6 — net report and NAT classification
 
 `mapping_varies_by_dest_*` is the actual classifier: two probes to *different*
@@ -146,6 +160,9 @@ report is pure arithmetic over timestamps and latencies.
 
 `UserData` caps at 245 bytes for a reason worth writing down: a DNS TXT character
 string is capped at 255 and `user-data=` costs 10.
+
+Built as the fold and the classifier. Not built: any real probe transport, the
+live QAD or captive-portal probe, or the interface and network-change watcher.
 
 ### M7 — the transport seam
 
@@ -191,7 +208,8 @@ them apart.
 
 ### M8 — the QUIC substrate ✅
 
-**Done 2026-09-30, with two items still open.** The decision and its price are
+**Built 2026-09-30, and still partial: the open list below has four items.** The
+decision and its price
 in [`DECISIONS/0001`](DECISIONS/0001-transport-substrate.md); the
 [execution record](DECISIONS/0001-transport-substrate.md#execution-record-of-2026-09-30)
 says what was built, what it cost against what was predicted, and what was not
@@ -267,6 +285,17 @@ no nonce at all.
   repository — upstream's runner is a git submodule outside the published
   package. M8 did not re-run it, so requirement 3 is re-established against
   this fork or not at all.
+- **RFC 7250.** The vendored TLS writes the 44-byte Ed25519 SPKI certificate but
+  negotiates no client or server certificate type, and upstream's raw-key
+  resolver and verifier require that negotiation. The fix is in the ClientHello
+  offers and the TLS 1.3 EncryptedExtensions selections, fail-closed parsing,
+  captured wire vectors, and a live Rust partner in both directions — not in
+  ServerHello and not in CertificateRequest.
+- **A recorded resumption deviation.** Pinned-client resumption requests a fresh
+  client certificate after PSK selection and fails closed through
+  `serverIdentityEstablished`. That is an added RFC 8446 deviation and an
+  additional compatibility limitation; it is not an identity bypass, and it is
+  not a guard to restore.
 
 **One divergence to know before touching TLS.** `Tls13Handshake.step` takes
 `now_s`, and it is a second on the **caller's** clock, not the epoch. The
@@ -297,6 +326,10 @@ consume the dependency directly" exit is not open today; the revisit triggers in
 - Graceful close is mandatory: dropping an `EndpointInner` without `close()` is
   an error, not a cleanup.
 
+Retry is refused because no hook runs before `acceptConnection` in the vendored
+core, the node admits one ALPN, and the CLI's exceptional close path does not
+reach the protected wind-down.
+
 ### M10 — NAT traversal
 
 Holepunching is not an application protocol. It is one call into the QUIC stack
@@ -315,6 +348,13 @@ connection. What ozai owns is the gate around it:
 - A selected relay path is not a reason to stop trying to punch.
 
 All of the above is pure over state, and therefore testable before QUIC exists.
+
+The gate is the whole of what exists. Three of the seven inputs have producers;
+four do not — the connection to punch on, the QUIC round result, whether a path
+carried traffic, and the socket's interface addresses — and no action can start
+a real QNT round, because QNT is absent from the vendored core. Increasing the
+two-path array does not create per-path congestion control, packet numbers,
+RTT, validation, ECN or egress selection.
 
 ### M11+ — compose protocols
 
@@ -341,21 +381,174 @@ Its hard invariants:
 - Actor event ordering is biased and fixed. Reordering the arms changes
   observable behaviour under load.
 
+**Not built yet, and self-interoperation does not stand in for it.** There is no
+production gossip codec: the encoder used by the loopback test inverts the
+`DeliveryScope` tags, upstream emits Swarm before Neighbors, and that codec
+cannot become the production one unchanged. `plumtree.max_content` is 1024
+bytes against upstream's 4096-byte default. The peer-ID connection index,
+bounded per-topic routing and the real send and disconnect actions are absent —
+production gossip counts `send_message` and `disconnect_peer` without
+performing either.
+
 Blobs: the framing is type-dependent (Get/GetMany/Observe consume the stream to
 EOF; Push is varint-length-prefixed with bao data following on the same
 stream), all ranges are in 1024-byte BLAKE3 chunks with a 16384-byte block size,
 and **missing data is EOF, not an error frame**.
 
-`iroh-willow` (~14.3k lines) and `iroh-docs` (~14.7k lines) are out of scope
-until the transport is proven. Willow is capability-secured with ristretto255
-private-area-intersection; docs is a Loro-backed CRDT, and most of what makes it
-"docs" is not portable to Zig anyway.
+**Not built yet.** Framing and range algebra are done. The Bao tree, the proof
+and root verifier, the store and any production provider or getter are not, so
+no getter verifies content; collections, tags and GC, resume, Observe and Push
+are all absent.
+
+`iroh-willow` and `iroh-docs` stay outside the project rather than waiting for
+the transport, and two of the earlier descriptions of them were wrong.
+`iroh-docs` is signed-entry range-based reconciliation over signed entries and
+byte ranges, not a Loro-backed implementation. `iroh-willow`'s Rust generation
+and its group choice are not the current Willow specification's defaults, so one
+implementation's parameterization is not evidence about the protocol. A line
+count for either crate is not an argument for porting it to Zig.
+
+## Open work, in dependency order
+
+Planned, not started, and none of it is a claim about the tree as it stands.
+Each wave's acceptance is something a caller or a peer can observe; a count of
+tests is not acceptance.
+
+### Wave 0 — runtime safety and an honest baseline
+
+1. Replace the production generator with a full-strength CSPRNG seeded from an
+   injected `Io.randomSecure`, covering TLS ephemeral scalars, relay admission
+   challenges and every cryptographic nonce and id draw, keeping deterministic
+   simulation behind explicit test seams.
+2. Protected exceptional wind-down around the CLI driver: preserve the original
+   error, attempt the close where I/O permits, release resources once.
+3. Bound accepted connection-id tracking at the reap and expiry boundaries.
+4. Make native, portable and core verification reachable from one documented
+   entry point with the overlapping roots labelled separately, run both safety
+   modes explicitly, resolve the four recorded lint findings, and carry each
+   static-analysis disposition as gate policy instead of as suppression.
+
+Acceptance: equivalent production sessions never repeat an ephemeral key or an
+admission challenge while deterministic replay remains a simulation input;
+invalid signatures and a captured reply for another challenge are refused;
+forced post-creation errors reach closed teardown; sequential connection churn
+leaves bounded tracking; a failure in each required suite and mode fails the
+documented gate; a wrong-scope or duplicate expected error log fails the runner.
+
+### Wave 1 — the endpoint contract, proved against Rust
+
+A minimal Rust partner locked to iroh 1.3.0, with no container dependency.
+Capture the current mixed-peer handshake and a failing RFC 7250 regression
+before the repair, then implement certificate-type negotiation in both roles.
+Prove mutual NodeId authentication, wrong-peer rejection, ALPN
+selection and refusal, and application bytes in both directions. Add the
+pre-accept Retry hook with token validation and the already-validated filter
+behaviour; expose uni-stream and datagram operations with explicit limits and
+ownership; and replace the single-ALPN runtime restriction with bounded
+configured ALPN selection and per-protocol task routing over the existing pure
+router, migrating every caller.
+
+Acceptance: ozai→Rust and Rust→ozai handshake and transfer, captured immutable
+wire vectors, negative identity, ALPN and certificate-type tests, Retry
+validation, stream and datagram boundary behaviour, several ALPN handlers with
+correct dispatch, wrong-protocol refusal and independent close lifetimes.
+Self-interoperation is not enough.
+
+### Wave 2 — independent vertical slices over one shared I/O seam
+
+One resolver/TCP/HTTPS owner first: A/AAAA, certificate trust, cancellation,
+and the DNS TC → TCP retry with staggering. Relay hostnames and pkarr HTTPS both
+consume it. The leaves below then develop in parallel and share no files; one
+integration owner edits the shared node and root.
+
+- **A, the standard relay carrier.** RFC 6455 WebSocket binary messages over the
+  HTTP upgrade and the TLS seam — `GET /relay`, `Upgrade: websocket`, version 13,
+  accept-key, masking and framing, `iroh-relay-v1|v2` negotiation — with
+  Health/Status translation, exporter or signed-challenge authentication, ping,
+  restart and reconnect, configured access policy, and synthetic relay egress
+  mapped through the carrier instead of sent to UDP. Acceptance: a Rust client
+  against an ozai server and the reverse where server parity is claimed, an
+  authenticated inner QUIC session through the relay with direct UDP blocked
+  transferring application bytes, and v1/v2 refusal and translation, queue
+  pressure, ping timeout, restart and exact-once disconnect covered. A renamed
+  private ALPN or an outer opaque datagram cannot pass it.
+- **B, discovery and network producers.** DNS TXT and pkarr publish, resolve,
+  republish, source fan-in and live probe execution over that seam, plus the
+  production/staging N0 preset with relay-only publication by default. The
+  pinned `iroh-dns` tree is the behavioural referent, not a dependency to add.
+  Acceptance: a locally controlled Rust DNS and pkarr service supplies signed
+  endpoint addresses an ozai node resolves and dials; signer rejection;
+  timeout, empty result and the TC bit kept distinct; cancellation; republish;
+  relay-only default publication; and real probe outcomes with no fakes.
+- **C, gossip wire and actor integration.** One production postcard codec
+  carrying the field order upstream emits, replacing the test-only encoder; the
+  peer-ID connection index, bounded per-topic routing, and real send and
+  disconnect actions. The captured-reference membership, convergence and
+  broadcast expectations already in `src/gossip/` are the floor and are
+  preserved, Neighbour/reply admission included; upstream's randomized
+  iteration and different PRNG mean event-for-event trace equality is not
+  claimed. Acceptance adds captured wire vectors and a mixed Rust/Zig
+  multi-node broadcast over real sockets, with topic event order, disconnect
+  cleanup, duplicate handling and message-size boundaries preserved. Counters
+  alone cannot pass.
+- **D, Bao and blob transfer.** The BLAKE3/Bao tree, outboard, range and size
+  proof processing, and fail-closed verification before any production getter
+  reports success; then owned storage and provider/getter drivers. Acceptance:
+  captured bao-tree vectors, valid mixed-peer transfers, corrupt, truncated,
+  proof, root and range rejection, exact missing-data EOF semantics and
+  allocation/I/O failure cleanup; then collections, tags and GC, resume,
+  Observe and Push as separate slices with permission and ownership tests.
+
+### Wave 3 — automatic reachability, not a better punch gate
+
+Reopen `DECISIONS/0001` before claiming automatic NAT traversal and compare a
+real per-path extension of the fork against a verified alternative; an
+available alternative is not assumed to meet Zig 0.16 and raw-key requirements.
+Required surfaces: per-path identity and state, observed-address reporting, the
+relay-role QAD service and its client, QNT round initiation and results,
+interface and network-change input, biased-RTT selection and pruning, and
+bounded ordered candidate dialing instead of the current single-target policy.
+All seven holepunch inputs get real producers. Acceptance: independent peers
+behind controlled NATs showing relay fallback, transition to direct traffic,
+new-address and retry behaviour, traffic-aware pruning and interface changes,
+with congestion, RTT and ECN state preserved across simultaneous paths. A
+loopback transfer has no NAT and cannot prove this wave. Wave 2's inner-QUIC
+routing is its prerequisite.
+
+### Wave 4 — authenticated resumption and release evidence
+
+Node-level resumption only after standards-compatible peer identity and stable
+session-store ownership are proven. Replace the post-PSK certificate flight
+with an RFC-compatible authenticated design, or fall back to a full handshake
+while a pin is required; never weaken `serverIdentityEstablished` and never
+accept an unbound ticket. Acceptance: resume to the correct peer, reject
+cross-peer, ALPN and version misuse and forbidden early data, keep the
+authenticated identity on resumed sessions, define application replay
+acceptance, run Debug and ReleaseSafe with the bounded decoder fuzz, publish the
+current portable, native and core cross surveys with build-only and failed cells
+labelled honestly, and check against independent QUIC implementations.
+
+Only then are optional bindings, browser support, extra lookup transports,
+content discovery and RPC scheduled.
 
 ## What is deliberately not planned
 
 - **A QUIC implementation.** If M8 resolves against writing one, this document
   changes and the reason gets recorded in DECISIONS/0001.
-- **An HTTP/3 client.** iroh does not have one and ozai does not need one.
+- **An HTTP/3 client.** iroh does not have one and ozai does not need one. This
+  is not a decision against HTTP: the standard relay carrier is WebSocket over
+  an HTTP upgrade with TLS, and discovery publishes and resolves over HTTPS.
+  Both are Wave 2 work, not exclusions.
 - **CAR files.** iroh-blobs uses its own Collection format now.
 - **Backward compatibility.** No iroh 0.x ticket layouts, no deprecated ALPN
   aliases, no shims. Delete rather than deprecate.
+- **`iroh-docs` and `iroh-willow`.** Excluded rather than deferred, with the
+  corrections recorded under M11+.
+- **RPC and application layers.** `irpc`/`irpc-iroh` and the older
+  `quic-rpc`, content discovery, share and services, and bindings for Rust, JS,
+  Python, Swift, Kotlin, C or Go are deferred until a verified endpoint and
+  ownership contracts exist. They sit above this transport, not inside it.
+- **Browser, alternate lookup and alternate transport carriers.** WASM/browser
+  reachability, mDNS, the Mainline DHT, and custom Tor, Nym or BLE transports
+  are deferred for the same reason. A `CustomAddr` value is not a live
+  transport implementation, and an address codec is not a carrier.

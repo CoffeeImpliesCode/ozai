@@ -6,6 +6,9 @@ const std = @import("std");
 const base32 = @import("base/base32.zig");
 const key = @import("base/key.zig");
 const addr = @import("base/addr.zig");
+const relay_url = @import("base/relay_url.zig");
+const transport_addr = @import("base/transport_addr.zig");
+const node_addr = @import("base/node_addr.zig");
 const ula = @import("base/ula.zig");
 const postcard = @import("wire/postcard.zig");
 const net_report = @import("net/report.zig");
@@ -33,6 +36,7 @@ const range_spec = @import("blobs/range_spec.zig");
 const blobs_protocol = @import("blobs/protocol.zig");
 const endpoint_ticket = @import("ticket/endpoint_ticket.zig");
 const blob_ticket = @import("ticket/blob_ticket.zig");
+const ticket_codec = @import("ticket/ticket_codec.zig");
 const gossip_hyparview = @import("gossip/hyparview.zig");
 const gossip_plumtree = @import("gossip/plumtree.zig");
 
@@ -41,6 +45,9 @@ test {
     std.testing.refAllDecls(base32);
     std.testing.refAllDecls(key);
     std.testing.refAllDecls(addr);
+    std.testing.refAllDecls(relay_url);
+    std.testing.refAllDecls(transport_addr);
+    std.testing.refAllDecls(node_addr);
     std.testing.refAllDecls(ula);
     std.testing.refAllDecls(postcard);
     std.testing.refAllDecls(net_report);
@@ -68,6 +75,7 @@ test {
     std.testing.refAllDecls(blobs_protocol);
     std.testing.refAllDecls(endpoint_ticket);
     std.testing.refAllDecls(blob_ticket);
+    std.testing.refAllDecls(ticket_codec);
     std.testing.refAllDecls(gossip_hyparview);
     std.testing.refAllDecls(gossip_plumtree);
 }

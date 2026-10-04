@@ -2576,3 +2576,455 @@ test "a received payload too long to record is refused" {
     );
     try t.expectEqual(@as(usize, 0), state.cache.count());
 }
+
+// ---------------------------------------------------------------------------
+// Allocation-failure sweeps
+// ---------------------------------------------------------------------------
+
+/// How many allocations `run` makes. The error the probe saw is dropped on
+/// purpose: the count is what this is for, and every sweep below re-runs each
+/// boundary and asserts the error it gets there.
+///
+/// `resize_fail_index` is pinned at zero. A growth the backing allocator can
+/// satisfy in place goes through `resize` rather than `alloc`, consumes no
+/// allocation index, and is a boundary no `fail_index` can reach — the sweep
+/// would step over it and the case would look complete while a growth went
+/// untested. Refusing every resize routes each growth through `alloc`.
+fn boundariesOf(comptime run: anytype, args: anytype) !usize {
+    var probe = t.FailingAllocator.init(t.allocator, .{ .resize_fail_index = 0 });
+    // Bound and dropped by name rather than swallowed by `catch {}`: the error
+    // is the measurement's companion, not a surprise, and the sweep below
+    // re-runs each boundary and asserts the error it gets there.
+    _ = @call(.auto, run, .{probe.allocator()} ++ args) catch |probe_error| {
+        std.mem.doNotOptimizeAway(&probe_error);
+    };
+    return probe.alloc_index;
+}
+
+/// Live bytes a refused `handle` left behind that `out` does not account for.
+///
+/// `Actions` owns its list and nothing else, and every cache, queue and claim
+/// table in a `State` is inline in the value, so the caller's own container is
+/// the only thing that can hold memory at the end of a refused call. This is
+/// the assertion that says so rather than assuming it: a sweep that leaked a
+/// chunk into the state, or freed the container's buffer under it, would not
+/// come out as zero here.
+fn liveIn(
+    comptime Out: type,
+    out: *const Actions(Out),
+    failing: *const t.FailingAllocator,
+) usize {
+    return failing.allocated_bytes - failing.freed_bytes -
+        out.items.capacity * @sizeOf(Out);
+}
+
+/// Node ids `first`..`first + span`, in the order the tree iterates them: the
+/// iTree sets are sorted by node id, not by the seed the ids are drawn from,
+/// so a test that asserts where a payload went has to sort them the same way.
+fn sortedIds(comptime span: usize, comptime first: u8) ![span]NodeId {
+    var ids: [span]NodeId = undefined;
+    for (0..span) |index| {
+        ids[index] = try testNodeId(first + @as(u8, @intCast(index)));
+    }
+    std.mem.sort(NodeId, &ids, {}, struct {
+        fn less(_: void, a: NodeId, b: NodeId) bool {
+            return a.order(b) == .lt;
+        }
+    }.less);
+    return ids;
+}
+
+/// The payload every sweep below moves. A compile-time constant so the setup
+/// costs no allocation: a boundary count that included the test's own buffer
+/// would be a count of the test rather than of the code under it.
+const sweep_payload = "ozai-gossip-allocation-sweep";
+
+/// Six neighbours: five on the eager side and one lazy edge, which is a tree
+/// wide enough that a forwarded payload is four appends before anything else.
+fn eagerTree(state: *State, out: *Actions(OutEvent)) !void {
+    // `2` is the sender the payload arrives from; `3`..`6` are the children it
+    // is forwarded to; `7` is the lazy edge it is announced on instead.
+    for ([_]u8{ 2, 3, 4, 5, 6 }) |index| {
+        try state.handle(.{ .neighbor_up = try testNodeId(index) }, 0, out);
+    }
+    try state.addLazy(try testNodeId(7));
+}
+
+fn forwardedGossip(content: []const u8) !InEvent {
+    return .{ .recv_message = .{
+        .from = try testNodeId(2),
+        .message = .{ .gossip = .{
+            .id = MessageId.fromContent(content),
+            .content = content,
+            .scope = .{ .swarm = .{ .value = 3 } },
+        } },
+    } };
+}
+
+fn forwardOnce(alloc: std.mem.Allocator) !void {
+    var state: State = .init(try testNodeId(1), .{});
+    var warm: Actions(OutEvent) = .init(t.allocator);
+    defer warm.deinit();
+    try eagerTree(&state, &warm);
+    var out: Actions(OutEvent) = .init(alloc);
+    defer out.deinit();
+    try state.handle(try forwardedGossip(sweep_payload), 0, &out);
+}
+
+// A forwarded payload across a tree with four eager children and a lazy edge:
+// six appends, of which the fifth is the dispatch timer the lazy arm queues
+// and the sixth is the application event. This is the path where the refusal
+// lands *after* work the state has already committed — the id is remembered
+// and the payload is cached before the first append — so it is where "not
+// transactional" has to be read as something the caller can act on.
+test "a refused forward publishes a prefix and keeps what the prefix names" {
+    const id = MessageId.fromContent(sweep_payload);
+    const children = try sortedIds(4, 3);
+
+    // The reference run, so the sweep below is compared against what this
+    // event publishes rather than against a number someone wrote down.
+    var reference_count: usize = 0;
+    {
+        var state: State = .init(try testNodeId(1), .{});
+        var warm: Actions(OutEvent) = .init(t.allocator);
+        defer warm.deinit();
+        try eagerTree(&state, &warm);
+        var out: Actions(OutEvent) = .init(t.allocator);
+        defer out.deinit();
+        try state.handle(try forwardedGossip(sweep_payload), 0, &out);
+        reference_count = out.count();
+    }
+    try t.expectEqual(@as(usize, 6), reference_count);
+
+    const boundaries = try boundariesOf(forwardOnce, .{});
+    // One boundary is the first append and nothing else, which would make the
+    // case a single row with extra steps.
+    try t.expect(boundaries > 1);
+
+    var deepest: usize = 0;
+    for (0..boundaries) |refused| {
+        var state: State = .init(try testNodeId(1), .{});
+        var warm: Actions(OutEvent) = .init(t.allocator);
+        defer warm.deinit();
+        try eagerTree(&state, &warm);
+        var failing = t.FailingAllocator.init(t.allocator, .{
+            .fail_index = refused,
+            .resize_fail_index = 0,
+        });
+        const alloc = failing.allocator();
+
+        const published: usize = blk: {
+            var out: Actions(OutEvent) = .init(alloc);
+            defer out.deinit();
+            try t.expectError(
+                error.OutOfMemory,
+                state.handle(try forwardedGossip(sweep_payload), 0, &out),
+            );
+            // A prefix of the reference: the payload sends first, in the tree's
+            // own sorted order, then the dispatch timer, then the application
+            // event, which no refusal here can reach.
+            const count = out.count();
+            const sent = @min(count, children.len);
+            for (out.slice()[0..sent], 0..) |produced, index| {
+                try t.expect(produced == .send_message);
+                try t.expect(sameNode(produced.send_message.to, children[index]));
+            }
+            if (count > sent) {
+                try t.expect(out.at(sent) == .schedule_timer);
+                try t.expect(out.at(sent).schedule_timer.timer == .dispatch_lazy_push);
+            }
+            try t.expect(count <= reference_count);
+            // The payload the published sends name is the one the cache is
+            // holding, and it is still there after the refusal: the entry is a
+            // borrow, so a sweep that lost the cache would leave the caller
+            // holding a pointer into nothing.
+            const cached = state.cache.get(id) orelse return error.TestUnexpectedResult;
+            try t.expectEqualStrings(sweep_payload, cached.content);
+            try t.expect(state.received_messages.contains(id));
+            try t.expectEqual(@as(usize, 0), liveIn(OutEvent, &out, &failing));
+            break :blk count;
+        };
+        deepest = @max(deepest, published);
+
+        // The dispatch latch is a claim that the caller holds the timer, and it
+        // is true exactly when that append made it into the list — so a
+        // refusal of the arm itself leaves it clear, which is what lets the
+        // next burst arm it. The idle arm's queued ids are a different thing:
+        // they are written before the timer is, so a refusal after them leaves
+        // work the next burst still flushes.
+        try t.expectEqual(published >= 4, state.dispatch_timer_scheduled);
+        try t.expectEqual(
+            @as(usize, @intFromBool(published >= 4)),
+            state.lazy_push_queue_len,
+        );
+
+        // The consumer's way forward. The id was remembered before the
+        // refusal, so asking again is not a repeat of the forward: the tree
+        // already holds this message, the sender moves to the lazy side and is
+        // pruned, and the id the lazy edge is waiting for is still queued.
+        {
+            failing.fail_index = std.math.maxInt(usize);
+            var again: Actions(OutEvent) = .init(alloc);
+            defer again.deinit();
+            try state.handle(try forwardedGossip(sweep_payload), 0, &again);
+            try t.expectEqual(@as(usize, 1), again.count());
+            try t.expect(again.at(0) == .send_message);
+            try t.expect(sameNode(again.at(0).send_message.to, try testNodeId(2)));
+            try t.expect(again.at(0).send_message.message == .prune);
+            try t.expect(state.lazy_push_peers.contains(try testNodeId(2)));
+            try t.expect(!state.eager_push_peers.contains(try testNodeId(2)));
+        }
+
+        // And the timer the caller is owed. The latch read above is what the
+        // caller is actually holding, so the burst after it arms a timer
+        // exactly when the refusal left the latch clear, and firing the timer
+        // it already holds empties the queue that timer was going to flush.
+        {
+            const owed = !state.dispatch_timer_scheduled;
+            var burst: Actions(OutEvent) = .init(alloc);
+            defer burst.deinit();
+            try state.broadcast(sweep_payload, .swarm, 0, &burst);
+            try t.expectEqual(owed, burst.at(0) == .schedule_timer);
+            try t.expect(state.dispatch_timer_scheduled);
+            var flush: Actions(OutEvent) = .init(alloc);
+            defer flush.deinit();
+            try state.handle(.{ .timer_expired = .dispatch_lazy_push }, 0, &flush);
+            try t.expectEqual(@as(usize, 0), state.lazy_push_queue_len);
+            try t.expect(!state.dispatch_timer_scheduled);
+        }
+
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+
+    // The deepest prefix any of those refusals could leave is five: the
+    // sixth append is the application event and no allocation stands between
+    // it and the fifth, so no boundary can be refused after it.
+    try t.expectEqual(@as(usize, 5), deepest);
+}
+
+/// Eight distinct messages a peer advertises in one `IHave`. Distinct
+/// compile-time constants, so the burst costs no allocation of its own and a
+/// boundary count is a count of the protocol and not of the fixture.
+const advertised = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
+
+fn advertisement(from: u8) !InEvent {
+    var ihaves: [advertised.len]IHave = undefined;
+    for (advertised, 0..) |content, index| {
+        ihaves[index] = .{
+            .id = MessageId.fromContent(content),
+            .round = .{ .value = 2 },
+        };
+    }
+    return .{ .recv_message = .{
+        .from = try testNodeId(from),
+        .message = .{ .i_have = try IHaves.init(&ihaves) },
+    } };
+}
+
+fn burstOnce(alloc: std.mem.Allocator) !void {
+    var state: State = .init(try testNodeId(1), .{});
+    var warm: Actions(OutEvent) = .init(t.allocator);
+    defer warm.deinit();
+    try state.handle(.{ .neighbor_up = try testNodeId(2) }, 0, &warm);
+    var out: Actions(OutEvent) = .init(alloc);
+    defer out.deinit();
+    try state.handle(try advertisement(2), 0, &out);
+}
+
+// A burst of eight advertisements: one claim and one graft timer each, so
+// eight appends and three boundaries. The single-claim case above can only
+// fail its first timer, so the latch rule has nothing to be wrong about past
+// that point; here a refusal in the middle leaves half the claims owing a
+// timer and half not, and every later claim is skipped because the error
+// leaves the loop.
+test "a refused advertisement burst queues the timers that are still owed" {
+    const boundaries = try boundariesOf(burstOnce, .{});
+    try t.expect(boundaries > 1);
+
+    var deepest: usize = 0;
+    for (0..boundaries) |refused| {
+        var state: State = .init(try testNodeId(1), .{});
+        var warm: Actions(OutEvent) = .init(t.allocator);
+        defer warm.deinit();
+        try state.handle(.{ .neighbor_up = try testNodeId(2) }, 0, &warm);
+        var failing = t.FailingAllocator.init(t.allocator, .{
+            .fail_index = refused,
+            .resize_fail_index = 0,
+        });
+        const alloc = failing.allocator();
+
+        const published: usize = blk: {
+            var out: Actions(OutEvent) = .init(alloc);
+            defer out.deinit();
+            try t.expectError(
+                error.OutOfMemory,
+                state.handle(try advertisement(2), 0, &out),
+            );
+            for (out.slice()) |produced| {
+                try t.expect(produced == .schedule_timer);
+                try t.expect(produced.schedule_timer.timer == .send_graft);
+            }
+            try t.expectEqual(@as(usize, 0), liveIn(OutEvent, &out, &failing));
+            break :blk out.count();
+        };
+        deepest = @max(deepest, published);
+
+        // One claim per advertisement, in arrival order, and one more than the
+        // published timers: the claim is filed before its timer is queued, so
+        // the claim whose timer was refused is on record and owes one.
+        try t.expectEqual(published + 1, state.missing_messages_len);
+        for (state.missing_messages[0..published], 0..) |entry, index| {
+            try t.expect(entry.id.eql(MessageId.fromContent(advertised[index])));
+            try t.expect(entry.graft_timer_scheduled);
+        }
+        const owed = state.missing_messages[published];
+        try t.expect(owed.id.eql(MessageId.fromContent(advertised[published])));
+        // A latch set before the append would say a timer exists for this
+        // claim, and nothing would ever ask for that message.
+        try t.expect(!owed.graft_timer_scheduled);
+
+        // The consumer's way forward: the same burst again. Claims whose timer
+        // was published are skipped, so the retry queues exactly the timers
+        // that are still owed and re-queues none of the others.
+        {
+            failing.fail_index = std.math.maxInt(usize);
+            var again: Actions(OutEvent) = .init(alloc);
+            defer again.deinit();
+            try state.handle(try advertisement(2), 0, &again);
+            try t.expectEqual(advertised.len - published, again.count());
+            for (again.slice()) |produced| {
+                try t.expect(produced == .schedule_timer);
+                try t.expect(produced.schedule_timer.timer == .send_graft);
+            }
+            try t.expectEqual(advertised.len, state.missing_messages_len);
+            for (state.missing_messages[0..advertised.len]) |entry| {
+                try t.expect(entry.graft_timer_scheduled);
+            }
+        }
+
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+
+    // Five is the deepest prefix any of those refusals leaves: the sixth
+    // append fits the capacity the third growth bought, and the eighth is the
+    // last one there is.
+    try t.expectEqual(@as(usize, 5), deepest);
+}
+
+/// Seven eager children and one lazy edge: a tree wide enough that a broadcast
+/// is eight appends.
+fn wideTree(state: *State, out: *Actions(OutEvent)) !void {
+    for ([_]u8{ 3, 4, 5, 6, 7, 8, 9 }) |index| {
+        try state.handle(.{ .neighbor_up = try testNodeId(index) }, 0, out);
+    }
+    try state.addLazy(try testNodeId(10));
+}
+
+fn broadcastOnce(alloc: std.mem.Allocator) !void {
+    var state: State = .init(try testNodeId(1), .{});
+    var warm: Actions(OutEvent) = .init(t.allocator);
+    defer warm.deinit();
+    try wideTree(&state, &warm);
+    var out: Actions(OutEvent) = .init(alloc);
+    defer out.deinit();
+    try state.broadcast(sweep_payload, .swarm, 0, &out);
+}
+
+// `broadcast` is the other public door into a tree, and it publishes its
+// dispatch timer *before* the payload sends — the reverse of the forward path
+// above, so the latch rule is observable from both ends and neither case can
+// stand in for the other.
+test "a refused broadcast arms the timer it published and no other" {
+    const id = MessageId.fromContent(sweep_payload);
+    const children = try sortedIds(7, 3);
+
+    const boundaries = try boundariesOf(broadcastOnce, .{});
+    try t.expect(boundaries > 1);
+
+    for (0..boundaries) |refused| {
+        var state: State = .init(try testNodeId(1), .{});
+        var warm: Actions(OutEvent) = .init(t.allocator);
+        defer warm.deinit();
+        try wideTree(&state, &warm);
+        var failing = t.FailingAllocator.init(t.allocator, .{
+            .fail_index = refused,
+            .resize_fail_index = 0,
+        });
+        const alloc = failing.allocator();
+
+        const published: usize = blk: {
+            var out: Actions(OutEvent) = .init(alloc);
+            defer out.deinit();
+            try t.expectError(
+                error.OutOfMemory,
+                state.broadcast(sweep_payload, .swarm, 0, &out),
+            );
+            // The timer is the first thing published, so a refusal at any
+            // later boundary still shows it first, and nothing is published at
+            // all when the very first append is the one refused.
+            if (out.count() > 0) {
+                try t.expect(out.at(0) == .schedule_timer);
+                try t.expect(out.at(0).schedule_timer.timer == .dispatch_lazy_push);
+                for (out.slice()[1..], 0..) |produced, index| {
+                    try t.expect(produced == .send_message);
+                    try t.expect(sameNode(produced.send_message.to, children[index]));
+                    try t.expectEqualStrings(
+                        sweep_payload,
+                        produced.send_message.message.gossip.content,
+                    );
+                }
+            }
+            try t.expectEqual(@as(usize, 0), liveIn(OutEvent, &out, &failing));
+            break :blk out.count();
+        };
+
+        // The latch says the caller holds the timer, and it is true exactly
+        // when the append that publishes it made it into the list.
+        try t.expectEqual(published > 0, state.dispatch_timer_scheduled);
+        // The idle arm queues its ids before it queues the timer, so the queue
+        // outlives a refusal of that timer — and it is the flush the caller
+        // still has to be given.
+        try t.expectEqual(@as(usize, 1), state.lazy_push_queue_len);
+        // The payload is in the cache whatever the refusal did to the list, and
+        // the entries published name it.
+        try t.expectEqual(@as(usize, 1), state.cache.count());
+        try t.expectEqualStrings(sweep_payload, state.cache.get(id).?.content);
+
+        if (published > 0) {
+            // The caller holds the timer it was given. Firing it is what
+            // delivers the id the idle arm queued, and the latch is released
+            // before the flush so nothing stands in for the timer the caller
+            // just consumed.
+            failing.fail_index = std.math.maxInt(usize);
+            var flush: Actions(OutEvent) = .init(alloc);
+            defer flush.deinit();
+            try state.handle(.{ .timer_expired = .dispatch_lazy_push }, 0, &flush);
+            try t.expectEqual(@as(usize, 1), flush.count());
+            try t.expect(sameNode(flush.at(0).send_message.to, try testNodeId(10)));
+            const ihaves = flush.at(0).send_message.message.i_have.slice();
+            try t.expectEqual(@as(usize, 1), ihaves.len);
+            try t.expect(ihaves[0].id.eql(id));
+            try t.expectEqual(@as(usize, 0), state.lazy_push_queue_len);
+            try t.expect(!state.dispatch_timer_scheduled);
+        } else {
+            // No timer was published, so the caller holds none to fire and
+            // delivering one would be its own mistake. The next burst is what
+            // arms it, and the id that was queued is still waiting for that
+            // timer rather than lost with the refusal.
+            failing.fail_index = std.math.maxInt(usize);
+            var burst: Actions(OutEvent) = .init(alloc);
+            defer burst.deinit();
+            try state.broadcast(sweep_payload, .swarm, 0, &burst);
+            try t.expect(burst.at(0) == .schedule_timer);
+            try t.expect(burst.at(0).schedule_timer.timer == .dispatch_lazy_push);
+            try t.expect(state.dispatch_timer_scheduled);
+            try t.expectEqual(@as(usize, 1), state.lazy_push_queue_len);
+            try t.expectEqual(@as(usize, 2), state.lazy_push_queue[0].count);
+        }
+
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}

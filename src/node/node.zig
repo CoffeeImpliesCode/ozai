@@ -62,8 +62,8 @@
 //! `test/protocol_loopback_test.zig`'s, which is explicitly not the project's
 //! format. So every `send_message` membership asks for is counted, in
 //! `gossip_membership_asked` and `gossip_broadcast_asked`, and the peer it
-//! names is kept in `Node.named`, and nothing else happens to it. That is
-//! the whole of the gap and it is visible in the counters rather than
+//! names is kept in `Node.gossip_state`, and nothing else happens to it. That
+//! is the whole of the gap and it is visible in the counters rather than
 //! inferred from silence: a node whose counters grow while nothing arrives at
 //! its peer is a finding, and the binary prints both halves. The codec belongs
 //! in `src/gossip/`, where a codec belongs, and lands with the protocol
@@ -147,11 +147,28 @@
 //! `Node.config`, and that is the whole of the protection there is: the
 //! language offers none other, and README's blanket line about reachable
 //! fields is a disclaimer rather than a rule a caller can follow.
+//!
+//! # What this file owns, and what it only holds
+//!
+//! Two groups of this node's state own storage and are therefore structs of
+//! their own rather than fields beside the rest: `gossip_state.zig` holds the
+//! topic, its timers and the peers it named, and `relay_state.zig` holds the
+//! relay's registry, its clients' queues, the relay this node spoke to and the
+//! two buffers a frame passes through. `Node` holds each by value and drives it.
+//!
+//! **The line is drawn at ownership and not at size.** What a relay pass and a
+//! gossip turn need — the bridge, the dialer, the socket, and the counters a
+//! caller reads — belongs to the node, so those loops stay here and reach into
+//! the two structs for the storage. Moving them would not move any state with
+//! them; it would only make every one of those calls take this struct, which is
+//! the facade `AGENTS.md` §9 is about. What moved is every field whose lifetime
+//! `Node` used to be responsible for, and the `init` and `deinit` that now are.
 
 const std = @import("std");
 
 const base_key = @import("../base/key.zig");
 const base_addr = @import("../base/addr.zig");
+const base_transport_addr = @import("../base/transport_addr.zig");
 const base_ula = @import("../base/ula.zig");
 const addr_map = @import("../transport/addr_map.zig");
 const batch = @import("../transport/batch.zig");
@@ -166,6 +183,11 @@ const plumtree = @import("../gossip/plumtree.zig");
 const relay_frame = @import("../relay/frame.zig");
 const relay_client = @import("../relay/client.zig");
 const relay_server = @import("../relay/server.zig");
+// The two halves of this node's own state that own their storage. `Node` holds
+// each by value and drives it; the fields and their lifetime are theirs, which
+// is what leaves the node's own field list a list of seams rather than of bytes.
+const gossip_state = @import("gossip_state.zig");
+const relay_state = @import("relay_state.zig");
 
 const NodeId = base_key.NodeId;
 const SecretKey = base_key.SecretKey;
@@ -178,10 +200,19 @@ const Dialer = dial_mod.Dialer;
 const Socket = socket_mod.Socket;
 const ControlBuffer = socket_mod.ControlBuffer;
 
-/// A seeded generator's engine, kept beside every value handed out from it:
-/// `std.Random` is an interface over a pointer to the engine, so the engine has
-/// to outlive the connection it seeds.
-const Prng = std.Random.DefaultPrng;
+/// The engine behind this node's production generator: a CSPRNG, kept beside
+/// every value handed out from it because `std.Random` is an interface over a
+/// pointer to the engine, so the engine has to outlive the connection it seeds.
+///
+/// **`std.Random.DefaultCsprng` and not `DefaultPrng`.** The audited defect was
+/// that this was a fast non-cryptographic generator seeded from a caller-supplied
+/// `u64`, which made every cryptographic draw reachable from it reconstructible
+/// from one reconstructible stream: TLS ephemeral scalars, the relay admission
+/// challenge, connection ids and path-validation nonces alike. `DefaultCsprng` is
+/// `std.Random.ChaCha` — ChaCha8 with forward-secure key erasure, whose seed is
+/// `secret_seed_length` bytes (32, the cipher key length) and must be uniform,
+/// secret and full width, which is what `create` draws it to be.
+const Csprng = std.Random.DefaultCsprng;
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -379,7 +410,7 @@ pub const Serve = struct {
     /// **This one is read on every pass, and it is the field that makes the
     /// pair construction-fixed rather than merely construction-sized.**
     /// `queueDepth` returns it, and `queuesOf` and `ringOf` re-cut every live
-    /// client's two queues and its ring out of storage `initRelay` sized from
+    /// client's two queues and its ring out of storage `relay_storage.init` cut from
     /// the value this node was built with, once, in `create`. So a write to it
     /// after `create` re-points or overruns storage that was never resized: a
     /// larger depth indexes past the end of `packets` and `messages`, and a
@@ -419,7 +450,7 @@ pub const Peer = struct {
     /// Where to reach it. A direct socket address, a relay, or a registered
     /// non-IP transport: the three ways `base/addr.zig` models reaching a
     /// node, and the three `Dialer.dial` takes.
-    addr: base_addr.TransportAddr,
+    addr: base_transport_addr.TransportAddr,
 };
 
 /// What a node is told to be, in this project's own vocabulary.
@@ -468,24 +499,11 @@ pub const Config = struct {
 
 /// One datagram a relay handed this node, and the node it came from.
 ///
-/// `data` is a copy this node allocated from its own `gpa`, not a view of the
-/// bytes the relay frame was read from: a relay frame borrows its datagrams out
-/// of its inbox and that inbox is reused by the next read, so a payload handed
-/// out has to be a copy or it is a view of a buffer that has moved on.
-///
-/// **Two lifetimes, and they are not the same one.** The payload is owned by
-/// the node until `clearDelivered` gives it back — or until `deinit`, which
-/// frees whatever is still listed — and the node's allocator is the one that
-/// frees it. The list it sits in does not survive the next delivery: appending
-/// to it may move it. `Node.delivered` says which is which from the outside.
-pub const Delivered = struct {
-    /// The node id the relay says this datagram came from. Copied, and so
-    /// independent of the payload and of every other item on the list.
-    src: NodeId,
-    /// The datagram bytes this node copied. Empty is a datagram of no bytes,
-    /// which the relay protocol permits and which is not an absence.
-    data: []u8,
-};
+/// **Declared with the storage that owns it and re-exported here**, because
+/// the payload's lifetime is the relay's and this file is only the route a
+/// caller reaches it by. `node.Delivered` and `relay_state.Delivered` are one
+/// type, so every signature below keeps the name it has always had.
+pub const Delivered = relay_state.Delivered;
 
 /// What this file refuses.
 ///
@@ -598,12 +616,6 @@ pub const Stop = struct {
         const due = self.due orelse return false;
         return at >= due;
     }
-};
-
-/// A timer the gossip layers asked for, and the instant it comes due.
-const Pending = struct {
-    due: hyparview.Nanos,
-    timer: hyparview.Timer,
 };
 
 /// What one action the endpoint owes is answered with.
@@ -723,73 +735,13 @@ pub const Stats = struct {
     relay_told_displaced: u64 = 0,
 };
 
-/// One client this node serves.
-///
-/// The registry holds connection ids and not these, because a registry that
-/// held queues would allocate and `relay/server.zig`'s does not — it is a table
-/// over storage the caller owns, and this is where the caller put the rest.
-const Served = struct {
-    /// Whether this slot holds a client.
-    live: bool = false,
-    /// The core connection this client is spoken on, which is the id the
-    /// registry holds for it.
-    conn: u64 = 0,
-    /// The relay half of the handshake, from the moment the connection is
-    /// established. `.admitted` is where a client stops being a handshake and
-    /// starts being a client.
-    handshake: relay_server.State = .opened,
-    /// The handle that ends this client, and the only way out of the registry.
-    /// Null is a client that has not been admitted, and must not be reported
-    /// as gone: `Registry.unregister` is not public, so a client with no
-    /// handle has no exit at all.
-    guard: ?relay_server.Registry(relay_displaced).OnDisconnectGuard = null,
-    /// The node id the handshake proved, or null until it has.
-    node_id: ?NodeId = null,
-    /// The two queues, over storage this node owns.
-    queues: relay_server.Connection = undefined,
-    /// The bytes a queued datagram borrows: one fixed slot per queue position,
-    /// so a `Packet` points at the slot its own ring position names and the
-    /// slot is free the moment it is popped.
-    ///
-    /// Fixed rather than an arena that grows, because a growing arena moves
-    /// the bytes every queued `Packet` points at.
-    ring: []u8 = &.{},
-    /// The stream this relay writes to the client on: one it opened itself.
-    ///
-    /// **Two streams per client, and they are not interchangeable.** A QUIC
-    /// stream is read by whichever end opened it, so the client's half of the
-    /// protocol can only be read from the stream the *client* opened — which
-    /// this connection does not hold until the client has written something.
-    /// That is why the relay opens one of its own to speak on: a relay that
-    /// waited for the client's stream could not send the challenge that makes
-    /// the client write on it. `serveRead` finds the other half each pass.
-    out: bridge_mod.Stream = undefined,
-    /// What has been read off that stream and is not yet a whole message.
-    inbox: std.ArrayList(u8) = .empty,
-    /// Whether the client has been told there is nothing more.
-    ended: bool = false,
-};
+/// The relay's storage, sized by the two bounds this file declares: the table
+/// the registry probes and the inactive list behind each entry.
+const relay_storage = relay_state.State(relay_table_slots, relay_displaced);
 
-/// The relay this node spoke to, and what it has handed back.
-const Spoke = struct {
-    /// The core connection the relay is on.
-    conn: u64,
-    /// The stream the relay protocol runs on, once there is one.
-    ///
-    /// **Not at the dial.** `StreamsMap.openBidiStream` refuses while the
-    /// peer's stream limit is still zero (`stream.zig:1385-1389`), and a
-    /// dialled connection has not read a peer's transport parameters until its
-    /// handshake is through. So the stream is opened on the first pass where
-    /// the connection is established, which is also the first pass where
-    /// anything could be written on it.
-    stream: ?bridge_mod.Stream,
-    /// The client half of the handshake, from the dial.
-    handshake: relay_client.State,
-    /// What has been read and is not yet a whole message.
-    inbox: std.ArrayList(u8),
-    /// Everything the relay has handed this node, owned until cleared.
-    delivered: std.ArrayList(Delivered),
-};
+/// The gossip layer's state, its timers, and the peers it named. Sized by the
+/// ring depth this file declares, for the reason that one states.
+const gossip_layer = gossip_state.State(named_ring);
 
 // ---------------------------------------------------------------------------
 // The node
@@ -844,7 +796,7 @@ pub const Node = struct {
     /// caller holding them, and `Config.peers` for each `addr` inside.
     ///
     /// *Construction-fixed, and one of them read on every pass.* `relay.role`
-    /// chose what `initRelay` allocated and is what every role check in this
+    /// chose what `relay_storage.init` allocated and is what every role check in this
     /// file reads; `Serve.queue_depth` is what `queueDepth` returns on every
     /// pass, out of this field, to re-cut each live client's queues and ring
     /// from storage sized once from the value `create` was given. **Do not
@@ -858,8 +810,8 @@ pub const Node = struct {
     ///
     /// *Consumed by `create`, read by nothing after it.* `listen` is the
     /// address the socket now holds and `topic` was translated into
-    /// `Node.topic`. `peers` is walked by `start` and by nothing else, so a
-    /// caller driving passes itself may change the list before its first
+    /// `Node.gossip_state`. `peers` is walked by `start` and by nothing else, so
+    /// a caller driving passes itself may change the list before its first
     /// `start` and gets nothing from a change made after it.
     ///
     /// *Copied, with one later reader.* `create` copied `secret` and the core
@@ -891,17 +843,32 @@ pub const Node = struct {
     accept: endpoint.Loop,
     lease: router.Lease,
 
-    /// The gossip layer, its timers, and the peers it named.
-    topic: hyparview.TopicState,
-    timers: std.ArrayList(Pending),
-    named: [named_ring]NodeId,
-    named_len: usize,
+    /// The gossip layer, its timers, and the peers it named — one struct, held
+    /// by value, which owns all three and their lifetime. The node drives it and
+    /// publishes what it reports; see `gossip_state.zig`.
+    gossip_state: gossip_layer,
 
-    /// The generator, and the buffers the socket and the drain seams need.
-    /// They are on the heap because the receive buffer is
-    /// `receive_room` bytes: a stack frame that overflows fails for a reason
-    /// that has nothing to do with QUIC.
-    engine: Prng,
+    /// This node's production generator, and the buffers the socket and the
+    /// drain seams need.
+    ///
+    /// **`engine` is a CSPRNG and there is no other production generator in
+    /// this file.** Every cryptographic draw reaches it: the TLS ephemeral
+    /// scalars `Dialer.open` hands `Tls13Handshake.initClientInto`, the relay
+    /// admission challenge `serveAdmit` draws, and the connection ids and
+    /// path-validation nonces the core takes from the generator a pass is
+    /// driven with. It is seeded from `io.randomSecure` in `create` and is not
+    /// reachable from any configuration field, so a caller cannot choose it.
+    ///
+    /// **A caller-supplied `std.Random` is still how a caller drives passes**,
+    /// which is what makes this file's own tests deterministic, and that seam is
+    /// unchanged. What changed is that the generator this node *owns* — the one
+    /// its production path draws from — is a CSPRNG rather than a fast
+    /// generator a caller could seed by passing a number.
+    ///
+    /// The buffers are on the heap because the receive buffer is `receive_room`
+    /// bytes: a stack frame that overflows fails for a reason that has nothing
+    /// to do with QUIC.
+    engine: Csprng,
     egress: []Egress,
     out: []u8,
     scratch: []u8,
@@ -922,53 +889,23 @@ pub const Node = struct {
     /// `start`'s own rule.
     joined: bool,
 
-    /// The relay's tables, its clients' queues and the buffers a relay frame
-    /// passes through. **The slots, the registry, the clients and their three
-    /// allocations are built for a `.serve` and are not initialised for any
-    /// other role** — `initRelay` returns before it reaches them — so they are
-    /// not "empty" elsewhere, they are unwritten, and every reader of them is
-    /// gated on the role instead of trusting a table nobody filled. `.off`
-    /// builds none of them, and `.client` builds no registry, no queues and no
-    /// clients.
+    /// The relay's tables, its clients' queues, the relay this node spoke to,
+    /// and the buffers a relay frame passes through — one struct, held by
+    /// value, which owns all of them and their lifetime. **The slots, the
+    /// registry, the clients and their three allocations are built for a
+    /// `.serve` and are not initialised for any other role**, so they are not
+    /// "empty" elsewhere, they are unwritten, and every reader of them is gated
+    /// on the role instead of trusting a table nobody filled. `.off` builds
+    /// none of them, and `.client` builds no registry, no queues and no clients.
     ///
-    /// **The two frame buffers below are the exception, and they are every
-    /// node's.** `initRelay` allocates `relay_out` and `relay_scratch` before
-    /// it looks at the role at all, and `freeRelay` frees both whatever the
-    /// role was, so a `.off` node holds and returns two relay allocations it
-    /// never writes a byte into — `relay_frame_room + varint_max` and
-    /// `relay_frame_room`. An ownership audit that reads this group as "no
-    /// relay storage off a relay node" misses both, on every gossip node in the
-    /// tree.
-    slots: [relay_table_slots]relay_server.Registry(relay_displaced).Slot,
-    registry: relay_server.Registry(relay_displaced),
-    clients: []Served,
-    /// The two queues' storage for every client, laid out back to back and
-    /// cut into one client's depth apiece. One allocation for all of them,
-    /// because a per-client allocation is a pointer chase on the hot path and
-    /// the sizes are all the same.
-    packets: []relay_server.Packet,
-    messages: []relay_server.Control,
-    ring: []u8,
-    /// The relay this node spoke to, when it is a client of one.
-    spoke: ?Spoke,
-    /// Whether that dial has been attempted, whatever it answered. `start`
-    /// records a peer the same way, and for the same reason: a relay that was
-    /// not there is a fact about the network and not a reason to retry.
-    relay_dialled: bool,
-    /// Where a relay frame is encoded — the varint length first, then the
-    /// frame behind it. **The only relay buffer sized by `relay_frame_room`.**
-    /// A read used to have one too, and that conflation was the defect: a read
-    /// is a run of whatever arrived, not a frame, so sizing it by the frame
-    /// bound refused the run after the core had already handed the bytes over.
-    /// See `Stream.drain`.
-    relay_out: []u8,
-    /// What a decoded relay frame borrows out of. See `peekFrame`.
-    relay_scratch: []u8,
+    /// The two frame buffers inside it are the exception, and they are every
+    /// node's; `relay_state.zig` says so where the allocations are taken.
+    relay_state: relay_storage,
 
     stats: Stats,
 
-    /// Build a node from `config`, with `seed` as the root of every generator
-    /// it draws from.
+    /// Build a node from `config`, with this node's production generator seeded
+    /// from `io.randomSecure` and no way for a caller to choose or narrow it.
     ///
     /// **`gpa` is this node's allocator for its whole life.** Every allocation
     /// made after this call — the egress list, the three scratch buffers, the
@@ -996,31 +933,49 @@ pub const Node = struct {
     /// payload inside it is the caller's and has to outlive the node.
     ///
     /// **A cancelled `io` is `error.Canceled`, not `error.EntropyUnavailable`.**
-    /// The two transport secrets are drawn from `io.randomSecure` here and
-    /// nowhere else, so an `Io` that is cancelled while they are being drawn
-    /// answers `error.Canceled` and one that has no secure entropy answers
-    /// `error.EntropyUnavailable`. Nothing is left behind either way: every
-    /// line below this one is under an `errdefer`, so a failed `create` frees
-    /// the socket, the bridge, the dialer and every buffer it had taken.
+    /// Three draws come from `io.randomSecure` here — this node's CSPRNG seed
+    /// and the two transport secrets `Bridge.create` was not given — so an `Io`
+    /// that is cancelled while they are being drawn answers `error.Canceled` and
+    /// one that has no secure entropy answers `error.EntropyUnavailable`.
+    /// Nothing is left behind either way: every line below this one is under an
+    /// `errdefer`, so a failed `create` frees the socket, the bridge, the dialer
+    /// and every buffer it had taken.
     ///
-    /// `io` is used for exactly one thing: the two transport secrets
-    /// `Bridge.create` was not given. It is null-drawn from `io.randomSecure`
+    /// `io` is used for exactly two things, both of them entropy draws: the seed
+    /// of this node's own generator and the two transport secrets
+    /// `Bridge.create` was not given. All three are drawn from `io.randomSecure`
     /// rather than from a process CSPRNG because a global generator is what
     /// `AGENTS.md` §2 forbids and an `Io` the caller handed over is not a
-    /// global — and it is read here and nowhere else, because `Node` stores no
+    /// global — and `io` is read here and nowhere else, because `Node` stores no
     /// `Io`.
     ///
-    /// That includes the relay's admission challenge: it is drawn from the
-    /// `random` this node is driven with, not from `io`, because a challenge
-    /// that differs between two runs of the same node is what makes a test
-    /// reproducible and `Io` is not drivable. What that costs is stated where
-    /// the challenge is drawn — `serveAdmit`.
+    /// **The seed is full width and is not a parameter.** `Csprng.init` takes
+    /// `Csprng.secret_seed_length` bytes — 32, the ChaCha8 cipher key length —
+    /// and requires them uniform, secret and of that width, so a caller cannot
+    /// narrow it and there is no configuration field that carries one. The
+    /// temporary the draw lands in is zeroed on every path out of this function,
+    /// including both error paths, because it is the whole of this node's
+    /// generator's entropy in plain memory for as long as the frame lives.
+    ///
+    /// The relay's admission challenge is drawn from the `random` a pass is
+    /// driven with, which in production is this node's own CSPRNG and in a test
+    /// is the caller's own generator. That seam is deliberate and unchanged; what
+    /// it now reaches is a CSPRNG rather than a fast generator seeded from a
+    /// number, which is the whole of the repair.
     ///
     /// Everything after `Bridge.create` is the configuration translation, and
     /// it happens here once rather than at the call sites that would otherwise
     /// have to know both vocabularies. `quic_bridge.zig` gives the rule: "a
     /// translation nobody can read is a translation nobody can check".
-    pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node {
+    pub fn create(gpa: Allocator, io: std.Io, config: Config) Error!*Node {
+        // Drawn before anything else is built, so a runtime that cannot supply
+        // secure entropy fails before a descriptor is opened rather than after.
+        var secret_seed: [Csprng.secret_seed_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &secret_seed);
+        io.randomSecure(&secret_seed) catch |err| switch (err) {
+            error.EntropyUnavailable => return error.EntropyUnavailable,
+            error.Canceled => return error.Canceled,
+        };
         const self = try gpa.create(Node);
         errdefer gpa.destroy(self);
         self.* = .{
@@ -1037,11 +992,8 @@ pub const Node = struct {
             .tasks = undefined,
             .accept = undefined,
             .lease = undefined,
-            .topic = undefined,
-            .timers = .empty,
-            .named = [_]NodeId{undefined} ** named_ring,
-            .named_len = 0,
-            .engine = Prng.init(seed),
+            .gossip_state = undefined,
+            .engine = Csprng.init(secret_seed),
             .egress = &.{},
             .out = &.{},
             .scratch = &.{},
@@ -1051,22 +1003,12 @@ pub const Node = struct {
             .offered = .empty,
             .dialled = .empty,
             .joined = false,
-            .slots = undefined,
-            .registry = undefined,
-            .clients = &.{},
-            .packets = &.{},
-            .messages = &.{},
-            .ring = &.{},
-            .spoke = null,
-            .relay_dialled = false,
-            .relay_out = &.{},
-            .relay_scratch = &.{},
+            .relay_state = undefined,
             .stats = .{},
         };
         errdefer self.map.deinit(gpa);
         errdefer self.offered.deinit(gpa);
         errdefer self.dialled.deinit(gpa);
-        errdefer self.timers.deinit(gpa);
 
         self.socket = try Socket.create(config.listen, .{});
         errdefer self.shutdownSocket();
@@ -1107,11 +1049,33 @@ pub const Node = struct {
         self.buf = try gpa.alloc(u8, receive_room);
         errdefer gpa.free(self.buf);
 
-        // The relay's storage, and only for a node that is one. Every failure
-        // here unwinds what it took, so the struct this leaves behind is the
-        // one `deinit` will find.
-        try self.initRelay();
-        errdefer self.freeRelay();
+        // The relay's storage, and only for a node that is one.
+        const relay_sizing: ?relay_state.Sizing = switch (config.relay.role) {
+            .serve => |role| relay_state.Sizing{
+                .clients = role.clients,
+                .queue_depth = role.queue_depth,
+                .datagram = max_datagram,
+            },
+            else => null,
+        };
+        // **The operator's numbers are validated here rather than in the struct
+        // that is cut from them**, because `max_relay_clients` is this file's
+        // bound and a refusal is this file's own error: a relay built wider than
+        // the tables below it would probe a table the registry answers
+        // `NoFreeSlot` to long before it was full, and a queue of no room drops
+        // every datagram while reporting that it forwarded none. Both are
+        // refused before anything is allocated.
+        if (relay_sizing) |size| {
+            if (size.clients > max_relay_clients) return error.TooManyRelayClients;
+            if (size.queue_depth == 0) return error.RelayQueueDepthZero;
+        }
+        try self.relay_state.init(
+            gpa,
+            relay_frame_room + varint_max,
+            relay_frame_room,
+            relay_sizing,
+        );
+        errdefer self.relay_state.deinit(gpa);
 
         // What this node advertises as its own contact data: the address it
         // is reachable at. Upstream carries opaque bytes and this is the one
@@ -1129,12 +1093,25 @@ pub const Node = struct {
                 .{SocketAddr.max_text_length},
             ),
         };
-        self.topic = try hyparview.TopicState.init(
+        // **The gossip layer's own generator is drawn from this node's CSPRNG,
+        // not from a caller's number.** `hyparview.Rng` is the deterministic
+        // simulation generator that module's own tests inject, and its type
+        // belongs to that module rather than to this one; what is decided here
+        // is only that no caller chooses its seed. It used to be the same `u64`
+        // that seeded the transport generator, which meant one caller-supplied
+        // number fixed both the TLS scalars and the membership shuffle order.
+        // The draw is 64 bits because that is the width `hyparview.Rng.init`
+        // takes, and this is not a cryptographic value: it orders shuffles.
+        self.gossip_state = try gossip_layer.init(
             self.bridge.nodeId(),
             try hyparview.PeerData.fromBytes(advertised),
             config.topic,
-            hyparview.Rng.init(seed),
+            hyparview.Rng.init(self.engine.random().int(u64)),
         );
+        // Registered after the assignment rather than with the rest above: the
+        // topic holds no heap, so a `create` that failed before this line has
+        // nothing of the gossip layer's to give back.
+        errdefer self.gossip_state.deinit(gpa);
 
         // Last, because the two values below read through this struct and a
         // failure after this point would have to unwind a lease that nothing
@@ -1208,7 +1185,7 @@ pub const Node = struct {
         // points at a connection the core is about to free. An orderly
         // shutdown has already released every client, so this is the backstop
         // for the node that was dropped without one.
-        self.freeRelay();
+        self.relay_state.deinit(self.gpa);
         // The walk above already applied `destroy`'s own test — every entry
         // with `!entry.conn.is_server` — to every entry there was, and
         // `removeConnection` swap-removes the entry it is handed
@@ -1233,9 +1210,13 @@ pub const Node = struct {
         self.map.deinit(self.gpa);
         self.offered.deinit(self.gpa);
         self.dialled.deinit(self.gpa);
-        self.timers.deinit(self.gpa);
+        self.gossip_state.deinit(self.gpa);
         self.shutdownSocket();
         self.config.secret.deinit();
+        // The ChaCha key, and every ephemeral scalar, relay challenge,
+        // connection id and path-validation nonce derived from it, lives here
+        // for the node's whole life; wipe it before the block goes back.
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.engine));
         self.gpa.destroy(self);
     }
 
@@ -1250,7 +1231,20 @@ pub const Node = struct {
         return self.socket.address;
     }
 
-    /// A borrowed generator valid until `deinit`. Copies advance the same engine.
+    /// This node's own generator, borrowed until `deinit`; copies advance the
+    /// same engine.
+    ///
+    /// **It is a CSPRNG and it is the production one**, seeded from
+    /// `io.randomSecure` in `create` and unreachable from any configuration
+    /// field. This is what a driver passes as the `random` of `start`, `step`
+    /// and `close`, so in production every cryptographic draw — TLS ephemeral
+    /// scalars, the relay admission challenge, connection ids, path-validation
+    /// nonces — comes from it rather than from a caller-chosen number.
+    ///
+    /// A caller that wants a deterministic run passes its own `std.Random` to
+    /// those seams instead of calling this, which is the simulation seam and is
+    /// unchanged: it is a parameter of every one of them. What a caller can no
+    /// longer do is make *this node's own* generator predictable.
     ///
     /// Named for what it is and not `random`, because every seam below takes
     /// its generator as a parameter called `random` and a declaration by that
@@ -1277,14 +1271,15 @@ pub const Node = struct {
     /// first. See `named_ring`.
     /// The slice borrows this node and changes when later actions name peers.
     pub fn namedPeers(self: *const Node) []const NodeId {
-        return self.named[0..self.named_len];
+        return self.gossip_state.namedPeers();
     }
 
     /// Dial every peer the configuration names, once, and tell the gossip
     /// layer to join them.
     ///
     /// Not part of `create`: a dial needs an instant and a generator, and
-    /// `create` has a seed rather than either. Upstream dials from
+    /// `create` has neither — the first is the caller's clock and the second is
+    /// the generator this node is being driven with. Upstream dials from
     /// `Endpoint::connect`, after the endpoint exists; this draws the line
     /// where the instant is available, which is the same line.
     ///
@@ -1372,7 +1367,7 @@ pub const Node = struct {
     /// **A failed pass is a node to be closed, not a pass to be replayed.**
     /// Each seam consumes before it can fail. A datagram `take` took is gone
     /// from the socket whether the core took it or refused it, and a gossip
-    /// timer `gossip` has already taken out of `self.timers` by the time
+    /// timer `gossip` has already taken out of `self.gossip_state` by the time
     /// `feedGossip` propagates the failure that produced it. So a caller that
     /// answers a failed `step` by running the same pass again is replaying an
     /// event this node has already acted on, and nothing here promises that is
@@ -1618,8 +1613,17 @@ pub const Node = struct {
         }
     }
 
-    /// The close a failed `run` owes: a graceful one where there is an instant
+    /// The close a failed loop owes: a graceful one where there is an instant
     /// to stamp it with, and the disposal behind it in every case.
+    ///
+    /// **Public because two loops owe it, and both are real drivers.** `run`
+    /// registers it before its first clock read, and `src/node/main.zig`'s
+    /// `drive` registers it around itself, because `drive` is a second loop over
+    /// the same node rather than a call to `run` — it exists so the program can
+    /// put a `--send` datagram on the wire between two passes. Before this was
+    /// reachable, `drive` had no such guard, so a pass that failed left `main`
+    /// to return the error over a node still in `serving` and the `deinit`
+    /// behind it dropped the lease without writing a CONNECTION_CLOSE.
     ///
     /// **The graceful half runs with cancellation protection switched on**
     /// (`std.Io.CancelProtection`), which is the runtime's own answer to
@@ -1629,10 +1633,18 @@ pub const Node = struct {
     ///
     /// It is bounded — one step per shutdown phase, one pass over the
     /// connection table, one `sendmsg` per egress run, no wait — and it runs
-    /// after the error that ended the loop has already been decided. Whatever
-    /// it cannot finish is handed to `dispose`, which is the only part of this
-    /// that cannot fail.
-    fn windDown(self: *Node, io: std.Io, at: ?Instant) void {
+    /// after the error that ended the loop has already been decided. **It
+    /// cannot change that error**: it returns nothing, logs at error level if
+    /// the graceful half did not finish, and leaves the loop's own failure as
+    /// the failure. Whatever it cannot finish is handed to `dispose`, which is
+    /// the only part of this that cannot fail.
+    ///
+    /// `at` is the instant the failed loop had read, or null for a loop that
+    /// never read one. Null is not a lesser teardown: `dispose` still runs, so
+    /// the descriptor is released and every connection is freed. It means only
+    /// that no CONNECTION_CLOSE is stamped, because there is no instant to
+    /// stamp it with and a close on a guessed time is worse than none.
+    pub fn windDown(self: *Node, io: std.Io, at: ?Instant) void {
         if (at) |stamp| {
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
@@ -1877,6 +1889,7 @@ pub const Node = struct {
             // (`connection_manager.zig:711-713`), so whatever was last is now
             // at `index` and the walk must not step past it.
             self.stats.connections_finished += 1;
+            _ = self.offered.remove(conn.id());
             moved = true;
             if (self.accept.task(conn.id()) != null) {
                 try self.feed(io, .{
@@ -1912,68 +1925,36 @@ pub const Node = struct {
     /// (`test/protocol_loopback_test.zig`, `max_rounds = 512`), and a node
     /// keeps going: nothing here counts rounds, and the timers membership
     /// asked for are the only thing that decides when this runs again.
+    ///
+    /// **The walk belongs to the layer and the firing does not.** `Due` holds
+    /// the cursor and takes the timers; what happens to one is a node's business,
+    /// because it is a node that counts and feeds.
     fn gossip(self: *Node, at: Instant) Error!bool {
-        var moved = false;
         const now = try gossipNow(at);
-        // In the order they were asked for, so a node that has been idle wakes
-        // up on the same schedule every time.
-        var position: usize = 0;
-        while (position < self.timers.items.len) {
-            if (self.timers.items[position].due > now) {
-                position += 1;
-                continue;
-            }
-            const due = self.timers.orderedRemove(position);
+        var due: gossip_layer.Due = .{ .state = &self.gossip_state, .now = now };
+        var moved = false;
+        while (due.next()) |timer| {
             self.stats.gossip_timers_fired += 1;
             moved = true;
-            try self.feedGossip(.{ .timer_expired = due.timer }, now);
+            try self.feedGossip(.{ .timer_expired = timer }, now);
         }
         return moved;
     }
 
-    /// Hand one event to the gossip layer and do what it asks for.
+    /// Hand one event to the gossip layer and do what it asks for, publishing
+    /// what it reported.
     fn feedGossip(self: *Node, event: hyparview.InEvent, now: hyparview.Nanos) Error!void {
-        var out: hyparview.Actions(hyparview.OutEvent) = .init(self.gpa);
-        defer out.deinit();
-        try self.topic.handle(event, now, &out);
-        self.stats.gossip_events += 1;
-        for (out.slice()) |produced| switch (produced) {
-            // **Not wired.** The gossip wire format does not exist in this
-            // project — `gossip/hyparview.zig` says of itself that it has no
-            // codec, and the only encoder here is a test's. So the request is
-            // counted, split by the layer that asked, and the peer is named;
-            // nothing is sent. See the module doc.
-            .send_message => |send| {
-                self.noteNamed(send.to);
-                switch (send.message) {
-                    .swarm => self.stats.gossip_membership_asked += 1,
-                    .gossip => self.stats.gossip_broadcast_asked += 1,
-                }
-            },
-            .schedule_timer => |schedule| {
-                self.stats.gossip_timers_scheduled += 1;
-                try self.timers.append(self.gpa, .{
-                    .due = now + schedule.after,
-                    .timer = schedule.timer,
-                });
-            },
-            // Also not wired, for the same reason: a `disconnect_peer` names a
-            // node, and this node finds a connection by an address the map or
-            // the dialer holds, never by an id. Counting it is the honest
-            // report; tearing a connection down by node id belongs with the
-            // codec, which is what would have carried the message the state
-            // machine is asking to be believed about.
-            .disconnect_peer => |peer| {
-                self.stats.gossip_disconnects_asked += 1;
-                self.noteNamed(peer);
-            },
-            .emit_event => switch (produced.emit_event) {
-                .neighbor_up => self.stats.neighbor_up += 1,
-                .neighbor_down => self.stats.neighbor_down += 1,
-                .received => self.stats.broadcasts_received += 1,
-            },
-            .peer_data => self.stats.peer_data_seen += 1,
-        };
+        var tally: gossip_state.Tally = .{};
+        try self.gossip_state.feed(self.gpa, event, now, &tally);
+        self.stats.gossip_events += tally.events;
+        self.stats.gossip_timers_scheduled += tally.timers_scheduled;
+        self.stats.gossip_membership_asked += tally.membership_asked;
+        self.stats.gossip_broadcast_asked += tally.broadcast_asked;
+        self.stats.gossip_disconnects_asked += tally.disconnects_asked;
+        self.stats.neighbor_up += tally.neighbor_up;
+        self.stats.neighbor_down += tally.neighbor_down;
+        self.stats.broadcasts_received += tally.broadcasts_received;
+        self.stats.peer_data_seen += tally.peer_data_seen;
     }
 
     /// Tell the gossip layer a peer went away, which is how membership is told
@@ -2167,7 +2148,8 @@ pub const Node = struct {
         var index: usize = 0;
         while (self.bridge.connectionAt(index)) |conn| : (index += 1) {
             conn.entry.conn.close(0, "", at);
-            for (try conn.drain(self.egress, self.out, at, random)) |egress| {
+            const drained = try conn.drain(self.egress, self.out, at, random);
+            for (drained) |egress| {
                 self.stats.datagrams_out += egress.send.datagramCount();
                 self.note(try self.socket.send(io, egress.to, egress.send));
             }
@@ -2235,12 +2217,21 @@ pub const Node = struct {
     /// reached here for the same reason it is the honest one.
     ///
     /// **The challenge comes from `random`**, the generator this node is being
-    /// driven with, and not from `Io.randomSecure`. A node that drew one
-    /// admission challenge differently from the last could not be driven twice
-    /// and compared, and that is the property this whole loop is built for.
-    /// What it costs is real and is not hidden: a relay serving clients it has
-    /// not met seeds its engine from `Io.randomSecure` when it is created, and
-    /// a relay whose seed is known admits anyone who can guess it.
+    /// driven with. A node driven with a caller's own generator can therefore be
+    /// driven twice and compared, which is the property this whole loop is built
+    /// for, and that is why it is a parameter of the pass rather than a draw
+    /// from `io` here.
+    ///
+    /// **What that parameter is in production is what makes this safe.** A driver
+    /// passes `node.generator()`, and that generator is a CSPRNG seeded from
+    /// `io.randomSecure` in `create` (`Error.EntropyUnavailable` and
+    /// `error.Canceled` from that draw propagate as they do for the transport
+    /// secrets). So the challenge is full-strength random per client in
+    /// production and the deterministic case is a caller that has deliberately
+    /// chosen to inject its own generator, which is a simulation and not a
+    /// deployment. The earlier cost of this seam — that a relay whose seed was
+    /// known admitted anyone who could guess it — no longer exists, because no
+    /// caller supplies a seed to this node at all.
     fn serveAdmit(self: *Node, at: Instant, random: std.Random) Error!bool {
         var moved = false;
         var index: usize = 0;
@@ -2249,9 +2240,9 @@ pub const Node = struct {
             // connection this node asked for is never a client of it.
             if (!conn.entry.conn.is_server) continue;
             if (!conn.established()) continue;
-            if (self.servedFor(conn.id()) != null) continue;
+            if (self.relay_state.servedFor(conn.id()) != null) continue;
             // The relay opens the stream it speaks on and reads the one the
-            // client opened. See `Served.out` for why they are two.
+            // client opened. See `relay_storage.client_type.out` for why they are two.
             //
             // **The slot is taken before the stream is opened, and that order
             // is what the refusal below survives on.** The core keeps every
@@ -2283,7 +2274,7 @@ pub const Node = struct {
             // relay that swallowed it would go on serving as though it had
             // admitted a client it never admitted. The split is the whole of
             // this arm; `error.NoStreamRoom` is named for it.
-            const slot = self.freeClient() orelse {
+            const slot = self.relay_state.freeClient() orelse {
                 // Upstream refuses rather than drops, for the reason
                 // `endpoint.zig` gives: an attempt accepted and then held
                 // nowhere is a client that believes it is connected.
@@ -2297,12 +2288,12 @@ pub const Node = struct {
                 },
                 else => return err,
             };
-            const owned = self.indexOf(slot);
+            const owned = self.relay_state.indexOf(slot);
             slot.* = .{
                 .live = true,
                 .conn = conn.id(),
-                .queues = self.queuesOf(owned),
-                .ring = self.ringOf(owned),
+                .queues = self.relay_state.queuesOf(self.queueDepth(), owned),
+                .ring = self.relay_state.ringOf(self.queueDepth(), max_datagram, owned),
                 .out = stream,
             };
             var challenge: [relay_frame.ServerChallenge.challenge_length]u8 = undefined;
@@ -2322,7 +2313,7 @@ pub const Node = struct {
     fn serveHandshake(
         self: *Node,
         at: Instant,
-        slot: *Served,
+        slot: *relay_storage.client_type,
         event: relay_server.Event,
     ) Error!bool {
         const stepped = relay_server.step(slot.handshake, event);
@@ -2351,14 +2342,14 @@ pub const Node = struct {
     fn serveAction(
         self: *Node,
         at: Instant,
-        slot: *Served,
+        slot: *relay_storage.client_type,
         action: ?relay_server.Action,
     ) Error!bool {
         const asked = action orelse return false;
         switch (asked) {
             .write => |message| {
                 var stream: bridge_mod.Stream = slot.out;
-                try writeRelay(&stream, self.relay_out, message);
+                try writeRelay(&stream, self.relay_state.out, message);
                 return true;
             },
             // Upstream drops the connection without writing. The connection is
@@ -2380,13 +2371,13 @@ pub const Node = struct {
     /// back, so a client cannot be admitted without one. That is invariant 10
     /// restated as a type, and it is why the guard is stored here and nowhere
     /// else.
-    fn serveRegister(self: *Node, slot: *Served) void {
+    fn serveRegister(self: *Node, slot: *relay_storage.client_type) void {
         const proof = switch (slot.handshake) {
             .admitted => |proof| proof,
             else => return,
         };
         slot.node_id = proof.node_id;
-        const admitted = self.registry.admit(proof.node_id, slot.conn) catch |err| {
+        const admitted = self.relay_state.registry.admit(proof.node_id, slot.conn) catch |err| {
             // A registry with no slot left is a relay that has to shed
             // connections, and this is where it finds out.
             std.log.warn("node: the relay could not admit a client: {t}", .{err});
@@ -2403,7 +2394,7 @@ pub const Node = struct {
         // The displaced connection is told over its *control* queue, and that
         // is the whole reason there are two: a client whose datagram queue is
         // full is exactly the client that most needs to be told.
-        const other = self.servedFor(replaced) orelse return;
+        const other = self.relay_state.servedFor(replaced) orelse return;
         other.queues.control.push(.{ .status = .same_endpoint_id_connected }) catch {
             self.stats.relay_queue_full += 1;
             return;
@@ -2414,7 +2405,7 @@ pub const Node = struct {
     /// Take everything the clients have sent, and act on it.
     fn serveRead(self: *Node) Error!bool {
         var moved = false;
-        for (self.clients) |*slot| {
+        for (self.relay_state.clients) |*slot| {
             if (!slot.live) continue;
             const conn = self.connFor(slot.conn) orelse continue;
             // The client's half arrives on the stream the *client* opened,
@@ -2444,7 +2435,7 @@ pub const Node = struct {
     }
 
     /// Every whole message in a client's inbox, acted on in turn.
-    fn serveMessages(self: *Node, slot: *Served) Error!bool {
+    fn serveMessages(self: *Node, slot: *relay_storage.client_type) Error!bool {
         var moved = false;
         var consumed: usize = 0;
         // Dropping what the walk has been over is one decision, taken on the
@@ -2454,7 +2445,7 @@ pub const Node = struct {
         // served for the next pass to serve again — the poison in front of a
         // datagram being the worst of it, because it refuses first.
         errdefer dropInbox(&slot.inbox, consumed);
-        while (try peekFrame(slot.inbox.items, consumed, self.relay_scratch)) |found| {
+        while (try peekFrame(slot.inbox.items, consumed, self.relay_state.scratch)) |found| {
             // The end before the meaning: `decode` is what can fail, and the
             // frame it fails on arrived whole, so it is spent either way.
             consumed = found.end;
@@ -2469,7 +2460,7 @@ pub const Node = struct {
     /// One relay frame from a client.
     fn serveMessage(
         self: *Node,
-        slot: *Served,
+        slot: *relay_storage.client_type,
         message: relay_frame.Message,
     ) Error!void {
         switch (slot.handshake) {
@@ -2490,7 +2481,7 @@ pub const Node = struct {
             },
             .ping => |data| {
                 var out: bridge_mod.Stream = slot.out;
-                try writeRelay(&out, self.relay_out, .{ .pong = data });
+                try writeRelay(&out, self.relay_state.out, .{ .pong = data });
             },
             // Everything else is a frame this relay has no use for, and the
             // reason is the direction rather than the message: a `.status` and
@@ -2507,10 +2498,10 @@ pub const Node = struct {
     }
 
     /// One datagram from a client, onto the queue of the client it names.
-    fn forward(self: *Node, from: *Served, frame: relay_frame.DatagramFrame) Error!void {
+    fn forward(self: *Node, from: *relay_storage.client_type, frame: relay_frame.DatagramFrame) Error!void {
         const src = from.node_id orelse return;
         const payload = frame.datagrams.contents;
-        const destination = self.registry.activeConnectionId(frame.node_id);
+        const destination = self.relay_state.registry.activeConnectionId(frame.node_id);
         if (destination == null) {
             // Nobody holds that node id, and the frame that says so goes on the
             // *control* queue. See `serveRegister`.
@@ -2521,7 +2512,7 @@ pub const Node = struct {
             self.stats.relay_unknown_target += 1;
             return;
         }
-        const to = self.servedFor(destination.?) orelse return;
+        const to = self.relay_state.servedFor(destination.?) orelse return;
         // A relay forwards datagrams, and this is the length of one. A frame
         // that claims more is refused rather than truncated, because a
         // truncated QUIC packet is a packet the peer cannot use.
@@ -2553,7 +2544,7 @@ pub const Node = struct {
     fn serveQueues(self: *Node, drain_room: usize) Error!bool {
         var moved = false;
         var room = drain_room;
-        for (self.clients) |*slot| {
+        for (self.relay_state.clients) |*slot| {
             if (!slot.live) continue;
             var stream: bridge_mod.Stream = slot.out;
             // Control first, and not as a courtesy: a client that has stopped
@@ -2561,13 +2552,13 @@ pub const Node = struct {
             // would otherwise be behind is exactly the one that is full.
             while (room > 0) {
                 const control = slot.queues.control.pop() orelse break;
-                try writeRelay(&stream, self.relay_out, controlFrame(control));
+                try writeRelay(&stream, self.relay_state.out, controlFrame(control));
                 moved = true;
                 room -= 1;
             }
             while (room > 0) {
                 const packet = slot.queues.data.pop() orelse break;
-                try writeRelay(&stream, self.relay_out, .{
+                try writeRelay(&stream, self.relay_state.out, .{
                     .relay_to_client_datagram = .{
                         .node_id = packet.src,
                         .datagrams = .{
@@ -2591,68 +2582,32 @@ pub const Node = struct {
     /// gone rather than half gone.
     fn serveRelease(self: *Node) bool {
         var moved = false;
-        for (self.clients) |*slot| {
+        for (self.relay_state.clients) |*slot| {
             if (!slot.live) continue;
             if (self.connFor(slot.conn) != null) continue;
-            self.release(slot);
+            self.noteReleased(self.relay_state.release(self.gpa, slot));
             moved = true;
         }
         return moved;
     }
 
-    /// End one client, reporting it exactly once.
-    ///
-    /// The guard is *taken* and not merely deinited, so nothing is left on the
-    /// slot for a second call. That spends the type's own guarantee rather
-    /// than relying on it: a second `deinit` answers `.already_gone` without
-    /// reaching the registry, and taking the handle means there is no second
-    /// call to make.
-    ///
-    /// Nothing is written to the client here. Either its connection is gone,
-    /// which is the case that got here, or the whole endpoint is closing and
-    /// `close_endpoint` covers it — and a stream written to after `sweep` would
-    /// be a write into freed memory.
-    fn release(self: *Node, slot: *Served) void {
-        if (slot.guard) |*guard| self.reportDisconnection(guard);
-        slot.inbox.deinit(self.gpa);
-        slot.* = .{};
-    }
-
-    /// Tell access control, once, that a client has gone, and act on whatever
-    /// the registry did about it.
-    fn reportDisconnection(
-        self: *Node,
-        guard: *relay_server.Registry(relay_displaced).OnDisconnectGuard,
-    ) void {
-        switch (guard.deinit()) {
-            .disconnected => self.stats.relay_disconnects += 1,
-            // A connection that had already been displaced ends too, and the
-            // entry survives with its active connection untouched.
-            .duplicate => self.stats.relay_duplicates += 1,
-            .promoted => |promotion| {
-                self.stats.relay_disconnects += 1;
-                self.stats.relay_promoted += 1;
-                // Upstream tells the connection that took over that it is
-                // healthy (`server/clients.rs:122-129`), and it goes on that
-                // client's control queue like every other control message.
-                const took_over = self.servedFor(promotion.took_over) orelse return;
-                // Queue saturation drops the notification, not the promoted client.
-                took_over.queues.control.push(.{ .status = .healthy }) catch |err| switch (err) {
-                    error.QueueFull => self.stats.relay_queue_full += 1,
-                };
-            },
-            // The registry holds no such connection, which is what a second
-            // exit finds. Counting it is how a double report would show up.
-            .already_gone => self.stats.relay_double_reports += 1,
-        }
-    }
-
     /// End every client, at once, in the phase the handler's shutdown runs in.
     fn relayClose(self: *Node) void {
-        for (self.clients) |*slot| {
-            if (!slot.live) continue;
-            self.release(slot);
-        }
+        self.noteReleased(self.relay_state.releaseAll(self.gpa));
+    }
+
+    /// Publish what releasing the relay's clients reported.
+    ///
+    /// **The counting is here and the reporting is in the storage**, because
+    /// `Stats` is this file's vocabulary and the registry's own answer is which
+    /// arm it took. Keeping them apart is what lets the two agree: one place
+    /// decides what happened and one publishes what it means here.
+    fn noteReleased(self: *Node, released: relay_state.Reported) void {
+        self.stats.relay_disconnects += released.disconnects;
+        self.stats.relay_duplicates += released.duplicates;
+        self.stats.relay_promoted += released.promoted;
+        self.stats.relay_queue_full += released.queue_full;
+        self.stats.relay_double_reports += released.double_reports;
     }
 
     // -- the relay client ----------------------------------------------------
@@ -2666,12 +2621,12 @@ pub const Node = struct {
     /// open, and a pass in between is a call the surface permits. Dialing here
     /// would take a new core connection and spend a credit from the relay's
     /// stream grant on a node whose every other connection `close_endpoint`
-    /// has closed, and `relay_dialled` is latched — a node driven on after an
-    /// abandoned shutdown could never reach that relay again.
+    /// has closed, and `relay_state.dialled` is latched — a node driven on after
+    /// an abandoned shutdown could never reach that relay again.
     fn converse(self: *Node, at: Instant, random: std.Random) Error!bool {
         if (self.accept.shutdown.phase != .serving) return false;
         // The stream opened below must be retained in the node, not a Spoke copy.
-        const spoke = if (self.spoke) |*held| held else {
+        const spoke = if (self.relay_state.spoke) |*held| held else {
             const dialed = try self.converseOpen(at, random);
             return dialed;
         };
@@ -2698,10 +2653,10 @@ pub const Node = struct {
         };
         var moved = false;
         // The relay's half arrives on the stream the *relay* opened, which is
-        // the mirror of `Served.out` and for the same reason. Straight onto the
-        // inbox, as `serveRead` does it and for the same reason, and asking
-        // `Stream.drain`'s second half for the same reason: what it appended is
-        // not what came before it. See `discardTail`.
+        // the mirror of `relay_storage.client_type.out` and for the same reason.
+        // Straight onto the inbox, as `serveRead` does it and for the same
+        // reason, and asking `Stream.drain`'s second half for the same reason:
+        // what it appended is not what came before it. See `discardTail`.
         var finished = false;
         var inbound = conn.peerStream();
         if (inbound) |*incoming| {
@@ -2714,7 +2669,7 @@ pub const Node = struct {
         // than on every pass after it, and the frame in front of it is acted
         // on once rather than once per pass.
         errdefer dropInbox(&spoke.inbox, consumed);
-        while (try peekFrame(spoke.inbox.items, consumed, self.relay_scratch)) |found| {
+        while (try peekFrame(spoke.inbox.items, consumed, self.relay_state.scratch)) |found| {
             consumed = found.end;
             const message = try relay_frame.decode(found.frame, .v2);
             try self.converseMessage(spoke, &stream, message);
@@ -2737,8 +2692,8 @@ pub const Node = struct {
             .client => |peer| peer,
             else => return false,
         };
-        if (self.relay_dialled) return false;
-        self.relay_dialled = true;
+        if (self.relay_state.dialled) return false;
+        self.relay_state.dialled = true;
         const reached = self.dialer.dial(
             peer.addr,
             peer.id,
@@ -2755,7 +2710,7 @@ pub const Node = struct {
             return false;
         };
         self.stats.relay_dials += 1;
-        self.spoke = .{
+        self.relay_state.spoke = .{
             .conn = reached.conn.id(),
             .stream = null,
             .handshake = relay_client.start(.signed_challenge),
@@ -2768,7 +2723,7 @@ pub const Node = struct {
     /// One relay frame, to this node's relay client.
     fn converseMessage(
         self: *Node,
-        spoke: *Spoke,
+        spoke: *relay_state.Spoke,
         stream: *bridge_mod.Stream,
         message: relay_frame.Message,
     ) Error!void {
@@ -2782,7 +2737,7 @@ pub const Node = struct {
                 spoke.handshake = stepped.state;
                 if (stepped.action) |action| switch (action) {
                     .send_client_auth => |auth| {
-                        try writeRelay(stream, self.relay_out, .{ .client_auth = auth });
+                        try writeRelay(stream, self.relay_state.out, .{ .client_auth = auth });
                         self.stats.relay_auth_sent += 1;
                     },
                     .close => {
@@ -2820,7 +2775,7 @@ pub const Node = struct {
                 .same_endpoint_id_connected => self.stats.relay_displaced += 1,
                 else => {},
             },
-            .ping => |data| try writeRelay(stream, self.relay_out, .{ .pong = data }),
+            .ping => |data| try writeRelay(stream, self.relay_state.out, .{ .pong = data }),
             // Two groups reach here and neither is acted on. The handshake's
             // own frames — `.server_challenge`, `.server_confirms_auth`,
             // `.server_denies_auth` — cannot: `relay_client.step` above folds
@@ -2828,8 +2783,8 @@ pub const Node = struct {
             // sent one out of order has been closed by it and this node is no
             // longer reading that stream. What is left is `.restarting`, and
             // it is valid, decoded, and dropped: this client dials a relay
-            // once in its life and `relay_dialled` is latched, so there is no
-            // reconnect to schedule and the frame's wait and budget have
+            // once in its life and `relay_state.dialled` is latched, so there is
+            // no reconnect to schedule and the frame's wait and budget have
             // nothing here to bound. `.health` cannot reach this arm at all —
             // it is v1 only and `decode` is called with `.v2`. Nothing is
             // counted for either, because nothing happened.
@@ -2839,27 +2794,16 @@ pub const Node = struct {
 
     /// Retain one datagram the relay handed this node, and count it.
     ///
-    /// **The copy is the node's, and the guard for it is taken before the list
-    /// is.** `relay_frame.decode` borrows a frame's datagrams out of the bytes
-    /// that frame was read from, and those bytes are reused by the next read,
-    /// so a payload handed to a caller has to be copied rather than pointed
-    /// at. Copying makes it an allocation this node owns from that line on,
-    /// and the append that publishes it can still fail — so the `errdefer`
-    /// sits between the two: an append that cannot be given the copy releases
-    /// it rather than leaving one payload behind for every frame refused on
-    /// the way to the list.
-    ///
-    /// Nothing bounds the list. `delivered` hands out what is on it and
-    /// `clearDelivered` is what gives the payloads back, so a relay that keeps
-    /// answering grows it until a caller clears it — which is the same
-    /// contract `Delivered` states from the outside.
-    fn retain(self: *Node, spoke: *Spoke, frame: relay_frame.DatagramFrame) Error!void {
-        const owned = try self.gpa.dupe(u8, frame.datagrams.contents);
-        errdefer self.gpa.free(owned);
-        try spoke.delivered.append(self.gpa, .{
-            .src = frame.node_id,
-            .data = owned,
-        });
+    /// **The copy belongs to the relay's own storage and the count belongs to
+    /// the node.** `Spoke.retain` is what makes the payload and takes the
+    /// allocator; what this adds is the one counter a caller reads, which is
+    /// this file's vocabulary and not a property of the list.
+    fn retain(
+        self: *Node,
+        spoke: *relay_state.Spoke,
+        frame: relay_frame.DatagramFrame,
+    ) Error!void {
+        try spoke.retain(self.gpa, frame);
         self.stats.relay_datagrams_out += 1;
     }
 
@@ -2887,7 +2831,7 @@ pub const Node = struct {
     /// list is safe from a caller holding only a shared borrow; it is not safe
     /// from another thread while a pass is running.
     pub fn delivered(self: *const Node) []const Delivered {
-        const spoke = self.spoke orelse return &.{};
+        const spoke = self.relay_state.spoke orelse return &.{};
         return spoke.delivered.items;
     }
 
@@ -2904,9 +2848,8 @@ pub const Node = struct {
     /// grows the list for as long as the relay keeps answering — the copy in
     /// `retain` is the price of handing a caller bytes it can keep.
     pub fn clearDelivered(self: *Node) void {
-        const spoke = &(self.spoke orelse return);
-        for (spoke.delivered.items) |item| self.gpa.free(item.data);
-        spoke.delivered.clearRetainingCapacity();
+        const spoke = &(self.relay_state.spoke orelse return);
+        spoke.clearDelivered(self.gpa);
     }
 
     /// Send one datagram to `peer` through this node's relay.
@@ -2923,11 +2866,11 @@ pub const Node = struct {
         // relay answers `NoRelay` whatever it was handed, and the payload bound
         // is about the caller's bytes, which only matter once there is a relay
         // to refuse them to.
-        const spoke = self.spoke orelse return error.NoRelay;
+        const spoke = self.relay_state.spoke orelse return error.NoRelay;
         if (bytes.len > max_datagram) return error.DatagramTooLarge;
         const held = spoke.stream orelse return error.NoRelay;
         var stream: bridge_mod.Stream = held;
-        try writeRelay(&stream, self.relay_out, .{
+        try writeRelay(&stream, self.relay_state.out, .{
             .client_to_relay_datagram = .{
                 .node_id = peer,
                 .datagrams = .{
@@ -2944,143 +2887,37 @@ pub const Node = struct {
     /// and not a count kept beside it.
     ///
     /// **Zero for a node that does not serve, and the role is what says so.**
-    /// `initRelay` builds a registry for a `.serve` and for nothing else, so
-    /// the table under a `.off` or `.client` node is never initialised at all —
+    /// `relay_storage.init` builds a registry for a `.serve` and for nothing
+    /// else, so the table under a `.off` or `.client` node is never initialised
+    /// at all —
     /// reading it would answer from bytes `create` never wrote, which is a
     /// different number on every run and under every allocator. Such a node
     /// admits nobody, so zero is its count; the switch is the same rule
     /// `queueDepth` applies, and like it costs nothing but a read of the role.
     pub fn clientCount(self: *const Node) usize {
         return switch (self.config.relay.role) {
-            .serve => self.registry.nodeCount(),
+            .serve => self.relay_state.registry.nodeCount(),
             else => 0,
         };
     }
 
-    // -- the relay's storage ------------------------------------------------
-
-    /// Build the relay's storage, once, from the role `create` was given.
-    ///
-    /// **Two of these allocations belong to every role and four to `.serve`.**
-    /// `relay_out` and `relay_scratch` are taken before the role is read at
-    /// all, so a `.off` node holds them and `freeRelay` returns them without a
-    /// byte of either ever having been written: `serve`, `converse` and
-    /// `sendThrough` reach `writeRelay`; `serve` and `converse` reach `peekFrame`.
-    /// The registry, client slots and three queue allocations follow the `.serve` return; they
-    /// are the storage `Serve.clients` and `Serve.queue_depth` size, once,
-    /// here. That is why those two fields must not be written after `create`
-    /// (`Node.config`), and why `queueDepth` reads the same live field the
-    /// cuts are made from.
-    fn initRelay(self: *Node) Error!void {
-        const gpa = self.gpa;
-        self.relay_out = try gpa.alloc(u8, relay_frame_room + varint_max);
-        errdefer gpa.free(self.relay_out);
-        self.relay_scratch = try gpa.alloc(u8, relay_frame_room);
-        errdefer gpa.free(self.relay_scratch);
-        const role = switch (self.config.relay.role) {
-            .serve => |role| role,
-            // A client needs no registry and no queues. It needs the two
-            // buffers and one stream, and the buffers are all it allocates.
-            else => return,
-        };
-        // The tables here are sized by `max_relay_clients` and are built not to
-        // grow, so a relay that admitted more would probe a table the registry
-        // would answer `NoFreeSlot` to long before it was actually full.
-        if (role.clients > max_relay_clients) return error.TooManyRelayClients;
-        // A queue with no room can never take anything, and a relay with one
-        // drops every datagram while reporting that it forwarded none.
-        if (role.queue_depth == 0) return error.RelayQueueDepthZero;
-        const per_client = role.clients * role.queue_depth;
-        self.registry = relay_server.Registry(relay_displaced).init(&self.slots);
-        self.clients = try gpa.alloc(Served, role.clients);
-        errdefer gpa.free(self.clients);
-        self.packets = try gpa.alloc(relay_server.Packet, per_client);
-        errdefer gpa.free(self.packets);
-        self.messages = try gpa.alloc(relay_server.Control, per_client);
-        errdefer gpa.free(self.messages);
-        self.ring = try gpa.alloc(u8, per_client * max_datagram);
-        errdefer gpa.free(self.ring);
-        for (self.clients, 0..) |*client, index| {
-            client.* = .{ .queues = self.queuesOf(index), .ring = self.ringOf(index) };
-        }
-    }
-
-    /// One client's two queues, cut out of this node's storage.
-    ///
-    /// **The cut is redone from `config` on every call rather than kept beside
-    /// the storage it describes**, so `depth` is the value the field holds now
-    /// and not the one `initRelay` sized these allocations from. That is the
-    /// whole of the rule `Node.config` states: the relay's sizing is fixed at
-    /// construction because this call re-reads it, not because anything here
-    /// copied it.
-    fn queuesOf(self: *const Node, index: usize) relay_server.Connection {
-        const depth = self.queueDepth();
-        const base = index * depth;
-        return relay_server.Connection.init(
-            self.packets[base..][0..depth],
-            self.messages[base..][0..depth],
-        );
-    }
-
-    /// One client's datagram ring: a fixed slot per queue position.
-    fn ringOf(self: *const Node, index: usize) []u8 {
-        const depth = self.queueDepth();
-        return self.ring[index * depth * max_datagram ..][0 .. depth * max_datagram];
-    }
+    // -- the relay's sizing ------------------------------------------------
 
     /// One client's depth, read from the live configuration rather than kept
-    /// beside it. See `queuesOf` for why that is the same number on every pass
-    /// and what a write to it costs.
+    /// beside the storage it describes.
+    ///
+    /// **This is the only number left of the relay's sizing, and it is read
+    /// rather than kept because a kept copy would be a second answer.** Every
+    /// cut `relay_storage.queuesOf` and `relay_storage.ringOf` make is taken
+    /// from this value, which is the field's value now and not the one
+    /// `create` sized those allocations from — and that is the whole of the rule
+    /// `Node.config` states: the relay's sizing is fixed at construction
+    /// because every cut re-reads it, not because anything copied it.
     fn queueDepth(self: *const Node) usize {
         return switch (self.config.relay.role) {
             .serve => |role| role.queue_depth,
             else => 0,
         };
-    }
-
-    /// Give back everything the relay took, for whatever role it took it for.
-    ///
-    /// Before the bridge goes: a guard reaches into this struct's own registry,
-    /// and a client slot points at a connection the core frees. The two frame
-    /// buffers are the other half of `initRelay`'s unconditional pair and are
-    /// freed whatever the role was, which is what leaves a `.off` node holding
-    /// no relay storage after this returns.
-    fn freeRelay(self: *Node) void {
-        self.relayClose();
-        if (self.spoke) |*spoke| {
-            spoke.inbox.deinit(self.gpa);
-            for (spoke.delivered.items) |item| self.gpa.free(item.data);
-            spoke.delivered.deinit(self.gpa);
-        }
-        self.spoke = null;
-        self.gpa.free(self.relay_out);
-        self.gpa.free(self.relay_scratch);
-        self.gpa.free(self.ring);
-        self.gpa.free(self.messages);
-        self.gpa.free(self.packets);
-        self.gpa.free(self.clients);
-    }
-
-    /// The client on connection `conn`, or null when there is none.
-    fn servedFor(self: *const Node, conn: u64) ?*Served {
-        for (self.clients) |*slot| {
-            if (slot.live and slot.conn == conn) return slot;
-        }
-        return null;
-    }
-
-    /// A free client slot, or null when every one holds a client.
-    fn freeClient(self: *Node) ?*Served {
-        for (self.clients) |*slot| {
-            if (!slot.live) return slot;
-        }
-        return null;
-    }
-
-    /// Which slot this is, for the storage cuts `queuesOf` and `ringOf` make.
-    fn indexOf(self: *const Node, slot: *const Served) usize {
-        const at = @intFromPtr(slot) - @intFromPtr(self.clients.ptr);
-        return at / @sizeOf(Served);
     }
 
     // -- small helpers ------------------------------------------------------
@@ -3103,16 +2940,6 @@ pub const Node = struct {
     fn note(self: *Node, report: batch.Report) void {
         if (report.degraded) self.stats.sends_degraded += 1;
         if (!report.ecnSurvived()) self.stats.ecn_lost += 1;
-    }
-
-    /// Keep the peer an action named, for the report and for nothing else.
-    fn noteNamed(self: *Node, peer: NodeId) void {
-        if (self.named_len == named_ring) {
-            @memmove(self.named[0 .. named_ring - 1], self.named[1..]);
-            self.named_len -= 1;
-        }
-        self.named[self.named_len] = peer;
-        self.named_len += 1;
     }
 
     /// Close the descriptor, once.
@@ -3321,7 +3148,7 @@ fn acceptConnection(ptr: *anyopaque, connection: router.Connection) router.Accep
 fn shutdownHandler(ptr: *anyopaque) void {
     const self: *Node = @ptrCast(@alignCast(ptr));
     self.stats.handler_shutdowns += 1;
-    self.timers.clearRetainingCapacity();
+    self.gossip_state.clearTimers();
     // The relay is this handler's own state, and it is given up here rather
     // than in `deinit`: this is the phase upstream gives a handler's resources
     // in — while the accepts that might still be using them are running, and
@@ -3422,6 +3249,31 @@ fn closedOnExit(node: *Node) void {
     node.close(t.io, start_ns, node.generator()) catch |err|
         std.debug.panic("node close failed during test teardown: {t}", .{err});
 }
+
+/// The X25519 and P-256 public keys one connection offered in its
+/// `ClientHello`, read off the handshake the core built.
+///
+/// **Off the core's own handshake, not off a second draw.** `tls13_hs` is
+/// where `Tls13Handshake.initClientInto` put the scalars it drew, and
+/// `x25519_public`/`p256_public` are the public values it derived from them,
+/// so this is the key that went on the wire rather than a re-derivation that
+/// could agree with the first one by accident. False when no dialled
+/// connection of this node holds a handshake yet, which is a different answer
+/// from a zero key.
+fn readEphemeral(node: *Node, x25519: *[32]u8, p256: *[65]u8) bool {
+    var index: usize = 0;
+    while (node.bridge.connectionAt(index)) |conn| : (index += 1) {
+        // A dialled connection, not an accepted one: this is the half that
+        // offers a key share. An accepted connection answers with the group
+        // the client chose and holds no key pair of its own.
+        if (conn.entry.conn.is_server) continue;
+        const handshake = conn.entry.conn.tls13_hs orelse continue;
+        x25519.* = handshake.x25519_public;
+        p256.* = handshake.p256_public;
+        return true;
+    }
+    return false;
+}
 test "a node dials a peer, both ends finish a handshake, and every action is performed" {
     // The listener first: its ephemeral port is only known once the socket
     // exists, and the dialer is given that address rather than one made up.
@@ -3429,7 +3281,7 @@ test "a node dials a peer, both ends finish a handshake, and every action is per
         .secret = try identityOf(0x51),
         .listen = loopback,
         .topic = briskTopic(),
-    }, 0x1111);
+    });
     defer listener.deinit();
 
     const peers = [_]Peer{.{
@@ -3441,7 +3293,7 @@ test "a node dials a peer, both ends finish a handshake, and every action is per
         .listen = loopback,
         .peers = &peers,
         .topic = briskTopic(),
-    }, 0x2222);
+    });
     defer dialer.deinit();
 
     // Two different identities: a node that dialled itself would be told its
@@ -3524,6 +3376,85 @@ test "a node dials a peer, both ends finish a handshake, and every action is per
     // artifact, so reaching here is itself part of what is asserted.
 }
 
+test "two nodes built the same way offer two different TLS ephemeral keys" {
+    // The property an observer of a captured handshake needs, stated as a
+    // production invariant rather than as an inspection of the generator.
+    //
+    // **Two nodes configured identically must not share an ephemeral key.**
+    // The audited defect was that `create` seeded `std.Random.DefaultPrng` from
+    // a caller-supplied `u64`, so two nodes built from the same seed walked the
+    // same stream and `Tls13Handshake.initClientInto` drew the same X25519 and
+    // P-256 scalars for both. The scalars are the ECDHE secret: whoever holds
+    // them and a capture of either ClientHello reads the session's forward
+    // secrecy away. Equal ephemeral keys are therefore not a weak draw, they
+    // are the same key, and this is the boundary the fix has to move.
+    //
+    // **The key is read off the handshake the core built**, through
+    // `readEphemeral`, so a generator that stopped feeding this seam would fail
+    // here rather than pass by leaving the field unset. Both ends are driven
+    // over real sockets to a real handshake: `dialer.start` is the call that
+    // reaches `Dialer.open` and `Tls13Handshake.initClientInto`, and the
+    // connection is the one this project will put on a wire.
+    const listener = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x51),
+        .listen = loopback,
+        .topic = briskTopic(),
+    });
+    defer closedOnExit(listener);
+
+    // The same peer for both, and no `--seed`-shaped difference between them:
+    // these two are configured identically in every field a caller controls,
+    // which is exactly the claim.
+    const peers = [_]Peer{.{
+        .id = listener.nodeId(),
+        .addr = .{ .ip = listener.address() },
+    }};
+    const first = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xc1),
+        .listen = loopback,
+        .peers = &peers,
+        .topic = briskTopic(),
+    });
+    defer closedOnExit(first);
+    const second = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0xc1),
+        .listen = loopback,
+        .peers = &peers,
+        .topic = briskTopic(),
+    });
+    defer closedOnExit(second);
+
+    var at: Instant = start_ns;
+    try first.start(at, first.generator());
+    try second.start(at, second.generator());
+
+    var first_x25519: [32]u8 = undefined;
+    var first_p256: [65]u8 = undefined;
+    var second_x25519: [32]u8 = undefined;
+    var second_p256: [65]u8 = undefined;
+    // The handshake has to exist before the comparison means anything: a node
+    // that never drew a key would satisfy "the two differ" for the wrong
+    // reason, and `undefined` bytes would compare unequal by accident.
+    var passes: usize = 0;
+    while (passes < max_passes) : (passes += 1) {
+        at += time_quantum;
+        _ = try first.step(t.io, at, first.generator());
+        _ = try second.step(t.io, at, second.generator());
+        _ = try listener.step(t.io, at, listener.generator());
+        if (readEphemeral(first, &first_x25519, &first_p256) and
+            readEphemeral(second, &second_x25519, &second_p256)) break;
+    }
+    try t.expect(readEphemeral(first, &first_x25519, &first_p256));
+    try t.expect(readEphemeral(second, &second_x25519, &second_p256));
+    try t.expectEqual(@as(u64, 1), first.stats.dials);
+    try t.expectEqual(@as(u64, 1), second.stats.dials);
+
+    // The claim. Both groups, because the ClientHello offers both and either
+    // one repeating is the same defect.
+    try t.expect(!std.mem.eql(u8, &first_x25519, &second_x25519));
+    try t.expect(!std.mem.eql(u8, &first_p256, &second_p256));
+}
+
 test "a node that dials two peers reaches both of them" {
     // The shape one node dialling one peer cannot see. Two dials out of one
     // process are two connections with connection ids minted from one
@@ -3534,13 +3465,13 @@ test "a node that dials two peers reaches both of them" {
         .secret = try identityOf(0x33),
         .listen = loopback,
         .topic = briskTopic(),
-    }, 0x3333);
+    });
     defer gate.deinit();
     const listener = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0x51),
         .listen = loopback,
         .topic = briskTopic(),
-    }, 0x1111);
+    });
     defer listener.deinit();
 
     const peers = [_]Peer{
@@ -3552,7 +3483,7 @@ test "a node that dials two peers reaches both of them" {
         .listen = loopback,
         .peers = &peers,
         .topic = briskTopic(),
-    }, 0x2222);
+    });
     defer dialer.deinit();
 
     var at: Instant = start_ns;
@@ -3598,13 +3529,13 @@ test "a node that dialled two peers notices both of them close" {
         .secret = try identityOf(0x33),
         .listen = loopback,
         .topic = briskTopic(),
-    }, 0x3333);
+    });
     defer gate.deinit();
     const listener = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0x51),
         .listen = loopback,
         .topic = briskTopic(),
-    }, 0x1111);
+    });
     defer listener.deinit();
     const peers = [_]Peer{
         .{ .id = gate.nodeId(), .addr = .{ .ip = gate.address() } },
@@ -3615,7 +3546,7 @@ test "a node that dialled two peers notices both of them close" {
         .listen = loopback,
         .peers = &peers,
         .topic = briskTopic(),
-    }, 0x2222);
+    });
     defer dialer.deinit();
 
     var at: Instant = start_ns;
@@ -3650,6 +3581,110 @@ test "a node that dialled two peers notices both of them close" {
     try dialer.close(t.io, at, dialer.generator());
 }
 
+test "a reaped connection leaves no accepted id behind" {
+    // The lifetime defect, as an invariant a caller can observe rather than as
+    // a reading of a private map.
+    //
+    // `admit` records every offered connection id in `Node.offered` and the only
+    // removal in the file was on the shutdown cancellation path, so a
+    // connection that ended the ordinary way — the core finished with it, `drive`
+    // reaped its task, `expire` counted it — left its id in the set for the life
+    // of the node. Sequential accept/disconnect cycles therefore grow that set
+    // without bound on a long-lived listener.
+    //
+    // **What is claimed is that the set holds nothing for a connection that is
+    // gone.** The churn is driven through the real path — a handshake completes
+    // on a real socket, the peer closes, this node notices and reaps — and the
+    // assertion is made after the reap, which is the boundary the removal
+    // belongs at. A removal at process teardown would pass a test that checked
+    // the set before `close` and fail this one.
+    const listener = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x51),
+        .listen = loopback,
+        .topic = briskTopic(),
+    });
+    defer closedOnExit(listener);
+    const peers = [_]Peer{.{
+        .id = listener.nodeId(),
+        .addr = .{ .ip = listener.address() },
+    }};
+
+    // Two cycles rather than one. A single cycle cannot distinguish "removed at
+    // reap" from "removed when the second id arrived", and the second is exactly
+    // the shape that hid this: churn is what accumulates.
+    //
+    // One clock for the whole test, never restarted: the listener is the node
+    // whose timers these cycles advance, and a clock that went backwards
+    // between them would be a second thing under test that this one is not.
+    var at: Instant = start_ns;
+    for (0..2) |cycle| {
+        // Scoped, so the dialer is released on every exit including an
+        // assertion failure — which is the run this test is expected to have
+        // before the repair, and a leak there would report as a second,
+        // unrelated failure.
+        {
+            const dialer = try Node.create(t.allocator, t.io, .{
+                .secret = try identityOf(@intCast(0xc1 + cycle)),
+                .listen = loopback,
+                .peers = &peers,
+                .topic = briskTopic(),
+            });
+            defer dialer.deinit();
+
+            try dialer.start(at, dialer.generator());
+
+            // **Both ends established, not just the listener's.** The listener
+            // completes its half one round trip before the dialling side
+            // completes its own, so a loop that stops on the listener's count
+            // alone closes a connection the client is still handshaking — and a
+            // close at that point is not the event under test here. This is
+            // what the earlier version of this fixture got wrong: it drove on
+            // `listener.establishedCount()` alone, the listener finished the
+            // connection for that reason rather than because a peer said so,
+            // and the run failed on its own precondition
+            // (`connections_finished` read 0) before reaching the assertion
+            // about the retained id.
+            var passes: usize = 0;
+            while (passes < max_passes and
+                (listener.establishedCount() == 0 or dialer.establishedCount() == 0)) : (passes += 1)
+            {
+                at += time_quantum;
+                _ = try dialer.step(t.io, at, dialer.generator());
+                _ = try listener.step(t.io, at, listener.generator());
+            }
+            // The handshake happened on both sides, so the id really was
+            // offered: an assertion about a set that never grew would pass on a
+            // node that admitted nothing at all.
+            try t.expectEqual(@as(usize, 1), listener.establishedCount());
+            try t.expectEqual(@as(usize, 1), dialer.establishedCount());
+            try t.expectEqual(@as(usize, cycle + 1), listener.stats.attempts);
+
+            for (0..4) |_| {
+                at += time_quantum;
+                _ = try dialer.step(t.io, at, dialer.generator());
+                _ = try listener.step(t.io, at, listener.generator());
+            }
+            // The peer goes away the way a stopped process goes away, and this
+            // node keeps running: the close is on the wire and the core finishes
+            // the connection on a later pass.
+            try dialer.close(t.io, at, dialer.generator());
+        }
+
+        var passes: usize = 0;
+        while (passes < max_passes and
+            listener.stats.connections_finished < @as(u64, @intCast(cycle + 1))) : (passes += 1)
+        {
+            at += 10 * time_quantum;
+            _ = try listener.step(t.io, at, listener.generator());
+        }
+        try t.expectEqual(@as(u64, @intCast(cycle + 1)), listener.stats.connections_finished);
+        try t.expectEqual(@as(usize, 0), listener.establishedCount());
+
+        // The claim: the connection is over and nothing is still tracking it.
+        try t.expectEqual(@as(usize, 0), listener.offered.count());
+    }
+}
+
 test "a close cancels an accept that is still running before it closes the endpoint" {
     // The branch the ordering exists for. `router.zig:642-650` says why: a
     // handler's `shutdown` closes connections its own `accept` is still using,
@@ -3660,7 +3695,7 @@ test "a close cancels an accept that is still running before it closes the endpo
     const listener = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0x51),
         .listen = loopback,
-    }, 0x1111);
+    });
     defer listener.deinit();
 
     const peers = [_]Peer{.{
@@ -3671,7 +3706,7 @@ test "a close cancels an accept that is still running before it closes the endpo
         .secret = try identityOf(0xc1),
         .listen = loopback,
         .peers = &peers,
-    }, 0x2222);
+    });
     defer dialer.deinit();
 
     // The dialling side runs twice and the listening side once. One pass on
@@ -3718,7 +3753,7 @@ test "a stop asked for before the loop is entered ends it and closes the node" {
         .secret = try identityOf(0x7a),
         .listen = loopback,
         .topic = briskTopic(),
-    }, 0x3333);
+    });
     defer node.deinit();
 
     var stop = Stop.init();
@@ -3773,7 +3808,37 @@ fn cancelledSwap(userdata: ?*anyopaque, new: std.Io.CancelProtection) std.Io.Can
     _ = userdata;
     const previous = cancel_protection;
     cancel_protection = new;
+
     return previous;
+}
+
+/// An `std.Io` that is `io` in every slot except its entropy source, which
+/// answers `refused`.
+///
+/// **A copy of the live vtable with `io`'s own userdata, never a foreign
+/// backend's.** Every other slot keeps the real backend's answer, so every
+/// cancellation point around this node is a live one and only the entropy draw
+/// is the double. That is the whole of what `create` uses `io` for — the two
+/// transport secrets `Bridge.create` draws and this node's own CSPRNG seed —
+/// so nothing else about the runtime is being described here, and pairing this
+/// vtable with a different `userdata` would be exactly the mistake that pairs
+/// `Io.Threaded`'s slots with something that is not its backend.
+///
+/// `vtable` is the caller's own storage and so outlives every `Io` built from
+/// it here, which is the same discipline `quic_bridge.zig`'s own double
+/// follows for its `cancelled_vtable`.
+fn refusingEntropy(
+    comptime refused: std.Io.RandomSecureError,
+    io: std.Io,
+    vtable: *std.Io.VTable,
+) std.Io {
+    vtable.* = io.vtable.*;
+    vtable.randomSecure = struct {
+        fn draw(_: ?*anyopaque, _: []u8) std.Io.RandomSecureError!void {
+            return refused;
+        }
+    }.draw;
+    return .{ .userdata = io.userdata, .vtable = vtable };
 }
 
 test "a cancelled Io ends the loop, and the node is closed with its closes written" {
@@ -3785,7 +3850,7 @@ test "a cancelled Io ends the loop, and the node is closed with its closes writt
         .secret = try identityOf(0x61),
         .listen = loopback,
         .topic = briskTopic(),
-    }, 0x6161);
+    });
     defer listener.deinit();
 
     const peers = [_]Peer{.{
@@ -3797,7 +3862,7 @@ test "a cancelled Io ends the loop, and the node is closed with its closes writt
         .listen = loopback,
         .peers = &peers,
         .topic = briskTopic(),
-    }, 0xa1a1);
+    });
     defer dialer.deinit();
 
     // A live connection, established over real sockets exactly as the test
@@ -3867,7 +3932,7 @@ test "a clock this node cannot use still closes the node" {
         .secret = try identityOf(0x7c),
         .listen = loopback,
         .topic = briskTopic(),
-    }, 0x3737);
+    });
     defer node.deinit();
 
     var vtable = t.io.vtable.*;
@@ -3898,7 +3963,7 @@ test "a close that cannot write is finished by the close after it" {
         .secret = try identityOf(0x62),
         .listen = loopback,
         .topic = briskTopic(),
-    }, 0x6262);
+    });
     defer listener.deinit();
 
     const peers = [_]Peer{.{
@@ -3910,7 +3975,7 @@ test "a close that cannot write is finished by the close after it" {
         .listen = loopback,
         .peers = &peers,
         .topic = briskTopic(),
-    }, 0xa2a2);
+    });
     defer dialer.deinit();
 
     var at: Instant = start_ns;
@@ -3986,6 +4051,27 @@ fn bothAdmitted(nodes: []const *Node) bool {
         nodes[2].stats.relay_established == 1;
 }
 
+/// The challenge this relay is holding out to one of its clients, if it is
+/// holding one right now.
+///
+/// **Read from the slot the handshake actually wrote, not from a copy the test
+/// made.** `serveAdmit` draws sixteen bytes into a local and hands them to
+/// `relay_server.step`, which copies them into a client slot; this reads
+/// that copy, so it is the challenge that went on the wire and is still
+/// outstanding. Null once the client has answered, because `.challenged` is a
+/// state and the handshake has moved past it — which is why this has to be read
+/// before the answer rather than after the admission.
+fn outstandingChallenge(relay: *const Node) ?[relay_frame.ServerChallenge.challenge_length]u8 {
+    for (relay.relay_state.clients) |slot| {
+        if (!slot.live) continue;
+        switch (slot.handshake) {
+            .challenged => |challenged| return challenged.challenge.challenge,
+            else => {},
+        }
+    }
+    return null;
+}
+
 /// The first client has been told that a peer is not at the relay.
 fn toldPeerGone(nodes: []const *Node) bool {
     return nodes[1].stats.relay_peer_gone == 1;
@@ -4015,7 +4101,7 @@ test "a relay admits two clients, forwards both ways, and reports each once" {
             .queue_depth = 2,
             .drain_room = 1,
         } } },
-    }, 0x5150);
+    });
     defer relay.deinit();
 
     const relay_peer = [_]Peer{.{
@@ -4027,14 +4113,14 @@ test "a relay admits two clients, forwards both ways, and reports each once" {
         .listen = loopback,
         .alpn = relay_alpn,
         .relay = .{ .role = .{ .client = relay_peer[0] } },
-    }, 0xa1a1);
+    });
     defer a.deinit();
     const b = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0xb2),
         .listen = loopback,
         .alpn = relay_alpn,
         .relay = .{ .role = .{ .client = relay_peer[0] } },
-    }, 0xb2b2);
+    });
     defer b.deinit();
 
     // Three different identities, so no end of this can be the other: the
@@ -4169,6 +4255,111 @@ test "a relay admits two clients, forwards both ways, and reports each once" {
     try t.expectEqual(@as(u64, 1), relay.stats.handler_shutdowns);
 }
 
+test "two relays built the same way challenge their clients differently" {
+    // The relay half of the entropy claim, which is a different consumer from
+    // the TLS scalars and has to be claimed separately.
+    //
+    // **`serveAdmit` drew the admission challenge from the loop's `random`
+    // parameter**, which in production is the node's own generator — the same
+    // `std.Random.DefaultPrng` seeded from a caller-supplied `u64` that `create`
+    // builds. So a relay built the same way as another relay issued the same
+    // sixteen bytes to its first client, and a challenge is exactly the value a
+    // captured signed reply is replayed against.
+    //
+    // **What is not being claimed, and why.** A relay cannot forge ed25519 from a
+    // known challenge: `relay_server.step` verifies the client's signature under
+    // the node id it claimed, and `relay_server.zig`'s own tests already cover a
+    // challenge answered with a wrong key, one answered under another node id,
+    // and a captured reply presented against a different challenge. What a
+    // repeated challenge adds is replay of a reply that was valid once, so the
+    // invariant under test here is repetition and nothing else. Those denial
+    // cases are reused rather than restated, and nothing here weakens them.
+    //
+    // Two relays and two clients over real sockets. The challenge is read off
+    // the handshake the relay is actually holding (`outstandingChallenge`)
+    // before the client answers it, which is why the drive stops the moment the
+    // challenge exists: once the client has answered, `.challenged` is a state
+    // this node has moved past and the bytes are gone.
+    const first_relay = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x71),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .serve = .{
+            .clients = 1,
+            .queue_depth = 4,
+            .drain_room = 4,
+        } } },
+    });
+    defer closedOnExit(first_relay);
+    const second_relay = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x72),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .serve = .{
+            .clients = 1,
+            .queue_depth = 4,
+            .drain_room = 4,
+        } } },
+    });
+    defer closedOnExit(second_relay);
+
+    // Each client is given its relay and nothing else, as a peer holding a
+    // relay's node id and address is.
+    const first_peer = [_]Peer{.{
+        .id = first_relay.nodeId(),
+        .addr = .{ .ip = first_relay.address() },
+    }};
+    const second_peer = [_]Peer{.{
+        .id = second_relay.nodeId(),
+        .addr = .{ .ip = second_relay.address() },
+    }};
+    const first_client = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x81),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .client = first_peer[0] } },
+    });
+    defer closedOnExit(first_client);
+    const second_client = try Node.create(t.allocator, t.io, .{
+        .secret = try identityOf(0x82),
+        .listen = loopback,
+        .alpn = relay_alpn,
+        .relay = .{ .role = .{ .client = second_peer[0] } },
+    });
+    defer closedOnExit(second_client);
+
+    // Both relays are built from the same generator seed and are otherwise
+    // identical, which is the whole claim: two relays an operator would run
+    // with the same command line. Four different identities, so no end of this
+    // can be the other.
+    var at: Instant = start_ns;
+    try first_client.start(at, first_client.generator());
+    try second_client.start(at, second_client.generator());
+
+    // Senders first and relays last, so a frame written on one pass is on the
+    // wire before that relay is asked to read it.
+    const nodes = [_]*Node{ first_client, second_client, first_relay, second_relay };
+    var first_challenge: ?[relay_frame.ServerChallenge.challenge_length]u8 = null;
+    var second_challenge: ?[relay_frame.ServerChallenge.challenge_length]u8 = null;
+    var pass: usize = 0;
+    while (pass < max_passes and (first_challenge == null or second_challenge == null)) : (pass += 1) {
+        try passOnce(&nodes, &at);
+        if (first_challenge == null) first_challenge = outstandingChallenge(first_relay);
+        if (second_challenge == null) second_challenge = outstandingChallenge(second_relay);
+    }
+    const one = first_challenge orelse return error.NoChallengeWasIssued;
+    const two = second_challenge orelse return error.NoChallengeWasIssued;
+
+    // Each relay really did serve an arrival over a real handshake: the slot
+    // was taken and the challenge is only ever issued to one that got that far.
+    try t.expectEqual(@as(u64, 1), first_relay.stats.attempts);
+    try t.expectEqual(@as(u64, 1), second_relay.stats.attempts);
+
+    // The claim. Sixteen bytes is the whole of `challenge_length`, and a relay
+    // answering two clients from one stream would repeat every one of them.
+    try t.expect(!std.mem.eql(u8, &one, &two));
+}
+
 /// One pass over every node, virtual time one quantum further on.
 fn passOnce(nodes: []const *Node, at: *Instant) Error!void {
     at.* += time_quantum;
@@ -4190,7 +4381,7 @@ test "a relay with no room spends no stream, and admits again once a slot frees"
             .queue_depth = 4,
             .drain_room = 4,
         } } },
-    }, 0x5f5f);
+    });
     defer relay.deinit();
 
     const relay_peer = [_]Peer{.{
@@ -4202,21 +4393,21 @@ test "a relay with no room spends no stream, and admits again once a slot frees"
         .listen = loopback,
         .alpn = relay_alpn,
         .relay = .{ .role = .{ .client = relay_peer[0] } },
-    }, 0xa1a1);
+    });
     defer a.deinit();
     const b = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0xb2),
         .listen = loopback,
         .alpn = relay_alpn,
         .relay = .{ .role = .{ .client = relay_peer[0] } },
-    }, 0xb2b2);
+    });
     defer b.deinit();
     const c = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0xc3),
         .listen = loopback,
         .alpn = relay_alpn,
         .relay = .{ .role = .{ .client = relay_peer[0] } },
-    }, 0xc3c3);
+    });
     defer c.deinit();
     const nodes = [_]*Node{ a, b, c, relay };
 
@@ -4299,7 +4490,7 @@ test "a refused stream costs a connection and not the pass, a fault the pass" {
             .queue_depth = 4,
             .drain_room = 4,
         } } },
-    }, 0x5150);
+    });
     defer relay.deinit();
 
     const relay_peer = [_]Peer{.{
@@ -4311,21 +4502,21 @@ test "a refused stream costs a connection and not the pass, a fault the pass" {
         .listen = loopback,
         .alpn = relay_alpn,
         .relay = .{ .role = .{ .client = relay_peer[0] } },
-    }, 0xa1a1);
+    });
     defer a.deinit();
     const b = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0xb2),
         .listen = loopback,
         .alpn = relay_alpn,
         .relay = .{ .role = .{ .client = relay_peer[0] } },
-    }, 0xb2b2);
+    });
     defer b.deinit();
     const c = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0xc3),
         .listen = loopback,
         .alpn = relay_alpn,
         .relay = .{ .role = .{ .client = relay_peer[0] } },
-    }, 0xc3c3);
+    });
     defer c.deinit();
     const nodes = [_]*Node{ a, b, c, relay };
 
@@ -4348,7 +4539,7 @@ test "a refused stream costs a connection and not the pass, a fault the pass" {
     var index: usize = 0;
     while (relay.bridge.connectionAt(index)) |conn| : (index += 1) {
         if (!conn.entry.conn.is_server) continue;
-        if (relay.servedFor(conn.id()) != null) continue;
+        if (relay.relay_state.servedFor(conn.id()) != null) continue;
         idle = conn;
         break;
     }
@@ -4430,7 +4621,7 @@ test "a frame a peer stopped writing is counted and dropped, never read as a mes
             .queue_depth = 4,
             .drain_room = 4,
         } } },
-    }, 0x6060);
+    });
     defer relay.deinit();
 
     const relay_peer = [_]Peer{.{
@@ -4442,7 +4633,7 @@ test "a frame a peer stopped writing is counted and dropped, never read as a mes
         .listen = loopback,
         .alpn = relay_alpn,
         .relay = .{ .role = .{ .client = relay_peer[0] } },
-    }, 0xa4a4);
+    });
     defer a.deinit();
     const nodes = [_]*Node{ a, relay };
 
@@ -4465,7 +4656,7 @@ test "a frame a peer stopped writing is counted and dropped, never read as a mes
     // the path that got here and not a condition this test allows for. It is
     // returned rather than unwrapped so the runner reports which test broke
     // and the assertions below still say what was true of the wire.
-    const spoke = a.spoke orelse return error.TestUnexpectedResult;
+    const spoke = a.relay_state.spoke orelse return error.TestUnexpectedResult;
     var out = spoke.stream orelse return error.TestUnexpectedResult;
     try out.write(&half);
     out.close();
@@ -4505,8 +4696,8 @@ const poison_frame = [_]u8{ 2, 2, 0 };
 
 /// The one client this relay is serving, named by the slot that is live rather
 /// than by which connection the core happened to give it.
-fn liveSlot(relay: *Node) ?*Served {
-    for (relay.clients) |*slot| {
+fn liveSlot(relay: *Node) ?*relay_storage.client_type {
+    for (relay.relay_state.clients) |*slot| {
         if (slot.live) return slot;
     }
     return null;
@@ -4526,7 +4717,7 @@ test "a relay reads past a frame it cannot decode and does not serve one twice" 
             .queue_depth = 4,
             .drain_room = 4,
         } } },
-    }, 0x6161);
+    });
     defer relay.deinit();
 
     const relay_peer = [_]Peer{.{
@@ -4538,7 +4729,7 @@ test "a relay reads past a frame it cannot decode and does not serve one twice" 
         .listen = loopback,
         .alpn = relay_alpn,
         .relay = .{ .role = .{ .client = relay_peer[0] } },
-    }, 0xb1b1);
+    });
     defer a.deinit();
     const nodes = [_]*Node{ a, relay };
 
@@ -4560,7 +4751,7 @@ test "a relay reads past a frame it cannot decode and does not serve one twice" 
     try a.sendThrough(stranger, "one");
     // Established above, as in the test above: absent here is a defect in the
     // path that got here, reported rather than unwrapped.
-    const spoke = a.spoke orelse return error.TestUnexpectedResult;
+    const spoke = a.relay_state.spoke orelse return error.TestUnexpectedResult;
     var out = spoke.stream orelse return error.TestUnexpectedResult;
     try out.write(&poison_frame);
 
@@ -4617,7 +4808,7 @@ test "a relay client reads past a frame it cannot decode and acts on one frame o
             .queue_depth = 4,
             .drain_room = 4,
         } } },
-    }, 0x6262);
+    });
     defer relay.deinit();
 
     const relay_peer = [_]Peer{.{
@@ -4629,7 +4820,7 @@ test "a relay client reads past a frame it cannot decode and acts on one frame o
         .listen = loopback,
         .alpn = relay_alpn,
         .relay = .{ .role = .{ .client = relay_peer[0] } },
-    }, 0xb2b2);
+    });
     defer a.deinit();
     const nodes = [_]*Node{ a, relay };
 
@@ -4648,7 +4839,7 @@ test "a relay client reads past a frame it cannot decode and acts on one frame o
     // counted when it is acted on and writes nothing back.
     const slot = liveSlot(relay) orelse return error.NoLiveClient;
     const stranger = (try identityOf(0x78)).nodeId();
-    try writeRelay(&slot.out, relay.relay_out, .{ .endpoint_gone = stranger });
+    try writeRelay(&slot.out, relay.relay_state.out, .{ .endpoint_gone = stranger });
     try slot.out.write(&poison_frame);
 
     // Counted, not returned, for the reason the test above gives: the pass
@@ -4677,7 +4868,7 @@ test "a relay client reads past a frame it cannot decode and acts on one frame o
     try t.expectEqual(@as(u64, 1), a.stats.relay_peer_gone);
     // And the inbox holds nothing, which is the state that counter is
     // re-derived from on every pass that reads again.
-    const inbox = (a.spoke orelse return error.TestUnexpectedResult).inbox;
+    const inbox = (a.relay_state.spoke orelse return error.TestUnexpectedResult).inbox;
     try t.expectEqual(@as(usize, 0), inbox.items.len);
 
     for (nodes) |node| try node.close(t.io, at, node.generator());
@@ -4690,7 +4881,7 @@ test "a closing relay client dials no relay" {
     // there, so a pass in between is a call this surface permits. The relay
     // client's half of that pass is the one thing on the node that would go and
     // take new work: a connection of its own, for a relay it has never spoken
-    // to, on a node that has already said it is going — and `relay_dialled` is
+    // to, on a node that has already said it is going — and the relay dial is
     // latched, so a node driven on after an abandoned shutdown could never dial
     // that relay again.
     //
@@ -4718,7 +4909,7 @@ test "a closing relay client dials no relay" {
             .id = (try identityOf(0xc7)).nodeId(),
             .addr = .{ .ip = relay_recipient.address },
         } } },
-    }, 0xc6c6);
+    });
     defer node.deinit();
 
     // The preconditions, stated positively: one dialled connection, no relay at
@@ -4727,8 +4918,8 @@ test "a closing relay client dials no relay" {
     try node.start(at, node.generator());
     try t.expectEqual(@as(u64, 1), node.stats.dials);
     try t.expectEqual(router.Shutdown.Phase.serving, node.accept.shutdown.phase);
-    try t.expect(!node.relay_dialled);
-    try t.expect(node.spoke == null);
+    try t.expect(!node.relay_state.dialled);
+    try t.expect(node.relay_state.spoke == null);
 
     // A close stopped one send short of the descriptor. It needs nothing to be
     // established: the core builds its close flight from whichever seal it
@@ -4749,8 +4940,8 @@ test "a closing relay client dials no relay" {
     // free, and nothing put on the wire for a relay this node will not speak to.
     at += time_quantum;
     _ = try node.step(t.io, at, node.generator());
-    try t.expect(!node.relay_dialled);
-    try t.expect(node.spoke == null);
+    try t.expect(!node.relay_state.dialled);
+    try t.expect(node.relay_state.spoke == null);
     try t.expectEqual(@as(u64, 0), node.stats.relay_dials);
     try t.expectEqual(@as(u64, 0), node.stats.relay_dials_refused);
     try t.expectEqual(@as(u64, 0), node.stats.relay_auth_sent);
@@ -4759,8 +4950,8 @@ test "a closing relay client dials no relay" {
     // a pass and not a rule.
     at += time_quantum;
     _ = try node.step(t.io, at, node.generator());
-    try t.expect(!node.relay_dialled);
-    try t.expect(node.spoke == null);
+    try t.expect(!node.relay_state.dialled);
+    try t.expect(node.relay_state.spoke == null);
     try t.expectEqual(@as(u64, 0), node.stats.relay_dials);
 
     // The close that was owed still finishes it, which is what says the pass
@@ -4780,13 +4971,13 @@ test "a payload the relay handed over is retained once and given back once" {
         .secret = try identityOf(0x3d),
         .listen = loopback,
         .alpn = relay_alpn,
-    }, 0x3d3d);
+    });
     defer node.deinit();
 
     // The node's own storage, so `delivered` and `clearDelivered` are reading
     // and freeing the same list the delivery appended to, and `deinit` finds
     // whatever is left on it.
-    node.spoke = .{
+    node.relay_state.spoke = .{
         .conn = 0,
         .stream = null,
         .handshake = .{ .established = .signed_challenge },
@@ -4795,7 +4986,7 @@ test "a payload the relay handed over is retained once and given back once" {
     };
 
     const src = (try identityOf(0x4e)).nodeId();
-    const frame = relay_frame.DatagramFrame{
+    const frame: relay_frame.DatagramFrame = .{
         .node_id = src,
         .datagrams = .{
             .ecn = null,
@@ -4803,7 +4994,7 @@ test "a payload the relay handed over is retained once and given back once" {
             .contents = "from-the-relay",
         },
     };
-    const spoke = if (node.spoke) |*active| active else return error.TestUnexpectedResult;
+    const spoke = if (node.relay_state.spoke) |*active| active else return error.TestUnexpectedResult;
 
     // **The list refuses it.** The copy is made before the list is asked to
     // hold it, so an append that cannot grow must give the copy back rather
@@ -4872,7 +5063,7 @@ test "a message length round-trips at every varint width" {
 
 test "every relay role answers a client count, and only a serving relay holds one" {
     // Three roles and one answer each, for a node that has admitted nobody.
-    // `.off` and `.client` build no registry at all — `initRelay` returns
+    // `.off` and `.client` build no registry at all — `relay_storage.init` returns
     // before the table is initialised — so a count read out of one is a read
     // of bytes nobody wrote, and the memory `create` was handed says nothing
     // about what is in it. Filling that storage with a pattern first is what
@@ -4881,7 +5072,7 @@ test "every relay role answers a client count, and only a serving relay holds on
         .secret = try identityOf(0xa1),
         .listen = loopback,
         .topic = briskTopic(),
-    }, 0xa1a1);
+    });
     defer closedOnExit(gossip);
     const spoke = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0xa2),
@@ -4891,18 +5082,18 @@ test "every relay role answers a client count, and only a serving relay holds on
             .id = (try identityOf(0xa3)).nodeId(),
             .addr = .{ .ip = loopback },
         } } },
-    }, 0xa2a2);
+    });
     defer closedOnExit(spoke);
     const relay = try Node.create(t.allocator, t.io, .{
         .secret = try identityOf(0xa4),
         .listen = loopback,
         .topic = briskTopic(),
         .relay = .{ .role = .{ .serve = .{} } },
-    }, 0xa4a4);
+    });
     defer closedOnExit(relay);
 
-    gossip.registry.len = 3;
-    spoke.registry.len = 3;
+    gossip.relay_state.registry.len = 3;
+    spoke.relay_state.registry.len = 3;
 
     try t.expectEqual(@as(usize, 0), gossip.clientCount());
     try t.expectEqual(@as(usize, 0), spoke.clientCount());
@@ -4933,7 +5124,7 @@ test "a start that could not join refuses again, and a start that joined is not 
         .listen = loopback,
         .peers = &peers,
         .topic = briskTopic(),
-    }, 0xb9b9);
+    });
     defer closedOnExit(node);
 
     try t.expectError(error.BootstrapListTooLong, node.start(start_ns, node.generator()));
@@ -4956,7 +5147,7 @@ test "a start that could not join refuses again, and a start that joined is not 
         .secret = try identityOf(0xba),
         .listen = loopback,
         .topic = briskTopic(),
-    }, 0xbaba);
+    });
     defer closedOnExit(joining);
     try joining.start(start_ns, joining.generator());
     try t.expect(joining.joined);
@@ -4975,7 +5166,7 @@ test "a join the gossip layer could not take leaves the node not joined" {
         .secret = try identityOf(0xbb),
         .listen = loopback,
         .topic = briskTopic(),
-    }, 0xbbbb);
+    });
     defer closedOnExit(listener);
     const peers = [_]Peer{.{
         .id = listener.nodeId(),
@@ -4986,7 +5177,7 @@ test "a join the gossip layer could not take leaves the node not joined" {
         .listen = loopback,
         .peers = &peers,
         .topic = briskTopic(),
-    }, 0xbcbc);
+    });
     defer closedOnExit(node);
 
     var failing = t.FailingAllocator.init(t.allocator, .{});
@@ -5009,4 +5200,45 @@ test "a join the gossip layer could not take leaves the node not joined" {
     // with.
     try t.expect(!node.joined);
     try t.expectEqual(@as(u64, 0), node.stats.gossip_events);
+}
+
+test "a runtime that cannot supply secure entropy builds no node" {
+    // The CSPRNG seed is drawn before anything else is built, so both refusals
+    // land on a runtime that has an open descriptor to give back and nothing
+    // else to unwind. That is the shape this asserts: the error each kind of
+    // refusal produces, and that neither leaves a node, a descriptor or an
+    // allocation behind — `std.testing`'s own allocator is what reports the
+    // last of those, so reaching the end of this test is itself half the claim.
+    //
+    // **The two errors stay two.** `error.EntropyUnavailable` is a runtime that
+    // cannot key this node and never will; `error.Canceled` is the caller
+    // stopping this operation and choosing to retry, which says nothing at all
+    // about its entropy source. Collapsing them told a cancelling caller its
+    // entropy was broken, and told one whose entropy is fine that it is not
+    // retryable.
+    var vtable: std.Io.VTable = undefined;
+    var refused_secret = try identityOf(0xe1);
+    defer refused_secret.deinit();
+    inline for ([_]std.Io.RandomSecureError{ error.EntropyUnavailable, error.Canceled }) |refused| {
+        const no_entropy = refusingEntropy(refused, t.io, &vtable);
+        try t.expectError(refused, Node.create(t.allocator, no_entropy, .{
+            .secret = refused_secret,
+            .listen = loopback,
+            .topic = briskTopic(),
+        }));
+    }
+
+    // And the same node on the real runtime, which is the control: it answers
+    // neither, because `t.io` has secure entropy and is not cancelled. Without
+    // this the two refusals above would also be satisfied by a `create` that
+    // refused everything.
+    var control_secret = try identityOf(0xe2);
+    defer control_secret.deinit();
+    const built = try Node.create(t.allocator, t.io, .{
+        .secret = control_secret,
+        .listen = loopback,
+        .topic = briskTopic(),
+    });
+    defer closedOnExit(built);
+    try t.expectEqual(control_secret.nodeId(), built.nodeId());
 }

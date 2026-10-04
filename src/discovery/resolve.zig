@@ -33,7 +33,11 @@
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
+const key = @import("../base/key.zig");
 const item = @import("item.zig");
+const node_addr = @import("../base/node_addr.zig");
+const relay_url = @import("../base/relay_url.zig");
+const transport_addr = @import("../base/transport_addr.zig");
 
 /// What a service is asked to publish, and what it takes on the duty of
 /// releasing.
@@ -84,7 +88,7 @@ pub const Published = struct {
     alloc: std.mem.Allocator,
     /// The address to publish, consumed by the call that takes this value. Its
     /// list is sorted, unique and owned; the caller must not read it again.
-    endpoint: addr.NodeAddr,
+    endpoint: node_addr.NodeAddr,
     /// When this address was learned, or null when the caller cannot say. Null
     /// sorts before every known timestamp in `Item.order`. Equal timestamps
     /// fall through to node id, address value order, and provenance.
@@ -146,7 +150,7 @@ pub const AddressLookup = struct {
         resolve: *const fn (
             ctx: *anyopaque,
             alloc: std.mem.Allocator,
-            node_id: addr.NodeId,
+            node_id: key.NodeId,
         ) ResolveError!?Stream,
     };
 
@@ -168,7 +172,7 @@ pub const AddressLookup = struct {
     pub fn resolve(
         self: AddressLookup,
         alloc: std.mem.Allocator,
-        node_id: addr.NodeId,
+        node_id: key.NodeId,
     ) ResolveError!?Stream {
         return self.vtable.resolve(self.ctx, alloc, node_id);
     }
@@ -190,7 +194,7 @@ pub const AddressLookup = struct {
     pub const refuse_resolve: *const fn (
         *anyopaque,
         std.mem.Allocator,
-        addr.NodeId,
+        key.NodeId,
     ) ResolveError!?Stream = refuseResolve;
 };
 
@@ -215,7 +219,7 @@ fn refuseResolve(
     // the public `AddressLookup` rather than here.
     // ziglint-ignore: Z023
     _: std.mem.Allocator,
-    _: addr.NodeId,
+    _: key.NodeId,
 ) ResolveError!?Stream {
     return null;
 }
@@ -623,12 +627,12 @@ pub const RecordSet = struct {
 ///   nothing at all, which is the one outcome a caller cannot act on.
 pub fn parseTxt(
     alloc: std.mem.Allocator,
-    node_id: addr.NodeId,
+    node_id: key.NodeId,
     records: RecordSet,
     provenance: item.Provenance,
 ) ParseError!item.Item {
     var set = records;
-    var endpoint = addr.NodeAddr.init(node_id);
+    var endpoint = node_addr.NodeAddr.init(node_id);
     // `NodeAddr.deinit` frees the outer list and nothing else, and an empty
     // list costs nothing to free, so this is unconditional.
     errdefer endpoint.deinit(alloc);
@@ -652,7 +656,7 @@ pub fn parseTxt(
         const value = after[0..value_end];
         switch (attribute) {
             .relay => {
-                const url = addr.RelayUrl.parse(value) catch continue;
+                const url = relay_url.RelayUrl.parse(value) catch continue;
                 // A duplicate is not a failure: `insert` reports one by
                 // returning null and upstream dedups too, in
                 // `EndpointData::new`. Only the error is an error.
@@ -752,7 +756,7 @@ pub const EncodeError = error{
 /// trailing `/` invariant 4 requires. The other two arms are far shorter —
 /// `addr=` with either 21 bytes of IPv4 or 39 of IPv6, or 77 bytes of custom id
 /// and data — and the relay arm is the one that has to be right.
-pub const max_record_length = 6 + 8 + addr.RelayUrl.max_host_length + 1 + 5 + 1;
+pub const max_record_length = 6 + 8 + relay_url.RelayUrl.max_host_length + 1 + 5 + 1;
 
 /// Buffer size `PkarrPublisher.writeTxtStrings` needs for this many addresses,
 /// separators included. The encoding has no fixed length, because the address
@@ -771,7 +775,7 @@ pub const Packet = struct {
     /// Who signed it, which *is* the node being published: upstream reads the
     /// id out of the packet's own public key (`iroh-dns/src/endpoint_info.rs`,
     /// `from_pkarr_signed_packet`).
-    node_id: addr.NodeId,
+    node_id: key.NodeId,
     /// The `_iroh` records, in whatever order the packet listed them. The
     /// `_iroh` name filter is already applied and the character strings of one
     /// record are already concatenated: upstream reads them with
@@ -1020,7 +1024,7 @@ const PkarrState = struct {
     alloc: std.mem.Allocator,
     /// The node the caller asked about, held because a packet is only an answer
     /// if it was signed by it. See `Reason.UnexpectedSigner`.
-    node_id: addr.NodeId,
+    node_id: key.NodeId,
     /// The service's answer set, by value: two resolves against one service
     /// each get their own position in the buffer.
     answers: RecordSet,
@@ -1042,9 +1046,14 @@ fn resolverResolve(
     // in the tree implements is fixed on `AddressLookup`.
     // ziglint-ignore: Z023
     alloc: std.mem.Allocator,
-    node_id: addr.NodeId,
+    node_id: key.NodeId,
 ) ResolveError!?Stream {
     const self: *PkarrResolver = @ptrCast(@alignCast(ctx));
+    // Ownership leaves this function with the `Stream` it returns: the vtable
+    // above names `pkarrDestroy`, which calls `alloc.destroy` on this pointer,
+    // and the `errdefer` below covers the paths that fail before that. The
+    // engine does not follow a pointer handed back to a caller.
+    // zwanzig-disable-next-line: store-violations-engine
     const state = try alloc.create(PkarrState);
     errdefer alloc.destroy(state);
     state.* = .{
@@ -1136,11 +1145,10 @@ fn failed(provenance: item.Provenance, reason: Reason) Event {
 }
 
 const t = std.testing;
-const key = @import("../base/key.zig");
 
 /// A node id from a fixed seed. A resolver hands out real keys and a `NodeId`
 /// cannot be made from arbitrary bytes, so a corpus draws from seeds.
-fn corpusId(seed: u8) !addr.NodeId {
+fn corpusId(seed: u8) !key.NodeId {
     var bytes: [key.SecretKey.seed_length]u8 = undefined;
     @memset(&bytes, seed);
     return (try key.SecretKey.fromSeed(bytes)).nodeId();
@@ -1236,10 +1244,10 @@ test "a publish nobody wanted still released what it was handed" {
 
     resolver.lookup().publish(.{
         .alloc = t.allocator,
-        .endpoint = try addr.NodeAddr.withRelay(
+        .endpoint = try node_addr.NodeAddr.withRelay(
             t.allocator,
             id,
-            try addr.RelayUrl.parse("https://relay.example./"),
+            try relay_url.RelayUrl.parse("https://relay.example./"),
         ),
         .last_updated = null,
     });
@@ -1270,19 +1278,19 @@ test "a publisher releases the slot it replaces with the allocator that made it"
 
     publisher.lookup().publish(.{
         .alloc = arena.allocator(),
-        .endpoint = try addr.NodeAddr.withRelay(
+        .endpoint = try node_addr.NodeAddr.withRelay(
             arena.allocator(),
             id,
-            try addr.RelayUrl.parse("https://one.example./"),
+            try relay_url.RelayUrl.parse("https://one.example./"),
         ),
         .last_updated = 1,
     });
     publisher.lookup().publish(.{
         .alloc = t.allocator,
-        .endpoint = try addr.NodeAddr.withRelay(
+        .endpoint = try node_addr.NodeAddr.withRelay(
             t.allocator,
             id,
-            try addr.RelayUrl.parse("https://two.example./"),
+            try relay_url.RelayUrl.parse("https://two.example./"),
         ),
         .last_updated = 2,
     });
@@ -1293,7 +1301,7 @@ test "a publisher releases the slot it replaces with the allocator that made it"
     try t.expectEqual(@as(?u64, 2), stored.last_updated);
     try t.expectEqual(@as(usize, 1), stored.endpoint.addrs.len);
     try t.expectEqual(
-        try addr.RelayUrl.parse("https://two.example./"),
+        try relay_url.RelayUrl.parse("https://two.example./"),
         stored.endpoint.addrs[0].relay,
     );
 
@@ -1301,10 +1309,10 @@ test "a publisher releases the slot it replaces with the allocator that made it"
     // the way out — the release a replaced slot never gets to make.
     publisher.lookup().publish(.{
         .alloc = t.allocator,
-        .endpoint = try addr.NodeAddr.withRelay(
+        .endpoint = try node_addr.NodeAddr.withRelay(
             t.allocator,
             id,
-            try addr.RelayUrl.parse("https://three.example./"),
+            try relay_url.RelayUrl.parse("https://three.example./"),
         ),
         .last_updated = 3,
     });
@@ -1451,7 +1459,7 @@ test "upstream's own records parse to the endpoint upstream says" {
     // relay, then IPv4 by address, which is the order the test lists them in.
     try t.expectEqual(@as(usize, 3), value.endpoint.addrs.len);
     try t.expectEqual(
-        try addr.RelayUrl.parse("https://euw1-1.relay.iroh.network./"),
+        try relay_url.RelayUrl.parse("https://euw1-1.relay.iroh.network./"),
         value.endpoint.addrs[0].relay,
     );
     try t.expectEqual(
@@ -1521,40 +1529,110 @@ test "a value that will not parse is dropped and the rest is kept" {
     defer value.endpoint.deinit(t.allocator);
     try t.expectEqual(@as(usize, 1), value.endpoint.addrs.len);
     try t.expectEqual(
-        try addr.RelayUrl.parse("https://relay.example./"),
+        try relay_url.RelayUrl.parse("https://relay.example./"),
         value.endpoint.addrs[0].relay,
     );
 }
 
+/// Release a parsed item the way `parseTxt` says a caller releases it: the
+/// address list with `NodeAddr.deinit`, and the payload behind every custom
+/// address by hand, because `deinit` frees the list and nothing else.
+fn releaseParsed(alloc: std.mem.Allocator, value: item.Item) void {
+    for (value.endpoint.addrs) |one| {
+        if (one == .custom) alloc.free(one.custom.data);
+    }
+    value.endpoint.deinit(alloc);
+}
+
+/// How many allocations `run` makes, whether it finishes or stops on an error
+/// that is not the allocator's — which is the whole point of the paths that
+/// end in `MalformedRecord`.
+///
+/// The error the probe saw is deliberately dropped: the count is what this is
+/// for, and every sweep that uses it re-runs each boundary and asserts the
+/// error it gets there, so nothing is asserted twice and nothing is skipped.
+///
+/// `resize_fail_index` is pinned at zero rather than left at its default. A
+/// growth the backing allocator can satisfy in place goes through `resize`
+/// instead of `alloc`, consumes no allocation index, and is therefore a
+/// boundary no `fail_index` can reach: the sweep would step over it and the
+/// case would look complete while a growth went untested. Refusing every
+/// resize routes each growth through `alloc`, so what comes back is the count
+/// of allocating boundaries rather than the count of the ones this allocator
+/// happens to make visible.
+fn boundariesOf(comptime run: anytype, args: anytype) !usize {
+    var probe = t.FailingAllocator.init(t.allocator, .{ .resize_fail_index = 0 });
+    // The error is the measurement, not a surprise: the probe refuses its first
+    // request, so a run that returns is the case this counts. Which error it
+    // stopped with is the boundary's identity, and every sweep re-runs each
+    // boundary and asserts the error it gets there — so the payload is bound
+    // and dropped here by name rather than swallowed by `catch {}`.
+    _ = @call(.auto, run, .{probe.allocator()} ++ args) catch |probe_error| {
+        std.mem.doNotOptimizeAway(&probe_error);
+    };
+    return probe.alloc_index;
+}
+
+/// One parse of `set` that keeps what it built and gives all of it back. The
+/// sweeps use it as the probe so a boundary is only ever counted against a run
+/// that releases everything, and so a successful run can compare its live
+/// bytes against the same shape.
+fn parseAndRelease(
+    alloc: std.mem.Allocator,
+    node_id: key.NodeId,
+    set: RecordSet,
+) ParseError!void {
+    const value = try parseTxt(alloc, node_id, set, .pkarr);
+    releaseParsed(alloc, value);
+}
+
+// The whole of one custom record's ownership, a boundary at a time. Three
+// allocations stand between the record and the item: the payload copy, the
+// tracker that records it, and the growth of the address list it is inserted
+// into. The middle one is the one that used to be missed — the copy went into
+// the address list first and was recorded afterwards, so a failure in the
+// recording handed back an item holding a buffer no path owned — and the
+// count below is what stops a fourth boundary from being added silently.
 test "a custom payload is released however the record fails" {
-    // Three allocations stand between this record and the item: the payload
-    // copy, the tracker that records it, and the growth of the address list.
-    // The middle one is the one that used to be missed — the copy went into the
-    // address list first and was recorded afterwards, so a failure in the
-    // recording handed back an item holding a buffer no path owned. Each probe
-    // fails one of the two later allocations by index, and `t.allocator` names
-    // the leak at the end of the test, so both are green only when the copy is
-    // released on each of those paths.
     const id = try corpusId(6);
     const records: RecordSet = .init("addr=1_a1b2c3\x00");
 
-    var recording = t.FailingAllocator.init(t.allocator, .{ .fail_index = 1 });
-    try t.expectError(error.OutOfMemory, parseTxt(recording.allocator(), id, records, .pkarr));
+    try t.expectEqual(@as(usize, 3), try boundariesOf(parseAndRelease, .{ id, records }));
 
-    var growing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 2 });
-    try t.expectError(error.OutOfMemory, parseTxt(growing.allocator(), id, records, .pkarr));
-
-    // The success path still owns what the contract says it does: the payload is
-    // the caller's to release, because `NodeAddr.deinit` frees the address list
-    // and nothing else. Reading it here is the other half of that sentence — an
-    // item that copied the bytes out and then lost track of them would fail on
-    // the leak check above and never reach this.
-    const value = try parseTxt(t.allocator, id, records, .pkarr);
-    try t.expectEqual(@as(usize, 1), value.endpoint.addrs.len);
-    for (value.endpoint.addrs) |one| {
-        if (one == .custom) t.allocator.free(one.custom.data);
+    for (0..3) |refused| {
+        var failing = t.FailingAllocator.init(t.allocator, .{
+            .fail_index = refused,
+            .resize_fail_index = 0,
+        });
+        // `parseTxt` promises that nothing survives either error: the address
+        // list and every payload copied before the failing record are released
+        // before the error leaves. `t.allocator` would name the leak at the end
+        // of the test; the byte equality is the stronger claim, because it
+        // says the allocator is back to what it was on entry at every boundary
+        // rather than only at the end.
+        try t.expectError(error.OutOfMemory, parseAndRelease(failing.allocator(), id, records));
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
-    value.endpoint.deinit(t.allocator);
+
+    // The retry the contract promises, and the half of the ownership sentence
+    // the byte count above cannot reach: the payload is the caller's to
+    // release, because `NodeAddr.deinit` frees the address list and nothing
+    // else. Reading it back here is the other half — an item that copied the
+    // bytes out and then lost track of them would fail on the leak check above
+    // and never reach this line.
+    var working = t.FailingAllocator.init(t.allocator, .{ .resize_fail_index = 0 });
+    const alloc = working.allocator();
+    const value = try parseTxt(alloc, id, records, .pkarr);
+    defer releaseParsed(alloc, value);
+    try t.expectEqual(@as(usize, 1), value.endpoint.addrs.len);
+    switch (value.endpoint.addrs[0]) {
+        .custom => |custom| {
+            try t.expectEqual(@as(u64, 1), custom.id);
+            try t.expectEqualSlices(u8, &.{ 0xa1, 0xb2, 0xc3 }, custom.data);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "a packet signed for another node is reported, not returned" {
@@ -1616,9 +1694,9 @@ test "published records read back as the address that was published" {
     // Three families, so the loop that writes one record per address is walked
     // in all three, and the v6 and custom arms are the ones whose text form is
     // not this project's own display form.
-    var endpoint = addr.NodeAddr.init(id);
-    for ([_]addr.TransportAddr{
-        .{ .relay = try addr.RelayUrl.parse("https://relay.example./") },
+    var endpoint = node_addr.NodeAddr.init(id);
+    for ([_]transport_addr.TransportAddr{
+        .{ .relay = try relay_url.RelayUrl.parse("https://relay.example./") },
         .{ .ip = .{ .ip = .{ .v4 = .{ 192, 0, 2, 7 } }, .port = 7842 } },
         .{ .ip = .{ .ip = .{ .v6 = .{
             0xfd, 0x15, 0x07, 0x0a, 0x51, 0x0b, 0, 0,
@@ -1726,4 +1804,346 @@ test "resolver output is what merge and order are for" {
         try t.expectEqual(std.math.Order.lt, same_by_dns.order(pulled[0]));
         try t.expectEqual(std.math.Order.gt, pulled[0].order(same_by_dns));
     }
+}
+
+// Three good records, then a value that will not parse — dropped, with the
+// rest kept, upstream's `filter_map` — and then a key that is not one of the
+// three, which fails the whole lookup and takes the good records with it.
+test "a malformed tail releases the records that came before it" {
+    const id = try corpusId(22);
+    const records: RecordSet = .init(
+        "relay=https://relay.example./\x00" ++
+            "addr=1_a1b2c3\x00" ++
+            "relay=not a url\x00" ++
+            "hostname=x\x00",
+    );
+
+    // Two address-list growths, one payload copy, and the tracker that owns it.
+    // The dropped relay allocates nothing and the tail allocates nothing, so
+    // four is every boundary this record set has.
+    try t.expectEqual(@as(usize, 4), try boundariesOf(parseAndRelease, .{ id, records }));
+
+    for (0..4) |refused| {
+        var failing = t.FailingAllocator.init(t.allocator, .{
+            .fail_index = refused,
+            .resize_fail_index = 0,
+        });
+        try t.expectError(error.OutOfMemory, parseAndRelease(failing.allocator(), id, records));
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+
+    // The tail itself, with nothing refused. `MalformedRecord` is not an
+    // allocation, so the same promise has to hold on this path and the sweep
+    // above is not what proves it: the address list and the payload copy are
+    // both released before the error leaves, and there is no partial item.
+    var whole = t.FailingAllocator.init(t.allocator, .{ .resize_fail_index = 0 });
+    try t.expectError(error.MalformedRecord, parseAndRelease(whole.allocator(), id, records));
+    try t.expect(!whole.has_induced_failure);
+    try t.expectEqual(whole.allocated_bytes, whole.freed_bytes);
+}
+
+// The same record twice. `NodeAddr.insert` reports the second one as already
+// present and returns null *without allocating*, so the payload copy made for
+// it is unreferenced the moment its record has been read — and only `parseTxt`
+// is in a position to know that, which is why the release is this loop's job
+// rather than the address list's.
+test "a duplicate custom payload leaves one copy behind and not two" {
+    const id = try corpusId(23);
+    const records: RecordSet = .init(
+        "addr=1_a1b2c3\x00" ++
+            "addr=1_a1b2c3\x00" ++
+            "addr=127.0.0.1:1234\x00",
+    );
+
+    // First copy, the tracker that owns it, the list it goes into, the second
+    // copy, and the growth that adds the socket address. The duplicate's own
+    // insert allocates nothing, which is the whole reason there are five
+    // boundaries here and not six.
+    try t.expectEqual(@as(usize, 5), try boundariesOf(parseAndRelease, .{ id, records }));
+
+    for (0..5) |refused| {
+        var failing = t.FailingAllocator.init(t.allocator, .{
+            .fail_index = refused,
+            .resize_fail_index = 0,
+        });
+        try t.expectError(error.OutOfMemory, parseAndRelease(failing.allocator(), id, records));
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+
+    var working = t.FailingAllocator.init(t.allocator, .{ .resize_fail_index = 0 });
+    const alloc = working.allocator();
+    const value = try parseTxt(alloc, id, records, .pkarr);
+    defer releaseParsed(alloc, value);
+
+    // Two addresses, one payload. The byte count is what says the second copy
+    // went back: an item that kept it would hold one extra copy per duplicate
+    // record, which a count of addresses cannot see and which only surfaces as
+    // a leak at the end of the test.
+    try t.expectEqual(@as(usize, 2), value.endpoint.addrs.len);
+    try t.expectEqual(
+        2 * @sizeOf(transport_addr.TransportAddr) + 3,
+        working.allocated_bytes - working.freed_bytes,
+    );
+    // `TransportAddr` orders relay, then ip, then custom, so the payload is on
+    // the second of the two.
+    switch (value.endpoint.addrs[1]) {
+        .custom => |custom| try t.expectEqualSlices(u8, &.{ 0xa1, 0xb2, 0xc3 }, custom.data),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+// One record set that grows the address list five times and copies two
+// payloads along the way. This is the case the single-record sweep cannot
+// reach: a refusal in the middle leaves an address list, a tracker and one
+// payload behind it, and all three have to come back.
+test "every boundary of a growing multi-record set releases what came before it" {
+    const id = try corpusId(29);
+    const records: RecordSet = .init(
+        "relay=https://a.example./\x00" ++
+            "relay=https://b.example./\x00" ++
+            "addr=1_a1b2c3\x00" ++
+            "addr=2_deadbeef\x00" ++
+            "addr=127.0.0.1:1234\x00" ++
+            "addr=192.0.2.9:443\x00",
+    );
+
+    // Six address-list growths — one per address that is kept — plus the first
+    // payload copy, the tracker that owns it, and the second payload copy. The
+    // second `owned` append fits the tracker's capacity the first one bought,
+    // so it is not a boundary.
+    try t.expectEqual(@as(usize, 9), try boundariesOf(parseAndRelease, .{ id, records }));
+
+    for (0..9) |refused| {
+        var failing = t.FailingAllocator.init(t.allocator, .{
+            .fail_index = refused,
+            .resize_fail_index = 0,
+        });
+        try t.expectError(error.OutOfMemory, parseAndRelease(failing.allocator(), id, records));
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+
+    var working = t.FailingAllocator.init(t.allocator, .{ .resize_fail_index = 0 });
+    const alloc = working.allocator();
+    const value = try parseTxt(alloc, id, records, .pkarr);
+    defer releaseParsed(alloc, value);
+
+    try t.expectEqual(@as(usize, 6), value.endpoint.addrs.len);
+    // Six addresses and both payloads: nothing was dropped and nothing was
+    // copied twice.
+    try t.expectEqual(
+        6 * @sizeOf(transport_addr.TransportAddr) + 7,
+        working.allocated_bytes - working.freed_bytes,
+    );
+    // Relay, then ip, then custom, so the two payloads are last and in id
+    // order.
+    switch (value.endpoint.addrs[4]) {
+        .custom => |custom| try t.expectEqualSlices(u8, &.{ 0xa1, 0xb2, 0xc3 }, custom.data),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (value.endpoint.addrs[5]) {
+        .custom => |custom| try t.expectEqualSlices(u8, &.{ 0xde, 0xad, 0xbe, 0xef }, custom.data),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+/// One resolve over three answers, drained to the end and released: the shape
+/// every boundary of the resolver's lifetime is measured against.
+fn drainThree(alloc: std.mem.Allocator, node_id: key.NodeId) !void {
+    const packets = [_]Packet{
+        .{ .node_id = node_id, .txt = .init("addr=1_a1b2c3\x00") },
+        .{ .node_id = node_id, .txt = .init("addr=2_deadbeef\x00relay=https://relay.example./\x00") },
+        .{ .node_id = node_id, .txt = .init("addr=127.0.0.1:1234\x00") },
+    };
+    var relay: FakeRelay = .{ .answers = "signed\x00signed\x00signed\x00", .packets = &packets };
+    var resolver = PkarrResolver.init(relay.source());
+    var stream = (try resolver.lookup().resolve(alloc, node_id)) orelse
+        return error.TestUnexpectedResult;
+    defer stream.deinit();
+    var items: usize = 0;
+    while (stream.next()) |event| switch (event) {
+        .item => items += 1,
+        .failed => return error.TestUnexpectedResult,
+    };
+    try t.expectEqual(@as(usize, 3), items);
+    try t.expectEqual(@as(?usize, 3), stream.finish().itemCount());
+    try t.expectEqual(@as(u32, 1), relay.cancels);
+}
+
+// The resolver's whole allocating lifetime: the state block a resolve creates,
+// and then the arena and the item list behind it as the answers are turned
+// into items. One boundary is the construction and the rest are the drain, so
+// a sweep that only walked the first would say nothing about a stream that has
+// to answer for anybody.
+test "a resolve, a drain and a release, refused at every allocation in turn" {
+    const id = try corpusId(25);
+    const boundaries = try boundariesOf(drainThree, .{id});
+    try t.expect(boundaries > 1);
+
+    for (0..boundaries) |refused| {
+        const packets = [_]Packet{
+            .{ .node_id = id, .txt = .init("addr=1_a1b2c3\x00") },
+            .{ .node_id = id, .txt = .init("addr=2_deadbeef\x00relay=https://relay.example./\x00") },
+            .{ .node_id = id, .txt = .init("addr=127.0.0.1:1234\x00") },
+        };
+        var relay: FakeRelay = .{ .answers = "signed\x00signed\x00signed\x00", .packets = &packets };
+        var resolver = PkarrResolver.init(relay.source());
+        var failing = t.FailingAllocator.init(t.allocator, .{
+            .fail_index = refused,
+            .resize_fail_index = 0,
+        });
+        const alloc = failing.allocator();
+
+        const started = resolver.lookup().resolve(alloc, id);
+        if (started) |maybe| {
+            var stream = maybe orelse return error.TestUnexpectedResult;
+            defer stream.deinit();
+            var items: usize = 0;
+            var failures: usize = 0;
+            while (stream.next()) |event| switch (event) {
+                .item => items += 1,
+                .failed => |why| {
+                    failures += 1;
+                    // A failed answer is lost and the stream is not, which is
+                    // what makes the count below exact rather than a bound.
+                    try t.expectEqual(error.OutOfMemory, why.reason);
+                    try t.expectEqual(item.Provenance.pkarr, why.provenance);
+                },
+            };
+            // Every answer was still walked, and exactly one of them was lost —
+            // the one whose building allocation the sweep refused.
+            try t.expectEqual(@as(usize, 3), items + failures);
+            try t.expect(if (refused != 0) failures >= 1 else failures == 0);
+            // `finish` counts the items that survived, so a lost answer is one
+            // the caller never sees and not one it sees twice.
+            try t.expectEqual(@as(?usize, items), stream.finish().itemCount());
+            stream.deinit();
+            // A drained stream is still cancelled, and once.
+            try t.expectEqual(@as(u32, 1), relay.cancels);
+        } else |reason| {
+            // The first allocation a resolve makes is the state block, and
+            // refusing it starts nothing: no stream exists to cancel and
+            // nothing was allocated to release.
+            try t.expectEqual(error.OutOfMemory, reason);
+            try t.expectEqual(@as(usize, 0), refused);
+            try t.expectEqual(@as(u32, 0), relay.cancels);
+        }
+        try t.expect(failing.has_induced_failure);
+
+        // The retry a caller gets by asking again rather than abandoning: the
+        // refusal was one event, the service is undamaged, and this time all
+        // three answers arrive and the arena goes back to the allocator whole.
+        failing.fail_index = std.math.maxInt(usize);
+        var again: FakeRelay = .{ .answers = "signed\x00signed\x00signed\x00", .packets = &packets };
+        var second = PkarrResolver.init(again.source());
+        var retried = (try second.lookup().resolve(alloc, id)) orelse
+            return error.TestUnexpectedResult;
+        while (retried.next()) |event| switch (event) {
+            .item => {},
+            .failed => return error.TestUnexpectedResult,
+        };
+        try t.expectEqual(@as(?usize, 3), retried.finish().itemCount());
+        retried.deinit();
+        try t.expectEqual(@as(u32, 1), again.cancels);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+// The boundary the drain above walks past: a caller that stops reading part
+// way. Abandonment has to hold on the path where one answer was refused and
+// the arena holds a delivered item and a lost one at the same time, so this
+// finds the second answer's first allocation by running the same drain once
+// with nothing refused and watching how far the first pull got.
+test "a stream abandoned after a refused answer is still stopped exactly once" {
+    const id = try corpusId(26);
+    const packets = [_]Packet{
+        .{ .node_id = id, .txt = .init("addr=1_a1b2c3\x00") },
+        .{ .node_id = id, .txt = .init("addr=127.0.0.1:1234\x00bad_record\x00") },
+        .{ .node_id = id, .txt = .init("addr=127.0.0.1:1234\x00") },
+    };
+
+    var relay: FakeRelay = .{ .answers = "signed\x00signed\x00signed\x00", .packets = &packets };
+    var resolver = PkarrResolver.init(relay.source());
+    var failing = t.FailingAllocator.init(t.allocator, .{});
+    const alloc = failing.allocator();
+    var stream = (try resolver.lookup().resolve(alloc, id)) orelse
+        return error.TestUnexpectedResult;
+
+    // The first answer arrives whole, and the second is the one refused.
+    switch (stream.next() orelse return error.TestUnexpectedResult) {
+        .item => |delivered| try t.expectEqual(id, delivered.endpoint.node_id),
+        .failed => return error.TestUnexpectedResult,
+    }
+    switch (stream.next() orelse return error.TestUnexpectedResult) {
+        .item => return error.TestUnexpectedResult,
+        .failed => |why| try t.expectEqual(error.MalformedRecord, why.reason),
+    }
+
+    // Abandoned here: the third answer is never read, which is the whole of
+    // what a cancellation buys, and nothing has been told to stop yet.
+    try t.expectEqual(@as(u32, 0), relay.cancels);
+    stream.deinit();
+    try t.expectEqual(@as(u32, 1), relay.cancels);
+    // The arena and the state went with it, so the allocator is empty again
+    // after a stream that delivered one item and lost another.
+    try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    // And a second `deinit` is a caller mistake that costs nothing.
+    stream.deinit();
+    try t.expectEqual(@as(u32, 1), relay.cancels);
+}
+
+// `PkarrPublisher` is the one service here with no allocation of its own: it
+// takes a value built by somebody else and hands it back with the allocator
+// that built it. So a probe across two publications and a `deinit` must see
+// exactly the two address lists this test built and no more — an allocation
+// inside `publish` would be the publisher building an address list it was
+// handed whole, and counting is how that would be caught.
+test "the publisher allocates nothing of its own across two publications" {
+    const id = try corpusId(24);
+    var publisher = PkarrPublisher.init();
+    var failing = t.FailingAllocator.init(t.allocator, .{ .resize_fail_index = 0 });
+    const alloc = failing.allocator();
+
+    publisher.lookup().publish(.{
+        .alloc = alloc,
+        .endpoint = try node_addr.NodeAddr.withRelay(
+            alloc,
+            id,
+            try relay_url.RelayUrl.parse("https://one.example./"),
+        ),
+        .last_updated = 1,
+    });
+    publisher.lookup().publish(.{
+        .alloc = alloc,
+        .endpoint = try node_addr.NodeAddr.withRelay(
+            alloc,
+            id,
+            try relay_url.RelayUrl.parse("https://two.example./"),
+        ),
+        .last_updated = 2,
+    });
+
+    // The replaced slot was released as the second publication arrived, so the
+    // publisher holds one list and the caller has handed over both.
+    try t.expectEqual(@as(usize, 2), failing.allocations);
+    try t.expectEqual(@as(usize, 1), failing.deallocations);
+    const stored = publisher.published() orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(?u64, 2), stored.last_updated);
+    try t.expectEqual(
+        try relay_url.RelayUrl.parse("https://two.example./"),
+        stored.endpoint.addrs[0].relay,
+    );
+
+    // `deinit` releases the slot that is still in it, with the allocator that
+    // slot arrived with, and the whole lifecycle is two allocations and two
+    // releases with nothing in between that the publisher itself did.
+    publisher.deinit();
+    try t.expect(publisher.published() == null);
+    try t.expectEqual(@as(usize, 2), failing.deallocations);
+    try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    // And a second `deinit` frees nothing.
+    publisher.deinit();
+    try t.expectEqual(@as(usize, 2), failing.deallocations);
 }

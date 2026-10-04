@@ -179,8 +179,12 @@
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
+const base_relay_url = @import("../base/relay_url.zig");
 const holepunch = @import("holepunch.zig");
+const key = @import("../base/key.zig");
+const node_addr = @import("../base/node_addr.zig");
 const report = @import("report.zig");
+const transport_addr = @import("../base/transport_addr.zig");
 
 const Nanos = report.Nanos;
 const Path = holepunch.Path;
@@ -457,7 +461,7 @@ pub const Join = struct {
     /// `remote` is cleared first, for `local`'s reason: a record replaces the
     /// record before it, and an address the peer has withdrawn must stop being
     /// punched at.
-    pub fn observePeer(self: *Join, reported: *const addr.NodeAddr) Peered {
+    pub fn observePeer(self: *Join, reported: *const node_addr.NodeAddr) Peered {
         var result: Peered = .{
             .candidates = .{ .added = 0, .refused = 0, .pruned = none_pruned },
             .not_candidates = 0,
@@ -629,7 +633,7 @@ pub const Join = struct {
     }
 
     /// The slot holding `wanted`, or null when the table does not carry it.
-    fn find(self: *Join, wanted: addr.TransportAddr) ?*Path {
+    fn find(self: *Join, wanted: transport_addr.TransportAddr) ?*Path {
         var index: usize = 0;
         while (index < self.path_count) : (index += 1) {
             if (self.paths[index].addr.order(wanted) == .eq) return &self.paths[index];
@@ -666,11 +670,11 @@ fn millis(n: u64) Nanos {
 
 /// A relay URL rendered into `scratch`. The host is `<n>.example.`, so the
 /// URLs sort by index and the fold's relay ordering is predictable.
-fn namedRelay(scratch: []u8, index: usize) !addr.RelayUrl {
-    return addr.RelayUrl.parse(try std.fmt.bufPrint(scratch, "https://{d}.example./", .{index}));
+fn namedRelay(scratch: []u8, index: usize) !base_relay_url.RelayUrl {
+    return base_relay_url.RelayUrl.parse(try std.fmt.bufPrint(scratch, "https://{d}.example./", .{index}));
 }
 
-fn relaySet(scratch: []u8) ![3]addr.RelayUrl {
+fn relaySet(scratch: []u8) ![3]base_relay_url.RelayUrl {
     return .{
         try namedRelay(scratch[0..64], 0),
         try namedRelay(scratch[64..128], 1),
@@ -703,7 +707,7 @@ const client_conns: []const holepunch.Connection = &.{.{ .id = 4, .side = .clien
 /// curve point is a fact about the build and not about the run: a constant
 /// that stopped being one stops the build, where a `catch unreachable` would
 /// abort the first test that read it and say nothing about why.
-const peer_node: addr.NodeId = addr.NodeId.fromBytes([_]u8{7} ** 32) catch
+const peer_node: key.NodeId = key.NodeId.fromBytes([_]u8{7} ** 32) catch
     @compileError("the fixed test peer is not a canonical ed25519 point");
 
 /// A published record carrying exactly `addrs`.
@@ -712,7 +716,7 @@ const peer_node: addr.NodeId = addr.NodeId.fromBytes([_]u8{7} ** 32) catch
 /// `insert`, and a test hands over its own array instead: the borrow lasts
 /// the length of the test, which is the same borrow `NodeAddr.withRelay`
 /// makes into the heap and the reason the type is careful about it.
-fn peerRecord(addrs: []addr.TransportAddr) addr.NodeAddr {
+fn peerRecord(addrs: []transport_addr.TransportAddr) node_addr.NodeAddr {
     return .{ .node_id = peer_node, .addrs = addrs };
 }
 
@@ -815,7 +819,7 @@ fn onEndCheck(_: *anyopaque, _: probe_run.Why) void {}
 /// is what crosses the seam, not the round's storage.
 fn probeRound(
     wire: *Wire,
-    relays: []const addr.RelayUrl,
+    relays: []const base_relay_url.RelayUrl,
     now: Nanos,
     if_state: probe.IfState,
     protocols: probe.Protocols,
@@ -995,7 +999,7 @@ test "a rebind inside the interval is a punch and an unchanged report is not" {
     // no probe round reaches: a peer address that was not there then is a
     // punch for the same reason, because `holepunch.decide` compares both
     // sets the same way and only one of them is this file's.
-    var seen = [_]addr.TransportAddr{ .{ .ip = peer[0] }, .{ .ip = ip(7001) } };
+    var seen = [_]transport_addr.TransportAddr{ .{ .ip = peer[0] }, .{ .ip = ip(7001) } };
     _ = join.observePeer(&peerRecord(&seen));
     try t.expect(std.meta.eql(Action{ .punch = 4 }, join.ready(start + millis(3))));
 }
@@ -1075,7 +1079,7 @@ test "the advertised ceiling is refused before the gate is asked" {
     ));
     // The peer's addresses count towards the same ceiling, because it is one
     // connection's advertised set.
-    var published = [_]addr.TransportAddr{.{ .ip = ip(7000) }};
+    var published = [_]transport_addr.TransportAddr{.{ .ip = ip(7000) }};
     _ = join.observePeer(&peerRecord(&published));
     try t.expect(std.meta.eql(
         Action{ .tooManyAddresses = holepunch.max_qnt_addresses + 2 },
@@ -1187,7 +1191,7 @@ test "a burst through the peer's record does not evict the paths that work" {
     // table: one peer's own record, published all at once. This is the path
     // the module doc promises, so the rule the test above pins is re-pinned
     // here — a producer that bypassed the prune would be worse than none.
-    var published: [40]addr.TransportAddr = undefined;
+    var published: [40]transport_addr.TransportAddr = undefined;
     for (&published, 0..) |*slot, index| slot.* = .{ .ip = ip(@intCast(4000 + index)) };
     const filed = join.observePeer(&peerRecord(&published));
 
@@ -1223,7 +1227,7 @@ test "the peer's published record is the producer for its candidates" {
 
     // Everything a record may carry, and only one of it a way to punch at: a
     // relay is the fallback path, a custom transport is not an IP socket.
-    var published = [_]addr.TransportAddr{
+    var published = [_]transport_addr.TransportAddr{
         .{ .relay = try namedRelay(scratch[0..32], 0) },
         .{ .custom = .{ .id = 3, .data = &.{} } },
         .{ .ip = ip(7000) },
@@ -1251,7 +1255,7 @@ test "the peer's published record is the producer for its candidates" {
     // A later record replaces the one before it: the address the peer
     // withdrew stops being punched at, and the one it kept is a path the table
     // already carries, so it is filed once and not twice.
-    var withdrawn = [_]addr.TransportAddr{.{ .ip = ip(7001) }};
+    var withdrawn = [_]transport_addr.TransportAddr{.{ .ip = ip(7001) }};
     const second = join.observePeer(&peerRecord(&withdrawn));
     try t.expectEqual(@as(usize, 1), join.remote.len);
     try t.expectEqual(@as(usize, 0), second.candidates.added);
@@ -1261,7 +1265,7 @@ test "the peer's published record is the producer for its candidates" {
     // And a record carrying nothing but a fallback still punches, for the same
     // reason an empty report does: the set is handed over as it is and
     // `not_enough_addresses` is the stack's answer, not this file's.
-    var fallback = [_]addr.TransportAddr{
+    var fallback = [_]transport_addr.TransportAddr{
         .{ .relay = try namedRelay(scratch[32..64], 1) },
     };
     const empty = join.observePeer(&peerRecord(&fallback));
@@ -1284,7 +1288,7 @@ test "a path the table already carries is updated, not duplicated" {
 
 test "a republished candidate keeps the status its path already carries" {
     var join: Join = .{};
-    var published = [_]addr.TransportAddr{ .{ .ip = ip(7000) }, .{ .ip = ip(7001) } };
+    var published = [_]transport_addr.TransportAddr{ .{ .ip = ip(7000) }, .{ .ip = ip(7001) } };
     const first = join.observePeer(&peerRecord(&published));
     try t.expectEqual(@as(usize, 2), first.candidates.added);
 
@@ -1351,7 +1355,7 @@ test "a peer's record is refused what a full path table cannot hold" {
     // The peer's own record: the address the table already carries, and one
     // address more than the stack will advertise to a peer, none of them seen
     // before.
-    var published: [holepunch.max_qnt_addresses + 1]addr.TransportAddr = undefined;
+    var published: [holepunch.max_qnt_addresses + 1]transport_addr.TransportAddr = undefined;
     published[0] = .{ .ip = ip(7000) };
     for (published[1..], 0..) |*slot, index| slot.* = .{ .ip = ip(@intCast(8000 + index)) };
     const filed = join.observePeer(&peerRecord(&published));
@@ -1413,7 +1417,7 @@ test "a settled Join copied afterwards answers from its own recorded set" {
     // has both halves answered: a peer that advertised nothing now, having
     // advertised two, is a change worth punching, and this test is about the
     // copy, not about that rule.
-    var published = [_]addr.TransportAddr{ .{ .ip = ip(2000) }, .{ .ip = ip(2001) } };
+    var published = [_]transport_addr.TransportAddr{ .{ .ip = ip(2000) }, .{ .ip = ip(2001) } };
     _ = join.observePeer(&peerRecord(&published));
     // Settling records the round; it owes no instruction, and the gate is what
     // decides the next one.

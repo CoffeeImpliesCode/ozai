@@ -742,6 +742,30 @@ reader auditing this file should not have to look twice for either half.
   is a published prefix: a duplicate node list, which is the price of not
   dropping the peer.
 
+### 9. A PADDING frame that reports itself as zero octets wide
+
+`src/quic/frame.zig` `parseSized`, the `0x00` arm.
+
+`paddingLen(bytes)` counts the run of zero bytes from offset zero, but §16
+lets a frame type occupy more than one octet, so `80 00 00 00` is a PADDING
+frame four octets wide — the type code plus the zeros behind it — and the run
+it finds at offset zero is empty. `parseSized` then wrote that empty run back
+over the `stream.seek` that `readVarInt` had just advanced, so a **successful**
+call returned `size = 0` against its own documentation that a successful
+`size` names the next frame.
+
+The callers trusted it. `connection.zig` walks a coalesced packet by
+subtracting each frame's width from the remainder, with no zero guard, and
+only pre-skips a leading `0x00` run. A packet whose payload began `40 00` —
+PADDING is permitted between any two frames, §19.1 — therefore advanced by
+zero and re-read the same type code forever, on an authenticated connection.
+The vendored `quic_wire` fuzz corpus reproduces it with `80 00 00 00 01 00 00`
+and `80 00 00 00 00 00 00`.
+
+The fix counts from the end of the type code: `stream.seek + paddingLen(bytes[stream.seek..])`.
+No other behaviour moves, and the returned length is now the frame's real width.
+
+
 ## Measured cost
 
 | | Predicted | Measured |

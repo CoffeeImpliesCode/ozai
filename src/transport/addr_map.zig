@@ -29,10 +29,11 @@ const std = @import("std");
 // this module's own vocabulary and a parameter may not shadow a declaration.
 const base_key = @import("../base/key.zig");
 const base_addr = @import("../base/addr.zig");
+const base_relay_url = @import("../base/relay_url.zig");
 const ula = @import("../base/ula.zig");
 
 const NodeId = base_key.NodeId;
-const RelayUrl = base_addr.RelayUrl;
+const RelayUrl = base_relay_url.RelayUrl;
 const CustomAddr = base_addr.CustomAddr;
 const Ula = ula.Ula;
 const HostBits = ula.HostBits;
@@ -397,7 +398,7 @@ test "a candidate the reverse index holds is drawn again, not handed out twice" 
 }
 
 test "an address that arrives off the wire names the key that owns it" {
-    const url = try base_addr.RelayUrl.parse("https://use1-1.relay.iroh.network./");
+    const url = try base_relay_url.RelayUrl.parse("https://use1-1.relay.iroh.network./");
     const path_key: Key = .{ .relay = .{ .relay = url, .node = try testNodeId(1) } };
     var prng: std.Random.DefaultPrng = .init(0x5eed);
     var map: MappedAddrs = .init();
@@ -469,7 +470,7 @@ test "the same injected sequence allocates the same addresses" {
     const keys = [_]Key{
         .{ .any_path = try testNodeId(1) },
         .{ .relay = .{
-            .relay = try base_addr.RelayUrl.parse("https://a.example./"),
+            .relay = try base_relay_url.RelayUrl.parse("https://a.example./"),
             .node = try testNodeId(2),
         } },
         .{ .custom = try CustomKey.from(.{ .id = 0x2a, .data = &.{ 0xab, 0xcd } }) },
@@ -501,7 +502,7 @@ test "the three key arms are three addresses even on one host value" {
     const keys = [_]Key{
         .{ .any_path = try testNodeId(1) },
         .{ .relay = .{
-            .relay = try base_addr.RelayUrl.parse("https://a.example./"),
+            .relay = try base_relay_url.RelayUrl.parse("https://a.example./"),
             .node = try testNodeId(1),
         } },
         .{ .custom = try CustomKey.from(.{ .id = 0x2a, .data = &.{ 0xab, 0xcd } }) },
@@ -554,4 +555,456 @@ test "a custom address too long for the length byte is refused, not a trap" {
     const far_too_long = [_]u8{0} ** (@as(usize, std.math.maxInt(u8)) + 1);
     const overlong: CustomAddr = .{ .id = 1, .data = &far_too_long };
     try t.expectError(error.DataTooLong, CustomKey.from(overlong));
+}
+
+/// One key the map was given and the address it answered with.
+///
+/// Kept together because every assertion about the state a map was in
+/// before an operation under test needs both halves, and half a pair is how
+/// a map ends up answering a departing path with `null`.
+const Entry = struct {
+    key: Key,
+    addr: Ula,
+};
+
+/// Host values, one per entry a filled map holds. Distinct because a repeat
+/// inside one subnet is a candidate the reverse index refuses, and a fill
+/// built from repeats would spend `max_generate_attempts` on every key after
+/// the first. The allocation counts read off such a fill would stop meaning
+/// what they say.
+const fill_hosts = [_]HostBits{
+    .{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+    .{ 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+};
+
+/// A probe's draw, on a subnet these tests never fill. The first draw lands,
+/// so the allocation under test is the first one the key makes.
+const first_draw = [_]HostBits{host_a};
+
+/// A probe's draw on the subnet the fill writes into: the host the first
+/// fill entry holds, and then one the map does not. The first draw is thrown
+/// away by the reverse index, which is the retry loop upstream left
+/// unbounded, and the allocation under test is the second draw's.
+const colliding_draws = [_]HostBits{ fill_hosts[0], host_a };
+
+/// One key family and the address a single draw allocates for it.
+const Probe = struct {
+    key: Key,
+    allocated: Ula,
+};
+
+/// The `any_path` family on its own. It is the one the fill writes into, so
+/// this is the only family whose draw can be made to land on an address the
+/// map already holds.
+fn anyPathProbe() !Probe {
+    return .{
+        .key = .{ .any_path = try testNodeId(7) },
+        .allocated = ula.ulaFor(.any_path, host_a),
+    };
+}
+
+/// One probe per key family, in tag order. Three families are three
+/// different entry sizes in the same two tables, and a table that grew for
+/// one of them has to grow for the others.
+fn probes() ![3]Probe {
+    const relay_url = try base_relay_url.RelayUrl.parse("https://use1-1.relay.iroh.network./");
+    return .{
+        try anyPathProbe(),
+        .{
+            .key = .{ .relay = .{ .relay = relay_url, .node = try testNodeId(8) } },
+            .allocated = ula.ulaFor(.relay, host_a),
+        },
+        .{
+            .key = .{ .custom = try CustomKey.from(.{ .id = 0x2a, .data = &.{ 0xab, 0xcd } }) },
+            .allocated = ula.ulaFor(.custom, host_a),
+        },
+    };
+}
+
+/// Whether `table` has to grow before it can take one more entry.
+///
+/// A table with no capacity has no slots at all, which is the one state in
+/// which a free-slot count of zero does not mean full. The rest is std's
+/// load limit read off the table rather than restated here, so a change to
+/// the growth policy changes what these tests fill and not what they expect.
+fn needsRoom(comptime Table: type, table: Table) bool {
+    return table.capacity() == 0 or table.available != 0;
+}
+
+/// Fill both tables until neither has a slot left, writing every entry into
+/// `entries` and returning the part of it that was used.
+///
+/// A map in this state makes the next `put` in either direction allocate,
+/// which is the state an insertion has to survive being refused in. The
+/// loop is bounded by the caller's buffer and fails rather than truncating:
+/// a sweep over half a filled map says nothing about the other half.
+fn fillTables(gpa: std.mem.Allocator, map: *MappedAddrs, entries: []Entry) ![]Entry {
+    var script: ScriptedBits = .{ .script = &fill_hosts };
+    var filled: usize = 0;
+    while (needsRoom(Forward, map.by_key) or needsRoom(Reverse, map.by_addr)) {
+        if (filled == entries.len) return error.TestUnexpectedResult;
+        // One seed per entry, taken from the size of the host script this
+        // loop cannot outrun, so the cast into the length byte is inside it.
+        const seed: u8 = @intCast(@min(filled + 1, fill_hosts.len));
+        const key: Key = .{ .any_path = try testNodeId(seed) };
+        entries[filled] = .{ .key = key, .addr = try map.get(gpa, key, script.random()) };
+        filled += 1;
+    }
+    return entries[0..filled];
+}
+
+/// Assert that every entry a map was seeded with is still in it, in both
+/// directions.
+///
+/// Separately, because a rollback that took out the wrong one of the pair
+/// leaves a map that still answers `get` while the direction a departing
+/// path uses to find the peers that care answers `null`. The reads go
+/// through the allocator that has just refused everything, so an answer here
+/// is also a statement that reading the old state allocates nothing.
+fn expectSeededEntries(gpa: std.mem.Allocator, map: *MappedAddrs, entries: []const Entry) !void {
+    var script: ScriptedBits = .{ .script = &first_draw };
+    for (entries) |seeded| {
+        try t.expectEqual(seeded.addr, try map.get(gpa, seeded.key, script.random()));
+        try expectSameKey(seeded.key, map.lookup(seeded.addr));
+    }
+    // Zero draws for `entries.len` answers: a key the map already holds is
+    // answered out of the table rather than allocated.
+    try t.expectEqual(@as(usize, 0), script.drawn);
+}
+
+/// The seeded entries and the size of both tables, for a pass in which the
+/// map held nothing else: a refused insertion changed no count in either
+/// direction.
+fn expectSeededIntact(gpa: std.mem.Allocator, map: *MappedAddrs, entries: []const Entry) !void {
+    try expectSeededEntries(gpa, map, entries);
+    try t.expectEqual(entries.len, @as(usize, map.by_key.count()));
+    try t.expectEqual(entries.len, @as(usize, map.by_addr.count()));
+}
+
+/// Assert that nothing of a refused key is visible from either direction.
+///
+/// The address is checked as well as the key: the reverse entry is the one
+/// an insertion writes first and takes back out last, and a rollback that
+/// missed it leaves the map answering `null` for a path it answered a moment
+/// ago.
+fn expectNothingRecorded(map: *const MappedAddrs, key: Key, candidate: Ula) !void {
+    try t.expectEqual(@as(?Ula, null), map.by_key.get(key));
+    try t.expectEqual(@as(?Key, null), map.lookup(candidate));
+}
+
+test "an allocation refused anywhere in an insertion leaves the old mappings exact" {
+    for (try probes()) |case| {
+        var open: t.FailingAllocator = .init(t.allocator, .{});
+        var open_map: MappedAddrs = .init();
+        defer open_map.deinit(open.allocator());
+        var open_slots: [fill_hosts.len]Entry = undefined;
+        const open_seeded = try fillTables(open.allocator(), &open_map, &open_slots);
+        // Everything the fill took, so a refusal can be aimed at one of the
+        // insertion's own allocations without counting the fill's.
+        const first_refused = open.alloc_index;
+        var open_script: ScriptedBits = .{ .script = &first_draw };
+        const open_addr = try open_map.get(open.allocator(), case.key, open_script.random());
+        try t.expectEqual(case.allocated, open_addr);
+        const insertions = open.alloc_index - first_refused;
+        // Both tables grow on the way in, so there are at least two
+        // allocations to refuse and one of them is the forward index failing
+        // after the reverse one was reserved. A count below that would leave
+        // the rollback the debt record names untested.
+        try t.expect(insertions >= 2);
+        try t.expect(open_seeded.len > 0);
+
+        var before_reverse: usize = 0;
+        var after_reverse: usize = 0;
+        for (0..insertions) |at| {
+            var failing: t.FailingAllocator = .init(t.allocator, .{
+                .fail_index = first_refused + at,
+            });
+            const gpa = failing.allocator();
+            var map: MappedAddrs = .init();
+            defer map.deinit(gpa);
+            var slots: [fill_hosts.len]Entry = undefined;
+            const seeded = try fillTables(gpa, &map, &slots);
+            var script: ScriptedBits = .{ .script = &first_draw };
+            try t.expectError(error.OutOfMemory, map.get(gpa, case.key, script.random()));
+
+            // The refusal landed exactly where this pass aimed it, and the
+            // two ends of it are named by what had already been allocated:
+            // nothing is the reverse index never being reserved, and
+            // anything above that is a reverse entry taken back out again.
+            try t.expectEqual(first_refused + at, failing.allocations);
+            if (failing.allocations == first_refused) {
+                before_reverse += 1;
+            } else {
+                after_reverse += 1;
+            }
+
+            try expectNothingRecorded(&map, case.key, case.allocated);
+            try expectSeededIntact(gpa, &map, seeded);
+
+            // A refused insertion may keep the capacity it grew into, so the
+            // bytes come back when the map is freed rather than when the
+            // refusal happened. Nothing else was ever allocated.
+            map.deinit(gpa);
+            try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        }
+        // Both ends were reached: the reverse index never reserved, and a
+        // reverse entry that had to be taken back out after the forward one
+        // failed.
+        try t.expect(before_reverse > 0);
+        try t.expect(after_reverse > 0);
+    }
+}
+
+test "an allocation refused anywhere in the first insertion records nothing" {
+    for (try probes()) |case| {
+        // Nothing in the map yet, so the whole of `get` is its own
+        // allocations and the sweep starts at index zero of them.
+        var open: t.FailingAllocator = .init(t.allocator, .{});
+        var open_map: MappedAddrs = .init();
+        defer open_map.deinit(open.allocator());
+        var open_script: ScriptedBits = .{ .script = &first_draw };
+        const open_addr = try open_map.get(open.allocator(), case.key, open_script.random());
+        try t.expectEqual(case.allocated, open_addr);
+        try t.expect(open.alloc_index >= 2);
+
+        var before_reverse: usize = 0;
+        var after_reverse: usize = 0;
+        for (0..open.alloc_index) |at| {
+            var failing: t.FailingAllocator = .init(t.allocator, .{ .fail_index = at });
+            const gpa = failing.allocator();
+            var empty: MappedAddrs = .init();
+            defer empty.deinit(gpa);
+            var script: ScriptedBits = .{ .script = &first_draw };
+            try t.expectError(error.OutOfMemory, empty.get(gpa, case.key, script.random()));
+            try t.expectEqual(@as(usize, at), failing.allocations);
+            if (failing.allocations == 0) {
+                before_reverse += 1;
+            } else {
+                after_reverse += 1;
+            }
+            try expectNothingRecorded(&empty, case.key, case.allocated);
+            // An empty map grew or did not and holds nothing in either
+            // direction, which is what the counts are for: the refusal
+            // changed no state a caller can observe.
+            try t.expectEqual(@as(u32, 0), empty.by_key.count());
+            try t.expectEqual(@as(u32, 0), empty.by_addr.count());
+            empty.deinit(gpa);
+            try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        }
+        try t.expect(before_reverse > 0);
+        try t.expect(after_reverse > 0);
+
+        // One allocation past the last one: nothing is refused, the key is
+        // recorded, and the address is the one every refusal above was
+        // reaching for. `has_induced_failure` says the insertion asked for
+        // nothing beyond what it needed, which is what "to success" means.
+        var whole: t.FailingAllocator = .init(t.allocator, .{ .fail_index = open.alloc_index });
+        var whole_map: MappedAddrs = .init();
+        defer whole_map.deinit(whole.allocator());
+        var whole_script: ScriptedBits = .{ .script = &first_draw };
+        const whole_addr = try whole_map.get(whole.allocator(), case.key, whole_script.random());
+        try t.expectEqual(case.allocated, whole_addr);
+        try expectSameKey(case.key, whole_map.lookup(case.allocated));
+        try t.expect(!whole.has_induced_failure);
+        try t.expectEqual(open.alloc_index, whole.alloc_index);
+    }
+}
+
+test "a draw that collides is thrown away and the next draw is the one refused" {
+    const case = try anyPathProbe();
+
+    var open: t.FailingAllocator = .init(t.allocator, .{});
+    var open_map: MappedAddrs = .init();
+    defer open_map.deinit(open.allocator());
+    var open_slots: [fill_hosts.len]Entry = undefined;
+    _ = try fillTables(open.allocator(), &open_map, &open_slots);
+    const first_refused = open.alloc_index;
+    var open_script: ScriptedBits = .{ .script = &colliding_draws };
+    const open_addr = try open_map.get(open.allocator(), case.key, open_script.random());
+    try t.expectEqual(case.allocated, open_addr);
+    try t.expectEqual(@as(usize, 2), open_script.drawn);
+    const insertions = open.alloc_index - first_refused;
+    try t.expect(insertions >= 2);
+
+    for (0..insertions) |at| {
+        var failing: t.FailingAllocator = .init(t.allocator, .{
+            .fail_index = first_refused + at,
+        });
+        const gpa = failing.allocator();
+        var map: MappedAddrs = .init();
+        defer map.deinit(gpa);
+        var slots: [fill_hosts.len]Entry = undefined;
+        const seeded = try fillTables(gpa, &map, &slots);
+        var script: ScriptedBits = .{ .script = &colliding_draws };
+        try t.expectError(error.OutOfMemory, map.get(gpa, case.key, script.random()));
+        // Two draws even though the first one was refused: the loop drew
+        // again rather than handing out an address that was taken.
+        try t.expectEqual(@as(usize, 2), script.drawn);
+        try expectNothingRecorded(&map, case.key, case.allocated);
+        // The address the first draw landed on still belongs to the key the
+        // fill gave it. A retry that evicted it instead of redrawing would
+        // leave a live path unanswerable, and this loop is where it would.
+        try expectSameKey(seeded[0].key, map.lookup(ula.ulaFor(.any_path, fill_hosts[0])));
+        try expectSeededIntact(gpa, &map, seeded);
+        map.deinit(gpa);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "a key refused for want of memory is the key the next call records" {
+    for (try probes()) |case| {
+        var open: t.FailingAllocator = .init(t.allocator, .{});
+        var open_map: MappedAddrs = .init();
+        defer open_map.deinit(open.allocator());
+        var open_slots: [fill_hosts.len]Entry = undefined;
+        _ = try fillTables(open.allocator(), &open_map, &open_slots);
+        const first_refused = open.alloc_index;
+        var open_script: ScriptedBits = .{ .script = &first_draw };
+        const open_addr = try open_map.get(open.allocator(), case.key, open_script.random());
+        try t.expectEqual(case.allocated, open_addr);
+        const insertions = open.alloc_index - first_refused;
+        try t.expect(insertions >= 2);
+
+        for (0..insertions) |at| {
+            var failing: t.FailingAllocator = .init(t.allocator, .{
+                .fail_index = first_refused + at,
+            });
+            const gpa = failing.allocator();
+            var map: MappedAddrs = .init();
+            defer map.deinit(gpa);
+            var slots: [fill_hosts.len]Entry = undefined;
+            const seeded = try fillTables(gpa, &map, &slots);
+            var script: ScriptedBits = .{ .script = &first_draw };
+            try t.expectError(error.OutOfMemory, map.get(gpa, case.key, script.random()));
+            try expectNothingRecorded(&map, case.key, case.allocated);
+            try expectSeededIntact(gpa, &map, seeded);
+
+            // The same call again, on the same map, with memory to spend,
+            // drawing the value it drew before. The address a refused
+            // insertion was reaching for is the address it records next
+            // time: a map that answered differently after a refusal would
+            // have handed the peer an address it then could not resolve.
+            //
+            // The retry allocates through the backing allocator rather than
+            // the refusing one, so this pass compares no byte totals of its
+            // own. The leak check on the backing allocator is what holds it
+            // to account here.
+            var retry: ScriptedBits = .{ .script = &first_draw };
+            try t.expectEqual(case.allocated, try map.get(t.allocator, case.key, retry.random()));
+            try expectSameKey(case.key, map.lookup(case.allocated));
+            try expectSeededEntries(t.allocator, &map, seeded);
+            try t.expectEqual(seeded.len + 1, @as(usize, map.by_key.count()));
+            try t.expectEqual(seeded.len + 1, @as(usize, map.by_addr.count()));
+        }
+    }
+}
+
+test "a key the map already holds answers with every allocation refused" {
+    var setup: t.FailingAllocator = .init(t.allocator, .{});
+    const gpa = setup.allocator();
+    var map: MappedAddrs = .init();
+    defer map.deinit(gpa);
+    // One key of every family, recorded while the map is empty, so the
+    // addresses below are the ones a single draw allocates.
+    var held: [3]Entry = undefined;
+    for (try probes(), 0..) |case, at| {
+        var script: ScriptedBits = .{ .script = &first_draw };
+        const addr = try map.get(gpa, case.key, script.random());
+        try t.expectEqual(case.allocated, addr);
+        held[at] = .{ .key = case.key, .addr = addr };
+    }
+
+    // From here on the first allocation is refused and every one after it,
+    // and the three keys still answer with the addresses they were given,
+    // in both directions. A hit reads the table the key is already in;
+    // there is nothing to allocate, which is the only reason these answer
+    // at all.
+    var blocked: t.FailingAllocator = .init(t.allocator, .{ .fail_index = 0 });
+    const blocked_gpa = blocked.allocator();
+    var script: ScriptedBits = .{ .script = &first_draw };
+    for (held) |known| {
+        try t.expectEqual(known.addr, try map.get(blocked_gpa, known.key, script.random()));
+        try expectSameKey(known.key, map.lookup(known.addr));
+    }
+    try t.expectEqual(@as(usize, 0), script.drawn);
+    // Nothing was even asked for, which is stronger than nothing succeeding.
+    try t.expect(!blocked.has_induced_failure);
+}
+
+test "a custom key recorded before a refused insertion still owns its bytes" {
+    // The lifetime half of `CustomKey`: an entry the parse buffer pointed
+    // into is read back out of the map after the buffer is dead, so a key
+    // that borrowed would answer with whatever the next frame wrote there.
+    var scratch: [base_addr.max_inline_length]u8 = undefined;
+    const borrowed = try base_addr.CustomAddr.parse("2a_abab", &scratch);
+    const recorded: Key = .{ .custom = try CustomKey.from(borrowed) };
+    const refused_payload: base_addr.CustomAddr = .{ .id = 0x2b, .data = &.{ 0x01, 0x02 } };
+    const refused: Key = .{ .custom = try CustomKey.from(refused_payload) };
+    const recorded_addr = ula.ulaFor(.custom, host_b);
+    const refused_addr = ula.ulaFor(.custom, host_a);
+
+    var open: t.FailingAllocator = .init(t.allocator, .{});
+    var open_map: MappedAddrs = .init();
+    defer open_map.deinit(open.allocator());
+    var open_record: ScriptedBits = .{ .script = &[_]HostBits{host_b} };
+    const open_recorded = try open_map.get(open.allocator(), recorded, open_record.random());
+    try t.expectEqual(recorded_addr, open_recorded);
+    var open_slots: [fill_hosts.len]Entry = undefined;
+    _ = try fillTables(open.allocator(), &open_map, &open_slots);
+    const first_refused = open.alloc_index;
+    var open_script: ScriptedBits = .{ .script = &first_draw };
+    const open_refused = try open_map.get(open.allocator(), refused, open_script.random());
+    try t.expectEqual(refused_addr, open_refused);
+    const insertions = open.alloc_index - first_refused;
+    try t.expect(insertions >= 2);
+
+    for (0..insertions) |at| {
+        var failing: t.FailingAllocator = .init(t.allocator, .{
+            .fail_index = first_refused + at,
+        });
+        const gpa = failing.allocator();
+        var map: MappedAddrs = .init();
+        defer map.deinit(gpa);
+        var record: ScriptedBits = .{ .script = &[_]HostBits{host_b} };
+        try t.expectEqual(recorded_addr, try map.get(gpa, recorded, record.random()));
+        var slots: [fill_hosts.len]Entry = undefined;
+        const seeded = try fillTables(gpa, &map, &slots);
+        // The frame the address was parsed into is gone before the operation
+        // under test runs. Anything the map still holds had to be a copy.
+        @memset(&scratch, 0xff);
+
+        var script: ScriptedBits = .{ .script = &first_draw };
+        try t.expectError(error.OutOfMemory, map.get(gpa, refused, script.random()));
+
+        const found = map.lookup(recorded_addr) orelse return error.TestUnexpectedResult;
+        switch (found) {
+            .custom => |custom| {
+                try t.expectEqual(@as(u8, 0x2a), custom.id);
+                try t.expectEqualSlices(u8, &[_]u8{ 0xab, 0xab }, custom.dataSlice());
+            },
+            else => return error.TestUnexpectedResult,
+        }
+        try expectNothingRecorded(&map, refused, refused_addr);
+        // The seeded entries and the custom key recorded above, and neither
+        // table grew by the key that was refused.
+        try expectSeededEntries(gpa, &map, seeded);
+        try t.expectEqual(seeded.len + 1, @as(usize, map.by_key.count()));
+        try t.expectEqual(seeded.len + 1, @as(usize, map.by_addr.count()));
+        map.deinit(gpa);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }

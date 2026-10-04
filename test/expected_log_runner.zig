@@ -31,6 +31,13 @@
 //! arriving from the other end, or an error from anywhere else in the stack is
 //! counted and fails the run exactly as it would have without this runner.
 //!
+//! An expectation is spent by the first message that matches it and by no
+//! other: the same refusal arriving a second time is one message too many, and
+//! it fails the run as an error nothing accounted for. A command line that
+//! names one expectation twice is refused before any test runs, because one
+//! message cannot answer two rows and nothing in the run could then say which
+//! of them it answered.
+//!
 //! An expectation nothing matched fails the run too, once every test has
 //! reported and the build asks the runner to stop. That is what keeps the list
 //! from rotting quietly: if the vendored core changes how it words a refusal,
@@ -69,8 +76,9 @@ const testing = std.testing;
 pub const std_options: std.Options = .{ .logFn = log };
 
 /// One tolerated message: the scope it was logged under and the message as it
-/// renders. Both are compared whole, and `seen` records that the run produced
-/// it at least once.
+/// renders. Both are compared whole, and `seen` records that this expectation
+/// has been spent — that one message has claimed it — so a second copy of that
+/// message finds nothing left to claim.
 const Expected = struct {
     scope: []const u8,
     text: []const u8,
@@ -97,6 +105,14 @@ const runner_io: Io = Io.Threaded.global_single_threaded.io();
 var expected: std.ArrayList(Expected) = .empty;
 var unexpected: usize = 0;
 
+/// Whether any test has reported an error-level message nothing accounted for.
+///
+/// `unexpected` counts the test now running and is reset for the next one, so
+/// the run as a whole cannot be judged by whatever the last test happened to
+/// leave in it. `finish` answers this instead, and for the reason its own doc
+/// gives.
+var unaccounted: bool = false;
+
 // Only coverage attaches this module; leave its import lazy in a plain build.
 comptime {
     if (builtin.fuzz) _ = coverage_abi;
@@ -119,6 +135,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (index + 1 >= args.len) std.debug.panic(
                 "--expect-log takes a scope and a message, and was given neither",
                 .{},
+            );
+            if (namedAlready(args[index], args[index + 1])) refuse(
+                "--expect-log names the same expectation twice, and one message " ++
+                    "cannot answer two rows:\n  --expect-log {s} {s}",
+                .{ args[index], args[index + 1] },
             );
             try expected.append(gpa, .{
                 .scope = args[index],
@@ -279,12 +300,15 @@ fn runTest(server: *std.zig.Server, init: std.process.Init.Minimal) !void {
     });
 }
 
-/// End the run, and exit non-zero if an expectation went unmet.
+/// End the run, and exit non-zero if it did not go as the command line said.
 ///
 /// The build reads a runner's exit code here and nowhere else: it fails a run
 /// whose child closed stdout on a term other than `exited 0`, so this is the
 /// one place a list of expectations can be checked as a whole rather than one
-/// message at a time.
+/// message at a time. Two whole-run facts are checked here, and both are also
+/// reported per test: an expectation nothing met, and an error-level message
+/// nothing accounted for — a message no expectation had left to claim, which
+/// is what a second copy of an expected refusal is.
 fn finish() noreturn {
     for (expected.items) |want| {
         if (!want.seen) {
@@ -296,6 +320,15 @@ fn finish() noreturn {
             );
             std.process.exit(1);
         }
+    }
+    if (unaccounted) {
+        std.debug.print(
+            "\nthis run logged an error message no expectation had left to claim, so\n" ++
+                "something was said that this run does not account for. Every message\n" ++
+                "is printed above at the level it was logged at.\n",
+            .{},
+        );
+        std.process.exit(1);
     }
     std.process.exit(0);
 }
@@ -345,25 +378,50 @@ fn log(
     // exact sentence would otherwise tolerate a message nobody read.
     if (level == .err and (rendered == null or !accounted(@tagName(scope), text))) {
         unexpected += 1;
+        unaccounted = true;
     }
 
     std.debug.print("[{s}] ({s}): {s}\n", .{ @tagName(scope), @tagName(level), text });
 }
 
-/// Whether `text` is a message the build named, marking every expectation it
-/// met so that a run which produced none of them is visible.
+/// Whether `text` is a message the build named, spending the one expectation it
+/// matches.
 ///
-/// Every match, not the first: the same expectation twice is one claim made
-/// twice, and one occurrence answers both. Stopping at the first would leave
-/// the second looking unmet, and `finish` would then report that no test
-/// produced a log a test did produce.
+/// The first match and only the first. An expectation is a claim that one
+/// refusal happens once, and a second copy of the same message under the same
+/// scope is one message too many: marking every row again would let the same
+/// refusal answer as many times as it arrived, and a runner that tolerates a
+/// message however often it is said tolerates it not at all.
 fn accounted(scope: []const u8, text: []const u8) bool {
-    var met = false;
     for (expected.items) |*want| {
+        if (want.seen) continue;
         if (std.mem.eql(u8, want.scope, scope) and std.mem.eql(u8, want.text, text)) {
             want.seen = true;
-            met = true;
+            return true;
         }
     }
-    return met;
+    return false;
+}
+
+/// Whether this command line has already named this exact expectation.
+///
+/// Two rows that say one thing would both be met by one message, and the run
+/// could not say which of them that message answered, so the second row is
+/// refused here rather than left to decide it later.
+fn namedAlready(scope: []const u8, text: []const u8) bool {
+    for (expected.items) |want| {
+        if (std.mem.eql(u8, want.scope, scope) and std.mem.eql(u8, want.text, text)) return true;
+    }
+    return false;
+}
+
+/// Refuse a command line this runner will not run, naming it and stopping.
+///
+/// Not a `std.debug.panic`: that aborts, and an abort reads as a crash of the
+/// code under test rather than as a refusal of its own arguments. This exits 1
+/// with the reason on stderr, which is what a command line asking for one
+/// message to be tolerated twice is.
+fn refuse(comptime reason: []const u8, args: anytype) noreturn {
+    std.debug.print("this runner refuses to run: " ++ reason ++ "\n", args);
+    std.process.exit(1);
 }
