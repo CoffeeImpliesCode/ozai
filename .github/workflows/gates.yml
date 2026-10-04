@@ -1,0 +1,171 @@
+# The gate, as CI. One job per gate group, each running the repository's own
+# driver (`scripts/gate.zig`) with the pinned compiler selected explicitly:
+# the anyzig shim the house wrappers use cannot resolve a toolchain on every
+# host, and a gate that depends on it is a gate whose green means nothing.
+#
+# The driver is the single definition of what a group runs: this file names the
+# groups and nothing else, so a CI job cannot drift from the documented gate.
+# `AGENTS.md` §7 asks for one job per gate group and this is that shape.
+#
+# There is no flag on these invocations that lets a group go green without the
+# tools it needs, and that is deliberate rather than incidental. `zlint` and
+# `ziglint` (group `lint`) and `zbc` (group `static`) are required: the driver
+# records an absent tool as `not_available` and exits 1, and this workflow
+# inherits that exit code rather than summarising it away. This repository
+# records no source, version or checksum for those binaries — `AGENTS.md` §6
+# names them and places them in `~/.local/bin` on the development host — so
+# there is nothing here to install from, and a runner that does not already
+# have them fails the job instead of reporting a lint gate that did not run.
+# `zwanzig`, `zippy` and the sanitizers are the optional ones: absent is
+# recorded and labelled, never counted as a pass, and never a failure either.
+#
+# Every path this workflow writes is under `$RUNNER_TEMP`, outside the
+# checkout. Caches, the install prefix and the receipts all land there, because
+# a build's thousands of small files belong on the runner's local disk and
+# nothing this run produces belongs in the repository: the only thing uploaded
+# is the receipt, as a build artifact.
+
+name: gates
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, for the bounded fuzz runs and the advisory static analysis.
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: ${{ matrix.group }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Every group runs even when an earlier one failed: one broken suite must
+      # not hide the state of the other ten, and the receipts are the evidence.
+      fail-fast: false
+      matrix:
+        group:
+          - compiler
+          - fmt
+          - ast
+          - refdecls
+          - compile-all
+          - build
+          - test
+          - portable
+          - lint
+          - static
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          # The pin lives in `build.zig.zon`. The driver cross-checks the
+          # version it is given against that manifest and refuses to run
+          # anything else, so this line cannot drift from the build silently.
+          version: 0.16.0
+
+      - name: Prepare the scratch roots
+        run: |
+          # One scratch, prefix and receipt per matrix leg so two legs never
+          # write the same path; one cache and one TMPDIR shared by the legs on
+          # this runner, because Zig's cache is content-addressed and sharing it
+          # is the only reason a leg is not a cold rebuild. The driver refuses
+          # a relative or in-repo output path, and it refuses before it spawns
+          # anything, so this step is where that refusal is earned.
+          shared="$RUNNER_TEMP/ozai-gate"
+          leg="$shared/${{ matrix.group }}"
+          mkdir -p "$leg/scratch" "$shared/cache/global" "$shared/cache/local" "$shared/tmp"
+          {
+            echo "OZAI_GATE_LEG=$leg"
+            echo "ZIG_GLOBAL_CACHE_DIR=$shared/cache/global"
+            echo "ZIG_LOCAL_CACHE_DIR=$shared/cache/local"
+            echo "TMPDIR=$shared/tmp"
+            echo "TMP=$shared/tmp"
+            echo "TEMP=$shared/tmp"
+            echo "OZAIGATE_ZIG=$(command -v zig)"
+          } >> "$GITHUB_ENV"
+
+      - name: Run the ${{ matrix.group }} group
+        run: >-
+          zig run scripts/gate.zig --
+          --scratch "$OZAI_GATE_LEG/scratch"
+          --group ${{ matrix.group }}
+
+      - name: Record what did not run
+        if: always()
+        run: |
+          receipt="$OZAI_GATE_LEG/scratch/receipts.json"
+          if [ ! -f "$receipt" ]; then
+            # The driver refuses an unsafe scratch configuration, and fails to
+            # start, without writing one. That is a failed gate, and saying so
+            # here is the point: a missing receipt must never be reported as a
+            # run in which nothing was found.
+            echo "::error::no receipt at $receipt — the driver did not get far enough to write one"
+            exit 1
+          fi
+          jq -r '.steps[] | select(.status != "pass") | "\(.label): \(.status) \(.detail)"' "$receipt"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: receipt-${{ matrix.group }}
+          path: ${{ env.OZAI_GATE_LEG }}/scratch/receipts.json
+          if-no-files-found: warn
+
+  fuzz:
+    # AGENTS.md §7 has the fuzz group on a schedule rather than on every change;
+    # it is here as its own job because a bounded run over every decoder target
+    # is the slowest thing the gate does.
+    name: fuzz (bounded)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Prepare the scratch roots
+        run: |
+          # The same layout as the group job above, under this job's own leg.
+          # The bound is a driver constant; this passes only the run count.
+          shared="$RUNNER_TEMP/ozai-gate"
+          leg="$shared/fuzz"
+          mkdir -p "$leg/scratch" "$shared/cache/global" "$shared/cache/local" "$shared/tmp"
+          {
+            echo "OZAI_GATE_LEG=$leg"
+            echo "ZIG_GLOBAL_CACHE_DIR=$shared/cache/global"
+            echo "ZIG_LOCAL_CACHE_DIR=$shared/cache/local"
+            echo "TMPDIR=$shared/tmp"
+            echo "TMP=$shared/tmp"
+            echo "TEMP=$shared/tmp"
+            echo "OZAIGATE_ZIG=$(command -v zig)"
+          } >> "$GITHUB_ENV"
+
+      - name: Run the bounded decoder fuzz targets
+        run: >-
+          zig run scripts/gate.zig --
+          --scratch "$OZAI_GATE_LEG/scratch"
+          --group fuzz
+          --fuzz-runs 10000
+
+      - name: Record what did not run
+        if: always()
+        run: |
+          receipt="$OZAI_GATE_LEG/scratch/receipts.json"
+          if [ ! -f "$receipt" ]; then
+            echo "::error::no receipt at $receipt — the driver did not get far enough to write one"
+            exit 1
+          fi
+          jq -r '.steps[] | select(.status != "pass") | "\(.label): \(.status) \(.detail)"' "$receipt"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: receipt-fuzz
+          path: ${{ env.OZAI_GATE_LEG }}/scratch/receipts.json
+          if-no-files-found: warn

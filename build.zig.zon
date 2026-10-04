@@ -1,0 +1,27 @@
+.{
+    .name = .ozai,
+    .version = "0.0.0",
+    .fingerprint = 0x53ef56d532533043, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build_support.zig",
+        "build.zig.zon",
+        "src",
+        "test",
+        "scripts",
+        "README.md",
+        "TODO.md",
+        "AGENTS.md",
+        "zlint.json",
+        "cross-test.profile.sh",
+        "cross-test.portable.profile.sh",
+        "docs",
+        // The QUIC substrate is a module of this package, so a fetched copy
+        // without it builds to a module-not-found rather than to a stack.
+        // `vendor/` also has to be a subdirectory rather than a file list:
+        // the vendored source set changes without rewriting this manifest.
+        "vendor",
+    },
+}
