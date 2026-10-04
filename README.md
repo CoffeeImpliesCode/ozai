@@ -22,12 +22,12 @@ self-interoperation over one private carrier.
 
 | Gap | State |
 |---|---|
-| Production randomness | Repaired in Wave 0: `Node.create` draws a 32-byte secret seed from `io.randomSecure` into a `Csprng` (ChaCha) and erases the temporary with `secureZero`. `ozai-node` dropped `--seed`; no caller-chosen generator seed remains in production paths. |
-| iroh interoperability | No Rust exchange has run. The vendored TLS writes 44-byte Ed25519 SPKI certificates but negotiates no RFC 7250 certificate type, so a real peer is expected to refuse the handshake before the certificate is accepted. |
+| Production randomness | Wave 0 repaired the entropy source. `ozai.node_lifecycle.create` seeds an owned ChaCha `Csprng` from 32 bytes of `io.randomSecure`. It erases the temporary seed. `ozai-node` no longer accepts `--seed`. |
+| iroh interoperability | Wave 1 records actual native/Rust exchanges against an iroh 1.3.0 partner: both role orders authenticate exact peer IDs, negotiate one ALPN and verify six distinct payloads, and both processes exit 0. Typed wrong-peer and ALPN-mismatch refusals are recorded in both roles, and those four runs are expected to fail. Peer identities are by **role**, not by implementation: LISTENER secret seed `0x11` is `d04ab232…`, DIALER secret seed `0x22` is `a09aa5f4…`, and the native peer holds each role in a different receipt. Wave 1 is **not accepted** and not declared green: the full gate result against the current bytes is **pending**, and a pending gate is not recorded as a failed one. |
 | Standard relay carrier | The carrier in tree is the private QUIC `/iroh-relay/1`, not RFC 6455 WebSocket over an HTTP upgrade with TLS. No exporter authentication, ping driver, reconnect or access policy. |
 | Relay routing | Relayed inner QUIC is not routed: `drain` hands `Egress.to` straight to UDP. |
 | Blobs | Request framing and range algebra only. No Bao tree, proof or root verifier, store, provider or getter, so no getter verifies content. |
-| Gossip | Pure state machines with captured Rust neighbour, convergence and broadcast expectations. No production codec and no peer-ID connection index; the test-only encoder inverts the `DeliveryScope` tags, and `plumtree.max_content` is 1024 against upstream's 4096. |
+| Gossip | Pure state machines with captured Rust neighbour, convergence and broadcast expectations, a postcard codec checked against 15 captured upstream frames, a peer-ID connection index and bounded per-topic routing: `send_message` goes out as a real frame and `disconnect_peer` as a real close. The test-only encoder in `test/protocol_loopback_test.zig` is still in the tree and still inverts the `DeliveryScope` tags. Inbound gossip is not wired: nothing decodes a peer's streams, so a node learns a peer id only from a dial. `plumtree.max_content` is 1024 and the codec decodes up to 4096 — deliberately, since upstream sends the larger payloads. |
 | Discovery | TXT and pkarr codecs plus pure resolvers. No A/AAAA path, no TCP retry on the TC bit, no live pkarr HTTP transport and no node caller; `lookup_live.zig` has only its own tests as callers. |
 | Probes | Every probe transport in the tree is a test fake. |
 | Holepunching | The gate and its error classification are pure and tested. Three of the seven inputs have producers, four do not, and no action can start a real QNT round. |
@@ -39,7 +39,411 @@ The ordered plan, the owners and the acceptance for what remains are in
 
 ### Gate record
 
-Two records, kept apart because they measure different trees.
+**Current Wave 1 is recorded first. It is not a green wave, and it is not an
+accepted one.** Its evidence lives outside this repository, under
+`/tmp/scratch/ozai-waves-x3qoa8oq/evidence`; every file name
+below is relative to that directory.
+
+#### Current Wave 1, 2026-10-05
+
+**The focused runs below are green; the full gate result is pending.** Nothing
+in this section declares Wave 1 green or accepted, and no pending group is
+written as failed. The earlier figures for the lint and static groups describe
+older bytes and are kept under history below, not carried forward as the state
+of this tree.
+
+##### What was built, and what the receipts name
+
+| Check | Log | Result |
+|---|---|---|
+| Debug install of `ozai`, `ozai-node` and `ozai-interop-peer` | `resume-w1-native-debug-build.log` | exit 0; **7/7 steps succeeded** |
+| Focused vendored TLS decode fuzz | `resume-w1-tls-focused-after.log` | exit 0; **1/1** `tls_fuzz.test.vendored TLS decode...OK` |
+| Focused QUIC wire-decode corpus replay | `resume-w1-quic-wire-corpus-replay.log` | exit 0; **1/1** `quic_wire_fuzz.test.quic wire decode...OK`, under the `quic wire decode` filter |
+| Full gate — lint, static, fuzz, suite | — | **PENDING.** No group has been run against these bytes. |
+
+The focused TLS *before* leg — the real 1/1 failure — is kept further down with
+its cause, rather than dropped because the repair is in.
+
+| Binary | SHA256 |
+|---|---|
+| `install/bin/ozai-interop-peer`, native | `59b6a3ef3e26978f0507ee66a10b030bd96feea62f37db194107c2db67864a08` |
+| Rust partner `iroh-partner` | `748f0fca9dd2fa1b802b382e25f0eb2af6a12cd2ea7613b16ad9e7399ec80b65` |
+| `install/bin/ozai-node`, the three-process CLI relay smoke | `3ebe741c10b9b946614dab96472ee4cd78bc9a4e99479d4c840e5d50e185d74f` |
+
+##### Identities are by role, not by implementation
+
+| Role | Secret seed | Peer id |
+|---|---|---|
+| LISTENER | `0x11` | `d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737` |
+| DIALER | `0x22` | `a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0` |
+
+The listener is given `--secret-key 1111…11` and the dialer `--secret-key
+2222…22` in every one of the seven receipts, whichever implementation holds the
+role: the native peer listens in `resume-w1-live-listen-positive.json` and dials
+in `resume-w1-live-dial-positive.json`. **A peer id is therefore not a property
+of "native" or "Rust"**, and a row that names one by implementation is wrong.
+The negotiated ALPN is `/ozai/w1-fixture` = `2f6f7a61692f77312d66697874757265`.
+
+##### Seven live native/Rust exchanges on the binary above
+
+Each receipt carries the full argv of both processes, both binary digests and
+both output streams.
+
+| Scenario | Receipt | Outcome |
+|---|---|---|
+| Native listens, Rust dials | `resume-w1-live-listen-positive.json` | **payload**: exits 0/0; six distinct payloads verified by both ends |
+| Rust listens, native dials | `resume-w1-live-dial-positive.json` | **payload**: exits 0/0; six distinct payloads verified by both ends |
+| Native listens with `--require-retry`, Rust dials | `resume-w1-live-listen-retry.json` | **payload**: exits 0/0; six payloads; `1 replies` — one Retry observed |
+| Wrong peer, native listens | `resume-w1-live-listen-wrong-peer.json` | **typed refusal**: exits 1/1; native `error.BadCertificate`, partner alert 42 |
+| Wrong peer, native dials | `resume-w1-live-dial-wrong-peer.json` | **typed refusal**: exits 1/1; native `error.BadCertificate`, partner alert 42 |
+| ALPN mismatch, native listens | `resume-w1-live-listen-alpn-mismatch.json` | **typed refusal**: exits 1/1; native `error.NoApplicationProtocol`, partner alert 120 |
+| ALPN mismatch, native dials | `resume-w1-live-dial-alpn-mismatch.json` | **typed refusal**: exits 1/1; partner alert 120 and native `CONNECTION_CLOSE error_code=0x178` |
+
+The six payloads are bidi `0102030405` and `fafbfdfefe`, unidirectional
+`a1b2c3d4` and `10203040`, and datagram `decafbad` and `11223344`; each end
+names three of them on its own `verified_*` lines and the six are distinct.
+Every positive receipt carries `payload_proofs_complete: true` and every
+refusal carries `false`.
+
+**The four `1/1` rows are expected failures, not regressions.** They are the
+negative half of the matrix: the peer identity is wrong, or the ALPN is, and
+the correct outcome is a typed refusal. Both processes exit 1, one names the
+typed error and the other carries the matching TLS alert, 42 or 120, and no
+payload was owed and none was verified. The native harness then prints
+`error.DeadlineReached`, because the scenario it declared never completed; the
+typed refusal is the evidence, not the deadline.
+
+**One typed refusal is proved by a supplement rather than by its raw
+receipt's own flag, and the raw receipt is preserved.** The throwaway checker
+that wrote `resume-w1-live-dial-alpn-mismatch.json` demanded the literal Zig
+spelling `NoApplicationProtocol` in the Rust partner's human-readable output,
+which that partner never prints, so the receipt records
+`typed_no_application_protocol_observed: false`. Nothing was rerun and
+nothing was edited in it. The typed proof is derived from the bytes the
+receipt already carries, in
+`resume-w1-live-dial-alpn-mismatch-interpretation.json`: the partner reports the
+cryptographic handshake error **120**, and the native side reads the peer's
+`CONNECTION_CLOSE` with `error_code=0x178` = `0x100 + 120` and reason `peer
+doesn't support any known protocol`. Both processes exit 1,
+`payload_proofs_complete: false`, and the supplement names the raw receipt's own
+SHA256 (`87b7fa48621e1a67e07c07c6ccd500d2c09b72dbe76c72c15cfd4666c1f924fd`) with
+`accepted: true`. The other three refusals carry their typed proof in their
+own receipts.
+
+##### The three-process CLI relay smoke
+
+`resume-w1-current-cli-relay-smoke.json` runs three actual Debug `ozai-node`
+processes — a relay, a receiver and a sender — and **all three exit 0**. The
+sender sends `wave1-cli-split-wire`
+(`77617665312d636c692d73706c69742d77697265`, 20 bytes). The relay prints
+`relay out: read 1, forwarded 1`. The receiver prints `relay inbox: datagrams
+1, bytes in all 20` and `relay inbox[0]: bytes 20 from d907b1c3… 77617665312d
+636c692d73706c69742d77697265` — the exact declared payload, from the exact
+sender, byte for byte.
+
+**This is the private `/iroh-relay/1` carrier and nothing more.** It is not
+RFC 6455 WebSocket over an HTTP upgrade, it is not an inner QUIC session
+routed through a relay, and it is not a Wave 2 result. The same three
+processes print `not wired: the gossip wire codec` in their own output.
+
+##### The module size metric
+
+`resume-w1-node-production-metric.json` counts nonblank, noncomment production
+lines before the explicit `std.testing` seam, imports and braces included. The
+figure it recorded — 28 files, 26 production and 2 test-only, largest 240 —
+describes the bytes it measured, not the current tree: the relay-serve split
+has since landed, and the current measurement is **31 files under `src/node/`,
+28 production and 3 test-only (`node_tests.zig`, `node_retirement_tests.zig`,
+`node_relay_serve_tests.zig`), largest 223 (`relay_state.zig`), and zero
+violations** — nothing at or over the 250 limit `docs/PLAN.md` sets as a Wave 1
+acceptance requirement.
+`resume-w1-other-module-classification.json` records the same measurement for
+the other owners, and each matches the responsibility that module already has:
+`endpoint.zig` 197, `router.zig` 201, `quic_bridge.zig` 248, `dial.zig` 195,
+`socket.zig` 114, `batch.zig` 47, and `test/loopback_test.zig` 2 as test-only.
+
+##### The TLS silent failure, before and after
+
+`resume-w1-tls-focused-before.log` is **1/1 failing** at
+`test/tls_wire/messages.zig:333` in `certificateTypeShapes`, reached from
+`check` (432) and `tls_fuzz.zig:203`. `resume-w1-tls-focused-after.log` is
+**1/1 passing**, `tls_fuzz.test.vendored TLS decode...OK`.
+
+**The cause was the oracle table, not the parser, and it was not a `u16`
+production overflow.** `static-TlsSilentRootCause.json` names it. RFC 7250
+declares two separate things — §3's `CertificateType
+client_certificate_types<1..2^8-1>`, a count in front of a list, and §4.2's
+bare `CertificateType client_certificate_type`, where "only a single value is
+permitted" in the server hello — and the table had one exclusive `shape` enum
+per body, which forced both decoders into a single verdict. `&.{0}` was
+classified as neither an offer nor a selection although it is no offer at all
+(count 0, below the vector's own minimum of one) yet a whole x509 selection;
+`&.{1,2}` is a whole offer yet no selection the one-byte grammar has a shape
+for. **Both decoders in `vendor/quic/src/quic/tls13.zig` were correct**:
+`parseCertificateTypeOffer` refuses `len < 2`, `count == 0` and `count + 1 !=
+data.len`, and `parseCertificateTypeSelection` refuses `len != 1` and any byte
+outside the registry, which is what the leaf's own reference decoders already
+said. The fix gave the table one column per role — `offer` and `selection` —
+instead of one classification. The earlier account of this failure as a `u16`
+overflow in production is withdrawn; it was never the cause, and the
+`parseCertificateRequest` `u16` widening recorded in `vendor/quic/VENDORED.md`
+is a different, separately landed repair.
+
+`resume-w1-quic-wire-focused-after.log` prints `All 0 tests passed`, which
+proves nothing: **a zero-test command is not evidence.** The QUIC wire-decode
+corpus is evidenced by `resume-w1-quic-wire-corpus-replay.log`,
+`1/1 quic_wire_fuzz.test.quic wire decode...OK` under the correct filter.
+
+##### The disposition ledger
+
+The zbc disposition ledger **has been re-merged** against the current bytes at
+a merge fixed point: **32 source proofs and 59 records**
+(`scripts/gate_zbc_dispositions.zig` `sha256
+fb5f97f989ed8f11ba76d78a5c9e2c5fd780c94a78d9156aad682ae7f1ed4399`), re-emission
+byte-identical, helper suffix preserved. The earlier 60-record renders describe
+older bytes and are kept under history below; the one record retired since then
+is the relay-serve `closeOnExit` row the split moved verbatim to
+`node_relay_serve_tests.zig`. The generated file is format-clean
+(`resume-w1-generated-ledger-canonical-format.log`,
+`resume-w1-ledger-canonical-format-check.log`).
+
+The two controls behaved, which is why they are recorded:
+`resume-w1-ledger-conflict-refusal.log` stops with
+`IntentionalKindConflict=justified_panic, WaveOneEvidenceMap=false_positive` and
+refuses to emit rather than counting two reads as a vote, and
+`resume-w1-ledger-current-defect-refusal.log` stops because a fragment reported
+a defect in bytes that file still has — only a re-read of repaired source
+clears it, and that changes the digest. The merger keeps the helper suffix the
+gate calls (`pub fn find`, `pub fn reviewedDigest`), refuses a render that drops
+it, and re-checks both halves of every citation before it emits anything.
+
+##### What is pending
+
+**PENDING — the full gate result against these bytes.** The required source
+lint fixes have landed; no group of the full lint, static and fuzz gate has been
+run against the current tree yet. Until that result arrives this record
+declares no wave green and no wave accepted, and it does not carry the earlier
+red lint and static figures forward as the state of this tree — those describe
+older bytes and are kept under history below. Nothing here is closed by another
+passing.
+
+##### Waves 2–4
+
+Waves 2, 3 and 4 are **not implemented and not accepted**. The exclusions are
+named rather than implied: no RFC 6455 WebSocket relay carrier, no live
+DNS/pkarr transport, no production gossip codec or peer index, no BLAKE3/Bao
+tree or outboard verification, no multipath substrate, no per-path
+reachability, and no node-level resumption.
+
+Two of those phases were recorded here as blocked on inputs this repository
+does not contain. **That is withdrawn as a blocker, and it is not replaced by a
+result.** Scouts reached the primary upstream APIs those phases need, the
+authentic producers are being built against those reachable APIs, and the
+substrate citations are being re-anchored against the current tree. Neither
+phase has recorded work in this repository yet: there is still no production
+gossip encoder in the tree, and `DECISIONS/0001` is not reopened.
+
+#### Wave 1 as recorded earlier on 2026-10-05
+
+Superseded by the record above. Its figures, receipts and binary digests
+describe that run's bytes and not this tree's; it is kept because it is what
+those runs actually did.
+
+**The suite is green in both safety modes. The gate is red.** A green suite is
+not a green gate, and the two are recorded separately below.
+
+| Identity | Value |
+|---|---|
+| Native peer id | `a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0` |
+| Rust partner peer id | `d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737` |
+| Negotiated ALPN | `/ozai/w1-fixture` = `2f6f7a61692f77312d66697874757265` |
+| Bidi payloads | `0102030405`, `fafbfdfefe` |
+| Unidirectional payloads | `a1b2c3d4`, `10203040` |
+| Datagram payloads | `decafbad`, `11223344` |
+| Native binary | `70567c34fdd0f513dde3c21391c50cc74e03757c2304e3f971768aef1c64c399` |
+| Rust partner binary | `748f0fca9dd2fa1b802b382e25f0eb2af6a12cd2ea7613b16ad9e7399ec80b65` |
+
+##### The build and test matrix, as observed
+
+| Check | Log | Result |
+|---|---|---|
+| `zig build test -Doptimize=Debug` | `w1-full-debug-suite-wave1-union-verification.log` | exit 0; 28/28 steps; **790/790 tests** |
+| `zig build test -Doptimize=ReleaseSafe` | `w1-full-release-safe-suite-wave1.log` | exit 0; 28/28 steps; **790/790 tests**, the same per-artifact counts |
+| `zig build compile-all -Doptimize=Debug` | `w1-compile-all-union-seventh-pass.log` | exit 0; 19/19 steps |
+| `zig build quic-test` | `resume-w1-quic-test-after-pin-ruling.log` | exit 0; 3/3 steps; **564/564 tests**, 75 s, against vendored `tls13.zig` `sha256 02521578954ca75fe91391f75b9c56b98ec5c38190cef2e5d49f85599590ac60` (7,933 lines); the earlier 560/560 rows describe older bytes and are kept under history below; §§14–16 of `vendor/quic/VENDORED.md` are the receipts |
+| `zig fmt --check .` | `w1-zig-fmt-check-after-all-formatting.log` | exit 0, no output: the tree is format-clean |
+| Debug install of the interop peer | `w1-build-interop-peer-fresh.log` | exit 0; 7/7 steps |
+
+Per-artifact counts, identical in Debug and in ReleaseSafe: unit 678,
+integration 3, loopback 24, protocol-loopback 5, blobs-transfer 6,
+two-process 11, relay-wire 11, runtime-handlers 6, rust-wire-initial 23,
+expected-log-verdict 15, coverage 8.
+
+**790/790 is the whole first-party suite, in both safety modes, and it is the whole of
+it.** `zig build test` runs every package root; the vendored core's 564 tests
+are a separately built root reached by `zig build quic-test`, and that figure
+is never added to the package total. The vendored core ran 560/560 against the
+admission-hook bytes and is green at 564/564 on the current ones.
+
+##### Seven live native/Rust exchanges on the binary above
+
+Each receipt names both processes and carries the full argv of each, both
+binary digests and both output streams, so a re-run reproduces exactly what it
+names.
+
+| Scenario | Receipt | Outcome |
+|---|---|---|
+| Native listens, Rust dials | `w1-live-final-listen-positive.json` | **payload**: exits 0/0; all six payloads verified by both ends |
+| Rust listens, native dials | `w1-live-final-dial-positive.json` | **payload**: exits 0/0; all six payloads verified by both ends |
+| Native listens with `--require-retry`, Rust dials | `w1-live-final-listen-retry.json` | **payload**: exits 0/0; all six payloads; one Retry reply observed |
+| Wrong peer, native dials | `w1-live-final-dial-wrong-peer.json` | **typed refusal**: exits 1/1; `error.BadCertificate`, alert 42 |
+| Wrong peer, native listens | `w1-live-final-listen-wrong-peer.json` | **typed refusal**: exits 1/1; `error.BadCertificate`, alert 42 |
+| ALPN mismatch, native dials | `w1-live-final-dial-alpn-mismatch.json` | **typed refusal**: exits 1/1; `error.NoApplicationProtocol`, alert 120; the native side also observes the peer's transport close `0x178` |
+| ALPN mismatch, native listens | `w1-live-final-listen-alpn-mismatch.json` | **typed refusal**: exits 1/1; `error.NoApplicationProtocol`, alert 120 |
+
+**The four `1/1` rows are expected failures, not regressions.** They are the
+negative half of the matrix: the peer identity is wrong, or the ALPN is, and
+the correct outcome is that the handshake is refused. What proves each one is
+the typed refusal itself — one process names `error.BadCertificate` or
+`error.NoApplicationProtocol` while the other carries the matching TLS alert,
+42 or 120; both processes exit 1; and the receipt records
+`typed_bad_certificate_observed` or `typed_no_application_protocol_observed`
+as true with `payload_proofs_complete: false`, because no payload was owed and
+none was verified. The native harness then prints `error.DeadlineReached`,
+because the scenario it declared never completed; the typed refusal is the
+evidence, not the deadline.
+
+##### What is still open, by name
+
+1. **`zig build fuzz` has not been re-run since its two repairs.** Its last run
+   was red for two defects: a comptime branch quota in the new captured-golden
+   decode and a `u16` overflow in the TLS oracle. Both were repaired. No fuzz
+   run has happened since, so there is no green fuzz result for these bytes.
+2. **The zbc disposition ledger is at its fixed point; only the gate run is
+   outstanding.** The twelve triage fragments landed, the merge emits 32 sources
+   and 59 records with no problems, and the tree carries that table. What has
+   not happened is the gate's own `static:zbc` run against the current bytes.
+   Heavy test runners are additionally on hold by operator instruction after
+   orphaned `quic-test` binaries consumed >400G RSS, so the remaining runs are
+   blocked on an explicit go-ahead, not on code.
+3. **The lint and static gate groups are red.** `lint:zlint` passes;
+   `lint:ziglint` (required), `lint:zwanzig` (optional), `static:zbc`
+   (required) and `static:zbc-triage` do not. That run's own figures are in
+   `w1-lint-and-static-current-findings.log` and `gate-w1/receipts.json`, and
+   they describe the bytes of that run rather than of this tree.
+
+Those three are the whole of what stands between the green rows above and an
+accepted wave. None of them is closed by another passing.
+
+##### Waves 2–4
+
+Waves 2, 3 and 4 are **not implemented and not accepted**. The exclusions are
+named rather than implied: no RFC 6455 WebSocket relay carrier, no live
+DNS/pkarr transport, no production gossip codec or peer index, no BLAKE3/Bao
+tree or outboard verification, no multipath substrate, no per-path
+reachability, and no node-level resumption.
+
+Two of those phases are blocked on inputs this repository does not contain,
+so neither can start here:
+
+- **Wave 2's production gossip codec** is blocked on upstream gossip wire
+  vectors. The upstream format's enum tags, field order, size bound and
+  batching rule are not determined by anything in this tree; the only bytes it
+  holds are a test-only encoder that declares itself not the project format.
+- **Wave 3's substrate decision** is blocked on its own citations.
+  `DECISIONS/0001` has to be re-anchored against the current tree before it can
+  honestly be reopened, because the phase must argue against the code as it is
+  and not against what it was.
+
+Everything after this point is history from other trees.
+
+#### Wave 1 as recorded on 2026-10-04
+
+Superseded by the record above. Its figures, receipts and binary digests
+describe that tree and not this one; it is kept because it is what those gate
+runs actually did.
+
+| Identity | Value |
+|---|---|
+| Native peer id | `a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0` |
+| Rust partner peer id | `d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737` |
+| Negotiated ALPN | `/ozai/w1-fixture` = `2f6f7a61692f77312d66697874757265` |
+| Bidi payloads | `0102030405`, `fafbfdfefe` |
+| Unidirectional payloads | `a1b2c3d4`, `10203040` |
+| Datagram payloads | `decafbad`, `11223344` |
+| Native binary, current | `764dbfd837dbe11173cc8b098e11694adaef92a2403c42d65c9fd80d4b1561a2` |
+| Native binary, earlier | `0b95f54121abc6eb1ce38d8699abf7a410ab3891f5d222c9b46de5e45f1c4e7d` |
+| Rust partner binary | `748f0fca9dd2fa1b802b382e25f0eb2af6a12cd2ea7613b16ad9e7399ec80b65` |
+
+| Scenario | Receipt | Observed |
+|---|---|---|
+| Native listens, Rust dials | `w1-native-listener-after-role-predicate-fix.json` | exits 0/0; exact peer id each way; ALPN; all six payloads verified by both ends; native `8 in, 9 out, 0 replies, 0 degraded` |
+| Rust listens, native dials | `w1-native-dialer-after-role-predicate-fix.json` | exits 0/0; the same six proofs; native `9 in, 13 out, 0 replies, 0 degraded` |
+| Native listens, Rust dials, `--require-retry` | `w1-live-sdk-listen-retry.json` | exits 0/0; all six payloads; `1 replies` — one actual Retry |
+| Wrong peer, native listens | `w1-live-sdk-listen-wrong-peer.json` | exits 1/1; native `error.BadCertificate`, partner handshake error 42; nothing verified |
+| Wrong peer, native dials | `w1-live-sdk-dial-wrong-peer.json` | exits 1/1; the same typed refusal from the other role |
+| ALPN mismatch, native listens | `w1-live-sdk-listen-alpn-mismatch.json` | exits 1/1; native `error.NoApplicationProtocol`, partner handshake error 120 |
+| ALPN mismatch, native dials | `w1-live-sdk-dial-alpn-mismatch.json` | exits 1/1; the partner reads `0x178 peer doesn't support any known protocol` |
+
+Every negative row is a typed TLS refusal actually observed on both processes.
+The native harness then prints `error.DeadlineReached`, because the declared
+payload scenario never completed; the typed refusal is the evidence, not the
+deadline.
+
+Each receipt carries the full argv of both processes, both binary digests and
+both stdout streams, so a re-run reproduces exactly what it names. The two
+`w1-native-*-after-role-predicate-fix` receipts were taken with the earlier
+native binary. The five `w1-live-sdk-` receipts were taken with the current
+installed binary, built by the recorded Debug install in
+`w1-integrated-canonical-node-and-native-debug-build.log` (7/7 steps). That
+current build has no recorded positive native-dials run; that direction's 0/0
+six-payload receipt is the earlier build's.
+
+**Before the repair**, the immutable Wave 0 endpoint — parent `6ad2f69…`, clean
+change `a799195…`, binary `39b7cdfd…` — was refused by the same real partner in
+both directions with a typed RFC 7250 refusal, `peer is incompatible:
+IncorrectCertificateTypeExtension`, handshake error 40. A loopback UDP proxy
+forwarded the bytes unchanged and is not NAT proof.
+`w1-rfc7250-immutable-baseline-ozai-to-rust-wire-observation.json` holds the
+1200-byte ClientHello and the 103-byte CONNECTION_CLOSE that carried the
+refusal; `w1-rfc7250-immutable-baseline-rust-to-ozai-wire-red-after-proxy-parse-fix.json`
+holds the 75 captured datagrams of the other direction. The earlier
+`w1-rfc7250-immutable-baseline-rust-to-ozai-wire-red.json` is a probe error, not
+a wire result: an untrimmed banner column made the forwarding target an invalid
+hostname. It is kept as trace history only.
+
+| Check | Receipt | Result |
+|---|---|---|
+| Debug package suite, `zig build test -Doptimize=Debug` | `w1-integrated-debug-tests-after-three-typed-owner-repairs.log` | **fail**; 23/26 steps; **747/752 tests** |
+| `lint:zlint` | `gate-w1/receipts.json` | pass; 0 errors, 33 warnings over 184 files |
+| `lint:ziglint`, required | same | **fail**; 41 findings |
+| `lint:zwanzig`, optional | same | **fail**; 70 issues over 151 files |
+| `static:zbc`, required | same | **fail**; raw exit 1; 57 findings; 2 888 unresolved import lookups, so this run's import coverage is unproven |
+| `static:zbc-triage` | same | **fail**; 34 accepted, 39 rejected, 16 dispositions unused |
+| The whole lint and static run | `w1-current-lint-and-static-findings.log` | 8 recorded steps over 184 source files, FAILED |
+
+The recorded gate run's parameters:
+
+```sh
+zig run scripts/gate.zig -- --scratch /tmp/scratch/ozai-waves-x3qoa8oq/gate-w1 \
+  --jobs 2 --fuzz-runs 10000 --group lint --group static
+```
+
+The five Debug failures are three `src/transport/quic_bridge.zig` premises — the
+unidirectional credit bound, the over-bound datagram refusal, and a withdrawal
+racing an accepted handshake — plus `test/loopback_alpn_test.zig`'s
+wrong-protocol dial and `test/loopback_retry_test.zig`'s Initial-token read.
+
+The RFC 7250 hello wire corpus — `test/tls_wire/hello.zig`, three `RFC 7250:`
+cases — last ran 3/3 in `w1-rfc7250-wire-after-correct-fixture-bounds.log`; the
+earlier 1/3 capture is `w1-rfc7250-current-flight-wire-regressions.log`. It is a
+corpus over captured flights, not a mixed-peer run; its review against RFC 7250
+is not recorded here; and `zbc` still lists six uncovered diagnostics in that
+file.
+
+Waves 2–4 remain unimplemented and unaccepted.
+
+Everything after this point is history from other trees.
 
 **The audit snapshot** is a read-only audit of commit `8b8bcd96`, run against
 the pinned Zig 0.16.0 compiler directly on native x86-64 Linux. It did not use
@@ -86,8 +490,9 @@ runs; the largest advance is 10 213. The `Runs:` counters those reports print ar
 cumulative across the retained corpus and earlier runs, so a counter is not one
 invocation's work and the per-target advance is what the bound covers.
 
-**The working tree**, measured through the repository's own gate, which is the
-same driver CI runs (`.github/workflows/gates.yml`, one job per group):
+**The earlier working-tree snapshot**, measured through the repository's own gate.
+CI runs the same driver (`.github/workflows/gates.yml`, one job per group).
+These results predate the current cutover:
 
 | Command | Result |
 |---|---|
@@ -134,8 +539,8 @@ standard iroh relay exchange, not a gossip exchange and not a verified blob
 transfer, and it discharges none of the carrier parity requirements above.
 
 An earlier tree carried the 21-byte payload `api-cutover-live-wire` the same
-way, with seeds 401, 402 and 403: the CLI's fixed default is a replay aid, not
-independent entropy for several processes.
+way, with seeds 401, 402 and 403. That CLI used a fixed default seed.
+Wave 0 removed production seed arguments and replaced its generator with a CSPRNG.
 
 ### The out-of-tree consumer
 
@@ -266,11 +671,13 @@ refusal were not forced; injected socket refusals are not kernel evidence.
 
 The cross-platform survey and its toolchain limits are reported by
 `cross-test` below and by
-[`0004`](docs/DECISIONS/0004-vendored-core-contracts.md). No iroh
-interoperability, no performance number and no node-level authenticated
-0-RTT is claimed, and no Rust iroh exchange has been run at all. The
-cross-platform counts below belong to an older root; no current
-cross-platform survey has been executed, and a build-only row is not a pass.
+[`0004`](docs/DECISIONS/0004-vendored-core-contracts.md). These historical receipts
+establish no iroh interoperability, performance result, or node-level authenticated 0-RTT.
+The current Wave 1 record above carries the live Rust exchanges in both
+directions. Wave 1 acceptance is not recorded, because the full gate result
+against the current bytes is pending; the zbc disposition ledger has been
+re-merged and is recorded above.
+A build-only row is not a test pass.
 
 ### Earlier records, kept as dated history
 
@@ -304,7 +711,7 @@ and refusals it did not force, and compile-time or fixture attribution gaps.
 CLI refusal guards were separately smoke-tested; no duplicate tests were added
 to inflate counters. Two pre-existing map allocation-fault gaps and their
 triggers are in [`TODO.md`](TODO.md). These historical lists apply only to
-their named runs. The current measurement is under
+their named runs. The retained measurement is under
 [*Coverage measurement*](#coverage-measurement).
 
 After the portability fixes, `zig-gate --no-cross --cov` passed all nine local
@@ -512,9 +919,108 @@ The Linux socket driver uses libc syscalls and raw `poll`; passing `std.Io`
 provides cancellation checks, not a substitute network backend. Runtime
 cancellation alone does not wake that poll. Use the documented stop operation
 or a finite timeout. `Stop.request` requests exit but does not join or dispose;
-wait for `Node.run` before releasing its stop value. A backend-routed driver
+wait for `ozai.node_runtime.run` to return before releasing its stop value. A backend-routed driver
 would win when consumers need alternate networking or immediate cancellation;
 that requires a separate adapter for GSO/GRO/ECN, not a claim about this driver.
+
+### Transport and protocol ownership
+
+Use the owning namespace for transport declarations:
+
+| Namespace | Owns |
+|---|---|
+| `ozai.transport_quic_bridge` | `Bridge` and its `Datagram`, `Source`, `Outcome`, `Ingress`, `Tick` types |
+| `ozai.transport_quic_conn` | `Conn`, `Egress`, `Instant`, `min_datagram`, `toCoreAddress`, `fromCoreAddress` |
+| `ozai.transport_quic_config` | `Config`, `AlpnError`, `CreateError`, `validateAlpns`, `demandsPeerCertificate`, `connectionConfig`, `drawKey`, `max_alpns`, `max_alpn_name_len`, `spki_length` |
+| `ozai.transport_quic_error` | `Error` |
+| `ozai.transport_quic_stream` | `Stream`, `UniStream`, `RecvUni`, `max_drain_runs`, `openBidi(conn: *quic.connection.Connection)`, `openUni`, `acceptUni` |
+| `ozai.transport_quic_datagram` | `max_payload`, `Error`, `enabled`, `maxPayload`, `queued`, `send`, `recv` |
+| `ozai.transport_retry` | `RetryToken`, `Gate`, `Verdict`, `InitialHeader`, `initialHeader`, `Error`, and the `key_length`, `max_token_length`, `min_token_length`, `new_token_length`, `max_connection_id`, `max_age`, `max_tracked` bounds |
+| `ozai.transport_dial_route` | `Route`, `Error`, `resolveRoute`, `ownerOf` |
+
+`Bridge` does not re-export these declarations or modules.
+`Conn.close(application_error, reason, at)` queues an application close.
+It borrows `reason` until the connection is reaped. Drain the close before freeing its owner.
+
+`ozai.node_config.Config.protocols` registers an ALPN and handler selection for each protocol.
+`ozai.node_protocol` owns `Protocol`, `Handler`, `Turn`, and the borrowed handler `Connection`.
+A selection uses the standard handler or a custom handler.
+Registration order sets the server's ALPN preference.
+The configuration slice, ALPN bytes, and custom handler context must outlive the node.
+The node calls each handler during `ozai.node_runtime.step`.
+Callbacks must not re-enter `step` or call `ozai.node_close.close`.
+Handlers borrow the connection for the current turn.
+`Turn.more` keeps the task for another call. `Turn.finished` completes it.
+`ozai.node_close.retire` withdraws the ALPN, shuts down its handler once, and closes its connections.
+Other protocol handlers remain active.
+
+### Node owners and operations
+
+Node operations are free functions in their owning modules. One that needs the
+caller's runtime takes `io: std.Io` first and the node next.
+`ozai.node.Node` has no forwarding methods and no nested API namespaces.
+
+| Namespace | Owns |
+|---|---|
+| `ozai.node` | Stable `Node` data, `Stop`, and `Lane` |
+| `ozai.node_config` | `Config`, peer and relay configuration |
+| `ozai.node_protocol` | Protocol registrations, handler connections, ALPN bounds, and lane statistics |
+| `ozai.node_error` | `Error` |
+| `ozai.node_stats` | `Stats` |
+| `ozai.node_lifecycle` | `create`, `register`, `deinit` |
+| `ozai.node_runtime` | `start`, `step`, `wait`, `run`, `windDown`, `instantOf`, `dispose` |
+| `ozai.node_accept` | `admit`, `drive`, `runTask`, `continueTask` |
+| `ozai.node_ingress` | `take`, `deliver` |
+| `ozai.node_egress` | `drain`, `expire` |
+| `ozai.node_connection_close` | `closeConnections`, `closeOne` |
+| `ozai.node_close` | `close`, `finish`, `retire`, `cancelLane`, `protocols`, `laneStats` |
+| `ozai.node_dispatch` | `feed`, `perform`, `performShutdown`, `shutdownSocket` |
+| `ozai.node_relay_client` | `delivered`, `clearDelivered`, `sendThrough`, `clientCount`, `queueDepth` |
+| `ozai.node_relay_serve_admit` | `Client`, `serve`, `serveAdmit`, `serveHandshake`, and `serveAction` |
+| `ozai.node_relay_serve_read` | `serveRead` and `handshakeEnded` |
+| `ozai.node_relay_serve` | `serveMessages`, `serveMessage`, `forward`, and `serveQueues` |
+
+The data module also owns the free functions `ozai.node.nodeId`, `address`, and `generator`.
+It owns `establishedCount`, `namedPeers`, and `connFor`.
+Call these functions with the node. Do not use the retired method forms.
+
+`ozai.node_lifecycle.create(gpa, io, config)` returns one stable allocation.
+Keep the allocator and borrowed configuration alive until teardown. Do not copy the node.
+Close the node, then call `ozai.node_lifecycle.deinit(node)` exactly once.
+Deinitialization erases secrets and invalidates all borrowed views.
+
+The io-first operations are `node_runtime.step(io, node, at, random)`,
+`wait(io, node, timeout_ms)`, `run(io, node, stop)` and
+`windDown(io, node, at)`, `node_accept.admit(io, node, at, random)`,
+`drive(io, node, at, random)` and `runTask(io, node, …)`, `node_ingress.take(io, node, …)`
+and `deliver(io, node, …)`, `node_egress.drain(io, node, …)` and `expire(io, node, …)`,
+`node_connection_close.closeConnections(io, node, …)` and `closeOne(io, node, conn, at)`,
+and `node_close.close(io, node, …)`, `retire(io, node, alpn, at)` and
+`cancelLane(io, node, at, index)`. `node_runtime.instantOf(io)` reads the driver's
+clock and takes no node.
+
+Three forms are deliberately not io-first, and are not oversights.
+`node_lifecycle.create(gpa, io, config)` is allocator-first, because the
+allocation is the node's first resource. `node_dispatch.feed`, `perform` and
+`performShutdown`, and `node_close.finish`, keep `(node, io: ?std.Io, …)` so the
+disposal path can close the node with no runtime at all; `node_runtime.dispose`
+is that caller. `node_runtime.start(node, at, random)` and
+`node_lifecycle.deinit(node)` take no `io`.
+
+`step` performs one bounded pass and the caller supplies time and entropy.
+A failed pass requires closure, not a replay.
+`run` supplies the clock and closes the node on exit.
+Custom driver loops use `windDown` on failure, passing the last instant a pass
+stamped; a null instant means no instant to stamp with, not no teardown.
+Wind-down preserves the original driver error.
+
+Only `Stop.request` may run concurrently with the driver.
+Set its deadline before starting the loop. A request is not a join.
+Wait for `run` to return before releasing the node or stop value.
+
+The current Wave 1 runtime receipts cover both role orders; the full gate result
+against the current bytes is pending, so Wave 1 is not accepted.
+Waves 2–4 remain unimplemented and unaccepted.
 
 ### Contract changes
 
@@ -550,11 +1056,11 @@ node artifact built for each target. Its default matrix is
 **16 little-endian musl rows plus native x86_64 GNU**, not every Linux ABI.
 Foreign GNU runs require compatible guest runtimes and are separate from
 that self-contained gate. `cross-test.portable.profile.sh` surveys all 108
-libc ABI targets listed by the pinned Zig 0.16 compiler. It uses
-`src/portable_test.zig`: **32 pure modules**, including
-the socket-free endpoint and the socket-free `discovery/dial_source.zig`,
-`transport/quic_bridge.zig` and `transport/dial.zig`. It does **not** claim a
-non-Linux node backend.
+libc ABI targets listed by the pinned Zig 0.16 compiler.
+It uses `src/portable_test.zig`. The audit snapshot included **32 pure modules**:
+the socket-free endpoint, `discovery/dial_source.zig`, `transport/quic_bridge.zig`,
+`transport/dial.zig`, and the other pure roots.
+This survey does not establish a non-Linux node backend.
 
 The tree as it stood before the 2026-10-03 contract cutover executed
 **543/543 on all 26 live Linux ABI targets** in one
@@ -566,7 +1072,7 @@ runs, not non-Linux backends or native execution on foreign hardware.
 
 Earlier expanded invocations were interrupted by a shared-harness rewrite
 and incompatible private MIPS loader links. Their failed exits remain in the
-retained evidence; recovered rows and then the complete current matrix passed.
+retained evidence. Recovered rows and then the complete historical matrix passed.
 No shared-tool repair was made.
 
 ```sh
@@ -680,23 +1186,17 @@ scripts/                the gate driver and its receipt, scope and triage
 docs/                   plan, architecture, decision records
 ```
 
-`src/base` never touches a socket, a clock, or an allocator it was not handed.
-That is not a style preference: it is what lets a state machine be driven by a
-test instead of by a network. The one seam is `SecretKey.generate`, which takes
-the caller's `std.Io` for entropy, never stores it and never reads an ambient
-source; every other value in the module is a plain value with an `Io` parameter
-at most on the call that needs one. That is an ownership claim, not a strength
-claim: the draw is `Io.random`, which the standard library documents as seeded by
-`Io.randomSecure` *or by a less secure mechanism when that fails*.
+`src/base` uses only explicit resources.
+Pure values and state machines do not open sockets or read clocks.
+`SecretKey.generate` borrows the caller's `std.Io` and draws from `io.randomSecure`.
+It erases the temporary seed with `std.crypto.secureZero` on every exit.
+An unavailable secure entropy source returns an error. There is no fallback to `io.random`.
 
-The node's runtime generator is a different seam, and it is the open safety
-item. `Node.create` initializes `std.Random.DefaultPrng` from a `u64` the caller
-passes, and `ozai-node` passes the fixed public constant `0x6f7a_69` by default;
-that generator supplies the TLS ephemeral scalars, the relay admission
-challenges and the QUIC connection-id and path-validation draws. Identity keys
-do not come from it, so it is a predictable-key defect and not a demonstrated
-identity bypass. Replacing it is the first repair in
-[`docs/PLAN.md`](docs/PLAN.md).
+Wave 0 repaired the node's runtime entropy source. `ozai.node_lifecycle.create` draws a
+32-byte seed from `io.randomSecure` into an owned ChaCha `Csprng`.
+It erases the temporary seed with `std.crypto.secureZero`.
+This generator supplies TLS ephemeral scalars, relay challenges, QUIC connection IDs, and path-validation draws.
+`ozai-node` no longer accepts `--seed`. Tests can still inject deterministic `std.Random` values.
 
 ## Reference material
 

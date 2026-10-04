@@ -145,14 +145,59 @@ pub fn build(b: *std.Build) void {
         "Run an ozai node until it is stopped",
     ).dependOn(&run_node.step);
 
+    // `ozai-interop-peer`: the other end of the wave's external exchange. A
+    // program and not an entry under `examples`, for the reason the node is one
+    // — it is not a demonstration of something in this repository, it is a
+    // process `test/rust_partner/` talks to — and it is installed rather than
+    // only run, because the partner is started beside it by a supervisor that
+    // has to be able to name the path. Wired like the node for the same reasons:
+    // its own module, the `ozai` import, and `link_libc` because
+    // `src/transport/socket.zig` reaches libc for `socket`, `sendmsg`,
+    // `recvmsg` and `close`. It needs no options module: every byte of the
+    // scenario is on its command line, which is where a run's two ends have to
+    // be able to differ.
+    //
+    // It is not in `compile-all` either, and `ozai-node` is the reason: both are
+    // programs on the install step, so `zig build` already type-checks them and
+    // listing one twice would buy a second report of the same error.
+    //
+    // It is absent from the coverage list, and for the reason the fuzz targets
+    // are: an instrumented copy of this binary is only useful to a run that
+    // passes both `-Dcoverage` and the coverage runtime to whatever starts it,
+    // and the exchange that starts it is this wave's, not this build's.
+    const interop_peer_mod = b.createModule(.{
+        .root_source_file = b.path("test/interop_peer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    interop_peer_mod.addImport("ozai", lib_mod);
+    interop_peer_mod.link_libc = true;
+    const interop_peer_exe = b.addExecutable(.{
+        .name = "ozai-interop-peer",
+        .root_module = interop_peer_mod,
+    });
+    b.installArtifact(interop_peer_exe);
+
+    // One end of an exchange is not a whole run — the partner is a second
+    // process the caller starts beside it — so this step takes the command line
+    // it was given and prints the rest of the grammar on `--help`, exactly as
+    // the node's run step does.
+    const run_interop_peer = b.addRunArtifact(interop_peer_exe);
+    run_interop_peer.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_interop_peer.addArgs(args);
+    b.step(
+        "run-ozai-interop-peer",
+        "Run one end of a live interop exchange against the Rust partner",
+    ).dependOn(&run_interop_peer.step);
+
     // testing
 
     // The unit tests get a root module no other compilation imports: coverage
     // hangs the runtime object off the root module, and a shared `lib_mod` would
-    // hand a second copy of it to every link that imports the library. The
-    // module is otherwise identical, so the unit-test compile is unchanged.
+    // hand a second copy of it to every link that imports the library. The private
+    // root also reaches the extracted Node tests without exporting them.
     const lib_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = b.path("src/unit_test.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -169,8 +214,29 @@ pub fn build(b: *std.Build) void {
     // a silent hole. The vendored QUIC core must never need this — it opens no
     // socket — and `test/vendored_invariants.zig` is what keeps that true.
     lib_test_mod.link_libc = true;
-    const lib_unit_tests = b.addTest(.{ .root_module = lib_test_mod });
-    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
+    // It declares its expectations too, because the two ALPN-withdrawal
+    // vectors in `quic_bridge.zig` are handshakes that legitimately end in
+    // `no_application_protocol`: one offer leaves only a withdrawn protocol
+    // and the other offers a withdrawn one alone. Those are the refusals
+    // under test, so they are named here rather than passed over — a refusal
+    // arriving once more than this row declares is one message too many, and
+    // a row the run does not fill fails as the stale expectation it then is.
+    //
+    // Counted as two, not two rows: the runner refuses a command line that
+    // names one message twice, and a count is how an artifact says the same
+    // message arrived twice.
+    const unit = build_support.addTestRun(
+        b,
+        lib_test_mod,
+        "unit",
+        .{ .expect_log = &.{
+            .{
+                .scope = "default",
+                .text = "TLS 1.3 handshake error: error.NoApplicationProtocol",
+                .count = 2,
+            },
+        } },
+    );
 
     // Socket-free tests, in their own root and their own module, so the scope
     // that has no Linux adapter can be run and reported on its own. Labelled
@@ -182,10 +248,29 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     portable_test_mod.addImport("quic", quic_mod);
-    const portable_tests = b.addTest(.{ .root_module = portable_test_mod });
-    const run_portable_tests = b.addRunArtifact(portable_tests);
+    // The same row the unit root declares above, and for the same reason: this
+    // root reaches the same ALPN-withdrawal handshakes in `quic_bridge.zig`,
+    // whose two refused offers are the same message said twice. The runner
+    // prints every message either way, fails on an error log no row claims, and
+    // fails when a copy arrives beyond the count or a row is never filled, so
+    // the refusals are named rather than passed over. The generated runner
+    // this root wore has no account to give them and fails any binary that
+    // logged at error level, which is how two deliberate refusals failed a run
+    // whose every test passed.
+    const portable = build_support.addTestRun(
+        b,
+        portable_test_mod,
+        "portable",
+        .{ .expect_log = &.{
+            .{
+                .scope = "default",
+                .text = "TLS 1.3 handshake error: error.NoApplicationProtocol",
+                .count = 2,
+            },
+        } },
+    );
     const portable_step = b.step("test-portable", "Run socket-free protocol and state-machine tests");
-    portable_step.dependOn(&run_portable_tests.step);
+    portable_step.dependOn(&portable.run.step);
 
     // Integration tests live outside `src/` and get their own module: Zig only
     // runs the test blocks a root file reaches, so a test in a library file is
@@ -208,16 +293,24 @@ pub fn build(b: *std.Build) void {
     // stack against a kernel, so a failure in it is a finding about the stack
     // rather than about a module boundary.
     //
-    // It is the artifact that declares the expected log: the refusal the
-    // vendored core reports for a certificate it will not accept, which the
-    // wrong-peer test asserts.
+    // It is the artifact that declares the expected logs: the refusals the
+    // vendored core reports, one for a certificate it will not accept and one
+    // for a protocol it will not speak. Each row is spent by the first message
+    // that matches it, so the two are accountable separately and a second copy
+    // of either fails the run.
     const loopback = build_support.addTestRun(
         b,
         build_support.createTestModule(b, lib_mod, "test/loopback_test.zig", target, optimize),
         "loopback",
-        .{ .expect_log = .{
-            .scope = "default",
-            .text = "TLS 1.3 handshake error: error.BadCertificate",
+        .{ .expect_log = &.{
+            .{
+                .scope = "default",
+                .text = "TLS 1.3 handshake error: error.BadCertificate",
+            },
+            .{
+                .scope = "default",
+                .text = "TLS 1.3 handshake error: error.NoApplicationProtocol",
+            },
         } },
     );
 
@@ -306,6 +399,74 @@ pub fn build(b: *std.Build) void {
         .{},
     );
 
+    // The per-protocol handlers on the *production* accept loop: a `Node` with
+    // its own socket, real peers speaking real QUIC over real UDP, and one
+    // handler per configured protocol rather than one handler for all of them.
+    // Wired like the artifacts above and for the same reason — it opens
+    // sockets, so it needs the `link_libc` `createTestModule` gives every test
+    // root.
+    //
+    // The expected-log count accounts for the three actual handshake refusals
+    // exercised by this artifact. They share the same NoApplicationProtocol
+    // message, so one counted row accounts for all three; a fourth copy fails
+    // the run rather than silently accepting an unexpected refusal.
+    // Warnings remain visible on stderr but do not count as error-level rows.
+    const runtime_handlers = build_support.addTestRun(
+        b,
+        build_support.createTestModule(
+            b,
+            lib_mod,
+            "test/runtime_handlers_test.zig",
+            target,
+            optimize,
+        ),
+        "runtime-handlers",
+        .{ .expect_log = &.{
+            .{
+                .scope = "default",
+                .text = "TLS 1.3 handshake error: error.NoApplicationProtocol",
+                .count = 3,
+            },
+        } },
+    );
+    b.step("runtime-handlers-test", "Run per-protocol handler and lifetime regressions")
+        .dependOn(&runtime_handlers.run.step);
+
+    // The recorded Rust client's first datagram, read the way a server reads
+    // one: the long header, the Initial keys its own destination connection id
+    // derives, header protection, the payload, and the frames behind it.
+    //
+    // Its own module for the reason every other root above has one — Zig runs
+    // only the test blocks a root reaches — and the `quic` import for the
+    // reason `lib_test_mod` carries it: this root names the core's own
+    // `packet`, `frame` and `connection_manager`, and a fresh module does not
+    // inherit the imports of the module it was split from. The import is added
+    // to this module alone; putting it on `lib_mod` would hand the core to
+    // every consumer of the library rather than to the one root that names it.
+    //
+    // It reaches no socket, so the `link_libc` `createTestModule` gives every
+    // test root is unused here rather than absent.
+    //
+    // It drives `t.fuzz`, and the expected-log runner does not export `fuzz`,
+    // so this artifact wears the generated runner. That is also the right
+    // choice on the merits: this root drives the receive path over recorded
+    // and core-built bytes and provokes no error-level log on purpose, so an
+    // error log here would be a finding rather than a claim to account for.
+    const rust_wire_initial_mod = build_support.createTestModule(
+        b,
+        lib_mod,
+        "test/rust_wire_initial_test.zig",
+        target,
+        optimize,
+    );
+    rust_wire_initial_mod.addImport("quic", quic_mod);
+    const rust_wire_initial = build_support.addTestRun(
+        b,
+        rust_wire_initial_mod,
+        "rust-wire-initial",
+        .{ .runner = .generated },
+    );
+
     // The runner's own regressions, which are the only artifacts here that
     // wear it while judging it: the verdict root starts two fixture
     // executables that hold one intentional-failure case each and reads their
@@ -347,26 +508,30 @@ pub fn build(b: *std.Build) void {
             .{},
         );
         build_support.instrumentCoverage(b, target, optimize, &.{
-            lib_unit_tests,
+            unit.compile,
             integration.compile,
             loopback.compile,
             protocol.compile,
             transfer.compile,
             two_process.compile,
             relay_wire.compile,
+            runtime_handlers.compile,
+            rust_wire_initial.compile,
             verdict.compile,
             node_exe,
         }, rt);
     }
 
     const test_step = b.step("test", "Run unit tests and integration tests");
-    test_step.dependOn(&run_lib_unit_tests.step);
+    test_step.dependOn(&unit.run.step);
     test_step.dependOn(&integration.run.step);
     test_step.dependOn(&loopback.run.step);
     test_step.dependOn(&protocol.run.step);
     test_step.dependOn(&transfer.run.step);
     test_step.dependOn(&two_process.run.step);
     test_step.dependOn(&relay_wire.run.step);
+    test_step.dependOn(&runtime_handlers.run.step);
+    test_step.dependOn(&rust_wire_initial.run.step);
     test_step.dependOn(&verdict.run.step);
     test_step.dependOn(&invariants.run.step);
 
@@ -376,15 +541,17 @@ pub fn build(b: *std.Build) void {
     // root is only analysis that happens while a root compiles.
     const compile_all = b.step("compile-all", "Compile every test root without running it");
     for ([_]*std.Build.Step.Compile{
-        lib_unit_tests,
+        unit.compile,
         quic_tests,
-        portable_tests,
+        portable.compile,
         integration.compile,
         loopback.compile,
         protocol.compile,
         transfer.compile,
         two_process.compile,
         relay_wire.compile,
+        runtime_handlers.compile,
+        rust_wire_initial.compile,
         verdict.compile,
         invariants.compile,
     }) |artifact| compile_all.dependOn(&artifact.step);

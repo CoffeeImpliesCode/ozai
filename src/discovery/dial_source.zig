@@ -91,7 +91,7 @@
 //! * a copy of the answer set, because the buffer an `Io` read fills does not
 //!   outlive the call and a service holds its answers as values.
 //!
-//! Those four are what a real `resolve.PacketSource` and a real
+//! Those four are what a real `resolve_pkarr.PacketSource` and a real
 //! `dns.DnsAddressLookup` are built with, and this milestone does not build
 //! them: a relay client, a UDP socket and a DNS transaction manager are
 //! transport work, and `transport/socket.zig` is the seam they come through.
@@ -118,6 +118,8 @@ const addr = @import("../base/addr.zig");
 const key = @import("../base/key.zig");
 const item = @import("item.zig");
 const resolve = @import("resolve.zig");
+const pkarr = @import("resolve_pkarr.zig");
+const publish = @import("resolve_publish.zig");
 const node_addr = @import("../base/node_addr.zig");
 const relay_url = @import("../base/relay_url.zig");
 const transport_addr = @import("../base/transport_addr.zig");
@@ -398,6 +400,9 @@ const ula = @import("../base/ula.zig");
 const dns = @import("dns.zig");
 const batch = @import("../transport/batch.zig");
 const quic_bridge = @import("../transport/quic_bridge.zig");
+const quic_conn = @import("../transport/quic_conn.zig");
+const quic_error = @import("../transport/quic_error.zig");
+const dial_route = @import("../transport/dial_route.zig");
 const quic = @import("quic");
 
 /// Fixed seeds, so a run draws the same connection ids, the same nonces and
@@ -460,18 +465,18 @@ const Harness = struct {
         self.client = try quic_bridge.Bridge.create(t.allocator, t.io, .{
             .secret = self.client_secret,
             .expect_peer = null,
-            .alpn = alpn,
+            .alpns = &.{alpn},
         }, engine.random());
         errdefer self.client.destroy();
         self.server = try quic_bridge.Bridge.create(t.allocator, t.io, .{
             .secret = self.server_secret,
             .expect_peer = self.client_secret.nodeId(),
-            .alpn = alpn,
+            .alpns = &.{alpn},
         }, engine.random());
         errdefer self.server.destroy();
         self.dialer = try dial.Dialer.create(t.allocator, self.client, .{
             .secret = self.client_secret,
-            .alpn = alpn,
+            .alpns = &.{alpn},
         });
     }
 
@@ -543,11 +548,11 @@ fn firstAddress(
 /// value: signed-packet bytes in, a `Packet` out.
 ///
 /// `answers` is NUL-separated because each answer is a whole signed packet,
-/// which is `resolve.PacketSource`'s own contract and the reason the two
+/// which is `resolve_pkarr.PacketSource`'s own contract and the reason the two
 /// services can share a buffer shape.
 const FakeRelay = struct {
     answers: []const u8,
-    packets: []const resolve.Packet,
+    packets: []const pkarr.Packet,
     /// Which answer is being decoded, so a second resolve against one relay
     /// walks the same answer set from its start the way a fresh retrieval
     /// would.
@@ -556,7 +561,7 @@ const FakeRelay = struct {
     /// which is how a decode failure is reached.
     good: []const u8 = "signed",
 
-    fn decode(ctx: *anyopaque, packet: []const u8) resolve.DecodeError!resolve.Packet {
+    fn decode(ctx: *anyopaque, packet: []const u8) resolve.DecodeError!pkarr.Packet {
         const self: *FakeRelay = @ptrCast(@alignCast(ctx));
         if (!std.mem.eql(u8, packet, self.good)) return error.MalformedPacket;
         const at = self.cursor;
@@ -565,7 +570,7 @@ const FakeRelay = struct {
         return self.packets[at];
     }
 
-    fn source(self: *FakeRelay, cancellation: ?resolve.Cancellation) resolve.PacketSource {
+    fn source(self: *FakeRelay, cancellation: ?resolve.Cancellation) pkarr.PacketSource {
         return .{
             .ctx = @ptrCast(@alignCast(self)),
             .decode = decode,
@@ -670,13 +675,13 @@ fn refuseStart(
 /// milestone does not build, so it is handed to the peer instead — the same
 /// shortcut `transport/dial.zig`'s own harness takes.
 fn forward(
-    conn: quic_bridge.Conn,
+    conn: quic_conn.Conn,
     into: *quic_bridge.Bridge,
     map: *const addr_map.MappedAddrs,
     engine: *Prng,
-) quic_bridge.Error!bool {
+) quic_error.Error!bool {
     var scratch: [2 * max_datagram]u8 = undefined;
-    var egress: [max_egress]quic_bridge.Egress = undefined;
+    var egress: [max_egress]quic_conn.Egress = undefined;
     var out: [max_egress * max_datagram]u8 = undefined;
     const from = conn.local() orelse return error.NoPathAddress;
     const sends = try conn.drain(&egress, &out, at_instant, engine.random());
@@ -709,7 +714,7 @@ test "the merge chooses the address and the dial opens on it" {
         .answers = "signed\x00",
         .packets = &.{.{ .node_id = peer, .txt = .init("relay=https://two.example./\x00") }},
     };
-    var resolver = resolve.PkarrResolver.init(relay.source(stops.cancellation()));
+    var resolver = pkarr.PkarrResolver.init(relay.source(stops.cancellation()));
     var service = dns.DnsAddressLookup.init(
         .init("relay=https://one.example./\x00"),
         null,
@@ -746,7 +751,7 @@ test "the merge chooses the address and the dial opens on it" {
         .node = peer,
     } };
     try t.expectEqual(expected, dialled.dial.route.key.?);
-    try t.expectEqual(expected, dial.ownerOf(&harness.map, dialled.dial.route.socket).?);
+    try t.expectEqual(expected, dial_route.ownerOf(&harness.map, dialled.dial.route.socket).?);
     // One key for one target: the relay the other service named was never a
     // target, so no address was allocated for it.
     try t.expectEqual(@as(usize, 1), harness.map.by_key.count());
@@ -777,7 +782,7 @@ test "a service that will not resolve stops the walk where it made its claim" {
     // Upstream's publisher implements no `resolve`
     // (`iroh/src/address_lookup/pkarr.rs:357`), so this is a service in
     // ordinary production and not a double invented to make this test pass.
-    var publisher = resolve.PkarrPublisher.init();
+    var publisher = publish.PkarrPublisher.init();
     defer publisher.deinit();
     var refusing = Counted.init(publisher.lookup());
 
@@ -788,7 +793,7 @@ test "a service that will not resolve stops the walk where it made its claim" {
         .answers = "signed\x00",
         .packets = &.{.{ .node_id = peer, .txt = .init("addr=192.0.2.9:9999\x00") }},
     };
-    var first_resolver = resolve.PkarrResolver.init(
+    var first_resolver = pkarr.PkarrResolver.init(
         first_relay.source(first_stops.cancellation()),
     );
     var answering = Counted.init(first_resolver.lookup());
@@ -848,7 +853,7 @@ test "an answer with nothing in it does not stop the walk" {
         .answers = "signed\x00",
         .packets = &.{.{ .node_id = peer, .txt = .init("relay=https://relay.example./\x00") }},
     };
-    var resolver = resolve.PkarrResolver.init(relay.source(stops.cancellation()));
+    var resolver = pkarr.PkarrResolver.init(relay.source(stops.cancellation()));
     var relayed = Counted.init(resolver.lookup());
     const sources = [_]resolve.AddressLookup{ published_nothing.lookup(), relayed.lookup() };
 
@@ -883,7 +888,7 @@ test "an empty result, an empty address list and a refused path are told apart" 
     // world had nothing in it: no items at all, which is
     // `item.Resolution.isEmptyResult` and not the absence of a service.
     var quiet: FakeRelay = .{ .answers = "", .packets = &.{} };
-    var quiet_resolver = resolve.PkarrResolver.init(quiet.source(null));
+    var quiet_resolver = pkarr.PkarrResolver.init(quiet.source(null));
     var silent = Counted.init(quiet_resolver.lookup());
     const only_quiet = [_]resolve.AddressLookup{silent.lookup()};
     const nothing = try dialFromSources(
@@ -917,7 +922,7 @@ test "an empty result, an empty address list and a refused path are told apart" 
         .answers = "signed\x00",
         .packets = &.{.{ .node_id = peer, .txt = .init("relay=https://relay.example./\x00") }},
     };
-    var resolver = resolve.PkarrResolver.init(relay.source(stops.cancellation()));
+    var resolver = pkarr.PkarrResolver.init(relay.source(stops.cancellation()));
     var answered = Counted.init(resolver.lookup());
     const only_answered = [_]resolve.AddressLookup{answered.lookup()};
     var declined = requestAt(&harness, &engine);
@@ -954,7 +959,7 @@ test "a run that gives up mid-walk still stops every retrieval it started" {
         .answers = "signed\x00",
         .packets = &.{.{ .node_id = peer, .txt = .init("addr=192.0.2.9:9999\x00") }},
     };
-    var resolver = resolve.PkarrResolver.init(relay.source(stops.cancellation()));
+    var resolver = pkarr.PkarrResolver.init(relay.source(stops.cancellation()));
     var answering = Counted.init(resolver.lookup());
     var unstartable = Unstartable.init();
     const failing = [_]resolve.AddressLookup{ answering.lookup(), unstartable.lookup() };
@@ -980,9 +985,9 @@ test "a run that gives up mid-walk still stops every retrieval it started" {
     // left to cancel and says so rather than skipping the call.
     var quiet_stops: Counter = .{};
     var quiet: FakeRelay = .{ .answers = "", .packets = &.{} };
-    var quiet_resolver = resolve.PkarrResolver.init(quiet.source(quiet_stops.cancellation()));
+    var quiet_resolver = pkarr.PkarrResolver.init(quiet.source(quiet_stops.cancellation()));
     var silent = Counted.init(quiet_resolver.lookup());
-    var publisher = resolve.PkarrPublisher.init();
+    var publisher = publish.PkarrPublisher.init();
     defer publisher.deinit();
     const cut_short = [_]resolve.AddressLookup{
         answering.lookup(),

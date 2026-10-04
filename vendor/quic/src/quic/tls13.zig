@@ -10,8 +10,16 @@
 //! raw bytes of an Ed25519 key, and those 32 bytes are the node id. There is
 //! no chain to walk, no host name to match and no validity date to read: a
 //! peer is the key it presents or the handshake ends. Upstream validated an
-//! X.509 chain here, and every part of that is gone — see
-//! `liftEd25519Spki`, which is the whole of certificate validation now.
+//! X.509 chain here, and every part of that is gone — see `liftEd25519Spki`,
+//! which is the whole of certificate validation now.
+//!
+//! X.509 wrapping is what makes those bytes legible to a peer, and RFC 7250 is
+//! what says so on the wire: both ends offer `client_certificate_type` and
+//! `server_certificate_type` in the ClientHello and settle each one in the
+//! EncryptedExtensions, and an absent extension — which RFC 7250 §4.1 makes an
+//! implicit X.509 — is refused rather than defaulted. So the `Certificate`
+//! payload below is a `SubjectPublicKeyInfo` because the handshake negotiated
+//! one, and not because nothing else was ever tried.
 //!
 //! The state machine is `Tls13Handshake`, driven by `step` with bytes from
 //! the crypto streams and an `Action` back. Time and randomness are
@@ -261,6 +269,139 @@ pub fn liftEd25519Spki(der: []const u8) SpkiError![ed25519_key_len]u8 {
 /// produce it from an X.509 parse, so the arm was dead for a raw SPKI.
 const lifted_key_algo: Certificate.AlgorithmCategory = .curveEd25519;
 
+// ─── RFC 7250 certificate type ───────────────────────────────────────
+
+/// RFC 7250 §3's `CertificateType`, and the one value this stack
+/// negotiates.
+///
+/// `x509` is named because the negotiation is *about* which of these the
+/// `Certificate` payload carries: a peer that sends no extension at all has
+/// said X.509 by default (RFC 7250 §4.1), and a stack whose whole identity
+/// model is a bare `SubjectPublicKeyInfo` has to refuse that rather than read
+/// a certificate it cannot parse. `raw_public_key` is that
+/// `SubjectPublicKeyInfo` — the 44-byte DER around the 32 bytes of an Ed25519
+/// key, with nothing wrapped around it, which is what `liftEd25519Spki` reads.
+///
+/// `generic_cert` and `open_pgp_cert` are here for the same reason: the IANA
+/// registry is open, and an extension naming a value this build does not know
+/// is a `DecodeError` rather than a quiet "not RawPublicKey".
+pub const CertificateType = enum(u8) {
+    /// RFC 5246. The default when no extension is sent, and so the value a
+    /// peer has selected by omission.
+    x509 = 0,
+    /// RFC 5089.
+    open_pgp_cert = 1,
+    /// RFC 7250 §3. The only type this stack offers, selects or accepts.
+    raw_public_key = 2,
+    /// RFC 7250 §3, a placeholder for types from the same registry.
+    generic_cert = 3,
+};
+
+comptime {
+    // The two extensions are the whole of RFC 7250's wire surface, and a
+    // peer's dispatch is keyed on their numbers. std names them; these two
+    // values are what the names mean, so a toolchain that renumbered them
+    // would have every peer disagreeing with this stack in silence.
+    if (@intFromEnum(tls.ExtensionType.client_certificate_type) != 19) {
+        @compileError("RFC 7250's client_certificate_type is 19 and std no longer agrees");
+    }
+    if (@intFromEnum(tls.ExtensionType.server_certificate_type) != 20) {
+        @compileError("RFC 7250's server_certificate_type is 20 and std no longer agrees");
+    }
+}
+
+/// The type this stack offers, selects and accepts, named once because four
+/// sites write it and a fifth refuses everything else: the two builders, the
+/// two parsers' callers, and the fail-closed checks that make any other value
+/// an error. iroh presents a bare Ed25519 `SubjectPublicKeyInfo` in both
+/// directions, so this is the only certificate type there is here.
+pub const negotiated_certificate_type: CertificateType = .raw_public_key;
+
+/// RFC 7250 §3's `CertificateType certificate_types<1..2^8-1>`: the form a
+/// ClientHello uses — a one-byte count and that many one-byte types. The
+/// count is the vector's own length, so the extension body closes it.
+pub const certificate_type_offer_len = 2;
+
+/// RFC 7250 §3's bare `CertificateType`: the form a server's answer uses, one
+/// byte and no count in front of it. §4.2 spells out why the two forms
+/// differ: "only a single value is permitted in the server_certificate_type
+/// extension when carried in the server hello", and the client's type has the
+/// same structure.
+pub const certificate_type_selection_len = 1;
+
+/// Writes the offer a client makes, naming `kind` alone — RFC 7250 §4.1's "a
+/// list containing a single element", which is what a client that speaks one
+/// certificate type sends.
+///
+/// `out` is the caller's; the bytes written are
+/// `out[0..certificate_type_offer_len]`. `error.BufferTooSmall` when `out`
+/// cannot hold them, which is a caller's buffer and not a message this stack
+/// builds — so the refusal is the caller's to size against, not one a peer
+/// can provoke.
+pub fn encodeCertificateTypeOffer(
+    out: []u8,
+    kind: CertificateType,
+) error{BufferTooSmall}![]const u8 {
+    if (out.len < certificate_type_offer_len) return error.BufferTooSmall;
+    out[0] = 1; // the count: this stack offers exactly one type
+    out[1] = @intFromEnum(kind);
+    return out[0..certificate_type_offer_len];
+}
+
+/// Writes the selection a server makes, naming `kind` alone — RFC 7250 §3's
+/// bare `CertificateType`, with no count in front of it.
+pub fn encodeCertificateTypeSelection(
+    out: []u8,
+    kind: CertificateType,
+) error{BufferTooSmall}![]const u8 {
+    if (out.len < certificate_type_selection_len) return error.BufferTooSmall;
+    out[0] = @intFromEnum(kind);
+    return out[0..certificate_type_selection_len];
+}
+
+/// RFC 7250 §3's `CertificateType certificate_types<1..2^8-1>`, parsed: the
+/// types offered, borrowed from `data`.
+///
+/// `error.DecodeError` for a body that does not close the extension, and for
+/// a count of zero — the vector's own minimum is one, so a zero-length list
+/// is not an offer of nothing but a body this grammar has no shape for.
+pub fn parseCertificateTypeOffer(data: []const u8) error{DecodeError}![]const u8 {
+    if (data.len < 2) return error.DecodeError;
+    const count: usize = data[0];
+    if (count == 0 or count + 1 != data.len) return error.DecodeError;
+    return data[1..];
+}
+
+/// Whether `offer` — a body from `parseCertificateTypeOffer` — names `kind`.
+///
+/// A byte outside the IANA registry is skipped rather than refused: the
+/// registry is open, so a peer may offer a type added after this build, and
+/// the question here is whether *this* type is among the offers.
+pub fn offerContains(offer: []const u8, kind: CertificateType) bool {
+    for (offer) |byte| {
+        if (byte == @intFromEnum(kind)) return true;
+    }
+    return false;
+}
+
+/// RFC 7250 §3's bare `CertificateType`, parsed: the type a server selected.
+///
+/// `error.DecodeError` for a body that is not exactly one byte — §3 puts no
+/// count here, so a longer body is not a selection of several types but a
+/// message this grammar has no shape for — and for a value outside the IANA
+/// registry, which is a field this build cannot decode rather than a type it
+/// decided against.
+pub fn parseCertificateTypeSelection(data: []const u8) error{DecodeError}!CertificateType {
+    if (data.len != certificate_type_selection_len) return error.DecodeError;
+    return switch (data[0]) {
+        @intFromEnum(CertificateType.x509) => .x509,
+        @intFromEnum(CertificateType.open_pgp_cert) => .open_pgp_cert,
+        @intFromEnum(CertificateType.raw_public_key) => .raw_public_key,
+        @intFromEnum(CertificateType.generic_cert) => .generic_cert,
+        else => error.DecodeError,
+    };
+}
+
 const Tlv = struct { tag: u8, start: usize, end: usize };
 
 /// One element at `pos`, its contents within `limit`. Single-byte tags only,
@@ -329,9 +470,13 @@ pub const ClientAuth = struct {
     ///
     /// Compared against the key lifted from the peer's certificate, so it
     /// pins the key and not a subject, an issuer or a name. A client that
-    /// sends no certificate fails on `mode` before this is consulted; a
-    /// client that sends one carrying a different key fails on this, with
-    /// `error.BadCertificate`, whatever `mode` says.
+    /// sends no certificate fails on `mode` before this is consulted —
+    /// unless this is set, which is itself a demand for a certificate. A pin
+    /// is about which node has to be the one on the other end, and a mode
+    /// that lets a client through with nothing does not waive it: such a
+    /// client fails with `error.CertificateRequired`. A client that sends one
+    /// carrying a different key fails on this, with `error.BadCertificate`,
+    /// whatever `mode` says.
     expect_node_id: ?[32]u8 = null,
     /// What happens when the client sends no certificate at all. `.required`
     /// is the default and fails the handshake with
@@ -350,7 +495,11 @@ pub const ClientAuth = struct {
         /// No certificate: the handshake completes without a client identity.
         /// The connection is established and authenticated as the server, and
         /// nothing about the client is known; a caller that treats this as
-        /// `required` has an unauthenticated peer.
+        /// `required` has an unauthenticated peer. `expect_node_id` is not
+        /// waived by this mode and does not waive it: a policy that names a
+        /// node demands that node's certificate, so an empty
+        /// `certificate_list` is `error.CertificateRequired` here as it is
+        /// under `required`.
         optional,
     };
 };
@@ -433,7 +582,12 @@ pub fn parseCertificateRequest(body: []const u8) error{ DecodeError, MissingExte
         pos += len;
         if (kind == @intFromEnum(tls.ExtensionType.signature_algorithms)) {
             if (sig_algs != null) return error.IllegalParameter;
-            if (data.len < 2 or readU16(data) + 2 != data.len or data.len % 2 != 0) return error.DecodeError;
+            // RFC 8446 §4.2.3's `SignatureScheme supported_signature_algorithms<2..2^16-1>`
+            // is measured against a byte count, so the peer's length is read as
+            // a `usize`: a peer that writes `ff ff` names a list longer than any
+            // buffer, and adding two to it in a `u16` would overflow before the
+            // comparison could answer that.
+            if (data.len < 2 or @as(usize, readU16(data)) + 2 != data.len or data.len % 2 != 0) return error.DecodeError;
             sig_algs = data[2..];
         }
     }
@@ -1262,14 +1416,30 @@ pub const TlsConfig = struct {
     /// `private_key_bytes` / `private_key_algorithm`, with `certs[0]` as the
     /// default for a client that sends no SNI or an unknown name.
     certs: []const CertEntry = &.{},
-    /// The application protocols this side will speak. A client offers the
-    /// whole list in this order and fails with `error.IllegalParameter` when
-    /// the server names one it did not offer; a server walks the client's
-    /// list in the client's order, takes the first protocol that is also
-    /// here, echoes that one, and fails with `error.NoApplicationProtocol`
-    /// when it is offering something and the client named none of it. Empty
-    /// offers and selects nothing: the extension is then absent in both
-    /// directions, `negotiatedAlpn` answers `""`, and neither end fails.
+    /// The application protocols this side will speak, in the order it
+    /// prefers them. A client offers the whole list in this order and fails
+    /// with `error.IllegalParameter` when the server names one it did not
+    /// offer; a server walks this list, in this order, and takes the first
+    /// entry the client also named, so the negotiated protocol is this side's
+    /// preference among the ones both ends speak and not the client's order.
+    /// That is RFC 7301 §3.2's rule — "the server SHOULD select the most
+    /// highly preferred protocol that it supports and that is also advertised
+    /// by the client" — and this list is where that preference is written
+    /// down. The server fails with `error.NoApplicationProtocol` whenever the
+    /// client sent an ALPN list and none of its entries is one this list holds
+    /// — an empty list included, because a server that supports none of what a
+    /// client advertised is that same section's `no_application_protocol`, and
+    /// a peer let through with no protocol is what it exists to prevent. A
+    /// ClientHello carrying no ALPN extension is the other case and nothing is
+    /// echoed in it either: the extension is then absent in both directions,
+    /// `negotiatedAlpn` answers `""`, and neither end fails.
+    /// A name of no length is refused wherever it arrives: RFC 7301 §3.1's
+    /// `ProtocolName` is `opaque <1..2^8-1>` and says "Empty strings MUST NOT
+    /// be included", so an offer or a selection carrying one is a
+    /// `error.DecodeError` on the side that receives it. This list is not
+    /// checked for it here — `TlsConfig` is a public struct, and a caller who
+    /// fills one in with an empty name is refused by the peer rather than by
+    /// the type.
     ///
     /// Each name is at most `negotiated_alpn_len_max` bytes, which is what a
     /// selection can hold: a longer one has no encoding here, and a server is
@@ -1429,16 +1599,28 @@ pub const HandshakeError = error{
     /// The peer named no application protocol, or named one this side does
     /// not offer in `alpn`. Maps to `no_application_protocol`.
     NoApplicationProtocol,
-    /// An extension RFC 8446 makes mandatory for this message was absent —
-    /// supported_versions, key_share, or signature_algorithms in a
-    /// CertificateRequest. Maps to `missing_extension`.
+    /// An extension this stack requires for the message was absent —
+    /// supported_versions, key_share, `signature_algorithms` in a
+    /// CertificateRequest, the RFC 9001 transport parameters, or RFC 7250's
+    /// certificate-type extension: `client_certificate_type` and
+    /// `server_certificate_type` on both sides, because an absent one is an
+    /// implicit X.509 (RFC 7250 §4.1) and this stack reads only a raw
+    /// `SubjectPublicKeyInfo`. Maps to `missing_extension`.
     MissingExtension,
-    /// The client offers no signature scheme our certificate can use.
-    /// `signatureSchemeFor` found nothing in the client's
-    /// signature_algorithms that the configured key can sign with, so the
-    /// server has no CertificateVerify it could produce. Maps to
-    /// `handshake_failure`.
+    /// The peer's `signature_algorithms` named no scheme this side's own
+    /// certificate can be signed with: `signatureSchemeFor` found nothing, so
+    /// there is no CertificateVerify the handshake could have agreed on.
+    /// Maps to `handshake_failure`, RFC 8446's answer to a message that names
+    /// no mutually supported parameter.
     HandshakeFailure,
+    /// RFC 7250 §4.2's outcome 2: this server read the ClientHello's
+    /// `client_certificate_type` or `server_certificate_type` offer, supports
+    /// the extension, and has no certificate type in common with the client —
+    /// this side offers the raw key and the client's offer does not name it.
+    /// The RFC names its own answer: "the server terminates the session with a
+    /// fatal alert of type unsupported_certificate" (§4.2), and RFC 8446 §6.2
+    /// still carries that alert at 43. Maps to `unsupported_certificate`.
+    UnsupportedCertificate,
     /// The peer's QUIC transport parameters are malformed or violate a limit
     /// this stack enforces. The one member of this set that is *not* a TLS
     /// alert: `Connection` turns it into a QUIC TRANSPORT_PARAMETER_ERROR
@@ -1448,9 +1630,13 @@ pub const HandshakeError = error{
     /// Also raised when a server must sign and has no certificate at all.
     /// Maps to `certificate_required`.
     CertificateRequired,
-    /// A field carried a value RFC 8446 forbids: a non-empty
-    /// certificate_request_context, a second copy of an extension, or a
-    /// context where this stack sends none. Maps to `illegal_parameter`.
+    /// A field carried a value RFC 8446 or RFC 7250 forbids: a non-empty
+    /// certificate_request_context, a second copy of an extension, a context
+    /// where this stack sends none, or a certificate type the peer did not
+    /// offer — RFC 7250 §4.2 makes selecting one the client never named an
+    /// illegal parameter, and it is the same fact as the two disagreeing
+    /// about what the `Certificate` payload carries. Maps to
+    /// `illegal_parameter`.
     IllegalParameter,
 };
 
@@ -1723,6 +1909,27 @@ pub const Tls13Handshake = struct {
     /// handshake rather than leaving this field set to something rejected.
     peer_node_id: ?[32]u8 = null,
 
+    // RFC 7250 negotiation. Both are set only by the message that settles
+    // them, and neither end reads the other's, so one pair of fields names
+    // the same two facts from either side of the wire.
+
+    /// What the `server_certificate_type` extension settled: RFC 7250 §4.2's
+    /// selection in EncryptedExtensions, on a client, and the offer in the
+    /// ClientHello this server accepted, on a server.
+    ///
+    /// `.x509` is both "not settled yet" and "settled as X.509", and the two
+    /// are not told apart here for the same reason `selected_alpn_len`'s zero
+    /// is not: RFC 7250 §4.1 makes an absent extension an implicit X.509, and
+    /// an X.509 peer is refused before this field is read, so no path reaches
+    /// a certificate carrying one.
+    negotiated_server_certificate_type: CertificateType = .x509,
+
+    /// The same for `client_certificate_type`, which governs the certificate
+    /// *this* side sends when it is asked for one. On a client it is
+    /// `.raw_public_key` or the empty `Certificate` is answered; on a server
+    /// it is the type this server may read the client's leaf as.
+    negotiated_client_certificate_type: CertificateType = .x509,
+
     // Transcript hash at server Finished for app key derivation
     /// The transcript as of the server's Finished, snapshotted because the
     /// application secrets are derived from that point and the transcript
@@ -1770,9 +1977,9 @@ pub const Tls13Handshake = struct {
     /// 4.2.10 only lets EncryptedExtensions answer an extension the client
     /// offered, so accepting a PSK is not on its own a licence to send it.
     early_data_offered: bool = false,
-    /// Server side: which of `config.alpn` the client also offered. A
-    /// server advertising several has to echo the one that matched, not
-    /// its own first choice.
+    /// Server side: which of `config.alpn` the client also offered. Where
+    /// more than one entry matches it is this side's first of them, so the
+    /// selection is this side's preference rather than the client's order.
     ///
     /// At most `negotiated_alpn_len_max` bytes, and always the whole name: a
     /// server that matched an entry copies all of it and refuses to match one
@@ -1972,12 +2179,20 @@ pub const Tls13Handshake = struct {
         self.peer_cert = null;
         self.allocator = null;
         self.early_data_offered = false;
-        self.selected_alpn_len = 0;
+        self.negotiated_server_certificate_type = .x509;
+        self.negotiated_client_certificate_type = .x509;
         self.zero_rtt_accepted = false;
         self.received_ticket = null;
         self.ticket_nonce_counter = 0;
         self.peer_session_id_len = 0;
         self.peer_session_id = .{0} ** 32;
+
+        // `out` is the caller's storage and every field here is written by
+        // hand, so this struct's own default does not apply: a handshake that
+        // selects no protocol would otherwise read a length nothing set, and
+        // slice `selected_alpn` with it. Zero is what "nothing selected"
+        // means, and nothing reads past it.
+        self.selected_alpn_len = 0;
 
         // Nothing is published until the encode below says how much there is.
         self.tp_encoded_len = 0;
@@ -2078,12 +2293,21 @@ pub const Tls13Handshake = struct {
         self.peer_cert = null;
         self.allocator = null;
         self.early_data_offered = false;
-        self.selected_alpn_len = 0;
+        self.negotiated_server_certificate_type = .x509;
+        self.negotiated_client_certificate_type = .x509;
         self.zero_rtt_accepted = false;
         self.received_ticket = null;
         self.ticket_nonce_counter = 0;
         self.peer_session_id_len = 0;
         self.peer_session_id = .{0} ** 32;
+
+        // The same field and the same reason as the client edge above: `out`
+        // is uninitialized storage, this initializer writes every other field
+        // itself, and a server that has selected nothing — an offer list with
+        // no entry in common, or no ALPN extension at all — must still answer
+        // EncryptedExtensions with an empty selection rather than with whatever
+        // length the storage happened to hold.
+        self.selected_alpn_len = 0;
 
         self.tp_encoded_len = 0;
         self.tp_encoded_len = try encodeTransportParams(self.tp_encoded[0..], local_tp, random);
@@ -2498,6 +2722,17 @@ pub const Tls13Handshake = struct {
             return error.MissingExtension;
         }
 
+        // RFC 7250 §4.1 makes an absent extension an implicit X.509 and §4.2
+        // has the client treat that as the server's certificate type. This
+        // client offered one type, so a server that names no type has chosen
+        // one it cannot present and this connection cannot be authenticated:
+        // refused here, before any certificate is read. `clientProcessCertificate`
+        // relies on it — it reads the leaf as a raw `SubjectPublicKeyInfo`,
+        // which is only what that leaf is once this check has passed.
+        if (self.negotiated_server_certificate_type != negotiated_certificate_type) {
+            return error.MissingExtension;
+        }
+
         self.transcript.update(msg);
         self.state = .client_wait_certificate;
         return ._continue;
@@ -2679,7 +2914,31 @@ pub const Tls13Handshake = struct {
         // certificate_list, and no CertificateVerify to go with it. The
         // context is zero length: 4.3.2 only allows a non-empty one for
         // post-handshake auth, which RFC 9001 4.4 forbids over QUIC anyway.
-        if (!self.certificate_requested) {} else if (self.client_sig_scheme) |scheme| {
+        //
+        // Three things have to hold before this side's own key goes on the
+        // wire, and none of them is a licence on its own: the server asked,
+        // EncryptedExtensions settled `client_certificate_type` as
+        // RawPublicKey, and a key is configured whose scheme the
+        // CertificateRequest offered. The middle one is RFC 7250 §4.1's
+        // default doing its work — a server that named no type wanted X.509,
+        // and this client holds a bare `SubjectPublicKeyInfo` rather than a
+        // certificate, so the answer to that request is the empty list.
+        //
+        // Anything short of all three is that same answer, and the empty
+        // list is the one the server is built to read: it sits in
+        // `.server_wait_client_certificate` *because* it asked, so a flight
+        // that skipped the Certificate left its Finished to be read as one
+        // and refused the connection with `unexpected_message`. A client
+        // declining to authenticate does not say that; RFC 8446 §6.2's
+        // `certificate_required` is what it says, and `auth.mode == .required`
+        // reaches it from `serverProcessClientCertificate` on exactly this
+        // message.
+        if (!self.certificate_requested) {
+            // RFC 8446 4.4.2: the client's flight carries a Certificate only
+            // when a CertificateRequest asked for one. An empty list unasked
+            // is a message the peer is not in a state to read: a server that
+            // never requested client auth waits for Finished here.
+        } else if (self.clientAuthScheme()) |scheme| {
             const cert = self.config.client_certificate.?;
             const cert_msg = buildCertificate(self.out_buf[pos..], cert.cert_chain_der) catch return error.InternalError;
             self.transcript.update(cert_msg);
@@ -2732,6 +2991,24 @@ pub const Tls13Handshake = struct {
             .level = .handshake,
             .data = self.out_buf[0..self.out_len],
         } };
+    }
+
+    /// The scheme this client signs its own `CertificateVerify` with, or null
+    /// when the answer to a `CertificateRequest` is an empty
+    /// `certificate_list`.
+    ///
+    /// RFC 8446 §4.4.2 makes the empty list the answer whenever there is
+    /// nothing to put in it, and this is the one place that decides whether
+    /// there is: no key configured, a key whose scheme the request never
+    /// offered, or a `client_certificate_type` the RFC 7250 §4.1 default left
+    /// at X.509 — for which a bare `SubjectPublicKeyInfo` is not an answer at
+    /// all. A *server* wants one of these three; anything less has to be the
+    /// empty list, because the alternative is a flight with no Certificate in
+    /// it and a `Finished` the peer reads as one.
+    fn clientAuthScheme(self: *const Tls13Handshake) ?tls.SignatureScheme {
+        if (self.config.client_certificate == null) return null;
+        if (!clientCertificateIsRaw(self)) return null;
+        return self.client_sig_scheme;
     }
 
     // ─── Server states ───────────────────────────────────────────────
@@ -2854,37 +3131,85 @@ pub const Tls13Handshake = struct {
                     return error.TransportParameterError;
                 };
             } else if (etype == @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation)) {
-                // Parse client's ALPN list and try to match with our configured ALPNs
+                // The server's own order is the one that decides. `config.alpn`
+                // is what this side prefers, so the outer walk is ours and the
+                // inner one the client's: the first entry here the peer also
+                // named is the protocol. Walking the client's list instead
+                // hands the selection to a peer that leads with a protocol we
+                // serve later, which is the opposite of what a preference
+                // order means to the caller that registered these entries in
+                // it. RFC 7301 §3.2 asks only that the echoed name be one the
+                // client advertised, so this is the server's to choose.
+                // RFC 7301 §3.1 types `protocol_name_list` at `2..2^16-1`, so a
+                // body that cannot hold the list's own length is not a list with
+                // nothing in it: the `else` below refuses it. A ClientHello that
+                // advertises no protocol carries no extension at all, which is
+                // the case this whole branch is not reached for.
                 if (elen >= 2) {
-                    const list_len = readU16(ext_data[ext_pos..]);
-                    var alpn_pos: usize = 2;
+                    // RFC 7301 §3.1's `protocol_name_list` is measured against
+                    // a byte count, so the peer's length is read as a `usize`:
+                    // a peer that writes `ff ff` names a list longer than any
+                    // buffer, and adding two to it in a `u16` would overflow
+                    // before the comparison below could answer that.
+                    const list_len: usize = readU16(ext_data[ext_pos..]);
+                    // Every entry is read once here, before the selection below
+                    // and outside it. RFC 7301 §3.1 types each entry as
+                    // `ProtocolName`, `opaque <1..2^8-1>`, and says "Empty
+                    // strings MUST NOT be included": an entry of no length is
+                    // a `decode_error` and not a name. It is refused here rather
+                    // than inside the walk because that walk matches against
+                    // `config.alpn`, which is a caller's own list, and a caller
+                    // may hold an empty name in it — the entry below would then
+                    // pair with the peer's and record no protocol at all, which
+                    // is what `negotiatedAlpn` then reads as its fallback.
+                    var name_pos: usize = 2;
+                    while (name_pos < 2 + list_len and name_pos < elen) {
+                        const proto_len = ext_data[ext_pos + name_pos];
+                        if (proto_len == 0) return error.DecodeError;
+                        name_pos += 1 + proto_len;
+                    }
                     var matched = false;
-                    while (alpn_pos < 2 + list_len and alpn_pos + 1 <= elen) {
-                        const proto_len = ext_data[ext_pos + alpn_pos];
-                        alpn_pos += 1;
-                        if (alpn_pos + proto_len > elen) break;
-                        const proto = ext_data[ext_pos + alpn_pos ..][0..proto_len];
-                        for (self.config.alpn) |our_proto| {
-                            // An entry this stack cannot hold whole is not one
-                            // it can match: `selected_alpn` is where the
-                            // selection lives, and a prefix of a protocol name
-                            // is a different protocol. Skipping it leaves the
-                            // offer unmatched, which is the refusal below.
-                            if (our_proto.len > self.selected_alpn.len) continue;
-                            if (std.mem.eql(u8, proto, our_proto)) {
-                                matched = true;
-                                @memcpy(self.selected_alpn[0..proto.len], proto);
-                                self.selected_alpn_len = proto.len;
-                                break;
-                            }
+                    selection: for (self.config.alpn) |our_proto| {
+
+                        // This walk does not repeat the empty-name refusal, and
+                        // the order is what makes that sound: a zero-length
+                        // `ProtocolName` is refused before this walk can reach
+                        // it, so it is a `decode_error` rather than an entry the
+                        // walk steps over — including in a list of nothing but
+                        // empty entries, which is that rather than the
+                        // `no_application_protocol` below.
+
+                        // An entry this stack cannot hold whole is not one
+                        // it can match: `selected_alpn` is where the
+                        // selection lives, and a prefix of a protocol name
+                        // is a different protocol. Skipping it leaves the
+                        // offer unmatched, which is the refusal below.
+                        if (our_proto.len > self.selected_alpn.len) continue;
+                        var alpn_pos: usize = 2;
+                        while (alpn_pos < 2 + list_len and alpn_pos + 1 <= elen) {
+                            const proto_len = ext_data[ext_pos + alpn_pos];
+                            alpn_pos += 1;
+                            if (alpn_pos + proto_len > elen) break;
+                            const proto = ext_data[ext_pos + alpn_pos ..][0..proto_len];
+                            alpn_pos += proto_len;
+                            if (!std.mem.eql(u8, proto, our_proto)) continue;
+                            @memcpy(self.selected_alpn[0..proto.len], proto);
+                            self.selected_alpn_len = proto.len;
+                            matched = true;
+                            break :selection;
                         }
-                        if (matched) break;
-                        alpn_pos += proto_len;
                     }
-                    if (!matched and self.config.alpn.len > 0) {
-                        return error.NoApplicationProtocol;
-                    }
-                }
+                    // RFC 7301 §3.2: "In the event that the server supports no
+                    // protocols that the client advertises, then the server
+                    // SHALL respond with a fatal no_application_protocol
+                    // alert." An offer list with nothing in it supports none of
+                    // what the client named, so this is that refusal: the walk
+                    // above selected nothing, and letting a peer through with
+                    // no protocol at all is the outcome the section forbids. A
+                    // ClientHello carrying no ALPN extension never reaches here
+                    // — nothing was advertised, so nothing is echoed.
+                    if (!matched) return error.NoApplicationProtocol;
+                } else return error.DecodeError;
             } else if (etype == @intFromEnum(tls.ExtensionType.pre_shared_key)) {
                 // PSK extension must be the last one (RFC 8446 §4.2.11)
                 psk_ext_offset = ext_pos;
@@ -2896,11 +3221,54 @@ pub const Tls13Handshake = struct {
             } else if (etype == @intFromEnum(tls.ExtensionType.signature_algorithms)) {
                 if (elen < 2 or @as(usize, readU16(ext_data[ext_pos..])) + 2 != elen or elen % 2 != 0) return error.DecodeError;
                 sig_algs = ext_data[ext_pos + 2 ..][0 .. elen - 2];
+            } else if (etype == @intFromEnum(tls.ExtensionType.client_certificate_type)) {
+                // RFC 8446 §4.2 allows one copy of an extension per block, and
+                // a second copy is refused rather than treated as a better
+                // offer: which of two copies wins is precisely what a second
+                // copy would be for. The field doubles as the "have I seen it"
+                // record, because it only leaves its initial value here.
+                if (self.negotiated_client_certificate_type != .x509) return error.IllegalParameter;
+                const offer = parseCertificateTypeOffer(ext_data[ext_pos..][0..elen]) catch
+                    return error.DecodeError;
+                // RFC 7250 §4.2, outcome 2: this server has exactly one
+                // certificate type to give, so a client that did not offer it
+                // has nothing in common and the session ends. There is no
+                // X.509 to fall back to — `liftEd25519Spki` is the whole of
+                // this stack's certificate validation and it reads a raw
+                // `SubjectPublicKeyInfo` or nothing.
+                if (!offerContains(offer, negotiated_certificate_type)) {
+                    return error.UnsupportedCertificate;
+                }
+                self.negotiated_client_certificate_type = negotiated_certificate_type;
+            } else if (etype == @intFromEnum(tls.ExtensionType.server_certificate_type)) {
+                if (self.negotiated_server_certificate_type != .x509) return error.IllegalParameter;
+                const offer = parseCertificateTypeOffer(ext_data[ext_pos..][0..elen]) catch
+                    return error.DecodeError;
+                // The same outcome 2 for the other extension: this is the type
+                // this server would sign its own flight with, and a client
+                // that cannot read one of those cannot verify this handshake.
+                if (!offerContains(offer, negotiated_certificate_type)) {
+                    return error.UnsupportedCertificate;
+                }
+                self.negotiated_server_certificate_type = negotiated_certificate_type;
             }
             ext_pos += elen;
         }
 
         if (!found_key_share) return error.NoKeyShare;
+
+        // RFC 7250 §4.1: a client that omits an extension has selected X.509
+        // by default, and this stack has no X.509 verifier to fall back to —
+        // so an absent offer is a refusal here rather than a default. It is
+        // settled after the key share and with the other obligations this
+        // message carries, so a hello wrong in more than one way is reported
+        // for the one a client can act on first.
+        if (self.negotiated_server_certificate_type != negotiated_certificate_type or
+            self.negotiated_client_certificate_type != negotiated_certificate_type)
+        {
+            return error.MissingExtension;
+        }
+
         // The connection-wide policy, unless the entry the SNI selected names
         // one of its own. An entry that names none inherits what the
         // connection set: a statement about which certificate is served is
@@ -3045,11 +3413,19 @@ pub const Tls13Handshake = struct {
         var buf: [1024]u8 = undefined;
         // RFC 7301 §3.1: exactly the one protocol selected, never our list.
         const selected = [_][]const u8{self.selected_alpn[0..self.selected_alpn_len]};
+        // What the next message is, decided once: a CertificateRequest is
+        // asked for whenever a policy is in force, PSK or not; only this
+        // server's own Certificate is what a PSK removes. RFC 7250 §4.2
+        // reads that same fact — `client_certificate_type` is named only
+        // when a CertificateRequest follows — so one value decides both the
+        // extension and the state, rather than two that could disagree.
+        const request_client_certificate = self.client_auth != null;
         const msg = buildEncryptedExtensionsFromEncoded(
             &buf,
             if (self.selected_alpn_len > 0) &selected else &.{},
             self.tp_encoded[0..self.tp_encoded_len],
             self.zero_rtt_accepted, // early_data only answers a client that asked
+            request_client_certificate,
         ) catch return error.InternalError;
 
         self.transcript.update(msg);
@@ -3057,10 +3433,7 @@ pub const Tls13Handshake = struct {
         @memcpy(self.out_buf[0..msg.len], msg);
         self.out_len = msg.len;
 
-        // What the next message is, decided once. A CertificateRequest is
-        // asked for whenever a policy is in force, PSK or not; only this
-        // server's own Certificate is what a PSK removes.
-        self.state = if (self.client_auth != null)
+        self.state = if (request_client_certificate)
             .server_send_certificate_request
         else if (self.using_psk)
             .server_send_finished
@@ -3201,16 +3574,19 @@ pub const Tls13Handshake = struct {
     /// Whether this handshake may declare the connection complete.
     ///
     /// A policy in force means the connection completes only on an identity
-    /// this server verified. `serverProcessClientCertificate` is the sole
-    /// writer of `peer_node_id` and the sole comparison of
-    /// `auth.expect_node_id`, and a PSK does not reach it — which is
-    /// exactly why this is asked separately: the state machine routes a
-    /// resumed connection through the CertificateRequest just as it routes
-    /// a full one, and this refuses the handshake rather than the
-    /// connection if some future path ever skips it. Both writers of
+    /// this server verified, and a pin is asked for even where the mode would
+    /// let a client through with nothing: `.optional` is about what to do with
+    /// a client that has no certificate, not about which node may be absent.
+    /// `serverProcessClientCertificate` is the sole writer of `peer_node_id`
+    /// and the sole comparison of `auth.expect_node_id`, and a PSK does not
+    /// reach it — which is exactly why this is asked separately: the state
+    /// machine routes a resumed connection through the CertificateRequest
+    /// just as it routes a full one, and this refuses the handshake rather
+    /// than the connection if some future path ever skips it. Both writers of
     /// `connected` ask it, so there is one answer and no flag to remember.
     fn serverIdentityEstablished(self: *const Tls13Handshake) bool {
         const auth = self.client_auth orelse return true;
+        if (auth.expect_node_id != null) return self.peer_node_id != null;
         return auth.mode == .optional or self.peer_node_id != null;
     }
 
@@ -3231,7 +3607,14 @@ pub const Tls13Handshake = struct {
         // this stack would have to walk — and would not.
         var certs: [1][]const u8 = undefined;
         const list = (try parseCertificateList(msg[4..], &certs)) orelse {
-            if (auth.mode == .required) return error.CertificateRequired;
+            // An empty `certificate_list` is RFC 8446 §4.4.2's answer for a
+            // client with nothing to offer, and it is an answer only where
+            // nothing was asked. `.optional` waives the certificate; a pin is
+            // a demand for the node itself, which an empty list is not. So a
+            // pin refuses here too, which is what keeps the `optional` answer
+            // below from completing a connection whose peer this server never
+            // identified.
+            if (auth.mode == .required or auth.expect_node_id != null) return error.CertificateRequired;
             self.transcript.update(msg);
             self.state = .server_wait_client_finished;
             return ._continue;
@@ -3728,6 +4111,16 @@ pub const Tls13Handshake = struct {
                 // RFC 7301 §3.1: exactly one protocol, and one we offered.
                 const d = ext_data[ext_pos..][0..elen];
                 if (d.len < 3 or readU16(d) != d.len - 2 or @as(usize, d[2]) + 3 != d.len) return error.DecodeError;
+                // RFC 7301 §3.1 types the name a selection carries as
+                // `opaque <1..2^8-1>` and says "Empty strings MUST NOT be
+                // included", so `{0, 1, 0}` is not a selection of no protocol:
+                // all three checks above pass for it and `proto` below would be
+                // the empty string, which leaves `selected_alpn_len` at zero —
+                // what `negotiatedAlpn` reads as "nothing was selected" and
+                // falls back from. Refused here, ahead of the membership loop
+                // and not inside it: `config.alpn` is a caller's own list and
+                // may hold an empty name for this to match.
+                if (d[2] == 0) return error.DecodeError;
                 const proto = d[3..];
                 for (self.config.alpn) |ours| {
                     if (std.mem.eql(u8, ours, proto)) break;
@@ -3735,11 +4128,43 @@ pub const Tls13Handshake = struct {
                 if (proto.len > self.selected_alpn.len) return error.IllegalParameter;
                 @memcpy(self.selected_alpn[0..proto.len], proto);
                 self.selected_alpn_len = proto.len;
+            } else if (etype == @intFromEnum(tls.ExtensionType.server_certificate_type)) {
+                // RFC 8446 §4.2: one copy of an extension per block, and the
+                // field is the record of whether one was seen.
+                if (self.negotiated_server_certificate_type != .x509) return error.IllegalParameter;
+                const selected = parseCertificateTypeSelection(ext_data[ext_pos..][0..elen]) catch
+                    return error.DecodeError;
+                // RFC 7250 §4.2: the selection must be one the client offered,
+                // and the only one this client offers is the raw key. A
+                // server that answers with anything else has chosen a
+                // certificate format this handshake cannot read — the
+                // receiving half of the downgrade this check exists for.
+                if (selected != negotiated_certificate_type) return error.IllegalParameter;
+                self.negotiated_server_certificate_type = selected;
+            } else if (etype == @intFromEnum(tls.ExtensionType.client_certificate_type)) {
+                if (self.negotiated_client_certificate_type != .x509) return error.IllegalParameter;
+                const selected = parseCertificateTypeSelection(ext_data[ext_pos..][0..elen]) catch
+                    return error.DecodeError;
+                if (selected != negotiated_certificate_type) return error.IllegalParameter;
+                self.negotiated_client_certificate_type = selected;
             }
             ext_pos += elen;
         }
     }
 };
+
+/// Whether the client may present a raw `SubjectPublicKeyInfo` as its own
+/// certificate.
+///
+/// A single answer rather than something the caller of `step` has to
+/// combine: RFC 8446 §4.4.2 says the answer to a CertificateRequest this
+/// client cannot meet in the server's own terms is an *empty* certificate_list,
+/// so "not negotiated" is an answer to send rather than an error to raise — a
+/// server that required a certificate says so itself, with
+/// `certificate_required`.
+pub fn clientCertificateIsRaw(self: *const Tls13Handshake) bool {
+    return self.negotiated_client_certificate_type == negotiated_certificate_type;
+}
 
 // ─── Message builders ────────────────────────────────────────────────
 
@@ -3914,6 +4339,16 @@ fn buildClientHello(
     pos += 2;
     writeU16(buf[pos..], @intFromEnum(tls.NamedGroup.secp256r1));
     pos += 2;
+
+    // RFC 7250 §4.1: both offers, each a single-entry list. This is what
+    // makes the peer's `Certificate` payload a bare Ed25519
+    // `SubjectPublicKeyInfo` rather than an X.509 certificate this stack has
+    // no way to read, and it is the first flight, so a peer that does not
+    // speak RFC 7250 refuses here rather than after the certificate it cannot
+    // present. `pre_shared_key` must stay last (RFC 8446 §4.2.11), and this
+    // is nowhere near it.
+    pos = writeCertificateTypeOffer(buf, pos, .client_certificate_type);
+    pos = writeCertificateTypeOffer(buf, pos, .server_certificate_type);
 
     // SNI extension
     if (server_name) |sni| {
@@ -4135,11 +4570,24 @@ fn buildServerHello(
     return buf[0..pos];
 }
 
+/// Builds the TLS 1.3 EncryptedExtensions this server answers a
+/// ClientHello with.
+///
+/// `request_client_certificate` is whether a CertificateRequest follows
+/// this message, and it is the whole of the difference between the two
+/// RFC 7250 selections: §4.2 requires `server_certificate_type` whenever the
+/// server chose raw public keys for its own `Certificate`, and requires
+/// `client_certificate_type` to be *omitted* unless the server asks for a
+/// client certificate. ozai authenticates both ends, so both are on the wire
+/// there; a server with no `client_auth` sends one and says nothing about the
+/// other, which is what the RFC asks for and what a client with nothing to
+/// present needs to hear.
 fn buildEncryptedExtensionsFromEncoded(
     buf: []u8,
     alpn_list: []const []const u8,
     tp_encoded_data: []const u8,
     include_early_data: bool,
+    request_client_certificate: bool,
 ) ![]const u8 {
     var pos: usize = 4; // reserve for header
 
@@ -4162,6 +4610,15 @@ fn buildEncryptedExtensionsFromEncoded(
             @memcpy(buf[pos..][0..proto.len], proto);
             pos += proto.len;
         }
+    }
+
+    // RFC 7250 §4.2: what the `Certificate` payload will carry, in both
+    // directions. Each is the one permitted value the client offered, and the
+    // count in front of the list is gone — the selection is a bare
+    // `CertificateType`, not a list of them.
+    pos = writeCertificateTypeSelection(buf, pos, .server_certificate_type);
+    if (request_client_certificate) {
+        pos = writeCertificateTypeSelection(buf, pos, .client_certificate_type);
     }
 
     // QUIC transport parameters (pre-encoded)
@@ -4344,6 +4801,33 @@ fn writeExtHeader(buf: []u8, pos: usize, ext_type: u16, ext_len: usize) usize {
     writeU16(buf[pos..], ext_type);
     writeU16(buf[pos + 2 ..], @intCast(ext_len));
     return pos + 4;
+}
+
+/// Writes the RFC 7250 §3 extension `ext_type` carrying the offer this stack
+/// makes — a single-entry list naming `negotiated_certificate_type` — and
+/// returns the position after it.
+///
+/// The length is a constant and both messages that use this are built into a
+/// buffer this stack sizes itself, so there is nothing to measure: a client
+/// that cannot hold eleven more bytes of fixed extension block is a client
+/// whose `ClientHello` is already out of room, and `buildClientHello` reports
+/// that on the parts it measures (`extFits`) rather than here.
+fn writeCertificateTypeOffer(buf: []u8, pos: usize, ext_type: tls.ExtensionType) usize {
+    const next = writeExtHeader(buf, pos, @intFromEnum(ext_type), certificate_type_offer_len);
+    const body = encodeCertificateTypeOffer(buf[next..], negotiated_certificate_type) catch
+        unreachable; // the header just reserved certificate_type_offer_len bytes
+    return next + body.len;
+}
+
+/// Writes the RFC 7250 §3 extension `ext_type` carrying the selection this
+/// server makes, and returns the position after it. The mirror of
+/// `writeCertificateTypeOffer` in every byte but the one the RFC's grammar
+/// drops: the count goes with the list.
+fn writeCertificateTypeSelection(buf: []u8, pos: usize, ext_type: tls.ExtensionType) usize {
+    const next = writeExtHeader(buf, pos, @intFromEnum(ext_type), certificate_type_selection_len);
+    const body = encodeCertificateTypeSelection(buf[next..], negotiated_certificate_type) catch
+        unreachable; // the header just reserved certificate_type_selection_len bytes
+    return next + body.len;
 }
 
 fn readU16(data: []const u8) u16 {
@@ -4778,9 +5262,10 @@ test "loopback handshake: the server answers with the one ALPN it chose" {
         .expect_peer_node_id = server.node_id,
     }, tp, entropy.random());
     try driveLoopback(&cli, &srv, entropy.random());
-    // The client's order wins; both sides must agree on it.
-    try std.testing.expectEqualStrings("moqt-17", srv.negotiatedAlpn());
-    try std.testing.expectEqualStrings("moqt-17", cli.negotiatedAlpn());
+    // This side's order decides where the lists disagree: the server prefers
+    // moqt-18 to moqt-17, and both ends must agree on the one that won.
+    try std.testing.expectEqualStrings("moqt-18", srv.negotiatedAlpn());
+    try std.testing.expectEqualStrings("moqt-18", cli.negotiatedAlpn());
 }
 
 fn driveLoopback(client: *Tls13Handshake, server: *Tls13Handshake, random: std.Random) !void {
@@ -5081,11 +5566,11 @@ test "server: early_data in EncryptedExtensions only answers a client that offer
     var buf: [512]u8 = undefined;
     const alpn = [_][]const u8{"h3"};
 
-    const without = try buildEncryptedExtensionsFromEncoded(&buf, &alpn, &.{}, false);
+    const without = try buildEncryptedExtensionsFromEncoded(&buf, &alpn, &.{}, false, false);
     const len_without = without.len;
 
     var buf2: [512]u8 = undefined;
-    const with = try buildEncryptedExtensionsFromEncoded(&buf2, &alpn, &.{}, true);
+    const with = try buildEncryptedExtensionsFromEncoded(&buf2, &alpn, &.{}, true, false);
 
     // The extension is 4 bytes of header and no payload (RFC 8446 §4.2.10).
     try std.testing.expectEqual(len_without + 4, with.len);
@@ -6389,9 +6874,13 @@ test "QUIC client certificates: a raw SPKI identity, required or optional" {
     ));
     try std.testing.expectEqualSlices(u8, &client.spki, peer.?);
 
-    // Asked, and silent. `.required` refuses that; `.optional` completes with
+    // Asked, and silent. `.required` refuses that. `.optional` completes with
     // no client identity at all, which is a server that asked and took the
-    // answer for what it was.
+    // answer for what it was — but only once the pin is off, because a pin is a
+    // demand for a certificate that `.optional` does not waive (see
+    // `ClientAuth.Mode.optional`). `mode` is what this sub-case is about, so it
+    // is the pin that leaves, and it leaves here rather than at `auth`'s
+    // declaration, where the two sub-cases above still need it.
     var silent = clientConfig(server.node_id, &client);
     silent.client_certificate = null;
     try std.testing.expectEqual(refused(error.CertificateRequired), try handshake(
@@ -6401,6 +6890,10 @@ test "QUIC client certificates: a raw SPKI identity, required or optional" {
         &peer,
         &buf,
     ));
+    // `mode` decides what to do with a client that has nothing; the pin is a
+    // demand for a certificate, and it is not waived. So this sub-case reads
+    // `mode` on its own.
+    auth.expect_node_id = null;
     auth.mode = .optional;
     try std.testing.expectEqual(null, try handshake(
         gpa,
@@ -6413,9 +6906,12 @@ test "QUIC client certificates: a raw SPKI identity, required or optional" {
 
     // Asked, and answered with somebody else's key. The CertificateRequest
     // offers no issuer to choose from, so there is nothing a client can do
-    // here but present the wrong identity.
+    // here but present the wrong identity. The pin is back in play because
+    // this sub-case is about which key the client may carry, and the mode is
+    // back to `.required`.
     var wrong = silent;
     wrong.client_certificate = stranger.certificate();
+    auth.expect_node_id = client.node_id;
     auth.mode = .required;
     try std.testing.expectEqual(refused(error.BadCertificate), try handshake(
         gpa,
@@ -6439,6 +6935,28 @@ test "parseCertificateRequest and parseCertificateList reject malformed input" {
     }
     try std.testing.expectError(error.IllegalParameter, parseCertificateRequest(&.{ 1, 0, 0, 0 }));
     try std.testing.expectError(error.MissingExtension, parseCertificateRequest(&.{ 0, 0, 0 }));
+
+    // A list length that a `u16` addition cannot hold. Nine bytes, and every
+    // length in them closes: an empty context, a six-byte extension block, one
+    // `signature_algorithms` extension of two bytes whose own list length is
+    // `ff ff`. Read as a `u16`, `ff ff + 2` is an integer overflow and the
+    // process aborts before the comparison can answer — so the failure this
+    // case exists for is a crash and not a wrong expectation. That is also why
+    // the body is written out here rather than filled until it looks large:
+    // nothing in it is large except the one length that traps, and a constant
+    // has no unwritten bytes for a reader to wonder about.
+    const overflowing: [9]u8 = .{
+        0, // certificate_request_context, empty
+        0,
+        6, // extensions<0..2^16-1>, and 3 + 6 closes the nine
+        0,
+        @intFromEnum(tls.ExtensionType.signature_algorithms),
+        0,
+        2, // extension_data<0..2^16-1>, and 7 + 2 closes it
+        0xff,
+        0xff, // SignatureScheme supported_signature_algorithms<2..2^16-1>
+    };
+    try std.testing.expectError(error.DecodeError, parseCertificateRequest(&overflowing));
 
     var chain: [2][]const u8 = undefined;
     try std.testing.expectEqual(null, try parseCertificateList(&.{ 0, 0, 0, 0 }, &chain));
@@ -6550,10 +7068,15 @@ test "a ServerHello whose extension block runs past the message is refused" {
         else => unreachable,
     };
 
+    // The server offers the one protocol this client does. RFC 7301 §3.2
+    // refuses a server that supports none of what a client advertised, and a
+    // refusal here would take away the ServerHello this vector is about.
+    // `sh.len > 0` below is the fixture's own proof that one was produced; what
+    // the vector claims is the `DecodeError` the client answers with.
     var server = try Tls13Handshake.initServer(.{
         .cert_chain_der = &.{},
         .private_key_bytes = &.{},
-        .alpn = &.{},
+        .alpn = &[_][]const u8{"h3"},
     }, .{}, random);
     server.provideData(ch);
     var sh: []const u8 = &.{};

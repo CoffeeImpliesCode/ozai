@@ -3,7 +3,7 @@
 //!
 //! `transport/socket.zig` owns a `Socket`; this file owns every call that has
 //! to happen before there is one or before there is anything to send on it.
-//! Four of them, and they are the only four:
+//! Four steps, and the one function that runs them in order:
 //!
 //!   * `createSocket` and `createWake` — the two descriptors, opened with
 //!     every flag that has to be set before the first byte.
@@ -13,6 +13,18 @@
 //!     once, where a guessed `Capability` would be worse than none.
 //!   * `setOption` and the flags above it — the one `setsockopt` every other
 //!     option in this module is a spelling of.
+//!
+//!   * `open` — the four steps above, in the order they have to happen in.
+//!
+//! **The order they happen in is a socket-wide fact, so the order is here
+//! too.** `open` below is the whole of it: descriptor, reuse options,
+//! capability probe, wake, bind, name read back. Both reuse options take
+//! effect before the bind, and the congestion option has to be probed after
+//! them, because the port is not the socket's until `bind` answers and a
+//! socket refused on its own options never reached the point of having a wait
+//! to wake. A caller that ran the steps in another order would get a working
+//! socket with a wrong capability, which is the failure `probe` exists to
+//! prevent.
 //!
 //! **A `Capability` here is asked for, never assumed.** A driver that quietly
 //! ignores `UDP_SEGMENT` turns every batch into a stalled path and nothing
@@ -92,6 +104,84 @@ pub const OpenError = error{
     /// `EBADF`, `ENOTSOCK`, `ENOSPC`, or anything else.
     Unexpected,
 };
+
+/// What to set on a socket before the bind.
+pub const Options = struct {
+    /// `SO_REUSEADDR`, for a rebind inside the reuse window. On by default
+    /// because an endpoint that comes back on the port it held is the case it
+    /// exists for, and it costs nothing when nothing else is bound there.
+    reuse_addr: bool = true,
+    /// `SO_REUSEPORT`, for a v4 and a v6 socket sharing one port. Off by
+    /// default: it lets a second descriptor take the same address and port
+    /// and a share of the datagrams, which is a decision to make on purpose.
+    reuse_port: bool = false,
+};
+
+/// A socket and its wake, bound and ready to carry a datagram.
+///
+/// The four values `open` had to learn to build a `Socket`, and nothing else:
+/// which descriptors, what the socket can do, which family decides which
+/// control message carries the codepoint, and where the kernel actually bound
+/// it. It is a value rather than a callback so that `socket.zig`'s `create` is
+/// the naming of this and not a second copy of it.
+pub const Bound = struct {
+    /// The datagram descriptor, `O_NONBLOCK` from the moment it existed.
+    handle: c.fd_t,
+    /// The descriptor a stop writes to.
+    wake: c.fd_t,
+    /// What the socket said it can do, asked once at open.
+    caps: batch.Capability,
+    /// Which control message carries the codepoint here.
+    family: batch.Family,
+    /// Where it is bound, with the ephemeral port the kernel chose written in.
+    address: base_addr.SocketAddr,
+};
+
+/// Open a datagram socket on `address`, set `options`, ask what it can do,
+/// and bind it.
+///
+/// The probe runs here and only here. A `Capability` that is guessed rather
+/// than asked is worse than none, because a driver that quietly ignores
+/// `UDP_SEGMENT` turns every batch into a stalled path and nothing reports it.
+///
+/// **On success both descriptors are owned by the caller** and a refusal at
+/// any step closes the ones already opened: a socket that was never bound and
+/// a wake nobody will ever wait on are both leaks, and neither is visible from
+/// the error. Do not close either descriptor again; `socket.zig`'s `close` is
+/// the one release.
+pub fn open(address: base_addr.SocketAddr, options: Options) OpenError!Bound {
+    const family: batch.Family = batch.Family.of(address.ip);
+    const handle = try createSocket(family);
+    errdefer _ = c.close(handle);
+    // Reuse options first and the congestion option after, because both take
+    // effect before the bind: the port is not the socket's until `bind`
+    // answers.
+    if (options.reuse_addr) {
+        setFlag(handle, linux.SOL.SOCKET, linux.SO.REUSEADDR, true) catch |err| {
+            return openFromOption(err);
+        };
+    }
+    if (options.reuse_port) {
+        setFlag(handle, linux.SOL.SOCKET, linux.SO.REUSEPORT, true) catch |err| {
+            return openFromOption(err);
+        };
+    }
+    const caps = try probe(handle, family);
+    // After the probe: a socket refused on its own options never reached the
+    // point of having a wait to wake.
+    const wake = try createWake();
+    errdefer _ = c.close(wake);
+    var name: c.sockaddr.storage = undefined;
+    const length = ancillary.writeSockaddr(address, &name);
+    try bindSocket(handle, &name, length);
+    return .{
+        .handle = handle,
+        .wake = wake,
+        .caps = caps,
+        .family = family,
+        .address = try boundAddress(handle),
+    };
+}
 
 /// Open the datagram descriptor for `family`.
 pub fn createSocket(family: batch.Family) OpenError!c.fd_t {

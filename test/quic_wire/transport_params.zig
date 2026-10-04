@@ -159,7 +159,7 @@ fn preferredAddress(value: []const u8) Reason!tp.PreferredAddress {
     if (value.len != 41 + @as(usize, out.cid_len)) return error.bad_parameter;
     const cid_len: usize = out.cid_len;
     @memcpy(out.cid_buf[0..cid_len], value[25..][0..cid_len]);
-    @memcpy(out.stateless_reset_token[0..], value[41 + cid_len ..]);
+    @memcpy(out.stateless_reset_token[0..], value[25 + cid_len ..][0..16]);
     return out;
 }
 
@@ -337,4 +337,129 @@ pub fn check(input: []const u8) Error!void {
 
     const params = tp.TransportParams.decode(input) catch return error.TestExpectedError;
     try checkDecoded(input, params, shape);
+}
+
+/// RFC 9000 §9.6's preferred address written out on the wire by hand: the
+/// parameter id `0x0d`, the declared length, and then §18.2's fixed field
+/// order — IPv4 address and port, IPv6 address and port, the connection id
+/// length, the connection id, and the 16-octet stateless reset token. The
+/// count is §9.6's own arithmetic and not the decoder's: 4 + 2 + 16 + 2 + 1
+/// for the fixed part, 41 octets, then an 8-octet id and a 16-octet token is
+/// 49, and 49 is a one-octet varint.
+///
+/// Nothing here was produced by an encoder, so a decoder that read the token
+/// from a window that is empty on these bytes has nothing in this buffer to
+/// agree with it by accident. The id is eight octets and the token sixteen,
+/// so this is the first fixture on this side of the oracle that reaches
+/// `preferredAddress` past its length guard at all.
+const valid_preferred_address = [_]u8{
+    0x0d, 0x31, // preferred_address, 49 octets
+    // IPv4 address 192.0.2.1 (RFC 5737) and port 4433.
+    192,  0,
+    2,    1,
+    0x11, 0x51,
+    // IPv6 address 2001:db8::1 (RFC 3849) and port 8443.
+    0x20, 0x01,
+    0x0d, 0xb8,
+    0,    0,
+    0,    0,
+    0,    0,
+    0,    0,
+    0,    0,
+    0,    0x01,
+    0x20, 0xfb,
+    // Connection id length 8, then the connection id.
+    0x08, 0xc1,
+    0x7a, 0x05,
+    0xbe, 0xef,
+    0x30, 0x9d,
+    0x4f,
+    // The stateless reset token, which is the only part of this offer that
+    // makes a reset for the migrated connection recognisable: sixteen octets
+    // that are not a repeat of one octet, so a value left at
+    // `PreferredAddress`'s zeroed default cannot match them.
+    0x5e,
+    0xa1, 0x3c,
+    0x77, 0x0d,
+    0xe2, 0x46,
+    0x9b, 0x18,
+    0xc4, 0x60,
+    0xaf, 0x32,
+    0x85, 0xeb,
+    0x11,
+};
+
+/// What §9.6's field order says that buffer carries, written out a second
+/// time and separately from the bytes above. Both readers — this file's own
+/// walk and the core's `decode` — are held against this and against each
+/// other, so neither is ever its own oracle: a walk and a decode that were
+/// wrong in the same way still fail here, and a walk or decode that skipped
+/// the reset token leaves the zeroed default this does not name.
+const wanted_preferred_address: tp.PreferredAddress = .{
+    .ipv4_addr = .{ 192, 0, 2, 1 },
+    .ipv4_port = 4433,
+    .ipv6_addr = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 },
+    .ipv6_port = 8443,
+    .cid_len = 8,
+    .cid_buf = .{
+        0xc1, 0x7a, 0x05, 0xbe, 0xef, 0x30, 0x9d, 0x4f,
+        0,    0,    0,    0,    0,    0,    0,    0,
+        0,    0,    0,    0,
+    },
+    .stateless_reset_token = .{
+        0x5e, 0xa1, 0x3c, 0x77, 0x0d, 0xe2, 0x46, 0x9b,
+        0x18, 0xc4, 0x60, 0xaf, 0x32, 0x85, 0xeb, 0x11,
+    },
+};
+
+/// Oracle for one §9.6 value: every field a consumer of this struct reads,
+/// held against the hand-written expectation rather than against another
+/// decode. The two ports are asked separately from the two addresses because
+/// §9.6 gives an address its port, so a reader that spent one field's two
+/// octets on the other would still have to get both addresses right to pass.
+fn expectPreferred(got: tp.PreferredAddress) Error!void {
+    const want = wanted_preferred_address;
+    if (!std.mem.eql(u8, &got.ipv4_addr, &want.ipv4_addr)) return error.TestExpectedEqual;
+    if (got.ipv4_port != want.ipv4_port) return error.TestExpectedEqual;
+    if (!std.mem.eql(u8, &got.ipv6_addr, &want.ipv6_addr)) return error.TestExpectedEqual;
+    if (got.ipv6_port != want.ipv6_port) return error.TestExpectedEqual;
+    if (got.cid_len != want.cid_len) return error.TestExpectedEqual;
+    if (!std.mem.eql(u8, got.getCid(), want.getCid())) return error.TestExpectedEqual;
+    // §17.2 keeps `cid_buf` at the 20-octet maximum connection id length and
+    // says only `cid_buf[0..cid_len]` is the id, so the rest of the array is
+    // not part of the offer and has to stay at its zero default.
+    if (!std.mem.eql(u8, got.cid_buf[want.cid_len..], want.cid_buf[want.cid_len..])) {
+        return error.TestExpectedEqual;
+    }
+    if (!std.mem.eql(u8, &got.stateless_reset_token, &want.stateless_reset_token)) {
+        return error.TestExpectedEqual;
+    }
+    // §9.6 offers an address through a nonzero port, and that is what
+    // `hasIpv4`/`hasIpv6` answer, so the two accessors are asked rather than
+    // the ports compared a second time.
+    if (!got.hasIpv4()) return error.TestExpectedEqual;
+    if (!got.hasIpv6()) return error.TestExpectedEqual;
+}
+
+test "RFC 9000 §9.6: a valid preferred address keeps its id and reset token" {
+    const bytes = valid_preferred_address[0..];
+    // The fixture's own length, as §9.6's field widths add them up. A buffer
+    // whose body and declared length disagreed would be refused by both
+    // readers and would prove nothing about either of them.
+    if (bytes.len != 2 + (4 + 2 + 16 + 2 + 1 + 8 + 16)) return error.TestExpectedEqual;
+
+    // This file's walk: its own derivation of §9.6's field order, held
+    // against the expectation rather than against the decode.
+    const shape = rfcWalk(bytes) catch return error.TestUnexpectedResult;
+    const oracle = shape.preferred orelse return error.TestUnexpectedResult;
+    try expectPreferred(oracle);
+
+    // The core's decoder, reached the way a peer reaches it.
+    const params = tp.TransportParams.decode(bytes) catch return error.TestExpectedError;
+    const decoded = params.preferred_address orelse return error.TestExpectedResult;
+    try expectPreferred(decoded);
+
+    // And the entry point the fuzz root calls, which is where the two readers
+    // meet over every §18.2 field at once.
+    try check(bytes);
 }

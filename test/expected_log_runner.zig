@@ -23,20 +23,31 @@
 //! under test chose, in the form the default runner printed it. Only the
 //! accounting changes, and only for a message the build named on the command
 //! line:
+//!     --expect-log <scope> <text> [<count>]
 //!
-//!     --expect-log <scope> <text>
-//!
-//! An expectation is a scope and the whole rendered message, compared whole.
-//! Not a severity and not a substring: another TLS failure, the same refusal
+//! An expectation is a scope, the whole rendered message, and how many copies
+//! of that message the run provokes on purpose. The message is compared whole,
+//! not by severity and not by substring: another TLS failure, the same refusal
 //! arriving from the other end, or an error from anywhere else in the stack is
 //! counted and fails the run exactly as it would have without this runner.
 //!
-//! An expectation is spent by the first message that matches it and by no
-//! other: the same refusal arriving a second time is one message too many, and
-//! it fails the run as an error nothing accounted for. A command line that
-//! names one expectation twice is refused before any test runs, because one
-//! message cannot answer two rows and nothing in the run could then say which
-//! of them it answered.
+//! One row names one message, and a row that names no count says one copy of
+//! it. The row is spent once per copy and by no other — the count is the claim,
+//! not a ceiling — so a refusal arriving one time more than the artifact
+//! declared is one message too many, and a row the run did not fill fails as
+//! the stale expectation it then is.
+//!
+//! A count is the only way an artifact can provoke one refusal more than once
+//! and still account for it: two handshakes refused the same way, each refused
+//! by the end that refuses it, is one message said twice rather than two
+//! messages, and a count is what says so — a row names a message, never which
+//! occurrence of it.
+//!
+//! So a command line that names one message twice is refused before any test
+//! runs, whatever count either row carried. One message cannot answer two
+//! rows, and a count says how many copies arrive rather than which row any of
+//! them belongs to, so a second row of the same scope and text is a command
+//! line somebody wrote by accident rather than a claim the run could answer.
 //!
 //! An expectation nothing matched fails the run too, once every test has
 //! reported and the build asks the runner to stop. That is what keeps the list
@@ -75,14 +86,16 @@ const testing = std.testing;
 
 pub const std_options: std.Options = .{ .logFn = log };
 
-/// One tolerated message: the scope it was logged under and the message as it
-/// renders. Both are compared whole, and `seen` records that this expectation
-/// has been spent — that one message has claimed it — so a second copy of that
-/// message finds nothing left to claim.
+/// One tolerated message: the scope it was logged under, the message as it
+/// renders, and how many more copies of it this run will take. The scope and
+/// the message are compared whole, and `remaining` is the count the command
+/// line asked for drawn down one message at a time — a row that named none asks
+/// for one, and a row that named four takes the fourth copy as readily as the
+/// first.
 const Expected = struct {
     scope: []const u8,
     text: []const u8,
-    seen: bool = false,
+    remaining: usize = 1,
 };
 
 /// The arenas the runner itself runs on. `std.testing`'s own allocator is per
@@ -136,16 +149,46 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 "--expect-log takes a scope and a message, and was given neither",
                 .{},
             );
-            if (namedAlready(args[index], args[index + 1])) refuse(
+            const scope = args[index];
+            const text = args[index + 1];
+            index += 2;
+            // The count is the next argument when it is a number, and it is a
+            // number only when every character of it is a digit: that is the
+            // one thing a flag and a message are both not, so it cannot swallow
+            // either. An argument here that is not one is the next argument, and
+            // the bottom of this dispatch refuses it by name rather than
+            // reading it as a count of none.
+            var count: usize = 1;
+            if (index < args.len and isDecimal(args[index])) {
+                count = std.fmt.parseUnsigned(usize, args[index], 10) catch refuse(
+                    "--expect-log was given a count that is not a number:\n" ++
+                        "  --expect-log {s} {s} {s}",
+                    .{ scope, text, args[index] },
+                );
+                if (count == 0) refuse(
+                    "--expect-log was given a count of zero, which expects the " ++
+                        "message never to arrive and says nothing:\n" ++
+                        "  --expect-log {s} {s} 0",
+                    .{ scope, text },
+                );
+                index += 1;
+            }
+            // One message is one row, whatever either row said about how many
+            // copies to expect: two rows of one message are both met by its
+            // first copy, and a count says how many copies arrive rather than
+            // which row any of them belongs to, so the run could never say
+            // which row answered. Provoking one message twice is said by a
+            // count on the one row that names it, never by a second row.
+            if (namedAlready(scope, text)) refuse(
                 "--expect-log names the same expectation twice, and one message " ++
                     "cannot answer two rows:\n  --expect-log {s} {s}",
-                .{ args[index], args[index + 1] },
+                .{ scope, text },
             );
             try expected.append(gpa, .{
-                .scope = args[index],
-                .text = args[index + 1],
+                .scope = scope,
+                .text = text,
+                .remaining = count,
             });
-            index += 2;
         } else if (std.mem.startsWith(u8, arg, "--seed=")) {
             testing.random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
                 @panic("unable to parse --seed command line argument");
@@ -311,12 +354,12 @@ fn runTest(server: *std.zig.Server, init: std.process.Init.Minimal) !void {
 /// is what a second copy of an expected refusal is.
 fn finish() noreturn {
     for (expected.items) |want| {
-        if (!want.seen) {
+        if (want.remaining != 0) {
             std.debug.print(
                 "\nthis run expected an error log no test produced, so nothing it\n" ++
                     "tolerated happened and the expectation is stale:\n" ++
-                    "  [{s}] (err): {s}\n",
-                .{ want.scope, want.text },
+                    "  [{s}] (err): {s} ({d} still owed)\n",
+                .{ want.scope, want.text, want.remaining },
             );
             std.process.exit(1);
         }
@@ -384,19 +427,20 @@ fn log(
     std.debug.print("[{s}] ({s}): {s}\n", .{ @tagName(scope), @tagName(level), text });
 }
 
-/// Whether `text` is a message the build named, spending the one expectation it
-/// matches.
+/// Whether `text` is a message the build named, drawing one expectation down by
+/// one copy.
 ///
-/// The first match and only the first. An expectation is a claim that one
-/// refusal happens once, and a second copy of the same message under the same
-/// scope is one message too many: marking every row again would let the same
-/// refusal answer as many times as it arrived, and a runner that tolerates a
-/// message however often it is said tolerates it not at all.
+/// The first match and only the first. An expectation is a claim about how
+/// often a refusal happens, so it is spent exactly that many times and by no
+/// other: a message with no copies left to claim is one message too many, and
+/// answering it again would let the same refusal account for as many
+/// occurrences as it happened to arrive in, which is a runner that tolerates a
+/// message however often it is said and therefore tolerates it not at all.
 fn accounted(scope: []const u8, text: []const u8) bool {
     for (expected.items) |*want| {
-        if (want.seen) continue;
+        if (want.remaining == 0) continue;
         if (std.mem.eql(u8, want.scope, scope) and std.mem.eql(u8, want.text, text)) {
-            want.seen = true;
+            want.remaining -= 1;
             return true;
         }
     }
@@ -405,14 +449,26 @@ fn accounted(scope: []const u8, text: []const u8) bool {
 
 /// Whether this command line has already named this exact expectation.
 ///
-/// Two rows that say one thing would both be met by one message, and the run
-/// could not say which of them that message answered, so the second row is
-/// refused here rather than left to decide it later.
+/// Two such rows would both be met by one message, and the run could not say
+/// which of them the message answered, so the second is refused here rather
+/// than left to decide it later. A count does not make a row a different row:
+/// it says how many copies of the message to expect, not which occurrence
+/// belongs to which row, so this asks for the scope and the message alone.
 fn namedAlready(scope: []const u8, text: []const u8) bool {
     for (expected.items) |want| {
         if (std.mem.eql(u8, want.scope, scope) and std.mem.eql(u8, want.text, text)) return true;
     }
     return false;
+}
+
+/// Whether every character is a decimal digit, which is what makes an argument
+/// the count that may follow a message rather than the next argument.
+fn isDecimal(arg: []const u8) bool {
+    if (arg.len == 0) return false;
+    for (arg) |char| {
+        if (!std.ascii.isDigit(char)) return false;
+    }
+    return true;
 }
 
 /// Refuse a command line this runner will not run, naming it and stopping.

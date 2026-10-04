@@ -1,5 +1,5 @@
-//! The router: the ALPN table, the handler vtable it dispatches through, and
-//! the two machines the router is — one per connection, one per endpoint.
+//! The router's protocol set: the ALPN table, the handler vtable it dispatches
+//! through, and the value types a connection attempt is carried in.
 //!
 //! Captured 2026-09-30 from n0-computer/iroh commit
 //! 187f59e80afdae6bd9866002b33d3365c00b06d8: `ProtocolHandler` at
@@ -19,6 +19,36 @@
 //! ALPN into a handler call — and what is worth a machine is what surrounds
 //! the call: the accepts may not be cancelled until every handler has finished
 //! shutting down, and an `accept` that fails tells the peer nothing.
+//!
+//! **What this file owns, and what its siblings own.** Everything a caller
+//! needs in order to *hold* a connection attempt is a type here: the bounded
+//! configured protocol set (`Builder`, `Router`, `Entry`, and the
+//! `Claim`/`Route`/`Refusal` a dispatch answers with), the handler vtable, and
+//! the handshake and dispatch values (`Verdict`, `Failure`, `Drop`,
+//! `ConnState`, `ConnEvent`, `Outcome`, `DispatchStep`). The three machines
+//! that move those values are sibling files, each owning one and importing this
+//! one — never the other way round:
+//!
+//! - `dispatch.zig` — one connection attempt, `dispatchStep`.
+//! - `shutdown.zig` — the whole endpoint's close, `Shutdown` and its `Lease`.
+//! - `lifetime.zig` — one configured protocol's own close, `Lifetime`, `Lanes`.
+//!
+//! **Why the split rather than three sections of one file.** None of the
+//! machines needs a runtime and each of them is a decision a caller has to be
+//! able to check without one, but they have three different owners, three
+//! different callers and three different reasons to change. Keeping them here
+//! meant a caller that only registers handlers and reads a `Claim` — the common
+//! case, and what `Node`'s table build is — carried a connection machine, an
+//! endpoint close and a per-protocol close with it, and every reader of a
+//! registration had to page past all three to reach it.
+//!
+//! **Nothing here performs anything that would need a socket.** A handler call
+//! is *named* (`DispatchAction.on_accepting`, `DispatchAction.accept`) and a
+//! close step is *named* (`Shutdown.Action` in `shutdown.zig`, `Lifetime.Action`
+//! in `lifetime.zig`); the layer that performs them owns the runtime —
+//! `src/node/node_runtime.zig` for a node, and `src/endpoint/endpoint.zig`
+//! for the accept loop that hands them over. That split is the reason those
+//! files can be a value and the other one cannot.
 
 const std = @import("std");
 const ula = @import("../base/ula.zig");
@@ -100,11 +130,11 @@ pub const ProtocolHandler = struct {
     /// so it outlives the handshake and can outlive the connection. A handler's
     /// `shutdown` closes connections its own `accept` is still using, so the
     /// router may not cancel the accepts until every handler has been given its
-    /// `shutdown` — which is why `Shutdown` counts running accepts rather than
-    /// remembering that some exist. Here the caller runs the body inside its own
-    /// pass, so "long-lived" means "for as many passes as it takes": a handler
-    /// that wants a connection past this call has to be re-entered by the loop
-    /// driving it, not left running.
+    /// `shutdown` — which is why `shutdown.Shutdown` counts running accepts
+    /// rather than remembering that some exist. Here the caller runs the body
+    /// inside its own pass, so "long-lived" means "for as many passes as it
+    /// takes": a handler that wants a connection past this call has to be
+    /// re-entered by the loop driving it, not left running.
     ///
     /// Called once per connection that got past the handshake, on the thread
     /// stepping the router, with the handle borrowed for the call. An error
@@ -179,7 +209,7 @@ pub const AcceptError = error{
 /// **Nothing under `src/` calls `acceptInternal` today**, so this is a
 /// reservation and not a wired route: a table built in this tree never offers
 /// `/iroh-qad/0`, and a peer that negotiates it is dropped rather than served
-/// (`negotiatingStep`, `router.zig:616-617`). Registering the handler that
+/// (`negotiatingStep` in `dispatch.zig`). Registering the handler that
 /// would answer it is the endpoint layer's job and it has not been done.
 pub const qad_alpn: []const u8 = "/iroh-qad/0";
 
@@ -236,10 +266,14 @@ pub const Builder = struct {
     }
 
     /// Upstream `RouterBuilder::accept`. Registration order is the server's
-    /// preference order: the offer list goes to the endpoint in this order and
-    /// the first ALPN a peer offers that the server also offers is the one
-    /// negotiated (`iroh/src/endpoint.rs:973-977`, `protocol.rs:489-492`), so
-    /// the preferred protocol goes first.
+    /// preference order, and it is the server that decides: the offer list goes
+    /// to the endpoint in this order, and the negotiated protocol is the first
+    /// ALPN in *this* list that the peer also offers, not the first one the peer
+    /// happened to name (RFC 7301 §3.2 — the server chooses from the
+    /// intersection, a client preference does not reorder it; `iroh`'s
+    /// `set_alpns` hands this order over unchanged,
+    /// `iroh/src/endpoint.rs:973-977`, `protocol.rs:489-492`). So the preferred
+    /// protocol goes first.
     pub fn accept(
         self: *Builder,
         alpn: []const u8,
@@ -287,53 +321,147 @@ pub const Builder = struct {
     }
 };
 
-/// An ALPN to handler table.
+/// The configured protocol set: the bounded list of supported ALPNs and the
+/// handler each of them dispatches to.
 ///
 /// `docs/ARCHITECTURE.md`: the router owns ALPN dispatch and nothing else. It
 /// turns a negotiated ALPN into a handler call and knows nothing about what any
 /// protocol does.
+///
+/// **How many protocols an endpoint serves is the caller's choice, bounded by
+/// the slice it sized `Builder` with.** There is no single protocol anywhere in
+/// this file: one is a table of length one, which is what `Node` still builds
+/// (`max_alpns` in `src/node/node_protocol.zig`), and several is the same
+/// table read the same way.
 pub const Router = struct {
     /// The registrations, in registration order. Only `Builder.build` makes one,
     /// and the entries are the caller's.
     entries: []const Entry,
 
-    /// The ALPNs to offer a peer, in registration order. Upstream
-    /// `ProtocolMap::alpns` (`protocol.rs:397-399`) into `spawn`'s `set_alpns`
-    /// (`protocol.rs:515-522`).
+    /// How many protocols this endpoint is configured with: the bounded length
+    /// of the caller's slice. Upstream's bound is the heap (`Vec<Entry>`,
+    /// `protocol.rs:379`); here it is the array the caller sized `Builder`
+    /// with, so it is a property of the storage rather than of a check.
     ///
-    /// A repeated ALPN comes out twice, because that is what upstream offers.
-    pub fn alpns(self: *const Router) AlpnIterator {
-        return .{ .entries = self.entries, .index = 0 };
+    /// **Zero is a real answer, not an empty one.** An endpoint configured with
+    /// no protocol serves nothing and refuses every ALPN, and both halves of
+    /// that fall out of this number rather than out of a special case.
+    pub fn configured(self: *const Router) usize {
+        return self.entries.len;
     }
 
-    /// The registration an ALPN dispatches to: the newest one for it, which is
-    /// the entry upstream's `HashMap::insert` leaves behind
-    /// (`protocol.rs:391-394`).
-    pub fn lookup(self: *const Router, alpn: []const u8) ?*const Entry {
+    /// How many `shutdown` calls a close owes: the number of *distinct* ALPNs
+    /// in the table.
+    ///
+    /// Upstream awaits one future per *map value* (`protocol.rs:404-407`), and a
+    /// map holds one value per ALPN, so a handler registered twice is shut down
+    /// once, as the newer one, because the older one is unreachable
+    /// (`protocol.rs:385-394`, which `Builder.push` reproduces). A count of
+    /// registrations would wait for a `handler_finished` that never comes.
+    ///
+    /// It is counted here and not by the caller because it is a fact about the
+    /// table, and two answers for one count is how a close waits for a report
+    /// that is never sent.
+    pub fn protocolCount(self: *const Router) usize {
+        var distinct: usize = 0;
+        for (self.entries, 0..) |entry, index| {
+            var first = true;
+            for (self.entries[0..index]) |earlier| {
+                if (std.mem.eql(u8, earlier.alpn, entry.alpn)) {
+                    first = false;
+                    break;
+                }
+            }
+            if (first) distinct += 1;
+        }
+        return distinct;
+    }
+
+    /// The ALPNs to offer a peer, in registration order, into storage the
+    /// caller sizes. Upstream `ProtocolMap::alpns` (`protocol.rs:397-399`) into
+    /// `spawn`'s `set_alpns` (`protocol.rs:515-522`).
+    ///
+    /// A repeated ALPN comes out twice, because that is what upstream offers,
+    /// and an under-sized `out` is a count short of the list rather than an
+    /// index panic: this is the function that fills a transport's own bounded
+    /// array, and the caller is the one that sized it.
+    ///
+    /// **This list and `dispatch` read the same bounded set, and that is what
+    /// makes a wrong-protocol refusal clean.** A peer that asks for an ALPN
+    /// this list does not name never reaches a connection at all: the handshake
+    /// fails on the empty intersection (TLS `no_application_protocol`) and the
+    /// router is never asked. `Route.refused` is what is left for the case the
+    /// two halves were configured apart, and it is a refusal the caller reads
+    /// rather than a connection it has to diagnose.
+    ///
+    /// This is the list every lane still serving gets into: `Lanes.offers` in
+    /// `lifetime.zig` is this function with retirement applied.
+    pub fn offers(self: *const Router, out: [][]const u8) usize {
+        var count: usize = 0;
+        while (count < out.len and count < self.entries.len) : (count += 1) {
+            out[count] = self.entries[count].alpn;
+        }
+        return count;
+    }
+
+    /// The protocol an ALPN dispatches to, or the refusal it earns.
+    ///
+    /// The newest registration wins, which is the entry upstream's
+    /// `HashMap::insert` leaves behind (`protocol.rs:391-394`), and the claim
+    /// carries that entry's index so the caller can address this one protocol's
+    /// lifetime lane and its tasks by number rather than comparing ALPN bytes
+    /// a second time.
+    pub fn dispatch(self: *const Router, alpn: []const u8) Route {
         var index = self.entries.len;
         while (index > 0) {
             index -= 1;
-            if (std.mem.eql(u8, self.entries[index].alpn, alpn)) return &self.entries[index];
+            if (!std.mem.eql(u8, self.entries[index].alpn, alpn)) continue;
+            return .{ .protocol = .{ .index = index, .entry = &self.entries[index] } };
         }
-        return null;
+        return .{ .refused = .{ .alpn = alpn, .configured = self.entries.len } };
     }
 };
 
-/// The offer list, one ALPN at a time.
+/// The protocol one ALPN was dispatched to, and where it lives.
 ///
-/// An iterator rather than a slice because the ALPNs live in the entries, and a
-/// `[]const []const u8` over them would be a second copy of the registration
-/// order kept for nothing.
-pub const AlpnIterator = struct {
-    entries: []const Entry,
+/// The index is the whole point of carrying the entry: it is the address of
+/// that protocol's `Lifetime` lane in `Lanes` (`lifetime.zig`) and of the
+/// `protocol` field on every accept task routed to it, so routing a connection
+/// and retiring its protocol are both a number rather than a second comparison
+/// of ALPN bytes.
+pub const Claim = struct {
+    /// Which registration claimed it — the index into `Router.entries`.
     index: usize,
+    /// The registration itself, borrowed for as long as the table is. Its
+    /// handler is the one the caller calls and the one `shutdown` reaches.
+    entry: *const Entry,
+};
 
-    /// Bounded by the entries, so the loop cannot outrun the table.
-    pub fn next(self: *AlpnIterator) ?[]const u8 {
-        if (self.index == self.entries.len) return null;
-        defer self.index += 1;
-        return self.entries[self.index].alpn;
-    }
+/// What a dispatch to the table produced: a protocol, or a refusal.
+///
+/// Exhaustive on purpose, like `DispatchAction.peerOutcome`: a new arm that has
+/// not decided what happens to an ALPN nobody configured does not compile.
+pub const Route = union(enum) {
+    /// A configured protocol claims this ALPN.
+    protocol: Claim,
+    /// No configured protocol claims it, and this is why.
+    refused: Refusal,
+};
+
+/// Why an ALPN reached no protocol.
+///
+/// `Drop.refused_protocol` carries the same value, so the reason a connection
+/// went away and the reason a table declined to claim it are one type rather
+/// than two spellings of one fact.
+pub const Refusal = struct {
+    /// The ALPN that was asked for, borrowed from the peer and never stored.
+    alpn: []const u8,
+    /// How many protocols *are* configured, so a log line says whether the
+    /// peer named something this endpoint does not serve at all or something
+    /// it does not serve *here*. **Zero is a real answer**: an endpoint
+    /// configured with no protocol refuses every ALPN, and that is the
+    /// endpoint `Loop.init` documents, not a failure.
+    configured: usize,
 };
 
 /// What a `retry` verdict means, which upstream's single `Retry` variant does
@@ -419,9 +547,11 @@ pub const Failure = union(enum) {
 pub const Drop = union(enum) {
     /// A stage failed. The peer is told nothing.
     failed: Failure,
-    /// The peer negotiated an ALPN no handler is registered for. Upstream
-    /// warns and returns (`protocol.rs:653-656`).
-    unsupported_alpn: []const u8,
+    /// The peer negotiated an ALPN no configured protocol claims, and the
+    /// refusal says which one and how many are configured. Upstream warns and
+    /// returns (`protocol.rs:653-656`), which is the same ending — see
+    /// `negotiatingStep` in `dispatch.zig`.
+    refused_protocol: Refusal,
     /// An event this state cannot accept. ozai's own arm, with no upstream
     /// counterpart: upstream's accept loop is a `select!` and cannot be fed an
     /// event out of order, but a machine can, and the router is the last place
@@ -498,7 +628,7 @@ pub const DispatchAction = union(enum) {
 /// The four live arms are upstream's four awaits in `handle_connection`
 /// (`protocol.rs:637-671`) in order: the filter rules, the handshake produces
 /// an ALPN, the handler takes the connection, the handler runs on it. Every
-/// other arm is terminal.
+/// other arm is terminal. `dispatch.zig` is what moves between them.
 pub const ConnState = union(enum) {
     /// An attempt has arrived and nothing has been read of it. The filter rules
     /// on this, which is what an `Incoming` is for: it exists so a connection
@@ -563,449 +693,21 @@ pub const Outcome = union(enum) {
 };
 
 /// One step: the next state and the one thing to do about it.
+///
+/// The machine that produces one of these is `dispatchStep` in `dispatch.zig`.
 pub const DispatchStep = struct {
     state: ConnState,
     action: DispatchAction,
 };
 
-/// One step of a connection attempt.
-///
-/// `router` is a parameter, not state: which handler an ALPN resolves to is a
-/// question about the table, and the table is the caller's, so nothing about
-/// the answer is captured where a copy of it could go stale. Pure — the same
-/// table, state and event always give the same step, which is what lets a test
-/// drive a whole connection without a socket or a scheduler.
-pub fn dispatchStep(
-    router: *const Router,
-    state: ConnState,
-    event: ConnEvent,
-) DispatchStep {
-    return switch (state) {
-        .incoming => incomingStep(event),
-        .negotiating => negotiatingStep(router, event),
-        .accepting => |handler| acceptingStep(handler, event),
-        .handling => handledStep(event),
-        // A terminal state absorbs everything. The first ending is the ending,
-        // and a later event claiming otherwise is reported by the state the
-        // caller already has, not by a second verdict written over the first.
-        .retried, .refused, .ignored, .released, .dropped => .{
-            .state = state,
-            .action = .none,
-        },
-    };
-}
-
-fn incomingStep(event: ConnEvent) DispatchStep {
-    const verdict = switch (event) {
-        .filtered => |verdict| verdict,
-        .outcome => return dropped(.{ .out_of_order = event }),
-    };
-    return switch (verdict) {
-        .accept => .{ .state = .negotiating, .action = .negotiate_alpn },
-        .retry => |retry| .{
-            .state = .{ .retried = retry },
-            .action = .{ .send_retry = retry },
-        },
-        .reject => .{ .state = .refused, .action = .refuse },
-        .ignore => .{ .state = .ignored, .action = .ignore },
-    };
-}
-
-fn negotiatingStep(router: *const Router, event: ConnEvent) DispatchStep {
-    const outcome = switch (event) {
-        .outcome => |outcome| outcome,
-        .filtered => return dropped(.{ .out_of_order = event }),
-    };
-    return switch (outcome) {
-        .alpn => |alpn| blk: {
-            // No handler is a drop and not a refusal: upstream warns and
-            // returns, and the peer is told nothing (`protocol.rs:653-656`).
-            const entry = router.lookup(alpn) orelse
-                break :blk dropped(.{ .unsupported_alpn = alpn });
-            const handler = entry.handler;
-            break :blk .{
-                .state = .{ .accepting = handler },
-                // Upstream's default `on_accepting` is the router's await, so
-                // a handler that has no `on_accepting` is not called at all.
-                .action = if (handler.on_accepting == null)
-                    .await_handshake
-                else
-                    .{ .on_accepting = handler },
-            };
-        },
-        .failed => |failure| switch (failure) {
-            .handshake => |err| dropped(.{ .failed = .{ .handshake = err } }),
-            // The other two belong to the two stages after this one.
-            .accepting, .accept => dropped(.{ .out_of_order = event }),
-        },
-        .connection, .finished => dropped(.{ .out_of_order = event }),
-    };
-}
-
-fn acceptingStep(handler: ProtocolHandler, event: ConnEvent) DispatchStep {
-    const outcome = switch (event) {
-        .outcome => |outcome| outcome,
-        .filtered => return dropped(.{ .out_of_order = event }),
-    };
-    return switch (outcome) {
-        .connection => .{
-            .state = .{ .handling = handler },
-            .action = .{ .accept = handler },
-        },
-        .failed => |failure| switch (failure) {
-            .accepting => |err| dropped(.{ .failed = .{ .accepting = err } }),
-            .handshake, .accept => dropped(.{ .out_of_order = event }),
-        },
-        .alpn, .finished => dropped(.{ .out_of_order = event }),
-    };
-}
-
-fn handledStep(event: ConnEvent) DispatchStep {
-    const outcome = switch (event) {
-        .outcome => |outcome| outcome,
-        .filtered => return dropped(.{ .out_of_order = event }),
-    };
-    return switch (outcome) {
-        // Upstream drops the connection when the future returns; the handler
-        // kept a clone if it wanted the connection to live
-        // (`protocol.rs:262-265`).
-        .finished => .{ .state = .released, .action = .release },
-        .failed => |failure| switch (failure) {
-            // The headline: a drop, and nothing sent to the peer. See
-            // `Failure.accept`.
-            .accept => |err| dropped(.{ .failed = .{ .accept = err } }),
-            .handshake, .accepting => dropped(.{ .out_of_order = event }),
-        },
-        .alpn, .connection => dropped(.{ .out_of_order = event }),
-    };
-}
-
-/// The terminal step for a connection that is gone. The state and the action
-/// carry the same reason, because the caller has to act on one and the next
-/// step has to remember the other.
-fn dropped(reason: Drop) DispatchStep {
-    return .{ .state = .{ .dropped = reason }, .action = .{ .drop = reason } };
-}
-
-/// The router's shutdown, as a value.
-///
-/// Upstream runs these steps at the bottom of the accept loop once the loop
-/// stops (`protocol.rs:608-613`), in this order:
-///
-/// 1. `protocols.shutdown().await` — every handler's `shutdown`, awaited, so a
-///    handler gets to close its connections gracefully.
-/// 2. `handler_cancel_token.cancel()` — the `accept` futures stop.
-/// 3. `endpoint.close().await` — the endpoint closes, which force-closes
-///    whatever is left.
-///
-/// The order is the point, and an ordering bug here is a use-after-free. A
-/// handler's `shutdown` closes connections that its own `accept` is still
-/// using, so cancelling the accepts first cuts a graceful close in half;
-/// closing the endpoint force-closes live connections, so closing before the
-/// accepts are cancelled does the same damage a step later and without a
-/// warning. Upstream says as much in the other direction, on the tail after the
-/// close: the accepts are cancelled so that the `abort_all` which follows is
-/// "a noop" (`protocol.rs:614-615`).
-///
-/// That tail is not a fourth step here. It exists to clean up tasks the cancel
-/// already stopped, and the three steps above are where the order lives.
-pub const Shutdown = struct {
-    /// Which step is owed. Each phase owes exactly one action, and a phase
-    /// only advances when the step before it has been reported done, so the
-    /// cancel cannot be emitted while a handler is still shutting down and the
-    /// close cannot be emitted before the cancel.
-    phase: Phase = .serving,
-    /// Registered handlers, which become running when the shutdown starts and
-    /// reach zero when the last of them has returned. The count is not in the
-    /// phase because the table is the caller's and the machine holds no table.
-    ///
-    /// **Zero means the close owes no report at all**, and the machine takes
-    /// that as a fact on the first step rather than as a phase to wait in.
-    handlers: usize = 0,
-    /// `accept` futures still running. This is what a cancel has to account
-    /// for, and it is why the state is more than the phase: a router with three
-    /// accepts running and one that has been told they are gone are the same
-    /// phase and a different fact.
-    ///
-    /// **`accepts` does not gate anything.** The cancel is one step whatever
-    /// the count is, exactly as `cancel()` is one call upstream
-    /// (`protocol.rs:611`); the count is what a caller reads to know how many
-    /// accept futures its own cancel has to account for, and it saturates at
-    /// zero rather than wrapping.
-    accepts: usize = 0,
-
-    pub const Phase = enum {
-        /// The accept loop is taking connections. Upstream's `select!` body
-        /// before the cancel token fires.
-        ///
-        /// Nothing waits here, and a close taken with no handler registered
-        /// passes straight through this phase to the cancel rather than resting
-        /// in the drain (`beginShutdown`). Upstream's `protocols.shutdown().await`
-        /// over an empty map returns at once and the cancel follows it
-        /// (`protocol.rs:609-611`), so the two agree on what happens and only
-        /// the representation differs.
-        serving,
-        /// Intake has stopped and the handlers are draining. Upstream
-        /// `protocols.shutdown().await`.
-        draining_handlers,
-        /// Every handler has returned. The accepts are still running and are
-        /// owed their cancellation. Upstream `handler_cancel_token.cancel()`.
-        cancelling_accepts,
-        /// The accepts are cancelled. The endpoint is owed its close. Upstream
-        /// `endpoint.close().await`.
-        closing_endpoint,
-        /// Closed. Terminal.
-        closed,
-    };
-
-    /// One thing that happened to the shutdown.
-    pub const Event = union(enum) {
-        /// The application asked to close, or the accept loop stopped because
-        /// the endpoint closed under it. Upstream `Router::shutdown` cancels
-        /// the run token and awaits the task (`protocol.rs:435-452`), and the
-        /// loop also breaks when `endpoint.accept()` returns nothing
-        /// (`protocol.rs:569-571`).
-        close_requested,
-        /// A handler's `shutdown` returned.
-        handler_finished,
-        /// An `accept` returned, finished or was cancelled. This is the live
-        /// count going down, and it never advances the shutdown: upstream's
-        /// loop takes a finished task from the join set and goes back to
-        /// `select!` (`protocol.rs:545-565`).
-        accept_finished,
-        /// The cancellation landed: every `accept` future is gone.
-        ///
-        /// Upstream does not wait for this separately — `cancel()` is
-        /// synchronous and `endpoint.close()` follows it — but a machine that
-        /// is to be checkable without a scheduler has to be *told* the step
-        /// happened. Otherwise the close is emitted in the same breath as the
-        /// cancel and the ordering stops being observable at all.
-        accepts_cancelled,
-        /// `endpoint.close()` returned.
-        endpoint_closed,
-    };
-
-    /// The one thing the shutdown owes.
-    pub const Action = union(enum) {
-        /// Call `shutdown` on every registered handler and await all of them,
-        /// concurrently (`protocol.rs:404-407`).
-        shutdown_handlers: usize,
-        /// Cancel the `accept` futures.
-        cancel_accepts,
-        /// Close the endpoint.
-        close_endpoint,
-        /// Nothing: this event is not this phase's business, or the step is
-        /// already done. Upstream's `trace!` arms (`protocol.rs:559-565`).
-        none,
-    };
-
-    pub const Step = struct {
-        shutdown: Shutdown,
-        action: Action,
-    };
-
-    /// A router that has not been asked to close, with `handlers` registered and
-    /// `accepts` running. The counts are the caller's to know and the machine's
-    /// to keep.
-    ///
-    /// **`handlers == 0` is a legitimate answer, not an empty one.** It is what
-    /// an endpoint over a table with no registrations hands here, and it makes
-    /// the first close step emit the cancel directly — see `beginShutdown`. A
-    /// caller that reads it as "drain nothing, then wait" has read it wrong:
-    /// there is no report to wait for and the machine will not invent one.
-    pub fn init(handlers: usize, accepts: usize) Shutdown {
-        return .{ .handlers = handlers, .accepts = accepts };
-    }
-
-    /// One step. Pure, and the whole of the ordering.
-    ///
-    /// Every event is named in every phase and nothing falls through, so an
-    /// event added later has to be classified here rather than being absorbed
-    /// by a wildcard and never reaching the phase that owed it.
-    pub fn step(self: Shutdown, event: Event) Step {
-        return switch (self.phase) {
-            .serving => switch (event) {
-                .close_requested => beginShutdown(self),
-                .accept_finished => .{ .shutdown = self.fewerAccepts(), .action = .none },
-                // Nothing has been asked for yet, and a report from a phase
-                // that has not been entered is not this one's business.
-                .handler_finished, .accepts_cancelled, .endpoint_closed => self.hold(),
-            },
-            .draining_handlers => switch (event) {
-                .handler_finished => handlerFinished(self),
-                .accept_finished => .{ .shutdown = self.fewerAccepts(), .action = .none },
-                // The whole ordering is this arm: the cancel waits for the
-                // handlers and the close waits for the cancel, so neither of
-                // these can begin early.
-                .close_requested, .accepts_cancelled, .endpoint_closed => self.hold(),
-            },
-            .cancelling_accepts => switch (event) {
-                .accepts_cancelled => .{
-                    .shutdown = .{ .phase = .closing_endpoint, .accepts = 0 },
-                    .action = .close_endpoint,
-                },
-                .accept_finished => .{ .shutdown = self.fewerAccepts(), .action = .none },
-                .close_requested, .handler_finished, .endpoint_closed => self.hold(),
-            },
-            .closing_endpoint => switch (event) {
-                .endpoint_closed => .{
-                    .shutdown = .{ .phase = .closed },
-                    .action = .none,
-                },
-                .accept_finished, .close_requested, .handler_finished, .accepts_cancelled => {
-                    return self.hold();
-                },
-            },
-            .closed => self.hold(),
-        };
-    }
-
-    /// No step. Absorbing an event that does not apply here is the point: the
-    /// ordering lives in which event advances which phase, and an event that
-    /// advances nothing is the ordering holding.
-    fn hold(self: Shutdown) Step {
-        return .{ .shutdown = self, .action = .none };
-    }
-
-    /// One handler returned, and either there are others still draining or
-    /// every handler is done and the accepts are owed their cancellation.
-    ///
-    /// The count goes down on *every* report, not only on the last: an arm that
-    /// held the state unchanged until the end would never reach zero, the
-    /// cancel would never be emitted, and the endpoint would never close.
-    fn handlerFinished(self: Shutdown) Step {
-        // A report past zero is a handler the count never had, and holding is
-        // the only honest answer: there is nothing left to drain. `beginShutdown`
-        // is why that arm is unreachable on the way in — a close taken with no
-        // handler registered never enters the phase this runs in.
-        if (self.handlers == 0) return self.hold();
-        var next = self;
-        next.handlers -= 1;
-        if (next.handlers > 0) return .{ .shutdown = next, .action = .none };
-        return .{
-            .shutdown = .{ .phase = .cancelling_accepts, .accepts = self.accepts },
-            .action = .cancel_accepts,
-        };
-    }
-
-    /// A close, and the first thing it owes.
-    ///
-    /// **The counts decide the phase, and the phase is settled before the
-    /// action is named.** A close with a handler registered owes
-    /// `shutdown_handlers` and then one `handler_finished` per handler, and it
-    /// cannot leave `.draining_handlers` until every one of those has been
-    /// reported. A close with *no* handler registered owes no report at all, so
-    /// entering that phase with a `shutdown_handlers` of zero would be a phase
-    /// nothing can leave: `handler_finished` past zero is held, because there
-    /// is nothing left to drain, and the cancel this close owes is never
-    /// emitted — the endpoint stays open for ever.
-    ///
-    /// So the zero case is decided here, on the counts, rather than left to a
-    /// caller to notice: no handler means the cancel is owed the moment the
-    /// close is asked for, and the machine says so in one step. `accepts`
-    /// crosses either way, because the cancel has to account for them whatever
-    /// the handlers did.
-    ///
-    /// Upstream cannot reach the shape this avoids. `protocols.shutdown()`
-    /// awaits one future per *map value* (`protocol.rs:404-407`), and a map
-    /// with no values has nothing to await, so the cancel at `:611` is the very
-    /// next statement to run. `handlerCount` is what makes the count knowable
-    /// on this side, and it is the same count the phase it feeds would have
-    /// waited for.
-    fn beginShutdown(self: Shutdown) Step {
-        if (self.handlers == 0) return .{
-            .shutdown = .{ .phase = .cancelling_accepts, .accepts = self.accepts },
-            .action = .cancel_accepts,
-        };
-        return .{
-            .shutdown = .{
-                .phase = .draining_handlers,
-                .handlers = self.handlers,
-                .accepts = self.accepts,
-            },
-            .action = .{ .shutdown_handlers = self.handlers },
-        };
-    }
-
-    /// One `accept` returned. Saturating: a report past zero is a task the count
-    /// never had, and a wrapped count would read as "an enormous number of
-    /// accepts is still running".
-    fn fewerAccepts(self: Shutdown) Shutdown {
-        var next = self;
-        next.accepts = if (self.accepts == 0) 0 else self.accepts - 1;
-        return next;
-    }
-};
-
-/// The endpoint lease, which has to be given up by closing.
-///
-/// Upstream logs an error from `EndpointInner`'s `Drop` when `close()` was
-/// never called: dropping an endpoint without closing is a misuse, not a
-/// cleanup. Zig has no `Drop`, so the report moves to `deinit` and the guarantee
-/// is carried by a type rather than by discipline:
-///
-/// - `acquire` is the only way to hold a lease, so nothing is bound to an
-///   endpoint without one.
-/// - `deinit` is the only way to give it up, and it reads the answer out of the
-///   shutdown the lease watches rather than out of an argument, so a caller
-///   cannot talk its way out of it. `.abandoned` is upstream's drop error, with
-///   the phase it was dropped in.
-/// - the mark is set before the report, so a second `deinit` finds nothing to
-///   do — the same discipline as `OnDisconnectGuard` in `relay/server.zig`.
-///
-/// The shutdown must outlive the lease, because `deinit` reads it. That is the
-/// half of "the endpoint must never outlive its guard" a type can carry; the
-/// other half stays a discipline, because Zig has no move semantics and both
-/// `phase` and the lease's own fields are readable and writable by anyone
-/// holding the struct.
-pub const Lease = struct {
-    shutdown: *Shutdown,
-    reported: bool,
-
-    /// The only way to hold a lease.
-    pub fn acquire(shutdown: *Shutdown) Lease {
-        return .{ .shutdown = shutdown, .reported = false };
-    }
-
-    /// The single exit. `.closed` is the one good answer, and the only way to
-    /// reach it is to have driven the shutdown to `closed` — which is the only
-    /// way the endpoint is closed.
-    // `reported` is the readable report-once tombstone; Z030 only recognizes
-    // its fixed vocabulary of lifecycle field names, not this marker.
-    // ziglint-ignore: Z030
-    pub fn deinit(self: *Lease) Release {
-        const already = self.reported;
-        self.reported = true;
-        if (already) return .already_gone;
-        if (self.shutdown.phase == .closed) return .closed;
-        return .{ .abandoned = self.shutdown.phase };
-    }
-};
-
-/// What giving up a lease found.
-pub const Release = union(enum) {
-    /// The endpoint was closed. The one good exit.
-    closed,
-    /// The lease was given up with the endpoint still open, in this phase.
-    /// This is the drop upstream logs an error for, and the phase is in the
-    /// answer because "you forgot to close" and "you closed in the wrong
-    /// order" are different bugs.
-    abandoned: Shutdown.Phase,
-    /// Already reported. A lease is a plain struct and can be copied, so a
-    /// second copy can be deinited; the mark is set before the report, exactly
-    /// as `OnDisconnectGuard::deinit` does it.
-    already_gone,
-};
-
 const t = std.testing;
 
-/// A handler that records what the router called it for. Every test owns one,
-/// so the context pointer is the observable "which handler won".
+/// A handler that records what the router called it for. Every test here owns
+/// one, so the context pointer is the observable "which handler won".
 const Recorder = struct {
     on_accepting_calls: usize = 0,
     accept_calls: usize = 0,
     shutdown_calls: usize = 0,
-    accept_error: ?AcceptError = null,
 
     fn onAccepting(ctx: *anyopaque, accepting: Accepting) AcceptError!Connection {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
@@ -1018,7 +720,6 @@ const Recorder = struct {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
         _ = connection;
         self.accept_calls += 1;
-        if (self.accept_error) |err| return err;
     }
 
     fn shutdown(ctx: *anyopaque) void {
@@ -1034,48 +735,22 @@ const Recorder = struct {
             .shutdown = Recorder.shutdown,
         };
     }
-
-    /// A handler that implements `accept` and nothing else, which is the shape
-    /// upstream's default methods are for: the router runs both defaults and
-    /// this one is never called for them.
-    fn bare(self: *Recorder) ProtocolHandler {
-        return .{
-            .ptr = self,
-            .on_accepting = null,
-            .accept = Recorder.accept,
-            .shutdown = null,
-        };
-    }
 };
 
-/// The offer list, into storage the test owns. Bounded by `out` so an
-/// under-sized buffer shows up as a wrong count rather than an index panic.
-fn offered(router: *const Router, out: [][]const u8) usize {
-    var alpns = router.alpns();
-    var count: usize = 0;
-    while (count < out.len) {
-        const alpn = alpns.next() orelse break;
-        out[count] = alpn;
-        count += 1;
-    }
-    return count;
-}
-
-/// A router with one handler for `alpn`, and the recorder behind it.
-fn oneHandler(
-    alpn: []const u8,
-    entries: []Entry,
-    recorder: *Recorder,
-) RegisterError!Router {
-    var builder = Builder.init(entries);
-    _ = try builder.accept(alpn, recorder.handler());
-    return builder.build();
-}
-
-/// Which handler a lookup found. `*anyopaque` does not compare with a typed
+/// Which handler a dispatch found. `*anyopaque` does not compare with a typed
 /// pointer, so a test names the handler it expects through this.
 fn isContext(handler: ProtocolHandler, context: *Recorder) bool {
     return handler.ptr == @as(*anyopaque, context);
+}
+
+/// The claim a dispatch found, or null when nothing claimed it. A test names
+/// the handler it expects through the claim rather than through a bare entry,
+/// so the index is one assertion away.
+fn claim(router: *const Router, alpn: []const u8) ?Claim {
+    return switch (router.dispatch(alpn)) {
+        .protocol => |found| found,
+        .refused => null,
+    };
 }
 
 test "the handler vtable is four fields and no more" {
@@ -1122,16 +797,37 @@ test "registration order is the offer order" {
     // offered them in, which is the order a server's preference runs.
     var list: [3][]const u8 = undefined;
     const router = builder.build();
-    try t.expectEqual(@as(usize, 3), offered(&router, &list));
+    try t.expectEqual(@as(usize, 3), router.configured());
+    try t.expectEqual(@as(usize, 3), router.protocolCount());
+    try t.expectEqual(@as(usize, 3), router.offers(&list));
     try t.expectEqualStrings("/echo", list[0]);
     try t.expectEqualStrings("/blob", list[1]);
     try t.expectEqualStrings("/qad-probe", list[2]);
 
-    // And each one dispatches to the handler it was registered with.
-    try t.expect(isContext(router.lookup("/echo").?.handler, &first));
-    try t.expect(isContext(router.lookup("/blob").?.handler, &second));
-    try t.expect(isContext(router.lookup("/qad-probe").?.handler, &third));
-    try t.expectEqual(@as(?*const Entry, null), router.lookup("/nope"));
+    // And each one dispatches to the handler it was registered with, at the
+    // index the offer order gave it: a claim's index is what a lifetime lane
+    // and an accept task are addressed by, so it is the registration order and
+    // not an accident of where the entry sits.
+    try t.expect(isContext(claim(&router, "/echo").?.entry.handler, &first));
+    try t.expectEqual(@as(usize, 0), claim(&router, "/echo").?.index);
+    try t.expect(isContext(claim(&router, "/blob").?.entry.handler, &second));
+    try t.expectEqual(@as(usize, 1), claim(&router, "/blob").?.index);
+    try t.expect(isContext(claim(&router, "/qad-probe").?.entry.handler, &third));
+    try t.expectEqual(@as(usize, 2), claim(&router, "/qad-probe").?.index);
+    // And an ALPN nobody configured is refused, and the refusal says what *is*
+    // configured rather than only what is not.
+    try t.expectEqual(@as(?Claim, null), claim(&router, "/nope"));
+    try t.expectEqual(
+        Refusal{ .alpn = "/nope", .configured = 3 },
+        router.dispatch("/nope").refused,
+    );
+
+    // An under-sized offer buffer is a short count and not an index panic: the
+    // caller sizes the transport's own array, and one entry into a three-entry
+    // list is a caller that wanted a shorter list.
+    var narrow: [1][]const u8 = undefined;
+    try t.expectEqual(@as(usize, 1), router.offers(&narrow));
+    try t.expectEqualStrings("/echo", narrow[0]);
 }
 
 test "an ALPN registered twice is offered twice and dispatches to the newer handler" {
@@ -1156,16 +852,22 @@ test "an ALPN registered twice is offered twice and dispatches to the newer hand
     // peer is offered the ALPN twice, and only the newer handler can be picked.
     var list: [3][]const u8 = undefined;
     const router = builder.build();
-    try t.expectEqual(@as(usize, 3), offered(&router, &list));
+    try t.expectEqual(@as(usize, 3), router.offers(&list));
     try t.expectEqualStrings("/echo", list[0]);
     try t.expectEqualStrings("/echo", list[1]);
     try t.expectEqualStrings("/blob", list[2]);
 
-    try t.expect(isContext(router.lookup("/echo").?.handler, &newer));
-    try t.expect(isContext(router.lookup("/blob").?.handler, &older));
+    try t.expect(isContext(claim(&router, "/echo").?.entry.handler, &newer));
+    try t.expect(isContext(claim(&router, "/blob").?.entry.handler, &older));
+    // The claim names the *newest* registration, so the lane it indexes is the
+    // one the newer handler's lifetime lives in — which is why `Lanes` has one
+    // lane per registration rather than one per distinct ALPN.
+    try t.expectEqual(@as(usize, 1), claim(&router, "/echo").?.index);
     // The displaced entry is still there, holding the ALPN, because upstream
     // pushes onto the offer list unconditionally.
     try t.expect(isContext(router.entries[0].handler, &older));
+    // And the close owes one `shutdown` for the ALPN, not one per registration.
+    try t.expectEqual(@as(usize, 2), router.protocolCount());
 }
 
 test "the internal ALPN is one constant an application cannot register" {
@@ -1182,14 +884,14 @@ test "the internal ALPN is one constant an application cannot register" {
     // And the refusal changed nothing: no entry, no offer.
     var list: [1][]const u8 = undefined;
     const refused = builder.build();
-    try t.expectEqual(@as(usize, 0), offered(&refused, &list));
+    try t.expectEqual(@as(usize, 0), refused.offers(&list));
 
     // The one way in takes no ALPN, so there is no string to pass wrongly.
     try t.expectEqual(Registered.fresh, try builder.acceptInternal(recorder.handler()));
     const router = builder.build();
-    try t.expectEqual(@as(usize, 1), offered(&router, &list));
+    try t.expectEqual(@as(usize, 1), router.offers(&list));
     try t.expectEqualStrings(qad_alpn, list[0]);
-    try t.expect(isContext(router.lookup(qad_alpn).?.handler, &recorder));
+    try t.expect(isContext(claim(&router, qad_alpn).?.entry.handler, &recorder));
 }
 
 test "a full table refuses a registration and changes nothing" {
@@ -1202,9 +904,9 @@ test "a full table refuses a registration and changes nothing" {
 
     var list: [1][]const u8 = undefined;
     const router = builder.build();
-    try t.expectEqual(@as(usize, 1), offered(&router, &list));
+    try t.expectEqual(@as(usize, 1), router.offers(&list));
     try t.expectEqualStrings("/echo", list[0]);
-    try t.expectEqual(@as(?*const Entry, null), router.lookup("/blob"));
+    try t.expectEqual(@as(?Claim, null), claim(&router, "/blob"));
 }
 
 test "a retry is address validation on a direct path and a cost on a relay" {
@@ -1214,461 +916,4 @@ test "a retry is address validation on a direct path and a cost on a relay" {
     try t.expectEqual(Retry.source_validation, retryMeaning(.any_path));
     try t.expectEqual(Retry.source_validation, retryMeaning(.custom));
     try t.expectEqual(Retry.cost_imposition, retryMeaning(.relay));
-}
-
-test "the filter's four verdicts, and only a refusal reaches the peer" {
-    var recorder: Recorder = .{};
-    var entries: [1]Entry = undefined;
-    const router = try oneHandler("/echo", &entries, &recorder);
-
-    // Carry on: the handshake is owed and nothing is sent.
-    const accept = dispatchStep(&router, .incoming, .{ .filtered = .accept });
-    try t.expectEqual(ConnState.negotiating, accept.state);
-    try t.expectEqual(DispatchAction.negotiate_alpn, accept.action);
-    try t.expectEqual(PeerOutcome.nothing, accept.action.peerOutcome());
-
-    // Retry: the token is sent and the attempt ends. The meaning rides along.
-    const direct = dispatchStep(&router, .incoming, .{
-        .filtered = .{ .retry = retryMeaning(.custom) },
-    });
-    try t.expectEqual(ConnState{ .retried = .source_validation }, direct.state);
-    try t.expectEqual(
-        DispatchAction{ .send_retry = .source_validation },
-        direct.action,
-    );
-    try t.expectEqual(PeerOutcome.nothing, direct.action.peerOutcome());
-
-    // The same verdict on a relayed path is a different value and a different
-    // state, which is the whole point of carrying the meaning.
-    const relayed = dispatchStep(&router, .incoming, .{
-        .filtered = .{ .retry = retryMeaning(.relay) },
-    });
-    try t.expectEqual(ConnState{ .retried = .cost_imposition }, relayed.state);
-
-    // Reject: the one thing the peer is told.
-    const reject = dispatchStep(&router, .incoming, .{ .filtered = .reject });
-    try t.expectEqual(ConnState.refused, reject.state);
-    try t.expectEqual(DispatchAction.refuse, reject.action);
-    try t.expectEqual(PeerOutcome.refused, reject.action.peerOutcome());
-
-    // Ignore: no packet, and unlike every other ending here, no warning.
-    const ignore = dispatchStep(&router, .incoming, .{ .filtered = .ignore });
-    try t.expectEqual(ConnState.ignored, ignore.state);
-    try t.expectEqual(DispatchAction.ignore, ignore.action);
-    try t.expectEqual(PeerOutcome.nothing, ignore.action.peerOutcome());
-}
-
-test "an ALPN nobody registered is dropped, not refused" {
-    var recorder: Recorder = .{};
-    var entries: [1]Entry = undefined;
-    const router = try oneHandler("/echo", &entries, &recorder);
-
-    const step = dispatchStep(&router, .negotiating, .{
-        .outcome = .{ .alpn = "/unknown" },
-    });
-    // Upstream warns and returns: the peer is told nothing, so this is a drop
-    // and not a refusal even though the router does know the ALPN.
-    try t.expectEqual(
-        ConnState{ .dropped = .{ .unsupported_alpn = "/unknown" } },
-        step.state,
-    );
-    try t.expectEqual(
-        DispatchAction{ .drop = .{ .unsupported_alpn = "/unknown" } },
-        step.action,
-    );
-    try t.expectEqual(PeerOutcome.nothing, step.action.peerOutcome());
-    try t.expectEqual(@as(usize, 0), recorder.accept_calls);
-}
-
-test "the two accepting routes converge on the same call" {
-    var with_default: Recorder = .{};
-    var with_own: Recorder = .{};
-    var entries: [2]Entry = undefined;
-    var builder = Builder.init(&entries);
-    _ = try builder.accept("/bare", with_default.bare());
-    _ = try builder.accept("/own", with_own.handler());
-    const router = builder.build();
-
-    // No `on_accepting`: the router awaits the handshake itself, which is
-    // upstream's default body.
-    const awaited = dispatchStep(&router, .negotiating, .{
-        .outcome = .{ .alpn = "/bare" },
-    });
-    try t.expectEqual(ConnState{ .accepting = with_default.bare() }, awaited.state);
-    try t.expectEqual(DispatchAction.await_handshake, awaited.action);
-    try t.expectEqual(@as(usize, 0), with_default.on_accepting_calls);
-
-    // With one: the handler is called, and the action names the call rather
-    // than the router having made it. Calling it here is what makes the action
-    // checkable without a scheduler.
-    const called = dispatchStep(&router, .negotiating, .{
-        .outcome = .{ .alpn = "/own" },
-    });
-    switch (called.action) {
-        .on_accepting => |handler| {
-            const on_accepting = handler.on_accepting orelse return error.TestUnexpectedResult;
-            const connection = try on_accepting(handler.ptr, .{ .ptr = &with_own });
-            // The handle comes back unchanged, which is the whole of what a
-            // pre-handshake handle is allowed to be here.
-            try t.expect(connection.ptr == @as(*anyopaque, &with_own));
-            try t.expectEqual(@as(usize, 1), with_own.on_accepting_calls);
-
-            // Both routes now owe the same call, on the same kind of state.
-            const next = dispatchStep(&router, called.state, .{
-                .outcome = .{ .connection = connection },
-            });
-            try t.expectEqual(ConnState{ .handling = handler }, next.state);
-            try t.expectEqual(DispatchAction{ .accept = handler }, next.action);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-    try t.expectEqual(@as(usize, 0), with_default.on_accepting_calls);
-}
-
-test "an accept failure drops the connection and sends no error code" {
-    var recorder: Recorder = .{ .accept_error = error.NotAllowed };
-    var entries: [1]Entry = undefined;
-    const router = try oneHandler("/echo", &entries, &recorder);
-
-    // All the way to a running accept.
-    const offered_alpn = dispatchStep(&router, .negotiating, .{
-        .outcome = .{ .alpn = "/echo" },
-    });
-    const handling = dispatchStep(&router, offered_alpn.state, .{
-        .outcome = .{ .connection = .{ .ptr = &entries } },
-    });
-    try t.expectEqual(ConnState{ .handling = recorder.handler() }, handling.state);
-    try t.expectEqual(DispatchAction{ .accept = recorder.handler() }, handling.action);
-
-    // And now it fails.
-    const failed = dispatchStep(&router, handling.state, .{
-        .outcome = .{ .failed = .{ .accept = error.NotAllowed } },
-    });
-    const drop: Drop = .{ .failed = .{ .accept = error.NotAllowed } };
-    try t.expectEqual(ConnState{ .dropped = drop }, failed.state);
-    try t.expectEqual(DispatchAction{ .drop = drop }, failed.action);
-    // Invariant 19. The connection is dropped, nothing is sent, and the only
-    // trace of it is the warning the caller logs for a `.drop`. A handler that
-    // wants the peer to know closes the connection itself, before it returns
-    // the error — and if someone "fixes" this path into an error code, the two
-    // lines below are what fails.
-    try t.expectEqual(PeerOutcome.nothing, failed.action.peerOutcome());
-    // The refusal is still the one thing that reaches a peer, so the assertion
-    // above is not the assertion that every action is silent.
-    try t.expectEqual(
-        PeerOutcome.refused,
-        dispatchStep(&router, .incoming, .{ .filtered = .reject }).action.peerOutcome(),
-    );
-}
-
-test "a handler that returns cleanly releases the connection" {
-    var recorder: Recorder = .{};
-    var entries: [1]Entry = undefined;
-    const router = try oneHandler("/echo", &entries, &recorder);
-
-    const step = dispatchStep(&router, .{ .handling = recorder.handler() }, .{
-        .outcome = .finished,
-    });
-    try t.expectEqual(ConnState.released, step.state);
-    // Released is also a drop of the connection — upstream drops it when the
-    // future returns — but not a failure, so it is a different action and no
-    // warning goes with it.
-    try t.expectEqual(DispatchAction.release, step.action);
-    try t.expectEqual(PeerOutcome.nothing, step.action.peerOutcome());
-}
-
-test "a failed handshake or a failed on_accepting is a drop with a warning" {
-    var recorder: Recorder = .{};
-    var entries: [1]Entry = undefined;
-    const router = try oneHandler("/echo", &entries, &recorder);
-
-    // The handshake never produced an ALPN.
-    const handshake = dispatchStep(&router, .negotiating, .{
-        .outcome = .{ .failed = .{ .handshake = error.Connecting } },
-    });
-    try t.expectEqual(ConnState{ .dropped = .{
-        .failed = .{ .handshake = error.Connecting },
-    } }, handshake.state);
-    try t.expectEqual(PeerOutcome.nothing, handshake.action.peerOutcome());
-
-    // The handler's `on_accepting` failed, which upstream logs under the same
-    // line as the default await.
-    const accepting = dispatchStep(&router, .{ .accepting = recorder.handler() }, .{
-        .outcome = .{ .failed = .{ .accepting = error.MissingRemoteEndpointId } },
-    });
-    try t.expectEqual(ConnState{ .dropped = .{
-        .failed = .{ .accepting = error.MissingRemoteEndpointId },
-    } }, accepting.state);
-    try t.expectEqual(PeerOutcome.nothing, accepting.action.peerOutcome());
-    try t.expectEqual(@as(usize, 0), recorder.accept_calls);
-}
-
-test "each live state accepts only the outcome its own stage produces" {
-    var recorder: Recorder = .{};
-    var entries: [1]Entry = undefined;
-    const router = try oneHandler("/echo", &entries, &recorder);
-
-    // `ConnState` order, and the one `Outcome` success arm each state is
-    // waiting for. `incoming` owes the filter, not a stage.
-    const live = [_]ConnState{
-        .incoming,
-        .negotiating,
-        .{ .accepting = recorder.handler() },
-        .{ .handling = recorder.handler() },
-    };
-    const successes = [_]Outcome{
-        .{ .alpn = "/echo" },
-        .{ .connection = .{ .ptr = &recorder } },
-        .finished,
-    };
-    // The one failure each state can produce. The other two are out of order
-    // for it, which is what stops a handler failure being reported one stage
-    // early.
-    const failures = [_]Failure{
-        .{ .handshake = error.Connecting },
-        .{ .accepting = error.NotAllowed },
-        .{ .accept = error.Connection },
-    };
-
-    for (live, 0..) |state, stage| {
-        for (successes, 0..) |outcome, arm| {
-            const step = dispatchStep(&router, state, .{ .outcome = outcome });
-            // The one stage this state is waiting for moves it on; every other
-            // report is a drop that names the event it could not accept.
-            if (stage == arm + 1) {
-                try t.expect(std.meta.activeTag(step.state) != .dropped);
-            } else {
-                try t.expectEqual(
-                    Drop{ .out_of_order = .{ .outcome = outcome } },
-                    step.state.dropped,
-                );
-            }
-        }
-        for (failures) |failure| {
-            const step = dispatchStep(&router, state, .{
-                .outcome = .{ .failed = failure },
-            });
-            // `failures` is in `ConnState` order minus the state that owes no
-            // stage, so the state's own failure is one below its index.
-            if (stage > 0 and
-                std.meta.activeTag(failure) == std.meta.activeTag(failures[stage - 1]))
-            {
-                try t.expectEqual(Drop{ .failed = failure }, step.state.dropped);
-            } else {
-                try t.expectEqual(
-                    Drop{ .out_of_order = .{ .outcome = .{ .failed = failure } } },
-                    step.state.dropped,
-                );
-            }
-        }
-    }
-}
-
-test "a terminal connection state absorbs every event" {
-    var recorder: Recorder = .{};
-    var entries: [1]Entry = undefined;
-    const router = try oneHandler("/echo", &entries, &recorder);
-
-    // The first ending is the ending, and a later event does not overwrite the
-    // record of it.
-    const terminal = [_]ConnState{
-        .{ .retried = .cost_imposition },
-        .refused,
-        .ignored,
-        .released,
-        .{ .dropped = .{ .failed = .{ .accept = error.NotAllowed } } },
-    };
-    const events = [_]ConnEvent{
-        .{ .filtered = .accept },
-        .{ .filtered = .reject },
-        .{ .outcome = .finished },
-        .{ .outcome = .{ .failed = .{ .accept = error.NotAllowed } } },
-    };
-    for (terminal) |state| {
-        for (events) |event| {
-            const step = dispatchStep(&router, state, event);
-            try t.expectEqual(state, step.state);
-            try t.expectEqual(DispatchAction.none, step.action);
-        }
-    }
-}
-
-test "the shutdown order is handlers, then cancel, then close" {
-    var shutdown = Shutdown.init(2, 3);
-    try t.expectEqual(Shutdown.Phase.serving, shutdown.phase);
-
-    // Intake stops, and every handler is told at once.
-    const first = shutdown.step(.close_requested);
-    try t.expectEqual(Shutdown.Action{ .shutdown_handlers = 2 }, first.action);
-    try t.expectEqual(Shutdown.Phase.draining_handlers, first.shutdown.phase);
-    shutdown = first.shutdown;
-
-    // The cancel cannot begin while a handler is still shutting down, and
-    // neither can the close. These three are the ordering, and each is fed the
-    // event that would jump the queue.
-    for ([_]Shutdown.Event{ .accepts_cancelled, .endpoint_closed, .close_requested }) |event| {
-        const early = shutdown.step(event);
-        try t.expectEqual(Shutdown.Action.none, early.action);
-        try t.expectEqual(Shutdown.Phase.draining_handlers, early.shutdown.phase);
-    }
-    // One handler back out of two: still nothing.
-    const one = shutdown.step(.handler_finished);
-    try t.expectEqual(Shutdown.Action.none, one.action);
-    try t.expectEqual(Shutdown.Phase.draining_handlers, one.shutdown.phase);
-    try t.expectEqual(@as(usize, 1), one.shutdown.handlers);
-
-    // The last handler, and now the accepts are cancelled.
-    const cancel = one.shutdown.step(.handler_finished);
-    try t.expectEqual(Shutdown.Action.cancel_accepts, cancel.action);
-    try t.expectEqual(Shutdown.Phase.cancelling_accepts, cancel.shutdown.phase);
-    try t.expectEqual(@as(usize, 0), cancel.shutdown.handlers);
-    // A handler report that arrives after the cancel has nothing to do: there
-    // are none left.
-    const late = cancel.shutdown.step(.handler_finished);
-    try t.expectEqual(Shutdown.Action.none, late.action);
-    try t.expectEqual(Shutdown.Phase.cancelling_accepts, late.shutdown.phase);
-
-    // The close cannot begin before the cancellation has landed.
-    const too_early = late.shutdown.step(.endpoint_closed);
-    try t.expectEqual(Shutdown.Action.none, too_early.action);
-    try t.expectEqual(Shutdown.Phase.cancelling_accepts, too_early.shutdown.phase);
-
-    // The cancellation lands, and only now is the endpoint closed.
-    const close = late.shutdown.step(.accepts_cancelled);
-    try t.expectEqual(Shutdown.Action.close_endpoint, close.action);
-    try t.expectEqual(Shutdown.Phase.closing_endpoint, close.shutdown.phase);
-
-    // And the close is what finishes it.
-    const closed = close.shutdown.step(.endpoint_closed);
-    try t.expectEqual(Shutdown.Action.none, closed.action);
-    try t.expectEqual(Shutdown.Phase.closed, closed.shutdown.phase);
-
-    // A second close request is upstream's `Router::shutdown` returning `Ok`
-    // when already shut down, not a second shutdown.
-    for ([_]Shutdown.Event{
-        .close_requested,
-        .handler_finished,
-        .accept_finished,
-        .accepts_cancelled,
-        .endpoint_closed,
-    }) |event| {
-        const again = closed.shutdown.step(event);
-        try t.expectEqual(Shutdown.Action.none, again.action);
-        try t.expectEqual(Shutdown.Phase.closed, again.shutdown.phase);
-    }
-}
-
-test "a close with nothing registered still cancels the accepts and closes" {
-    // The shape an endpoint over a table with no registrations hands this
-    // machine, and the one place the counts have to be read before the phase is
-    // chosen. A close that entered `draining_handlers` here would owe a
-    // `handler_finished` that nobody can send, and every later event is held
-    // while it waits: the accepts are never cancelled and the endpoint is never
-    // closed.
-    const first = Shutdown.init(0, 0).step(.close_requested);
-    try t.expectEqual(Shutdown.Action.cancel_accepts, first.action);
-    try t.expectEqual(Shutdown.Phase.cancelling_accepts, first.shutdown.phase);
-    try t.expectEqual(@as(usize, 0), first.shutdown.handlers);
-
-    // So the order is reached by the two reports the close still owes, with no
-    // handler drain in between to stall in.
-    const cancelled = first.shutdown.step(.accepts_cancelled);
-    try t.expectEqual(Shutdown.Action.close_endpoint, cancelled.action);
-    try t.expectEqual(Shutdown.Phase.closing_endpoint, cancelled.shutdown.phase);
-    const closed = cancelled.shutdown.step(.endpoint_closed);
-    try t.expectEqual(Shutdown.Phase.closed, closed.shutdown.phase);
-
-    // And accepts that were running are still counted across the cancel, so a
-    // caller knows what its cancellation has to account for even though no
-    // handler ever reported and the close never waited for one.
-    const running = Shutdown.init(0, 2).step(.close_requested);
-    try t.expectEqual(Shutdown.Action.cancel_accepts, running.action);
-    try t.expectEqual(@as(usize, 2), running.shutdown.accepts);
-    try t.expectEqual(@as(usize, 1), running.shutdown.step(.accept_finished).shutdown.accepts);
-    try t.expectEqual(@as(usize, 0), running.shutdown.step(.accepts_cancelled).shutdown.accepts);
-}
-
-test "an accept finishing counts down and never advances the shutdown" {
-    var shutdown = Shutdown.init(1, 2);
-
-    // An accept can finish at any time, including before the shutdown is asked
-    // for, and it never moves the machine: upstream's loop takes the finished
-    // task from the join set and goes back to its `select!`.
-    var step = shutdown.step(.accept_finished);
-    try t.expectEqual(Shutdown.Action.none, step.action);
-    try t.expectEqual(Shutdown.Phase.serving, step.shutdown.phase);
-    try t.expectEqual(@as(usize, 1), step.shutdown.accepts);
-    shutdown = step.shutdown;
-
-    step = shutdown.step(.accept_finished);
-    try t.expectEqual(@as(usize, 0), step.shutdown.accepts);
-    try t.expectEqual(Shutdown.Phase.serving, step.shutdown.phase);
-    shutdown = step.shutdown;
-
-    // And after the cancel, including reports past zero: a count that wrapped
-    // would read as an enormous number of accepts still running.
-    shutdown = shutdown.step(.close_requested).shutdown;
-    shutdown = shutdown.step(.handler_finished).shutdown;
-    try t.expectEqual(Shutdown.Phase.cancelling_accepts, shutdown.phase);
-    for (0..3) |_| {
-        const late = shutdown.step(.accept_finished);
-        try t.expectEqual(@as(usize, 0), late.shutdown.accepts);
-        try t.expectEqual(Shutdown.Phase.cancelling_accepts, late.shutdown.phase);
-        shutdown = late.shutdown;
-    }
-}
-
-test "a lease given up with the endpoint open is reported" {
-    // Every phase but the last one is an endpoint nobody closed, and each is
-    // reported in the phase it was dropped in, because "you forgot to close"
-    // and "you closed in the wrong order" are different bugs.
-    const phases = [_]Shutdown.Phase{
-        .serving,
-        .draining_handlers,
-        .cancelling_accepts,
-        .closing_endpoint,
-    };
-    var shutdown = Shutdown.init(1, 1);
-    for (phases[0 .. phases.len - 1], phases[1..]) |phase, next_phase| {
-        var lease = Lease.acquire(&shutdown);
-        try t.expectEqual(Release{ .abandoned = phase }, lease.deinit());
-        // On to the next phase by driving the machine, so these are the phases a
-        // caller can actually be holding.
-        shutdown = switch (next_phase) {
-            .draining_handlers => shutdown.step(.close_requested).shutdown,
-            .cancelling_accepts => shutdown.step(.close_requested).shutdown
-                .step(.handler_finished).shutdown,
-            .closing_endpoint => shutdown.step(.close_requested).shutdown
-                .step(.handler_finished).shutdown.step(.accepts_cancelled).shutdown,
-            // `next_phase` is `phases[1..]`, which holds neither of these.
-            .serving, .closed => unreachable,
-        };
-        try t.expectEqual(next_phase, shutdown.phase);
-    }
-}
-
-test "a lease given up after the close reports the close, once" {
-    var shutdown = Shutdown.init(1, 1);
-    var lease = Lease.acquire(&shutdown);
-
-    // The whole shutdown, driven the way the caller has to drive it.
-    var step = shutdown.step(.close_requested);
-    try t.expectEqual(Shutdown.Action{ .shutdown_handlers = 1 }, step.action);
-    step = step.shutdown.step(.handler_finished);
-    try t.expectEqual(Shutdown.Action.cancel_accepts, step.action);
-    step = step.shutdown.step(.accepts_cancelled);
-    try t.expectEqual(Shutdown.Action.close_endpoint, step.action);
-    step = step.shutdown.step(.endpoint_closed);
-    try t.expectEqual(Shutdown.Phase.closed, step.shutdown.phase);
-    shutdown = step.shutdown;
-
-    try t.expectEqual(Release.closed, lease.deinit());
-    // The mark is set before the report, so a second exit finds nothing to do
-    // and a copy deinited after the original reports the same thing once.
-    try t.expectEqual(Release.already_gone, lease.deinit());
-    var copy = lease;
-    try t.expectEqual(Release.already_gone, copy.deinit());
-    // And the copy could not have reported anything else even if it tried: the
-    // answer comes out of the shutdown, not out of an argument.
-    try t.expectEqual(Shutdown.Phase.closed, shutdown.phase);
 }

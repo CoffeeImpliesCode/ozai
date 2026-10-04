@@ -1,0 +1,211 @@
+{
+  "purpose": "Where test/corpus/rust_wire/rust_client_initial.hex came from, and which vectors built on it are that capture and which are edits made here. Nothing in this file is synthesised: a vector is either the datagram a Rust peer emitted or a change this repository applies to it, and the classification below says which.",
+  "corpus_file": {
+    "path": "test/corpus/rust_wire/rust_client_initial.hex",
+    "encoding": "lowercase hex, two digits per byte, one line, terminated by a single \\n",
+    "length_bytes": 2401,
+    "sha256": "283e1169950f9c1a59e124ab1794b75ebca7dcd7828c33aac4baea904a34537c",
+    "decodes_to": {
+      "path": "test/corpus/rust_wire/rust_client_initial.hex",
+      "length_bytes": 1200,
+      "sha256": "473b53b1926dce2f9841718684b76792059ab02ba2fd7770f6b53e7315876f7d"
+    },
+    "why_hex": "A raw 1200-byte blob is not reviewable in a diff. The hex is a spelling of the same bytes: test/rust_wire_initial.zig decodes it and hashes the result, and the digest below is over the datagram, not over this file."
+  },
+  "source_capture": {
+    "directory": "/tmp/scratch/ozai-waves-x3qoa8oq/evidence/capture-w1-native-listener-after-role-predicate-fix",
+    "receipt": "/tmp/scratch/ozai-waves-x3qoa8oq/evidence/w1-native-listener-after-role-predicate-fix.json",
+    "datagram": "datagrams/000000-peer-inbound.bin",
+    "length_bytes": 1200,
+    "sha256": "473b53b1926dce2f9841718684b76792059ab02ba2fd7770f6b53e7315876f7d",
+    "direction": "peer-inbound, which evidence/capture-w1-native-listener-after-role-predicate-fix/wire.manifest defines as what the peer emitted. The peer was the Rust iroh-partner dialling the native listener, so this datagram's destination connection id is the client's own choice and is the whole of the Initial key domain (RFC 9001 5.2).",
+    "manifest": "/tmp/scratch/ozai-waves-x3qoa8oq/evidence/capture-w1-native-listener-after-role-predicate-fix/wire.manifest",
+    "manifest_columns": [
+      "sequence",
+      "direction",
+      "role",
+      "node",
+      "from",
+      "local",
+      "at_ns",
+      "length",
+      "form",
+      "version",
+      "type",
+      "dcid",
+      "scid",
+      "initial_dcid",
+      "file",
+      "keys"
+    ],
+    "manifest_row": [
+      "0",
+      "peer-inbound",
+      "listen",
+      "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+      "127.0.0.1:50819",
+      "127.0.0.1:49533",
+      "2697844968159130",
+      "1200",
+      "long",
+      "00000001",
+      "initial",
+      "25887d1add2ff5a090785aa55947ca4864b4e6f9",
+      "6d71f078e28979c5",
+      "25887d1add2ff5a090785aa55947ca4864b4e6f9",
+      "000000-peer-inbound.bin",
+      "initial"
+    ],
+    "header_as_read": {
+      "version": "00000001",
+      "dcid_len": 20,
+      "dcid": "25887d1add2ff5a090785aa55947ca4864b4e6f9",
+      "scid_len": 8,
+      "scid": "6d71f078e28979c5",
+      "token_len": 0,
+      "length_varint": 1162,
+      "packet_number_offset": 38,
+      "packet_number_length": 1,
+      "packet_number": 0,
+      "note": "The destination connection id is 20 bytes, which is the ceiling RFC 9000 17.2 puts on one. Nothing in test/rust_wire_initial.zig reads it at an offset: it is header.dcid after packet.parseQuicHeader, and the two lengths above are what that header reports."
+    },
+    "manifest_keys_column_caveat": "The manifest's own header says `initial_dcid` is the connection id the Initial keys are derived from. Its `keys` column is not read here to mean anything: test/interop_runtime.zig writes the constant \"initial\" for every row. For this row it does not matter, because dcid and initial_dcid are the same value.",
+    "negotiated_alpn_in_that_run": "2f6f7a61692f77312d66697874757265",
+    "negotiated_alpn_ascii": "/ozai/w1-fixture"
+  },
+  "session": {
+    "scope": "Actual native/Rust exchange after the liveConn role predicate repair; both roles authenticated exact peer IDs and ALPN and transferred all six declared payloads.",
+    "listener_exit": 0,
+    "dialer_exit": 0,
+    "binary_sha256": {
+      "/tmp/scratch/ozai-waves-x3qoa8oq/install/bin/ozai-interop-peer": "0b95f54121abc6eb1ce38d8699abf7a410ab3891f5d222c9b46de5e45f1c4e7d",
+      "/tmp/cache/cargo-target/iroh-partner/release/iroh-partner": "748f0fca9dd2fa1b802b382e25f0eb2af6a12cd2ea7613b16ad9e7399ec80b65"
+    },
+    "listener_argv": [
+      "/tmp/scratch/ozai-waves-x3qoa8oq/install/bin/ozai-interop-peer",
+      "--mode",
+      "listen",
+      "--listen",
+      "127.0.0.1:0",
+      "--secret-key",
+      "1111111111111111111111111111111111111111111111111111111111111111",
+      "--expect-remote",
+      "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+      "--alpn",
+      "/ozai/w1-fixture",
+      "--timeout-ms",
+      "5000",
+      "--expect-bi",
+      "0102030405",
+      "--response-bi",
+      "fafbfdfefe",
+      "--send-uni",
+      "10203040",
+      "--expect-uni",
+      "a1b2c3d4",
+      "--send-datagram",
+      "decafbad",
+      "--expect-datagram",
+      "11223344",
+      "--capture",
+      "/tmp/scratch/ozai-waves-x3qoa8oq/evidence/capture-w1-native-listener-after-role-predicate-fix"
+    ],
+    "dialer_argv": [
+      "/tmp/cache/cargo-target/iroh-partner/release/iroh-partner",
+      "--mode",
+      "dial",
+      "--listen",
+      "127.0.0.1:0",
+      "--secret-key",
+      "2222222222222222222222222222222222222222222222222222222222222222",
+      "--dial",
+      "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737@127.0.0.1:49533",
+      "--expect-remote",
+      "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+      "--alpn",
+      "/ozai/w1-fixture",
+      "--timeout-secs",
+      "6",
+      "--send-bi",
+      "0102030405",
+      "--expect-bi",
+      "fafbfdfefe",
+      "--send-uni",
+      "a1b2c3d4",
+      "--expect-uni",
+      "10203040",
+      "--send-datagram",
+      "11223344",
+      "--expect-datagram",
+      "decafbad"
+    ]
+  },
+  "counts": {
+    "capture": 4,
+    "derived_mutation": 6,
+    "external_datagrams": 1,
+    "note": "The four capture vectors are the one datagram in `source_capture`: three tests read its bytes through and the fuzz seed replays them, so the corpus has one external vector and not four witnesses. The six derived mutations are edits this repository makes to that same datagram, which makes them no more independent of it than the captures are. One test in `rust_wire_initial_test.zig` builds and seals a datagram of its own; it consumes no vector recorded here and is counted in neither column."
+  },
+  "vectors": [
+    {
+      "test": "the recorded datagram is the client Initial RFC 9000 17.2 lays out",
+      "classification": "capture",
+      "datagram": "source_capture",
+      "bytes": "The datagram in `source_capture`, decoded out of the hex file and nothing else. Hashed before anything reads it as a packet, then read twice: once in RFC 9000 17.2's own field order and once by `packet.parseQuicHeader`, which borrows the buffer and writes nothing."
+    },
+    {
+      "test": "the recorded datagram opens, and its CRYPTO frame is a ClientHello",
+      "classification": "capture",
+      "datagram": "source_capture",
+      "bytes": "The same one datagram as the entry above, not a second witness: the bytes are decoded again and opened under the Initial keys this packet's own destination connection id derives (RFC 9001 5.2). `packet.decrypt` unprotects a copy where it stands, so the vector this entry is made of is untouched by the open."
+    },
+    {
+      "test": "captured rust client hello negotiates /ozai/w1-fixture",
+      "classification": "capture",
+      "datagram": "source_capture",
+      "bytes": "The same one datagram as the two entries above, unmodified, decoded out of the hex file. Header, Initial keys, header protection, AEAD, one CRYPTO frame at offset zero carrying a 286-byte ClientHello, and the TLS 1.3 server's answer to it."
+    },
+    {
+      "test": "an initial key domain this packet does not carry refuses the tag",
+      "classification": "derived_mutation",
+      "datagram": "source_capture",
+      "mutation": "Key domain, not bytes. The datagram is untouched; the Initial keys are derived from the source connection id 6d71f078e28979c5 instead of the destination id 25887d1add2ff5a090785aa55947ca4864b4e6f9. Both ids are in the capture, and neither was invented."
+    },
+    {
+      "test": "a flipped ciphertext byte refuses the tag",
+      "classification": "derived_mutation",
+      "datagram": "source_capture",
+      "mutation": "One byte inside the AEAD ciphertext and past the packet number, so the associated data is untouched and only the payload is. The offset is derived from the capture's own header at run time."
+    },
+    {
+      "test": "a datagram cut inside the header protection sample refuses",
+      "classification": "derived_mutation",
+      "datagram": "source_capture",
+      "mutation": "The datagram truncated to one byte short of the 16-byte sample RFC 9001 5.4.2 reads four bytes past the packet number. The cut length is derived from the capture's own header at run time."
+    },
+    {
+      "test": "a derived server certificate type edit refuses the hello",
+      "classification": "derived_mutation",
+      "datagram": "source_capture",
+      "mutation": "The decrypted capture's own server_certificate_type offer (RFC 7250 3, one type named) rewritten to name X.509 alone. Length-preserving, so nothing after it moves; found by walking RFC 8446 4.1.2, not at a recorded offset. Not a capture."
+    },
+    {
+      "test": "a derived client certificate type edit refuses the hello",
+      "classification": "derived_mutation",
+      "datagram": "source_capture",
+      "mutation": "The same edit on the client_certificate_type offer, which is the other direction's extension and a separate refusal."
+    },
+    {
+      "test": "rust initial decode (fuzz corpus entry 1)",
+      "classification": "capture",
+      "datagram": "source_capture",
+      "bytes": "The same one datagram as the three entries above, decoded unchanged: `wire.decodeCapture` is the only writer of this seed's storage and the entry beside it is a three-byte copy taken out of it, so nothing here applies a change. What the fuzzer does to this seed afterwards is not replayed through here and is not a vector this record claims."
+    },
+    {
+      "test": "rust initial decode (fuzz corpus entry 2)",
+      "classification": "derived_mutation",
+      "datagram": "source_capture",
+      "mutation": "The first three bytes of the datagram above: a long header whose Version field is cut in half, so packet.parseQuicHeader refuses on a read that does not close."
+    }
+  ]
+}

@@ -18,10 +18,13 @@ demands. The plan front-loads that half and defers the half that needs QUIC.
    server and no raw-key certificate support. M8 is built on a recorded
    decision with a recorded price
    ([`DECISIONS/0001`](DECISIONS/0001-transport-substrate.md)), so this is a
-   known cost rather than an open risk. It is still partial, though: the
-   vendored TLS negotiates no RFC 7250 certificate type, no external exchange
-   has run, the bridge exposes bidirectional streams only and does not enable
-   DATAGRAM, and the node has no authenticated 0-RTT.
+   known cost rather than an open risk. It is still partial, though. Wave 1
+   closed the two it could: the vendored TLS negotiates an RFC 7250
+   certificate type in both roles, and external exchanges have run against the
+   real iroh 1.3.0 partner — `<scratch>/evidence/resume-w1-live-*.json`, seven
+   receipts, with bidirectional, uni-stream and datagram payloads verified in
+   both directions and typed refusals in both roles. What remains is the part no
+   later wave has touched: the node has no authenticated 0-RTT.
 2. **The TLS handshake is not a detail.** iroh's peer authentication *is* TLS 1.3
    with raw Ed25519 public keys: the certificate is a 44-byte DER
    `SubjectPublicKeyInfo` wrapping the 32-byte node id, in both directions, and
@@ -34,6 +37,45 @@ demands. The plan front-loads that half and defers the half that needs QUIC.
    messages, polling and eventfd, and the injected `Io` for cancellation.
    The network state machines remain pure over messages, state and supplied time;
    the real-socket runs are not a claim of whole-endpoint I/O simulation.
+   The node cutover keeps `src/node/node.zig` as the canonical `Node` data owner
+   and moves existing work into free functions in role-owned modules, not
+   forwarding methods or compatibility facades. `node_lifecycle.zig` owns
+   creation and destruction; `node_runtime.zig` owns the outer driver; lane,
+   accept, dispatch, close, connection-close, ingress, egress, gossip, reporting
+   and relay role/registry/admit/read modules own their work. That is twenty-one
+   processor namespaces registered under the data owner in `src/root.zig`, and
+   each one owns its operations outright.
+   Configuration, protocol, error, statistics and framing have separate leaf
+   owners. I/O remains an explicit argument where required, never node state.
+   The node's allocation stays fixed before the router receives pointers to
+   its lanes; each lane retains its `owner: *Node`, callback state and borrowed
+   ALPN. This preserves the existing lifetime contract rather than introducing
+   another node representation.
+
+   The argument order follows from that ownership. A required `std.Io` is a
+   leading argument, so a caller reads what it borrows before what it operates
+   on: `node_runtime.step(io, node, at, random)`,
+   `node_close.retire(io, node, alpn, at)`,
+   `node_connection_close.closeConnections(io, node, at, random)`. Two shapes
+   deliberately do not move. An allocator-first function keeps the allocator
+   first and the runtime next, because the allocator is the owner of the
+   allocation it hands back — `node_lifecycle.create(gpa, io, config)`. And an
+   optional `io: ?std.Io` stays after the node, because a value the caller may
+   not have is not a backend it borrows — `node_close.finish(node, io, at,
+   random)`, which `runtime.dispose(node)` calls with nulls, and
+   `node_dispatch.feed`, `perform` and `performShutdown`. Every caller migrated
+   together, internal calls included, and no method, facade, alias or shim was
+   left behind.
+
+   None of that moved data. `Node` still declares its 30 fields with one
+   allocator among them, lanes are still embedded and still point back through
+   `owner: *Node`, and ALPN bytes are still borrowed for the node's lifetime.
+   The two sweep roots keep their split: the native root `src/unit_test.zig`
+   references the whole package and reaches `node/node_tests.zig` exactly once,
+   while the socket-free root `src/portable_test.zig` imports only
+   `node_stats` and `node_framing` from the node, because the other eighteen
+   node namespaces reach the Linux socket adapters through `node_error` or the
+   `Node` data owner. Relocating a test must not move that platform boundary.
 4. **Interop is a test, not an intention.** Every wire format below ships with
    bytes captured from the Rust implementation. A claim of compatibility with no
    golden vector attached is an unverified claim and gets deleted.
@@ -326,9 +368,10 @@ consume the dependency directly" exit is not open today; the revisit triggers in
 - Graceful close is mandatory: dropping an `EndpointInner` without `close()` is
   an error, not a cleanup.
 
-Retry is refused because no hook runs before `acceptConnection` in the vendored
-core, the node admits one ALPN, and the CLI's exceptional close path does not
-reach the protected wind-down.
+The endpoint source has bounded configured ALPN registrations and a separate
+lane and handler pointer per protocol. Its accept-task and shutdown paths remain
+part of Wave 1's preservation contract; their presence is not evidence of the
+mixed-peer acceptance below.
 
 ### M10 — NAT traversal
 
@@ -410,9 +453,10 @@ count for either crate is not an argument for porting it to Zig.
 
 ## Open work, in dependency order
 
-Planned, not started, and none of it is a claim about the tree as it stands.
-Each wave's acceptance is something a caller or a peer can observe; a count of
-tests is not acceptance.
+The waves below retain their acceptance requirements while implementation and
+structural cutovers proceed. Source and test seams described here are not
+verification results or completed-wave claims. Each wave's acceptance is
+something a caller or a peer can observe; a count of tests is not acceptance.
 
 ### Wave 0 — runtime safety and an honest baseline
 
@@ -447,6 +491,83 @@ behaviour; expose uni-stream and datagram operations with explicit limits and
 ownership; and replace the single-ALPN runtime restriction with bounded
 configured ALPN selection and per-protocol task routing over the existing pure
 router, migrating every caller.
+
+Before Wave 1 can be declared green, complete the node ownership cutover:
+move the existing bodies to their canonical free-function owners, migrate every
+caller and remove the obsolete method and alias paths. Ownership determines
+the boundaries; the additional structural requirement is at most 250 nonblank,
+noncomment production lines per module, including imports and braces. That
+requirement is now measured rather than asserted:
+`<scratch>/evidence/resume-w1-node-production-metric.json` counts 28 files under
+`src/node/` — 26 production and 2 test-only (`node_tests.zig`,
+`node_retirement_tests.zig`) — with the largest at 240
+(`node_relay_serve.zig`) and an empty `violations` list, and
+`resume-w1-other-module-classification.json` gives the same measurement for the
+other owners (`endpoint.zig` 197, `router.zig` 201, `quic_bridge.zig` 248,
+`dial.zig` 195, `socket.zig` 114, `batch.zig` 47, `test/loopback_test.zig` 2 as
+test-only), each matching the responsibility that module already owns. A
+measured size is not a measured gate: the verification gates below are a
+separate question and none of them is closed by this count.
+
+The frozen pre-cutover node source already contains test seams for configured
+multi-ALPN selection and over-bound refusal, per-protocol shutdown accounting,
+accept cancellation and shutdown ordering, secure-entropy refusal, ephemeral
+key and relay-challenge separation, accepted-id reaping, cancellation and clock
+failure teardown, relay queue pressure, malformed frames and delivered-buffer
+ownership. Preserve those consumer assertions when relocating the tests to
+`src/node/node_tests.zig`, reachable exactly once through the native unit root.
+Keep this suite separate from the portable root, which excludes the Linux node
+runtime; relocating tests must not change that platform boundary.
+Preserve the production pass order: ingress, sweep, admit, drive, relay, drain,
+expire, gossip. Finished terminal accept tasks must not call a handler or be
+readmitted; protocol retirement must withdraw its claim before cancelling its
+accepts without closing another lane. The cutover does not implement Wave 2:
+production gossip still counts send and disconnect actions rather than
+performing them. These source seams do not establish Rust interoperability or
+any green-wave result.
+
+**Status of that cutover, and what it does not mean.** The ownership work above
+is in the tree: each operation is the canonical free function in its named
+namespace, every caller uses the leading-`io` order or one of the two shapes
+that deliberately keep theirs, and no method, alias or shim remains. The
+accompanying I/O argument move changed no field and no ownership rule.
+
+Seven actual native↔Rust exchanges have run against the current Debug build
+(`resume-w1-live-*.json`, native binary `59b6a3ef…`, Rust partner
+`748f0fca…`). Two positives in the two role orders, one `--require-retry` run,
+two wrong-peer refusals and two ALPN refusals: the three payload runs exit 0/0
+with the six distinct bidirectional, uni-stream and datagram payloads verified
+by both ends, and the four refusals exit 1/1 on a typed error — 42 for the wrong
+peer, 120 for the ALPN — with no payload owed and none verified. **Peer
+identities are keyed by role, not by implementation:** LISTENER secret seed
+`0x11` is `d04ab232…` and DIALER secret seed `0x22` is `a09aa5f4…`, and the
+native peer holds each role in a different receipt, so "the native peer id" is
+not a property of the build. The dial-side ALPN refusal is proved by
+`resume-w1-live-dial-alpn-mismatch-interpretation.json` rather than by its raw
+receipt's own flag, because the throwaway checker that wrote that receipt
+wrongly demanded a Rust literal; the raw receipt is preserved unedited and
+nothing was rerun.
+
+One observed matrix is evidence about those runs. **It is not a green wave, it
+discharges nothing in the acceptance list below, and it asserts no lint or
+static result.** The full gate and runtime verification for this wave are
+**pending** against the current bytes: the required source lint fixes have
+landed and no gate group has been run over them yet, so no pending group is
+recorded as a failed one and the earlier red lint and static figures — which
+belong to older bytes — are not carried forward. Two repairs do have focused
+evidence: the vendored TLS decode is 1/1 after the certificate-type oracle
+repair (`resume-w1-tls-focused-before.log` 1/1 failing at
+`test/tls_wire/messages.zig:330`, `resume-w1-tls-focused-after.log` 1/1
+passing — the cause was the oracle's one exclusive shape column forcing RFC
+7250's offer and selection into a single verdict, not a `u16` production
+overflow; both production decoders were correct), and the QUIC wire-decode
+corpus replay is 1/1 under the `quic wire decode` filter
+(`resume-w1-quic-wire-corpus-replay.log`; a command that ran zero tests is not
+evidence). The zbc disposition ledger is re-merged at 32 source proofs and 60
+records, byte-idempotent on a second emission with the helper suffix preserved
+and both refusal controls behaving. The standard relay carrier, Bao and blob
+transfer, production gossip send and disconnect actions, and live I/O remain
+unimplemented.
 
 Acceptance: ozai→Rust and Rust→ozai handshake and transfer, captured immutable
 wire vectors, negative identity, ALPN and certificate-type tests, Retry

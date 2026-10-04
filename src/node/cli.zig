@@ -42,7 +42,7 @@ pub const Options = struct {
         .port = 0,
     },
     /// Who to dial, in the order the flags named them.
-    peers: std.ArrayList(ozai.node.Peer) = .empty,
+    peers: std.ArrayList(ozai.node_config.Peer) = .empty,
     /// This node's identity, drawn when the caller does not supply one.
     secret: ?ozai.SecretKey = null,
     /// The protocol to offer, or null for the default: the gossip ALPN, or the
@@ -185,12 +185,16 @@ pub const Options = struct {
     /// The refusal a command line earns by naming two things one node cannot
     /// be, and the line saying so.
     ///
-    /// A node runs one protocol, one half of the relay handshake, and reaches
-    /// peers one way. Each arm below is a command line that named two of them,
-    /// and each is answered on its own line because a caller's mistake is
-    /// worth naming exactly rather than resolving silently: both relay roles
-    /// at once, an ALPN beside a relay role, a peer list beside a relay role,
-    /// and a datagram on a node that is not a relay's client.
+    /// A node is one half of the relay handshake and reaches peers one way, and
+    /// `--alpn` names the one protocol this program configures a node with — a
+    /// second one is `node_config.Config.protocols`, which a command line does not
+    /// reach.
+    ///
+    /// Each arm below is a command line that named two of those answers, and
+    /// each is answered on its own line because a caller's mistake is worth
+    /// naming exactly rather than resolving silently: both relay roles at once,
+    /// an ALPN beside a relay role, a peer list beside a relay role, and a
+    /// datagram on a node that is not a relay's client.
     ///
     /// The arms run in that order and none of them is nested inside another,
     /// because a line that is wrong twice is refused for the first reason it
@@ -203,7 +207,7 @@ pub const Options = struct {
         options: Options,
     ) std.Io.Writer.Error!?Error {
         if (options.relay_peer) |target| {
-            // `node.Role` is a union, so one process runs one half. Choosing
+            // `node_config.Role` is a union, so one process runs one half. Choosing
             // one here would drop the other without a word.
             if (options.serve) {
                 try reject(out, "--relay-peer", target.url, error.TwoRelayRoles);
@@ -211,6 +215,10 @@ pub const Options = struct {
             }
         }
         if (options.serve or options.relay_peer != null) {
+            // A relay role already answers for the protocol: the role picks the
+            // ALPN when the flag does not name one, so a flag beside it is two
+            // sources for one value rather than a second protocol. A node may
+            // serve two (`node_protocol.max_alpns`); this program configures one.
             if (options.alpn) |named| {
                 try reject(out, "--alpn", named, error.RelayChoosesTheAlpn);
                 return @as(?Error, error.RelayChoosesTheAlpn);
@@ -262,11 +270,12 @@ pub const Error = values.ValueError || error{
     NotAnOption,
     /// A flag that takes a value, and the command line ended.
     FlagWithoutValue,
-    /// Both relay roles at once. `node.Role` is a union, so this program runs
+    /// Both relay roles at once. `node_config.Role` is a union, so this program runs
     /// one half of the relay handshake or the other.
     TwoRelayRoles,
-    /// An ALPN beside a relay role. A relay node speaks the relay protocol
-    /// because it cannot also gossip, so there is nothing here to choose.
+    /// An ALPN beside a relay role. A relay role already answers for the
+    /// protocol — it picks one when `--alpn` does not — so naming one here is
+    /// (`node_protocol.max_alpns`); this program configures one.
     RelayChoosesTheAlpn,
     /// A peer list beside a relay role. A relay reaches peers through a relay
     /// rather than at their own addresses, so a dial list is a dial to a

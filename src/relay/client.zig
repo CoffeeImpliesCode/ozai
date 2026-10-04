@@ -27,7 +27,7 @@
 
 const std = @import("std");
 const key = @import("../base/key.zig");
-const frame = @import("frame.zig");
+const frame = @import("frame_types.zig");
 const net_report = @import("../net/report.zig");
 
 const NodeId = key.NodeId;

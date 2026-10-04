@@ -954,7 +954,7 @@ pub const PacketPacker = struct {
                     // DATAGRAM_WITH_LENGTH frame: type(1) + varint(len) + payload
                     const varint_overhead: usize = if (dgram_data.len <= 63) 1 else 2;
                     const frame_size = 1 + varint_overhead + dgram_data.len;
-                    if (fbs.seek + frame_size + AEAD_TAG_LEN > effective_max) break;
+                    if (fbs.seek + frame_size > effective_max) break;
                     const dgram_frame = Frame{ .datagram_with_length = .{
                         .data = dgram_data,
                     } };
@@ -2745,4 +2745,108 @@ test "PacketPacker: a 0-RTT packet keeps the first flight's version" {
     );
     try testing.expect(handshake_len > 0);
     try testing.expectEqual(protocol.QUIC_V2, std.mem.readInt(u32, out_buf[1..5], .big));
+}
+
+test "PacketPacker: a DATAGRAM at the advertised payload budget crosses the wire" {
+    // `Connection.maxDatagramPayloadSize` (connection.zig:4857-4874) tells the
+    // application the largest payload that still crosses a datagram of
+    // `max_packet_size`, and it charges that budget for the short header, the
+    // longest packet number a peer may have to decode, the AEAD tag and the
+    // frame's own encoding — the tag once. This sends exactly that many bytes
+    // and reads them back off the wire: the packet is unprotected and opened
+    // with the AEAD half the packer sealed it with, and its frames are parsed,
+    // so what is asserted is the payload a peer receives rather than a counter
+    // in the queue. The entry queued behind it is the other half of the
+    // contract, because a head the budget refuses blocks everything behind it.
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    // The datagram `max_packet_size` names, less this destination connection
+    // id and its flag byte, four bytes of packet number, the AEAD tag, and the
+    // frame's type byte and two-byte length varint.
+    const ceiling_len = DEFAULT_MAX_PACKET_SIZE - (1 + dcid.len) - 4 - AEAD_TAG_LEN - (1 + 2);
+
+    var ceiling_payload: [ceiling_len]u8 = undefined;
+    for (&ceiling_payload, 0..) |*byte, index| byte.* = @truncate(index);
+    const follower = "the entry queued behind the ceiling";
+
+    var rng = TestRandom{};
+    var packer = PacketPacker.init(false, &[_]u8{0x01}, dcid, 0x00000001);
+
+    var pkt_handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer pkt_handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+    var pending_frames = frame_mod.PendingFrameQueue{};
+
+    var datagrams = conn_mod.DatagramQueue{};
+    try testing.expect(datagrams.push(&ceiling_payload, 1000));
+    try testing.expect(datagrams.push(follower, 1000));
+
+    // A packet number this side has not reached in millions is one RFC 9001
+    // §5.1 encodes in all four bytes, the width the ceiling above was charged
+    // for and the case with nothing left over.
+    pkt_handler.next_pn[@intFromEnum(ack_handler.EncLevel.application)] = 1 << 24;
+
+    // The same derivation with the sides the other way round, so the reader is
+    // the half that opens what this seal writes.
+    const seal_keys = try testClientKeys();
+    const open_keys = try testServerKeys();
+
+    var out_buf: [DEFAULT_MAX_PACKET_SIZE]u8 = undefined;
+    // The ceiling first and the follower second: the follower has no room left
+    // in the first packet, so it crosses only if the head did.
+    for ([_][]const u8{ &ceiling_payload, follower }) |want| {
+        const written = try packer.packCoalesced(
+            &out_buf,
+            &pkt_handler,
+            &crypto_mgr,
+            &streams,
+            &pending_frames,
+            null, // no initial
+            null, // no early
+            null, // no handshake
+            &seal_keys.seal,
+            1000,
+            &datagrams,
+            false,
+            rng.random(),
+        );
+
+        // `effective_max` is where the last plaintext byte stops and the tag
+        // lands after it, so the packet is at most the datagram the budget
+        // named, tag included.
+        try testing.expect(written > 0);
+        try testing.expect(written <= out_buf.len);
+
+        // Read it the way a peer does: unprotect the header, take the packet
+        // number out of it, and open the payload under that number.
+        var packet = out_buf[0..written];
+        const pn_offset: usize = 1 + @as(usize, packer.dcid_len);
+        const pn_len = crypto_mod.removeHeaderProtection(
+            packet,
+            pn_offset,
+            open_keys.open.hp_key,
+            open_keys.open.cipher_suite,
+        );
+        try testing.expectEqual(@as(usize, 4), pn_len);
+        const payload_start = pn_offset + pn_len;
+        const plaintext = try open_keys.open.decryptPayload(
+            std.mem.readInt(u32, packet[pn_offset..][0..4], .big),
+            packet[0..payload_start],
+            packet[payload_start..],
+        );
+
+        // One DATAGRAM_WITH_LENGTH, and it is the whole payload: no padding is
+        // standing in for bytes this packet could not carry.
+        var frame_size: usize = undefined;
+        const frame = try Frame.parseSized(plaintext, &frame_size);
+        try testing.expectEqual(plaintext.len, frame_size);
+        switch (frame) {
+            .datagram_with_length => |datagram| {
+                try testing.expectEqualSlices(u8, want, datagram.data);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }

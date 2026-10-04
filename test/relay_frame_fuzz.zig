@@ -9,7 +9,9 @@
 
 const std = @import("std");
 const ozai = @import("ozai");
-const frame = ozai.relay_frame;
+const frame = ozai.relay_frame_types;
+const writer = ozai.relay_frame_writer;
+const codec = ozai.relay_frame_codec;
 const t = std.testing;
 
 /// Seeds are the bytes a relay would read out of one WebSocket message.
@@ -81,7 +83,7 @@ fn testOne(_: Context, smith: *t.Smith) anyerror!void {
 }
 
 fn check(bytes: []const u8, version: frame.ProtocolVersion) !void {
-    const message = frame.decode(bytes, version) catch |err| {
+    const message = codec.decode(bytes, version) catch |err| {
         // Oracle: order. A frame type this version does not define is refused on
         // the type alone, before the payload is read, so the same bytes under the
         // version that does define it cannot fail the same way. Upstream checks
@@ -93,7 +95,7 @@ fn check(bytes: []const u8, version: frame.ProtocolVersion) !void {
         // (`relay.rs:998`).
         if (err == error.FrameNotAllowedInVersion) {
             const other: frame.ProtocolVersion = if (version == .v1) .v2 else .v1;
-            const other_refused = if (frame.decode(bytes, other)) |_|
+            const other_refused = if (codec.decode(bytes, other)) |_|
                 false
             else |other_err|
                 other_err == error.FrameNotAllowedInVersion;
@@ -112,8 +114,8 @@ fn check(bytes: []const u8, version: frame.ProtocolVersion) !void {
     // every variant. Upstream asserts this over a proptest
     // (`relay.rs:925`); here every decoded value goes through it.
     var out: [reencode_len]u8 = undefined;
-    const written = try frame.encode(message, version, &out);
-    try t.expectEqual(frame.encodedLen(message), written.len);
+    const written = try codec.encode(message, version, &out);
+    try t.expectEqual(writer.encodedLen(message), written.len);
 
     // Oracle: the batch invariant, both halves, in both directions. A datagram
     // frame that decoded as a batch must carry a segment size and one that
@@ -127,12 +129,12 @@ fn check(bytes: []const u8, version: frame.ProtocolVersion) !void {
     // and is written as zero — so the fixed point is taken from the second
     // decode, not the first. Upstream's own round-trip proptests
     // (`relay.rs:909`) have the same caveat and the same answer.
-    const recoded = try frame.decode(written, version);
-    try t.expect(frame.eql(message, recoded));
+    const recoded = try codec.decode(written, version);
+    try t.expect(codec.eql(message, recoded));
     try checkBatchInvariant(recoded, frame_type);
 
     var again: [reencode_len]u8 = undefined;
-    try t.expectEqualSlices(u8, written, try frame.encode(recoded, version, &again));
+    try t.expectEqualSlices(u8, written, try codec.encode(recoded, version, &again));
 }
 
 /// `segment_size.is_some()` if and only if the frame is the batch type, in the

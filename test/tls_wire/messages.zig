@@ -1,22 +1,33 @@
-//! An independent oracle for the TLS messages that carry a certificate or a
-//! name: RFC 8446 §4.4.2's Certificate list, RFC 8446 §4.3.2's
-//! CertificateRequest, RFC 6066 §3's `server_name`, and the request this build
-//! emits.
+//! An independent oracle for the TLS messages that carry a certificate, a
+//! name or a certificate type: RFC 8446 §4.4.2's Certificate list, §4.3.2's
+//! CertificateRequest, RFC 6066 §3's `server_name`, RFC 7250 §3's two
+//! certificate-type extensions, and the requests this build emits.
 //!
 //! **What is under test.** `parseCertificateList`, `parseCertificateRequest`,
-//! `buildCertificateRequest` and `parseServerNameExtension` — all `pub`, all
-//! reached here. The extension walk the handshake performs over a ClientHello
-//! lives in `hello.zig`, which uses this file's `server_name` verdict as its
-//! own precondition rather than re-deciding it.
+//! `buildCertificateRequest`, `parseServerNameExtension`,
+//! `parseCertificateTypeOffer`, `parseCertificateTypeSelection`,
+//! `encodeCertificateTypeOffer` and `encodeCertificateTypeSelection` — all
+//! `pub`, all reached here. The extension walk the handshake performs over a
+//! ClientHello lives in `hello.zig`, which uses this file's `server_name`
+//! verdict as its own precondition rather than re-deciding it.
 //!
-//! **Why these are worth a boundary each.** All four take a length a peer chose
-//! and every one of those lengths can disagree with the message around it: a
-//! `certificate_list` that does not close its own message, an empty
-//! `cert_data`, a `ServerNameList` of length zero, a second `host_name` entry.
-//! RFC 8446 §4.2 makes all of those `decode_error` and RFC 8446 §4.4.2 makes a
+//! **Why these are worth a boundary each.** All five take a length a peer
+//! chose, and every one of those lengths can disagree with the message around
+//! it: a `certificate_list` that does not close its own message, an empty
+//! `cert_data`, a `ServerNameList` of length zero, a second `host_name` entry,
+//! a certificate-type count that does not close its own body.
+//! RFC 8446 §4.2 makes every one of those `decode_error` and §4.4.2 makes a
 //! non-empty `certificate_request_context` an `illegal_parameter`, so the
 //! refusal is a specified alert rather than a shrug — which is exactly what an
 //! oracle can check.
+//!
+//! **Why the certificate-type extensions are here and not there.** They are
+//! the one pair whose refusal is decided *outside* the grammar — an offer that
+//! is well formed and names nothing in common is RFC 7250 §4.2's
+//! `unsupported_certificate`, not a decode error — and the walk that reaches
+//! that decision is a ClientHello walk. What belongs to this file is
+//! everything up to that point: the two payloads' shapes, their encoders, and
+//! whether what comes out can be read back as what went in.
 //!
 //! **Where the reference stops and where it refuses.** Every walk here refuses
 //! exactly where the decoder under it refuses: a certificate `extensions` block
@@ -106,7 +117,7 @@ fn scanExtensions(block: []const u8) error{ DecodeError, IllegalParameter }!Scan
         // `illegal_parameter`; §4.2.3 makes the body a length over two-octet
         // schemes, and anything else is `decode_error`.
         if (s.found) return error.IllegalParameter;
-        if (data.len < 2 or be16(data) + 2 != data.len or data.len % 2 != 0) {
+        if (data.len < 2 or @as(usize, be16(data)) + 2 != data.len or data.len % 2 != 0) {
             return error.DecodeError;
         }
         s.body = data[2..];
@@ -204,14 +215,228 @@ fn refServerName(d: []const u8) error{DecodeError}!?[]const u8 {
     return host;
 }
 
+/// RFC 7250 §3, read from the RFC and not from the decoder beside it:
+///
+///     CertificateType client_certificate_types<1..2^8-1>;  // a ClientHello
+///     CertificateType client_certificate_type;            // a server's answer
+///
+/// The first is a one-byte count followed by that many one-byte types, and
+/// the count is the vector's own length; the second is a bare `CertificateType`
+/// with no count in front of it, because §4.2 says "only a single value is
+/// permitted in the server_certificate_type extension when carried in the
+/// server hello". A zero count is not an offer of nothing — the vector's own
+/// minimum is one — and a value outside the IANA registry is a field this
+/// build cannot decode rather than a type it decided against.
+fn refCertificateTypeOffer(d: []const u8) ?[]const u8 {
+    if (d.len < 2) return null;
+    // Widened before the addition: in a `u8` a peer writing `ff` would overflow
+    // the count instead of earning the decode_error its length does.
+    const count: usize = d[0];
+    if (count == 0 or count + 1 != d.len) return null;
+    return d[1..];
+}
+
+/// The same RFC's bare `CertificateType`: one byte naming one of the four
+/// values the registry holds from RFC 5246 and RFC 7250.
+fn refCertificateTypeSelection(d: []const u8) ?tls13.CertificateType {
+    if (d.len != 1) return null;
+    return switch (d[0]) {
+        0 => .x509,
+        1 => .open_pgp_cert,
+        2 => .raw_public_key,
+        3 => .generic_cert,
+        else => null,
+    };
+}
+
+/// The whole of the registry, so both decoders are asked about every value
+/// rather than only the one this build negotiates — and so `offerContains` has
+/// a case where the answer has to be no.
+const certificate_types = [_]tls13.CertificateType{
+    .x509,
+    .open_pgp_cert,
+    .raw_public_key,
+    .generic_cert,
+};
+
+/// A type from the same registry that is not `kind`.
+fn otherThan(kind: tls13.CertificateType) tls13.CertificateType {
+    return switch (kind) {
+        .x509 => .generic_cert,
+        .open_pgp_cert => .raw_public_key,
+        .raw_public_key => .open_pgp_cert,
+        .generic_cert => .x509,
+    };
+}
+
+/// RFC 7250 §3's own shapes, written out here rather than left to the fuzzer
+/// to stumble into: an offer of one type, an offer of several in preference
+/// order, a count that does not close its own body, a count of zero, a
+/// selection, a value outside the registry, and a list where the grammar
+/// allows one value. What the RFC owes each is written next to it, and a body
+/// it has no shape for is named as such rather than left to a fuzzer.
+///
+/// The two roles are answered separately because they are separate
+/// declarations and a body can be one without being the other. §3 writes
+/// `CertificateType client_certificate_types<1..2^8-1>` as a count in front
+/// of the list and `CertificateType client_certificate_type` as a bare byte
+/// with no count in front of it, because §4.2 says "only a single value is
+/// permitted in the server_certificate_type extension when carried in the
+/// server hello". So a count of zero is no offer at all and yet is a whole
+/// selection of `x509`, and `{1, 2}` is a whole offer that no selection
+/// grammar has a shape for. One classification per body can say neither, and
+/// asking it to would hold both decoders to the same verdict about two
+/// different structures.
+const certificate_type_shapes = [_]struct {
+    body: []const u8,
+    /// Whether the body is §3's list form: a one-byte count and that many
+    /// one-byte types.
+    offer: bool,
+    /// Whether the body is §3's bare form: one byte naming one type, with
+    /// no count in front of it.
+    selection: bool,
+}{
+    // §4.1: "a list containing a single element" is one type, and three is
+    // three in the client's preference order. Each carries a count, so none of
+    // them is the bare byte §4.2 permits in a selection.
+    .{ .body = &.{ 1, 0 }, .offer = true, .selection = false },
+    .{ .body = &.{ 1, 2 }, .offer = true, .selection = false },
+    .{ .body = &.{ 3, 0, 2, 1 }, .offer = true, .selection = false },
+    .{ .body = &.{ 2, 2, 2 }, .offer = true, .selection = false },
+    // The count is the vector's own length and its minimum is one, so a zero
+    // in front is not an offer of nothing — a body this grammar has no shape
+    // for. The same byte is a whole selection of `x509`, and the byte after
+    // it is a whole selection of `raw_public_key`: this is the pair the two
+    // roles disagree on, neither of them an offer.
+    .{ .body = &.{0}, .offer = false, .selection = true },
+    .{ .body = &.{2}, .offer = false, .selection = true },
+    // A count that does not close its own body, and a count that leaves a
+    // byte past the types it counted. Neither is an offer, and both are longer
+    // than the single byte a selection allows.
+    .{ .body = &.{ 2, 2 }, .offer = false, .selection = false },
+    .{ .body = &.{ 1, 2, 0 }, .offer = false, .selection = false },
+    // A value the IANA registry does not hold: a field this build cannot
+    // decode rather than a type it decided against, so neither role reads it
+    // even though it is one byte long.
+    .{ .body = &.{4}, .offer = false, .selection = false },
+    // A body with nothing in it: below the list's own minimum of one, and
+    // short of the byte a selection is made of.
+    .{ .body = &.{}, .offer = false, .selection = false },
+};
+
+/// The two decoders against the table above, each asked only about its own
+/// role: an offer is the offered types themselves, borrowed, and a body the
+/// table does not call an offer is a `DecodeError` for the reason the table
+/// gives — never a different one. The selection half of the same loop reads
+/// its own column and owes the same of it, so neither verdict is read off
+/// the other.
+fn certificateTypeShapes() Error!void {
+    for (certificate_type_shapes) |vector| {
+        if (vector.offer) {
+            const parsed = tls13.parseCertificateTypeOffer(vector.body) catch
+                return error.TestUnexpectedError;
+            const owed = refCertificateTypeOffer(vector.body) orelse
+                return error.TestUnexpectedResult;
+            if (!std.mem.eql(u8, parsed, owed)) return error.TestExpectedEqual;
+            if (!borrowedFrom(vector.body, parsed)) return error.TestExpectedEqual;
+        } else if (tls13.parseCertificateTypeOffer(vector.body)) |_| {
+            return error.TestExpectedEqual;
+        } else |actual| {
+            if (actual != error.DecodeError) return error.TestExpectedError;
+        }
+
+        if (vector.selection) {
+            const parsed = tls13.parseCertificateTypeSelection(vector.body) catch
+                return error.TestUnexpectedError;
+            const owed = refCertificateTypeSelection(vector.body) orelse
+                return error.TestUnexpectedResult;
+            if (parsed != owed) return error.TestExpectedEqual;
+        } else if (tls13.parseCertificateTypeSelection(vector.body)) |_| {
+            return error.TestExpectedEqual;
+        } else |actual| {
+            if (actual != error.DecodeError) return error.TestExpectedError;
+        }
+    }
+}
+
+/// Both decoders against the reference above, on bytes a peer chose: the same
+/// types, borrowed from the peer's own body, or the same refusal — and
+/// `offerContains` asked about every value in the registry rather than only
+/// the one this stack speaks.
+fn checkCertificateType(d: []const u8) Error!void {
+    if (refCertificateTypeOffer(d)) |owed| {
+        const parsed = tls13.parseCertificateTypeOffer(d) catch return error.TestUnexpectedError;
+        if (!std.mem.eql(u8, parsed, owed)) return error.TestExpectedEqual;
+        if (!borrowedFrom(d, parsed)) return error.TestExpectedEqual;
+        for (certificate_types) |kind| {
+            const want = std.mem.indexOfScalar(u8, owed, @intFromEnum(kind)) != null;
+            if (tls13.offerContains(parsed, kind) != want) return error.TestExpectedEqual;
+        }
+    } else if (tls13.parseCertificateTypeOffer(d)) |_| {
+        return error.TestExpectedEqual;
+    } else |actual| {
+        if (actual != error.DecodeError) return error.TestExpectedError;
+    }
+
+    if (refCertificateTypeSelection(d)) |owed| {
+        const parsed = tls13.parseCertificateTypeSelection(d) catch
+            return error.TestUnexpectedError;
+        if (parsed != owed) return error.TestExpectedEqual;
+    } else if (tls13.parseCertificateTypeSelection(d)) |_| {
+        return error.TestExpectedEqual;
+    } else |actual| {
+        if (actual != error.DecodeError) return error.TestExpectedError;
+    }
+}
+
+/// The two encoders, against bytes written out from RFC 7250 §3 rather than
+/// from another copy of the same expression; the buffer-too-small refusal,
+/// which is the only way either can fail; and the round trip back through the
+/// parsers, so no accepted spelling can be re-read as a different type.
+fn emittedCertificateTypes() Error!void {
+    var buf: [8]u8 = undefined;
+    for (certificate_types) |kind| {
+        const one = [_]u8{@intFromEnum(kind)};
+        const offer = tls13.encodeCertificateTypeOffer(&buf, kind) catch
+            return error.TestUnexpectedResult;
+        if (!std.mem.eql(u8, offer, &([_]u8{1} ++ one))) return error.TestExpectedEqual;
+        if (tls13.encodeCertificateTypeOffer(buf[0 .. offer.len - 1], kind)) |_| {
+            return error.TestUnexpectedResult;
+        } else |why| {
+            if (why != error.BufferTooSmall) return error.TestExpectedError;
+        }
+        const parsed_offer = tls13.parseCertificateTypeOffer(offer) catch
+            return error.TestUnexpectedError;
+        if (!std.mem.eql(u8, parsed_offer, &one)) return error.TestExpectedEqual;
+        if (!tls13.offerContains(parsed_offer, kind)) return error.TestExpectedEqual;
+        if (tls13.offerContains(parsed_offer, otherThan(kind))) return error.TestExpectedEqual;
+
+        const selection = tls13.encodeCertificateTypeSelection(&buf, kind) catch
+            return error.TestUnexpectedResult;
+        if (!std.mem.eql(u8, selection, &one)) return error.TestExpectedEqual;
+        if (tls13.encodeCertificateTypeSelection(buf[0 .. selection.len - 1], kind)) |_| {
+            return error.TestUnexpectedResult;
+        } else |why| {
+            if (why != error.BufferTooSmall) return error.TestExpectedError;
+        }
+        const parsed = tls13.parseCertificateTypeSelection(selection) catch
+            return error.TestUnexpectedError;
+        if (parsed != kind) return error.TestExpectedEqual;
+    }
+}
+
 /// The one call a fuzz driver makes: `input` is the bytes a peer would hand the
-/// decoder, verbatim — a Certificate body, a CertificateRequest body or a
-/// `server_name` extension body, one of the three at a time.
+/// decoder, verbatim — a Certificate body, a CertificateRequest body, a
+/// `server_name` extension body or an RFC 7250 certificate-type extension
+/// body, one of the four at a time.
 pub fn check(input: []const u8) Error!void {
     try checkCertificateRequest(input);
     try checkCertificateList(input);
     try checkServerName(input);
+    try checkCertificateType(input);
     try emittedRequest();
+    try certificateTypeShapes();
+    try emittedCertificateTypes();
 }
 
 /// One decoder against one reference on an answer that is never absent: the

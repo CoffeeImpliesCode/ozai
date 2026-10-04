@@ -61,12 +61,37 @@ pub fn addVendoredInvariants(
     return .{ .compile = artifact, .run = b.addRunArtifact(artifact) };
 }
 
-/// The one error-level log an artifact provokes on purpose, named in full
-/// rather than by severity: the refusal the vendored core reports for a
-/// certificate it will not accept, which the wrong-peer test asserts. The
-/// runner prints it either way and fails on any other error log, and it fails
-/// if this message stops being said at all.
-pub const ExpectLog = struct { scope: []const u8, text: []const u8 };
+/// One error-level log an artifact provokes on purpose, named in full rather
+/// than by severity: a refusal the vendored core reports, which the test that
+/// asks for it asserts. The runner prints every such message either way and
+/// fails on any other error log, and it fails if a named message stops being
+/// said as often as the row said it would be.
+///
+/// A list rather than one optional row, because an artifact may refuse a
+/// certificate *and* a protocol: two distinct claims, each provable only by its
+/// own message. And a single message may be the claim more than once — two
+/// handshakes refused the same way, each refused once on the side that refuses
+/// it, is one sentence said twice rather than two sentences.
+///
+/// `count` is how many copies this artifact provokes deliberately, and it is a
+/// statement of fact rather than a tolerance. It is one or more: a count of
+/// zero claims a refusal that never happens, which is no claim, and the runner
+/// refuses it. A row naming 2 accounts for the second copy as well as the
+/// first and a third copy is one message too many, which is the whole
+/// accounting: the number of deliberate refusals is written down here instead
+/// of being left to be inferred from how often the runner was asked to
+/// tolerate one. A row that says nothing counts once.
+///
+/// It is also the only way to write down that repetition. Two rows of one scope
+/// and message are refused by the runner before any test runs, whatever count
+/// either row carried, because one message cannot answer two rows and a count
+/// says how many copies arrive rather than which row any of them belongs to.
+/// Saying a refusal twice is raising `count` on the one row that names it.
+pub const ExpectLog = struct {
+    scope: []const u8,
+    text: []const u8,
+    count: usize = 1,
+};
 
 /// The module every test root gets: the library under test, and libc, because
 /// the syscall layer is uncompiled until a test opens a socket — see
@@ -97,11 +122,11 @@ pub fn createTestModule(
 /// is a finding rather than an expectation.
 pub const Runner = enum { generated, expected_log };
 
-/// What one test artifact is: the runner that drives it, and the one
-/// error-level log it provokes on purpose.
+/// What one test artifact is: the runner that drives it, and the
+/// error-level logs it provokes on purpose.
 pub const TestSpec = struct {
     runner: Runner = .expected_log,
-    expect_log: ?ExpectLog = null,
+    expect_log: []const ExpectLog = &.{},
 };
 
 /// The project's own test runner and the run step that executes the artifact.
@@ -124,7 +149,21 @@ pub fn addTestRun(
         },
     });
     const run = b.addRunArtifact(artifact);
-    if (spec.expect_log) |log| run.addArgs(&.{ "--expect-log", log.scope, log.text });
+    for (spec.expect_log) |log| {
+        // The count is on the command line only when it is not one, so an
+        // artifact that provokes each of its refusals once is wired exactly as
+        // it was before a count existed.
+        if (log.count == 1) {
+            run.addArgs(&.{ "--expect-log", log.scope, log.text });
+        } else {
+            run.addArgs(&.{
+                "--expect-log",
+                log.scope,
+                log.text,
+                b.fmt("{d}", .{log.count}),
+            });
+        }
+    }
     return .{ .compile = artifact, .run = run };
 }
 
@@ -338,6 +377,14 @@ fn collectVendoredSources(
 /// either direction. `@embedFile` cannot glob, so that list is the gate's
 /// entire coverage: a file missing from it is a file nothing reads, and the
 /// gate would keep reporting full coverage while proving nothing about it.
+///
+/// Every refusal is a `std.debug.panic` carrying the specific disagreement
+/// rather than a bare `@panic`. `std.Build`'s `build` returns `void` on this
+/// toolchain and `std.Build` has no `fatal`, so a configure-time failure has
+/// no way to return an error and the panic message is the only channel there
+/// is. That makes the message the whole of the improvement available here,
+/// and one naming the path that disagrees is all the person fixing it has to
+/// go on.
 pub fn checkVendoredFileList(b: *std.Build) void {
     const root = "vendor/quic/src";
     const gpa = b.allocator;
@@ -345,9 +392,9 @@ pub fn checkVendoredFileList(b: *std.Build) void {
 
     var found: std.ArrayList([]const u8) = .empty;
     defer found.deinit(gpa);
-    // The `catch` arm below panics and never returns, and the `defer` after it
-    // closes the handle on every path that does reach it; the engine does not
-    // follow a `defer` to the scope exit it arms.
+    // The `catch` arm below fails the build and never returns, and the `defer`
+    // after it closes the handle on every path that does reach it; the engine
+    // does not follow a `defer` to the scope exit it arms.
     // zwanzig-disable-next-line: store-violations-engine
     var dir = b.build_root.handle.openDir(io, root, .{ .iterate = true }) catch |err| {
         std.debug.panic("cannot read {s}: {s}", .{ root, @errorName(err) });
@@ -358,7 +405,8 @@ pub fn checkVendoredFileList(b: *std.Build) void {
     };
 
     for (found.items) |relative| {
-        const wanted = std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, relative }) catch @panic("oom");
+        const wanted = std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, relative }) catch
+            std.debug.panic("out of memory formatting the path of {s}/{s}", .{ root, relative });
         const listed = for (vendored_invariants.vendored_files) |entry| {
             if (std.mem.eql(u8, entry, wanted)) break true;
         } else false;

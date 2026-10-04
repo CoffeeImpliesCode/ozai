@@ -86,9 +86,10 @@
 //! `Socket.stop` — one write to a second descriptor that sits in the same
 //! `poll` set as the socket, so a receive already inside `poll` returns at
 //! once rather than at the end of its slice. That write is the half a stop may
-//! do from a signal handler (`src/node/node.zig:485` says a stop may be raised
-//! from one), and the queue is emptied by the waiter rather than by the stop,
-//! because `recvmsg` is not on the list of calls such a handler may make.
+//! do from a signal handler (`Stop.request` in `src/node/node.zig` is one
+//! store, and `src/node/node_runtime.zig`'s `run` is the loop that reads it),
+//! and the queue is emptied by the waiter rather than by the stop, because
+//! `recvmsg` is not on the list of calls such a handler may make.
 //!
 //! The datagram is the other half of "in flight", and it was quietly the
 //! worse one. This file borrows a socket it cannot close, the abandoned
@@ -159,6 +160,8 @@ const key = @import("../base/key.zig");
 const batch = @import("../transport/batch.zig");
 const socket = @import("../transport/socket.zig");
 const dns = @import("dns.zig");
+const lookup_wire = @import("lookup_wire.zig");
+const lookup_answer = @import("lookup_answer.zig");
 const lookup_io = @import("lookup_io.zig");
 
 const SocketError = lookup_io.SocketError;
@@ -188,9 +191,10 @@ pub const poll_slice_ms: i32 = 20;
 /// what `receive` returned inside the same call and hands a copy of it upward,
 /// so a wire may not return bytes that die before that call returns. Nothing
 /// reenters the `Datagram` from a wire call: `stop` is the one callback that can
-/// arrive from elsewhere — `src/node/node.zig` says a stop may be raised from a
-/// signal handler — and it is the one that must therefore do nothing but latch
-/// and name the socket.
+/// arrive from elsewhere — a signal handler reaches the node only through
+/// `Stop.request`, one atomic store, which `src/node/node_runtime.zig`'s `run`
+/// reads between passes — and it is the one that must therefore do nothing but
+/// latch and name the socket.
 const Wire = struct {
     /// The value the two calls and the stop are made on, borrowed. Reachable
     /// from every call below, so it outlives them.

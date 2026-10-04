@@ -20,6 +20,7 @@ const std = @import("std");
 const addr = @import("../base/addr.zig");
 const key = @import("../base/key.zig");
 const resolve = @import("resolve.zig");
+const record = @import("resolve_record.zig");
 const item = @import("item.zig");
 const transport_addr = @import("../base/transport_addr.zig");
 
@@ -55,7 +56,7 @@ pub const NameError = error{
 
 /// Buffer size `queryName` needs for an origin of this length.
 pub fn queryNameLength(origin: []const u8) usize {
-    return resolve.iroh_txt_name.len + 1 + key.NodeId.z32_length + 1 + origin.len;
+    return record.iroh_txt_name.len + 1 + key.NodeId.z32_length + 1 + origin.len;
 }
 
 /// The name to query for a node: `_iroh.<z32>.<origin>`.
@@ -72,8 +73,8 @@ pub fn queryName(out: []u8, node_id: key.NodeId, origin: []const u8) []const u8 
     std.debug.assert(out.len >= queryNameLength(origin));
     const label = node_id.toZ32();
     var at: usize = 0;
-    @memcpy(out[at..][0..resolve.iroh_txt_name.len], resolve.iroh_txt_name);
-    at += resolve.iroh_txt_name.len + 1;
+    @memcpy(out[at..][0..resolve.iroh_txt_name.len], record.iroh_txt_name);
+    at += record.iroh_txt_name.len + 1;
     out[at - 1] = '.';
     @memcpy(out[at..][0..label.len], &label);
     at += label.len;
@@ -94,7 +95,7 @@ pub fn endpointIdFromName(name: []const u8) NameError!key.NodeId {
     // (`name.split(".").count() < 2`), so a name with no dot is `NumLabels`
     // however it is spelled, and not `NotAnIrohRecord`.
     const first_dot = std.mem.indexOfScalar(u8, name, '.') orelse return error.TooFewLabels;
-    if (!std.mem.eql(u8, name[0..first_dot], resolve.iroh_txt_name)) {
+    if (!std.mem.eql(u8, name[0..first_dot], record.iroh_txt_name)) {
         return error.NotAnIrohRecord;
     }
     const rest = name[first_dot + 1 ..];
@@ -117,7 +118,7 @@ pub fn endpointIdFromName(name: []const u8) NameError!key.NodeId {
 /// a `&str` per call to build a query this service never builds.
 pub const DnsAddressLookup = struct {
     /// The TXT records the query returned, already fetched and already one
-    /// string per record.
+    /// string per resolve_record.
     ///
     /// The joining of a record's character strings is upstream's, and it is
     /// done by the DNS layer and not by either service: `TxtRecordData`'s
@@ -128,7 +129,7 @@ pub const DnsAddressLookup = struct {
     /// and a byte sequence that is not UTF-8 reaches the parser as it is rather
     /// than as U+FFFD, which for a hex id, a URL or an address means it fails
     /// to parse either way.
-    answers: resolve.RecordSet,
+    answers: record.RecordSet,
     /// How to stop the query. Null when there was none — a lookup against a
     /// cached answer has nothing to cancel, and saying so is different from
     /// having a cancellation that nobody fired. Non-null is fired once per
@@ -143,7 +144,7 @@ pub const DnsAddressLookup = struct {
     /// against this service is closed; two streams each read their own copy of
     /// the set, and so walk one buffer from its start twice.
     pub fn init(
-        answers: resolve.RecordSet,
+        answers: record.RecordSet,
         cancellation: ?resolve.Cancellation,
     ) DnsAddressLookup {
         return .{
@@ -167,7 +168,7 @@ const dns_vtable: resolve.AddressLookup.VTable = .{
 const DnsState = struct {
     parent: *const DnsAddressLookup,
     /// The arena the item this stream produces lives in. See
-    /// `resolve.parseTxt` on why a resolver needs one: an item owns a
+    /// `resolve_record.parseTxt` on why a resolver needs one: an item owns a
     /// `NodeAddr` *and* the bytes behind any custom address in it, and a
     /// `NodeAddr` has nowhere to keep the second. One arena for the whole
     /// stream means `destroy` is one call and the item cannot outlive it.
@@ -184,7 +185,7 @@ const DnsState = struct {
     node_id: key.NodeId,
     /// The service's answer set, by value: two resolves against one service
     /// each get their own position in the buffer.
-    answers: resolve.RecordSet,
+    answers: record.RecordSet,
     /// Which of the two things a one-query lookup can do has already happened.
     /// There is no third: upstream's DNS resolve is a single `once_future`
     /// (`iroh/src/address_lookup/dns.rs`, `resolve`), so the stream is at most
@@ -250,7 +251,7 @@ const dns_stream_vtable: resolve.Stream.VTable = .{
 fn dnsNext(state: *anyopaque) ?resolve.Event {
     const self: *DnsState = @ptrCast(@alignCast(state));
     if (self.stage != .pending) return null;
-    const value = resolve.parseTxt(self.alloc, self.node_id, self.answers, .dns) catch |reason| {
+    const value = record.parseTxt(self.alloc, self.node_id, self.answers, .dns) catch |reason| {
         self.stage = .end;
         return .{ .failed = .{ .provenance = .dns, .reason = reason } };
     };
@@ -587,7 +588,7 @@ fn resolveRefusalSweep(records: []const u8, reason: resolve.Reason) !void {
         const outcome = try resolveAtIndex(index, records, .{ .refused = reason });
         if (outcome == null) continue;
         // Publishing an item is the one defect this sweep is for: the answer
-        // set is not records, so there was nothing there to publish.
+        // set is not records, so there was nothing there to resolve_publish.
         if (outcome.? == error.ItemWhereARefusalWasNamed) {
             return error.RefusedAnswerSetPublishedAnItem;
         }

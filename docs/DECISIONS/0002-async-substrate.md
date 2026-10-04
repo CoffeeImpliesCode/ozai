@@ -169,10 +169,11 @@ so can a caller that wants a different entropy source.
 That qualification is about ownership, not about strength. `SecretKey.generate`
 draws through `Io.random`, which the standard library documents as seeded by
 `Io.randomSecure` *or by a less secure mechanism when that fails*
-(`lib/std/Io.zig:2462-2469`). The node's runtime generator is a third seam and
-is outside this diagram entirely — `std.Random.DefaultPrng` initialized from a
-`u64` that the CLI defaults to a public constant — so the diagram says nothing
-about it. It is an open repair, not a property of this layering.
+(`lib/std/Io.zig:2462-2469`). The node's runtime generator is a separate seam:
+the pre-cutover source owns a `std.Random.DefaultCsprng`, seeded at full width
+from the caller's `io.randomSecure`, with temporary seed bytes wiped on exit.
+Explicit caller-supplied randomness remains a simulation input. These are
+source ownership facts, not a claim that a verification gate has passed.
 
 No layer moved. `ozai.transport` owned the socket before and owns it now — it
 just owns it in `std.c` rather than through `zio.ev`. `ozai.endpoint` owned
@@ -184,8 +185,8 @@ Consequences worth stating, because they will be argued about later:
 
 - **Tests of protocol logic construct their own time.** A timestamp or duration
   is an argument; state transitions do not read an `Io` clock. Runtime bridges
-  such as `Node.run` read time and pass it into the protocol logic. A test that
-  needs a runtime just to check a state transition has found a misplaced
+  such as `node_runtime.run` read time and pass it into the protocol logic.
+  A test that needs a runtime just to check a state transition has found a misplaced
   boundary. `0001` replaced 60 hidden-input sites in the vendored core with
   explicit time and randomness.
 - **An `Io` is never stored.** It is a parameter to the functions that need it,
@@ -430,9 +431,9 @@ and worth stating here rather than discovering later.
 
 `Action.spawn` and `Action.shutdown` are values for a caller to perform with
 its runtime. At the 2026-09-30 reconsideration that caller had not yet been
-written. The current executable has runtime loops in `Node.run` and
-`src/node/main.zig`'s `drive`; this paragraph is not a current claim that the
-package installs only a library.
+written. The node cutover names the outer driver `node_runtime.run`; the CLI
+driver remains in `src/node/main.zig`. This paragraph is not a current claim
+that the package installs only a library.
 
 Its shape is not free. The tree already fixes it:
 
@@ -441,11 +442,71 @@ Its shape is not free. The tree already fixes it:
   `test/protocol_loopback_test.zig`.
 - A caller of the pure endpoint loop owns the task handles and reports
   `Event.arrived`, `Event.reaped` and `Event.close_requested` through `Loop.step`.
-- Protocol time is an argument. Runtime loops such as `Node.run` read the clock
+- Protocol time is an argument. The outer `node_runtime.run` reads the clock
   at the bridge; the protocol loopback consumer constructs its instants.
 
 Written that way it is a `main` over `Io.Threaded`. Nothing in it needs a third
 runtime, and nothing in it may reach above `ozai.endpoint`.
+
+### Node ownership cutover
+
+The canonical node data owner remains `src/node/node.zig`, exposed as
+`root.node.Node`. There is no second `NodeData` type or `node_data.zig`.
+The chosen API moves existing implementation bodies into free functions whose
+first node argument is `*node_mod.Node`; it does not keep forwarding methods,
+`Node.module` namespaces, public alias bundles or back-compat facades.
+
+The role owners are explicit:
+
+- `node_lifecycle.zig`: create, register and deinit, with one heap allocation
+  owning the node and its existing storage lifetimes.
+- `node_runtime.zig`: start, step, wait, run, wind-down and disposal, the outer
+  orchestration that may call the lower-level close owner.
+- `node_lane.zig`: registered accept and shutdown callbacks and lane shutdown.
+- `node_accept.zig`: accept-task admission and driving.
+- `node_dispatch.zig`: endpoint actions and shutdown dispatch.
+- `node_connection_close.zig`: connection-close and close-drain operations.
+- `node_close.zig`: graceful node close, protocol retirement, cancellation and
+  protocol/lane inspection.
+- `node_ingress.zig` and `node_egress.zig`: intake/delivery and drain/expiry.
+- `node_gossip.zig`: the existing gossip state-machine inputs and actions.
+- `node_relay_serve.zig` and `node_relay_client.zig`: the existing relay roles.
+- `node_relay_registry.zig`: relay registration and release.
+- `node_error.zig`, `node_protocol.zig`, `node_config.zig`, `node_stats.zig`
+  and `node_framing.zig`: their canonical leaf types and operations.
+- `node_report.zig`: the existing reporting bodies; CLI role wording stays in
+  main rather than creating a dependency back to the CLI.
+
+Data does not import these processors; production dependencies below the outer
+driver do not import `node_runtime.zig`. The task-driving path goes from runtime
+to accept, dispatch and connection-close owners. Close uses dispatch and the
+connection-close owner without calling back into the runtime. Lane callbacks
+use the relay-registry owner; relay serving also uses that registry and the
+client owner's queue-depth read. These boundaries keep the existing work under
+its canonical owners without dependency cycles, a new scheduler or a change to
+the protocol state machines.
+
+The node address is fixed before registration stores `&node.lanes[index]` in
+each router handler's `ptr`. Each lane keeps its existing `owner: *Node`, a
+copied caller handler or built-in protocol choice, per-lane turn state and
+shutdown accounting. The node cannot be copied or moved after those pointers
+are installed. ALPN bytes and caller handler userdata retain their existing
+borrowed lifetimes; the registered table and offer list are fixed at creation.
+Shutdown releases the protocol's own resources before cancelling its accepts;
+retiring one lane does not retire another. The callback entry points change
+owners, not the callback targets or their lifetime.
+
+`Io` is still passed explicitly to operations that need it and is never stored
+in the node. Time and randomness remain supplied state-machine inputs, with
+the outer driver reading time and using the node-owned production generator.
+The step order stays intake, sweep, admit, drive, relay, drain, expire, gossip.
+This cutover does not turn counted gossip actions into network work.
+
+Ownership determines the split, and the Wave 1 structural requirement also
+limits each module to 250 nonblank, noncomment production lines, including
+imports and braces. The integrated module counts and runtime/test gates remain
+for the parent to verify before declaring that requirement closed. This record
+does not claim a green size gate, a completed Wave 1 or a Wave 2 implementation.
 
 ### What would make the other shape right
 

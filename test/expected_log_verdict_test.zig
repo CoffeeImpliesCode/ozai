@@ -4,6 +4,12 @@
 //! its stderr. `test/expected_log_cases.zig` only logs, so the runner is the
 //! only implementation of the rule under test.
 //!
+//! A row is what the runner's command line is read in: a scope, the whole
+//! rendered message, and how many copies of it this run will provoke. Most
+//! rows below leave the count off, which is the runner's own default of one;
+//! the rows that name a count are how an artifact accounts for the same
+//! refusal happening on purpose more than once.
+//!
 //! A verdict is an exit status. A process that did not exit on its own — a
 //! signal, a stop, one this file never reaped — is a broken fixture and says
 //! nothing about the runner, so every negative case below rejects it rather
@@ -64,9 +70,38 @@ const Run = struct {
     stderr: []u8,
 };
 
+/// One `--expect-log` row: the scope a message was logged under, the message
+/// as it renders, and how many copies of it this run will provoke. A null
+/// count leaves the argument off the command line, where the runner's default
+/// of one applies.
+///
+/// The count is a field rather than a third string in a flat list because a
+/// scope, a message and a count are three arguments of the same type, and a
+/// flat list of them is a call site that puts a count where a scope belongs
+/// and still compiles.
+const Row = struct {
+    scope: []const u8,
+    text: []const u8,
+    count: ?usize = null,
+};
+
+/// Which fixture to start and what to tell it to tolerate. The rows are the
+/// whole of the command line's `--expect-log` part, so a test that changes
+/// what the runner is asked to tolerate changes this and nothing else.
+const Fixture = struct {
+    executable: []const u8,
+    rows: []const Row,
+};
+
+/// A row naming one copy of a message by leaving the count off.
+fn named(scope: []const u8, text: []const u8) Row {
+    return .{ .scope = scope, .text = text };
+}
+
 test "one refusal named in full, once, passes the run and is still printed at error level" {
-    const run = try runFixture(t.allocator, t.io, once_executable, &.{
-        refusal_scope, refusal_text,
+    const run = try runFixture(t.allocator, t.io, .{
+        .executable = once_executable,
+        .rows = &.{named(refusal_scope, refusal_text)},
     });
     defer t.allocator.free(run.stderr);
 
@@ -75,8 +110,9 @@ test "one refusal named in full, once, passes the run and is still printed at er
 }
 
 test "the same refusal logged twice fails the run, and both copies are still printed" {
-    const run = try runFixture(t.allocator, t.io, twice_executable, &.{
-        refusal_scope, refusal_text,
+    const run = try runFixture(t.allocator, t.io, .{
+        .executable = twice_executable,
+        .rows = &.{named(refusal_scope, refusal_text)},
     });
     defer t.allocator.free(run.stderr);
 
@@ -93,9 +129,12 @@ test "two identical expectations fail the run with a refusal naming the row" {
     // is fail-closed rejection rather than counting the rows as two answers: a
     // duplicated entry is a command line somebody wrote by accident, and the
     // safest reading of it is none.
-    const run = try runFixture(t.allocator, t.io, once_executable, &.{
-        refusal_scope, refusal_text,
-        refusal_scope, refusal_text,
+    const run = try runFixture(t.allocator, t.io, .{
+        .executable = once_executable,
+        .rows = &.{
+            named(refusal_scope, refusal_text),
+            named(refusal_scope, refusal_text),
+        },
     });
     defer t.allocator.free(run.stderr);
 
@@ -109,8 +148,9 @@ test "two identical expectations fail the run with a refusal naming the row" {
 }
 
 test "an expectation naming another scope fails the run, and the refusal is still printed" {
-    const run = try runFixture(t.allocator, t.io, once_executable, &.{
-        absent_scope, refusal_text,
+    const run = try runFixture(t.allocator, t.io, .{
+        .executable = once_executable,
+        .rows = &.{named(absent_scope, refusal_text)},
     });
     defer t.allocator.free(run.stderr);
 
@@ -119,8 +159,9 @@ test "an expectation naming another scope fails the run, and the refusal is stil
 }
 
 test "an expectation no fixture produced fails the run, and the refusal is still printed" {
-    const run = try runFixture(t.allocator, t.io, once_executable, &.{
-        refusal_scope, absent_text,
+    const run = try runFixture(t.allocator, t.io, .{
+        .executable = once_executable,
+        .rows = &.{named(refusal_scope, absent_text)},
     });
     defer t.allocator.free(run.stderr);
 
@@ -135,12 +176,14 @@ test "an expectation naming part of the message fails the run, and the refusal i
     // message the run never made.
     const shorter = refusal_text[0 .. refusal_text.len / 2];
     const longer = refusal_text ++ " for the second time";
-    const short_run = try runFixture(t.allocator, t.io, once_executable, &.{
-        refusal_scope, shorter,
+    const short_run = try runFixture(t.allocator, t.io, .{
+        .executable = once_executable,
+        .rows = &.{named(refusal_scope, shorter)},
     });
     defer t.allocator.free(short_run.stderr);
-    const long_run = try runFixture(t.allocator, t.io, once_executable, &.{
-        refusal_scope, longer,
+    const long_run = try runFixture(t.allocator, t.io, .{
+        .executable = once_executable,
+        .rows = &.{named(refusal_scope, longer)},
     });
     defer t.allocator.free(long_run.stderr);
 
@@ -150,12 +193,114 @@ test "an expectation naming part of the message fails the run, and the refusal i
     try expectPrinted(long_run, 1);
 }
 
+test "one row naming two copies passes a run that provokes the message twice" {
+    const run = try runFixture(t.allocator, t.io, .{
+        .executable = twice_executable,
+        .rows = &.{.{ .scope = refusal_scope, .text = refusal_text, .count = 2 }},
+    });
+    defer t.allocator.free(run.stderr);
+
+    // Passing is the whole claim of a count: the artifact said it provokes
+    // this refusal twice and the run accounted for both copies. A run that
+    // failed here would be refusing something the build declared.
+    try expectVerdict(run, .passed);
+    // Twice: printing one copy of a message the code under test logged twice
+    // has silenced half of what it said.
+    try expectPrinted(run, 2);
+}
+
+test "a row naming two copies is stale when the run provokes one" {
+    const run = try runFixture(t.allocator, t.io, .{
+        .executable = once_executable,
+        .rows = &.{.{ .scope = refusal_scope, .text = refusal_text, .count = 2 }},
+    });
+    defer t.allocator.free(run.stderr);
+
+    // Failing is what a count the run did not fill has to do. The row claims
+    // two deliberate refusals and the artifact provoked one, so the second
+    // claim was never tested: a run that passed would be tolerating a claim
+    // about a refusal it never saw, which is the count read as a ceiling.
+    try expectVerdict(run, .failed);
+    // One: the copy that did arrive was printed, and it is not what failed.
+    try expectPrinted(run, 1);
+}
+
+test "a row naming two copies under a scope no fixture logs under fails the run" {
+    const run = try runFixture(t.allocator, t.io, .{
+        .executable = once_executable,
+        .rows = &.{.{ .scope = absent_scope, .text = refusal_text, .count = 2 }},
+    });
+    defer t.allocator.free(run.stderr);
+
+    // A count says how many copies, never which message: two copies of a
+    // message the run logged under another scope is not the row, and neither
+    // copy is accounted for by a row that cannot be met.
+    try expectVerdict(run, .failed);
+    try expectPrinted(run, 1);
+}
+
+test "two rows of one message naming two copies each are refused before any test runs" {
+    try expectSecondRowRefused(2, 2);
+}
+
+test "two rows of one message naming one copy each are refused before any test runs" {
+    try expectSecondRowRefused(1, 1);
+}
+
+test "two rows of one message naming two copies and one copy are refused in that order" {
+    try expectSecondRowRefused(2, 1);
+}
+
+test "two rows of one message naming one copy and two copies are refused in that order" {
+    try expectSecondRowRefused(1, 2);
+}
+
+test "a row without a count and a row naming two copies are refused in that order" {
+    try expectSecondRowRefused(null, 2);
+}
+
+test "a row naming two copies and a row without a count are refused in that order" {
+    try expectSecondRowRefused(2, null);
+}
+
+/// Start the fixture with two rows of one message — the first counting
+/// `first`, the second `second` — and check the runner refused the command
+/// line rather than running it.
+///
+/// The second row of one message is refused whatever the two counts say, and
+/// the run it would have started is what that has to be decided on: two rows
+/// of two copies each are both filled by the two copies the fixture logs, so
+/// the run exits zero having never said which row answered for which copy,
+/// and the command line was ambiguous from the first row onward.
+///
+/// Nothing is printed, because the refusal happens while the command line is
+/// read. A run that printed its refusals and failed at the end is a run that
+/// ran, and that is the thing ruled out here: this asserts the verdict on the
+/// command line, not on a run that happened to fail for another reason.
+fn expectSecondRowRefused(first: ?usize, second: ?usize) !void {
+    const run = try runFixture(t.allocator, t.io, .{
+        .executable = twice_executable,
+        .rows = &.{
+            .{ .scope = refusal_scope, .text = refusal_text, .count = first },
+            .{ .scope = refusal_scope, .text = refusal_text, .count = second },
+        },
+    });
+    defer t.allocator.free(run.stderr);
+
+    try expectVerdict(run, .failed);
+    try expectPrinted(run, 0);
+    // Refused while the command line was parsed, so no test ran and there is
+    // no product log to have printed; what is on stderr is the refusal naming
+    // the row it would not accept. A process that merely died cannot satisfy
+    // this — it neither exits on its own nor says which row it refused.
+    try expectNamed(run, refusal_scope, refusal_text);
+}
+
 /// Start one fixture process, drive it, and take everything it printed.
 fn runFixture(
     gpa: std.mem.Allocator,
     io: std.Io,
-    executable: []const u8,
-    expect_log: []const []const u8,
+    fixture: Fixture,
 ) !Run {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -163,16 +308,21 @@ fn runFixture(
 
     var argv: std.ArrayList([]const u8) = .empty;
     if (executor) |cross| try argv.append(arena, cross);
-    try argv.append(arena, executable);
+    try argv.append(arena, fixture.executable);
     // The runner's only mode, and the flag `std.Build.Step.Run` puts on every
     // test artifact it drives.
     try argv.append(arena, "--listen=-");
-    std.debug.assert(expect_log.len % 2 == 0);
-    var at: usize = 0;
-    while (at < expect_log.len) : (at += 2) {
+    for (fixture.rows) |row| {
         try argv.append(arena, "--expect-log");
-        try argv.append(arena, expect_log[at]);
-        try argv.append(arena, expect_log[at + 1]);
+        try argv.append(arena, row.scope);
+        try argv.append(arena, row.text);
+        // A row naming no count sends the two arguments the runner defaults
+        // to a single copy from, and one that names a count sends it as the
+        // third. The number is rendered rather than written out so the command
+        // line this file builds is the command line the runner documents.
+        if (row.count) |count| {
+            try argv.append(arena, try std.fmt.allocPrint(arena, "{d}", .{count}));
+        }
     }
 
     var child = try std.process.spawn(io, .{

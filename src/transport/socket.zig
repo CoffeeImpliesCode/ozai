@@ -16,12 +16,26 @@
 //! - `socket_receive.zig` — one `recvmsg`, the `poll` in front of it, and the
 //!   queue and the wake counter a stop leaves for the next send to clear.
 //! - `socket_control.zig` — opening the two descriptors, binding and reading
-//!   the name back, and the capability probe.
+//!   the name back, the capability probe, and `open`, the order those have to
+//!   happen in.
 //!
 //! The split is by responsibility and not by size, and it keeps one fact in one
 //! place: `ancillary.zig` knows what a control message is, `socket_send.zig`
-//! knows what a refusal costs, `socket_receive.zig` knows what a stop owes, and
-//! this file knows which descriptor each of those acts on.
+//! knows what a refusal costs, `socket_receive.zig` knows what a stop owes,
+//! `socket_control.zig` knows what a descriptor must be asked before it is
+//! usable, and this file knows which descriptor each of those acts on.
+//!
+//! # Where a stateless reply goes out
+//!
+//! A Retry, a Version Negotiation packet and a stateless reset are all
+//! `batch.Send` values the QUIC core writes and this socket sends, and the
+//! only thing that makes them different from any other datagram is that no
+//! connection is behind them. So there is nothing here for them: `send` takes
+//! the value, writes the traffic class on it and reports what the kernel kept
+//! of the codepoint. The one rule the core's side owes this side is that a
+//! reply carries the codepoint the request arrived with, because a codepoint
+//! that does not survive a stateless reply is one this module cannot report
+//! as lost — `transport/quic_bridge.zig` is where that is decided.
 //!
 //! # Why `std.c` and not `std.Io.net`
 //!
@@ -141,14 +155,14 @@ const batch = @import("batch.zig");
 const base_addr = @import("../base/addr.zig");
 
 const c = std.c;
-const linux = std.os.linux;
 
 /// The pure half: control messages and addresses, in the kernel's own layout.
 pub const ancillary = @import("ancillary.zig");
 
-/// The descriptors, and the capability probe. Spelled out rather than
-/// abbreviated, because `control` is the name a receive buffer's local
-/// carries in this file and Zig 0.16 refuses a declaration that shadows one.
+/// The descriptors, the capability probe, and the order `create` runs them
+/// in. Spelled out rather than abbreviated, because `control` is the name a
+/// receive buffer's local carries in this file and Zig 0.16 refuses a
+/// declaration that shadows one.
 const socket_control = @import("socket_control.zig");
 
 /// The send path: one `sendmsg`, and the passes over a batch.
@@ -177,17 +191,9 @@ pub const Received = recv_path.Received;
 /// Why a socket could not be opened. Declared in `socket_control.zig`.
 pub const OpenError = socket_control.OpenError;
 
-/// What to set on a socket before the bind.
-pub const Options = struct {
-    /// `SO_REUSEADDR`, for a rebind inside the reuse window. On by default
-    /// because an endpoint that comes back on the port it held is the case it
-    /// exists for, and it costs nothing when nothing else is bound there.
-    reuse_addr: bool = true,
-    /// `SO_REUSEPORT`, for a v4 and a v6 socket sharing one port. Off by
-    /// default: it lets a second descriptor take the same address and port
-    /// and a share of the datagrams, which is a decision to make on purpose.
-    reuse_port: bool = false,
-};
+/// What to set on a socket before the bind. Declared in
+/// `socket_control.zig`, beside the bind that honours it.
+pub const Options = socket_control.Options;
 
 /// A bound UDP socket that speaks `batch`.
 ///
@@ -222,45 +228,26 @@ pub const Socket = struct {
     /// Where it is bound, with the ephemeral port the kernel chose written in.
     address: base_addr.SocketAddr,
 
-    /// Open a socket on `address`, set the options, ask what it can do, and
+    /// Open a socket on `address`, set `options`, ask what it can do, and
     /// bind.
     ///
-    /// The probe runs here and only here. A `Capability` that is guessed
-    /// rather than asked is worse than none, because a driver that quietly
-    /// ignores `UDP_SEGMENT` turns every batch into a stalled path and
-    /// nothing reports it.
+    /// The order those happen in is a fact about the descriptors rather than
+    /// about this struct, so it is `socket_control.open`'s and this is the
+    /// naming of it: a `Capability` that is guessed rather than asked is worse
+    /// than none, and the only way not to guess is for the step and its
+    /// ordering to live with the descriptors.
+    ///
+    /// A successful call owns both descriptors; `close` releases them exactly
+    /// once. A refusal owns nothing.
     pub fn create(address: base_addr.SocketAddr, options: Options) OpenError!Socket {
-        const family: batch.Family = batch.Family.of(address.ip);
-        const handle = try socket_control.createSocket(family);
-        errdefer _ = c.close(handle);
-        // Reuse options first and the congestion option after, because both
-        // take effect before the bind: the port is not the socket's until
-        // `bind` answers.
-        if (options.reuse_addr) {
-            socket_control.setFlag(handle, linux.SOL.SOCKET, linux.SO.REUSEADDR, true) catch |err| {
-                return socket_control.openFromOption(err);
-            };
-        }
-        if (options.reuse_port) {
-            socket_control.setFlag(handle, linux.SOL.SOCKET, linux.SO.REUSEPORT, true) catch |err| {
-                return socket_control.openFromOption(err);
-            };
-        }
-        const caps = try socket_control.probe(handle, family);
-        // After the probe: a socket refused on its own options never reached
-        // the point of having a wait to wake.
-        const wake = try socket_control.createWake();
-        errdefer _ = c.close(wake);
-        var name: c.sockaddr.storage = undefined;
-        const length = ancillary.writeSockaddr(address, &name);
-        try socket_control.bindSocket(handle, &name, length);
+        const bound = try socket_control.open(address, options);
         return .{
-            .handle = handle,
-            .wake = wake,
+            .handle = bound.handle,
+            .wake = bound.wake,
             .stopped = .init(false),
-            .family = family,
-            .caps = caps,
-            .address = try socket_control.boundAddress(handle),
+            .family = bound.family,
+            .caps = bound.caps,
+            .address = bound.address,
         };
     }
 

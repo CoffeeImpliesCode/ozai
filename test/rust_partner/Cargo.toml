@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "iroh-partner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Pinned exactly: the interop fixture asserts wire behaviour against this release.
+iroh = "=1.3.0"
+# Only the runtime, macro, timer and channel surface this binary uses.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+hex = "0.4"
+anyhow = "1.0"

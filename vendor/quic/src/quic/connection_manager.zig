@@ -236,6 +236,65 @@ pub const ReplyLimits = struct {
     }
 };
 
+/// One Initial that would open a connection, as the caller's admission hook
+/// sees it. Borrowed by the call, which must not retain it: the connection this
+/// attempt may become does not exist yet, and the addresses are the manager's.
+pub const Admission = struct {
+    /// Where the datagram came from.
+    remote: address.Address,
+    /// The local address that received it.
+    local: address.Address,
+
+    /// The entry id this attempt carries **if it is accepted**. Nothing is
+    /// committed yet, so a verdict other than `accept` reserves nothing and
+    /// the next attempt is offered the same number. It is here so an admission
+    /// hook can name the attempt it is being asked about before the attempt
+    /// exists.
+    id: u64,
+    /// Whether this flow's address is **already proved** — a Retry or
+    /// NEW_TOKEN this manager sealed and validated on the way in.
+    ///
+    /// **This says proved, not proved-by-a-token.** `Connection.is_validated`
+    /// is lifted by a Handshake packet from the peer as well
+    /// (`connection.zig`), and this bit is read from the same place, so what
+    /// proved the address is not recorded and must not be guessed. For the one
+    /// question this bit answers — may a Retry still be sent on this flow —
+    /// both routes to the same answer: QUIC permits one Retry per flow
+    /// (RFC 9000 §17.2.5), and a proved path cannot be asked again.
+    validated: bool,
+};
+
+/// What the caller answers about an attempt, which the manager then acts on.
+///
+/// Three verdicts and not a boolean, because the endpoint layer already has
+/// this vocabulary and the mapping is where the contract lives: `accept`
+/// commits the connection, `retry` puts a Retry packet on the wire and commits
+/// nothing, and `drop` sends nothing at all.
+pub const AdmissionVerdict = enum {
+    /// Proceed with `acceptConnection`, as if no hook were registered.
+    accept,
+    /// Answer with a Retry token and commit no connection state.
+    retry,
+    /// Send nothing and commit nothing.
+    drop,
+};
+
+/// The caller's admission decision, consulted before a connection exists.
+///
+/// Null is the absence of a policy: every attempt is accepted, which is what
+/// the two manager-wide fields (`require_retry`, `retry_threshold`) were for.
+/// This hook is the per-attempt answer, and it is the only way an application
+/// verdict reaches the peer, because a verdict made after `acceptConnection`
+/// has no connection left to refuse and no Initial left to answer.
+pub const AdmissionHook = struct {
+    /// Caller-owned state handed back unchanged; never dereferenced here. It
+    /// must stay valid until the manager is released.
+    ptr: *anyopaque,
+    /// The call, on the thread that called `recvDatagram`, at most once per
+    /// attempt that would open a connection.
+    decide: *const fn (ptr: *anyopaque, attempt: Admission) AdmissionVerdict,
+};
+
 /// Manages multiple QUIC connections, routing packets by DCID.
 ///
 /// Owns connections, entries and routing tables through the retained allocator.
@@ -285,6 +344,16 @@ pub const ConnectionManager = struct {
     /// Also send Retry once this many connections are live, so a loaded
     /// server spends state only on clients that proved their address.
     retry_threshold: ?usize = null,
+
+    /// Asked about every Initial that would open a connection, before any
+    /// state is committed for it. Null accepts every attempt.
+    ///
+    /// This is the per-attempt half of admission, and it is the only one whose
+    /// answer reaches the peer: a verdict reached after `acceptConnection` has
+    /// no Initial left to answer. The two fields above are the manager-wide
+    /// half and still apply afterwards. Set it after `init`, like those, and
+    /// read it on the thread that calls `recvDatagram`.
+    admission: ?AdmissionHook = null,
 
     /// When true, every new connection is answered with CONNECTION_REFUSED,
     /// as it is at `max_connections`. Set while a server drains.
@@ -728,54 +797,73 @@ pub const ConnectionManager = struct {
                 // A token is honoured whether or not Retry is required now:
                 // load may have dropped since we sent the Retry, and its
                 // client will insist on seeing retry_source_connection_id.
+                // Both are validated here, before the caller's answer, so the
+                // hook is told what the core already knows about this flow
+                // rather than being handed the token to work out for itself.
                 const token = header.token orelse &[_]u8{};
                 const need_retry = self.require_retry or
                     (if (self.retry_threshold) |n| self.entries.items.len >= n else false);
+                var new_token = false;
                 if (token.len > 0) {
                     retry_token = packet.validateRetryToken(token, from, self.retry_token_key, now) catch null;
-                    if (retry_token) |*vt| {
-                        entry = self.acceptConnection(
-                            header,
-                            local,
-                            from,
-                            vt.getOdcid(),
-                            vt.getRetryScid(),
-                            now,
-                            random,
-                        ) catch return .{ .dropped = {} };
-                    } else if (packet.validateNewToken(token, from, self.retry_token_key, now)) {
-                        // Valid NEW_TOKEN — the address is proven already
-                        entry = self.acceptConnection(
-                            header,
-                            local,
-                            from,
-                            header.dcid,
-                            null,
-                            now,
-                            random,
-                        ) catch return .{ .dropped = {} };
-                    } else if (need_retry) {
-                        return .{ .dropped = {} };
+                    if (retry_token == null) {
+                        new_token = packet.validateNewToken(token, from, self.retry_token_key, now);
                     }
-                } else if (need_retry) {
-                    var retry_scid: [8]u8 = undefined;
-                    random.bytes(&retry_scid);
+                }
+                const validated = retry_token != null or new_token;
 
-                    var token_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
-                    const token_len = packet.generateRetryToken(
-                        &token_buf,
-                        header.dcid,
-                        &retry_scid,
+                // **The pre-accept decision, and the only place one can be
+                // made.** Nothing above has committed state for this flow and
+                // nothing below has yet, so a verdict reached here can still be
+                // answered on the wire: `retry` writes a Retry packet into
+                // `out_buf` — or a refusal, on a flow that has already proved its
+                // address, which is the one case it has nothing left to ask — and
+                // returns without accepting. That is the whole
+                // reason this hook exists, and the three answers are the three
+                // the endpoint layer already speaks.
+                if (self.admission) |hook| {
+                    switch (hook.decide(hook.ptr, .{
+                        .id = self.next_entry_id,
+                        .remote = from,
+                        .local = local,
+                        .validated = validated,
+                    })) {
+                        .accept => {},
+                        // The one-Retry-per-flow rule is not re-decided here:
+                        // `sendRetry` holds it, and this arm hands it the
+                        // flow's validation state to do so.
+                        .retry => return self.sendRetry(header, out_buf, from, validated, now, random),
+                        .drop => return .{ .dropped = {} },
+                    }
+                }
+
+                if (retry_token) |*vt| {
+                    entry = self.acceptConnection(
+                        header,
+                        local,
                         from,
-                        self.retry_token_key,
+                        vt.getOdcid(),
+                        vt.getRetryScid(),
                         now,
                         random,
                     ) catch return .{ .dropped = {} };
-
-                    var retry_fbs = io.fixedBufferStream(out_buf);
-                    packet.retry(header, &retry_scid, token_buf[0..token_len], &retry_fbs) catch
-                        return .{ .dropped = {} };
-                    return .{ .send_response = retry_fbs.buffered() };
+                } else if (new_token) {
+                    // Valid NEW_TOKEN — the address is proven already
+                    entry = self.acceptConnection(
+                        header,
+                        local,
+                        from,
+                        header.dcid,
+                        null,
+                        now,
+                        random,
+                    ) catch return .{ .dropped = {} };
+                } else if (token.len > 0) {
+                    // A token that proved nothing, on a flow that asked for a
+                    // Retry: dropped rather than answered twice.
+                    if (need_retry) return .{ .dropped = {} };
+                } else if (need_retry) {
+                    return self.sendRetry(header, out_buf, from, validated, now, random);
                 }
                 if (entry == null) {
                     entry = self.acceptConnection(
@@ -815,6 +903,57 @@ pub const ConnectionManager = struct {
             return .{ .processed = e };
         }
         return .{ .dropped = {} };
+    }
+
+    /// Answer one Initial with a Retry for `from`: a fresh server CID, a token
+    /// sealed over the peer's address and this connection's DCID, and the Retry
+    /// packet carrying both (RFC 9000 §17.2.5).
+    ///
+    /// The one place a Retry is written, so a Retry the caller's admission
+    /// hook asked for is the same packet, sealed the same way, as one
+    /// `require_retry` or `retry_threshold` asked for. Nothing is committed for
+    /// the flow: no connection, no entry, no routing map entry.
+    ///
+    /// **One Retry per flow (RFC 9000 §17.2.5) is decided here, and not at each
+    /// caller**, because this is the emission decision and every route into it
+    /// passes the same fact. `validated` is that fact, read where the flow's
+    /// state is consulted — `route`, immediately after token validation — and a
+    /// flow that has already proved its path has nothing left to be asked: a
+    /// peer sent a second Retry discards it (RFC 9000 §17.2.5), so the flow
+    /// would stall rather than end. So a Retry asked for on a proved flow is
+    /// **refused**, with CONNECTION_REFUSED sealed in an Initial the peer can
+    /// decrypt, which is the ending the endpoint layer gives a `retry` verdict
+    /// that has no token left to hand out (`incoming_filter.zig`, `admit`).
+    /// Refusing rather than staying silent is the point: the peer learns a
+    /// reason, and nothing is committed for the flow either way.
+    fn sendRetry(
+        self: *ConnectionManager,
+        header: packet.Header,
+        out_buf: []u8,
+        from: address.Address,
+        validated: bool,
+        now: i64,
+        random: std.Random,
+    ) RecvAction {
+        if (validated) return self.refuse(header, out_buf, now);
+        var retry_scid: [8]u8 = undefined;
+        random.bytes(&retry_scid);
+
+        var token_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
+        const token_len = packet.generateRetryToken(
+            &token_buf,
+            header.dcid,
+            &retry_scid,
+            from,
+            self.retry_token_key,
+            now,
+            random,
+        ) catch return .{ .dropped = {} };
+
+        var retry_fbs = io.fixedBufferStream(out_buf);
+        packet.retry(header, &retry_scid, token_buf[0..token_len], &retry_fbs) catch
+            return .{ .dropped = {} };
+        return .{ .send_response = retry_fbs.buffered() };
     }
 
     /// The server id `dcid` encodes, if it is another server's under our
@@ -1360,6 +1499,180 @@ test "past retry_threshold a new client gets Retry, and is served once it echoes
     try std.testing.expect(action == .processed);
     try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
     try std.testing.expect(mgr.entries.items[0].conn.paths[0].is_validated);
+}
+
+/// The caller's answer, for the hook below: a flow that has proved nothing is
+/// asked to come back, and a flow that has is let in. The verdict is what the
+/// manager acts on; the remembered attempt is how the test says which question
+/// it was asked.
+const AdmissionProbe = struct {
+    last: ?Admission = null,
+    always_retry: bool = false,
+
+    fn decide(ptr: *anyopaque, attempt: Admission) AdmissionVerdict {
+        const self: *AdmissionProbe = @ptrCast(@alignCast(ptr));
+        self.last = attempt;
+        if (self.always_retry) return .retry;
+        return if (attempt.validated) .accept else .retry;
+    }
+};
+
+/// Whether the packet on the wire is a Retry, which is what the peer decides on
+/// and therefore what this has to answer.
+///
+/// Retry is the one packet type with neither payload encryption nor header
+/// protection (RFC 9001 §5.5), so its type bits reach the wire in the clear:
+/// `0b11` in v1 and `0b00` in v2 (RFC 9369 §3), which are `0xf0` and `0xc0` in
+/// the first byte. Every other long header type is header-protected on the
+/// wire, so a bit mask alone cannot separate them — `& 0xc0` matches every
+/// long header packet, including the Initial that carries CONNECTION_REFUSED
+/// (RFC 9000 §5.2.2 puts a refusal in an Initial, not in a short header) — so
+/// the version is read first and the mask is keyed to the Retry type bits of
+/// that version. Without the version the predicate could not tell a second
+/// Retry from the refusal that takes its place.
+fn isRetryPacket(bytes: []const u8) bool {
+    if (bytes.len < 5 or !packet.isLongHeader(bytes[0])) return false;
+    const version = std.mem.readInt(u32, bytes[1..5], .big);
+    return (bytes[0] & 0xF0) == (packet.encodeLongHeaderTypeBits(.retry, version) & 0xF0);
+}
+
+test "an admission verdict reaches the peer: Retry before the connection, a token once it is proved" {
+    const alloc = std.testing.allocator;
+    const now = test_now;
+    var entropy = TestRandom.init(3);
+    const random = entropy.random();
+    var mgr = testManager(alloc, random);
+    defer mgr.deinit();
+    var probe: AdmissionProbe = .{};
+    mgr.admission = .{ .ptr = &probe, .decide = AdmissionProbe.decide };
+    const addr: address.Address = .unset;
+    var out: [1500]u8 = undefined;
+    var buf: [1500]u8 = undefined;
+
+    // The hook is asked about a flow that has proved nothing, and answers Retry.
+    // **The peer is answered and this server keeps nothing**: a Retry packet
+    // goes out and no connection, entry or routing key exists for the flow,
+    // which is the whole claim — a verdict reached after the accept could only
+    // have been a refusal.
+    const client = try clientInitial(alloc, &buf, now, random);
+    defer {
+        client.conn.deinit();
+        alloc.destroy(client.conn);
+    }
+    const token = switch (try mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out, now, random)) {
+        .send_response => |reply| reply,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(isRetryPacket(token));
+    try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+    try std.testing.expect(!probe.last.?.validated);
+    // And it is the id this attempt would carry, offered before it exists.
+    try std.testing.expectEqual(mgr.next_entry_id, probe.last.?.id);
+
+    // The client echoed the token, so the same flow arrives again and the core
+    // now has its own answer to give: proved. The hook is asked the same
+    // question and this time accepts, so the connection exists — and it is a
+    // connection whose address is proved, which is what a validated address
+    // bypassing a second Retry looks like from here.
+    const info: connection.RecvInfo = .{
+        .to = addr,
+        .from = addr,
+        .datagram_size = token.len,
+    };
+    client.conn.handleDatagram(@constCast(token), info, now, random);
+    try std.testing.expect(client.conn.retry_received);
+    const len = try client.conn.sendAt(&buf, now, random);
+    const served = try mgr.recvDatagram(buf[0..len], addr, addr, 0, &out, now, random);
+    try std.testing.expect(served == .processed);
+    try std.testing.expect(probe.last.?.validated);
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
+    try std.testing.expect(mgr.entries.items[0].conn.isPathValidated());
+}
+
+test "a Retry asked for on a flow that already proved its address is refused, not sent twice" {
+    // QUIC permits one Retry per flow (RFC 9000 17.2.5), so the hook's `retry`
+    // on a proved flow cannot become a token. It becomes the refusal upstream
+    // gives when `Incoming::retry` has nothing to give — and the refusal is
+    // what the peer can actually see, which a second Retry packet would not be.
+    const alloc = std.testing.allocator;
+    const now = test_now;
+    var entropy = TestRandom.init(3);
+    const random = entropy.random();
+    var mgr = testManager(alloc, random);
+    defer mgr.deinit();
+    var probe: AdmissionProbe = .{ .always_retry = true };
+    mgr.admission = .{ .ptr = &probe, .decide = AdmissionProbe.decide };
+    const addr: address.Address = .unset;
+    var out: [1500]u8 = undefined;
+    var buf: [1500]u8 = undefined;
+
+    const client = try clientInitial(alloc, &buf, now, random);
+    defer {
+        client.conn.deinit();
+        alloc.destroy(client.conn);
+    }
+    // Unproved, so this one is a token.
+    const first = switch (try mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out, now, random)) {
+        .send_response => |reply| reply,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(isRetryPacket(first));
+
+    // Proved, and asked again anyway: not a token this time.
+    const info: connection.RecvInfo = .{
+        .to = addr,
+        .from = addr,
+        .datagram_size = first.len,
+    };
+    client.conn.handleDatagram(@constCast(first), info, now, random);
+    const len = try client.conn.sendAt(&buf, now, random);
+    const second = switch (try mgr.recvDatagram(buf[0..len], addr, addr, 0, &out, now, random)) {
+        .send_response => |reply| reply,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(probe.last.?.validated);
+    try std.testing.expect(!isRetryPacket(second));
+    try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+
+    // And the refusal is one the peer can read, not merely something that is not
+    // a Retry: the same CONNECTION_CLOSE(CONNECTION_REFUSED) sealed in an Initial
+    // that `refuse` writes for a server at capacity, which the client decrypts
+    // with the keys its own DCID derives. This is what a second Retry would have
+    // cost the flow — nothing, because the peer discards a repeated Retry
+    // (RFC 9000 §17.2.5) and retransmits until it gives up.
+    const refused: connection.RecvInfo = .{
+        .to = addr,
+        .from = addr,
+        .datagram_size = second.len,
+    };
+    client.conn.handleDatagram(@constCast(second), refused, now, random);
+    try std.testing.expect(client.conn.isDraining());
+    try std.testing.expectEqual(
+        @as(u64, @intFromEnum(frame_mod.TransportError.connection_refused)),
+        client.conn.local_err.?.code,
+    );
+}
+
+test "no admission hook accepts every attempt, exactly as before it existed" {
+    const alloc = std.testing.allocator;
+    const now = test_now;
+    var entropy = TestRandom.init(3);
+    const random = entropy.random();
+    var mgr = testManager(alloc, random);
+    defer mgr.deinit();
+    std.debug.assert(mgr.admission == null);
+    const addr: address.Address = .unset;
+    var out: [1500]u8 = undefined;
+    var buf: [1500]u8 = undefined;
+
+    const client = try clientInitial(alloc, &buf, now, random);
+    defer {
+        client.conn.deinit();
+        alloc.destroy(client.conn);
+    }
+    const action = try mgr.recvDatagram(buf[0..client.len], addr, addr, 0, &out, now, random);
+    try std.testing.expect(action == .processed);
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
 }
 
 test "an accept that runs out of memory leaves no connection and no entry behind" {

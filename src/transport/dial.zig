@@ -185,6 +185,14 @@ const base_ula = @import("../base/ula.zig");
 const addr_map = @import("addr_map.zig");
 const batch = @import("batch.zig");
 const quic_bridge = @import("quic_bridge.zig");
+const quic_conn = @import("quic_conn.zig");
+const quic_config = @import("quic_config.zig");
+const quic_error = @import("quic_error.zig");
+
+// The address half of a dial, split out by responsibility: resolving a target
+// into an address and turning an address back into its key is not the same
+// runtime work as opening a connection to it. See `dial_route.zig`.
+const route_mod = @import("dial_route.zig");
 
 const NodeId = base_key.NodeId;
 const SecretKey = base_key.SecretKey;
@@ -193,8 +201,8 @@ const TransportAddr = base_transport_addr.TransportAddr;
 const CustomAddr = base_addr.CustomAddr;
 
 const Bridge = quic_bridge.Bridge;
-const Conn = quic_bridge.Conn;
-const Egress = quic_bridge.Egress;
+const Conn = quic_conn.Conn;
+const Egress = quic_conn.Egress;
 const Entry = quic.connection_manager.ConnEntry;
 const CidKey = quic.connection_manager.CidKey;
 const Connection = quic.connection.Connection;
@@ -204,11 +212,11 @@ const tls13 = quic.tls13;
 
 /// The instant the core is driven at. Re-exported so a caller threading a dial
 /// names one module for its identity and its clock.
-pub const Instant = quic_bridge.Instant;
+pub const Instant = quic_conn.Instant;
 
 /// The size of a peer certificate: a DER `SubjectPublicKeyInfo` wrapping 32
 /// bytes of ed25519 public key and nothing else.
-pub const spki_length = quic_bridge.spki_length;
+pub const spki_length = quic_config.spki_length;
 
 /// The 32 bytes of a secret key that are the actual entropy source; what the
 /// core wants as `private_key_bytes` for `.ed25519`.
@@ -222,14 +230,14 @@ pub const default_server_name = "ozai.invalid";
 ///
 /// Three other vocabularies are included whole rather than restated. One set
 /// covers a dialled and an accepted connection, and a second copy of
-/// `quic_bridge.Error` is a list that goes stale when that file grows an arm.
+/// `quic_error.Error` is a list that goes stale when that file grows an arm.
 /// A target can reach every arm of `base_addr.CustomAddrParseError` and of
 /// `addr_map.GetError`, and a caller should not have to import two more
 /// modules to handle a refused dial. Of those, `DataTooLong` is the one worth
 /// a word: a key that silently cut a custom address off would send the peer
 /// somewhere that is not here.
-pub const Error = quic_bridge.Error || base_addr.CustomAddrParseError ||
-    addr_map.GetError || error{
+pub const Error = quic_error.Error || quic_config.AlpnError ||
+    base_addr.CustomAddrParseError || addr_map.GetError || error{
     /// The caller's allocator refused the dial.
     OutOfMemory,
     /// The caller required a pin and named no peer to pin. Nothing was
@@ -265,9 +273,18 @@ pub const Config = struct {
     /// This node's identity: the seed the presented certificate is built from,
     /// and the node id a peer compares the certificate against.
     secret: SecretKey,
-    /// The one ALPN this build speaks. The core takes a list because it is a
-    /// general TLS stack; a node speaks one.
-    alpn: []const u8,
+    /// The protocols this node offers to dial with, in the order it prefers
+    /// them.
+    ///
+    /// **The same list and the same bound as `quic_config.Config.alpns`, and
+    /// for the same reason:** the core negotiates one of these
+    /// (`tls13.zig:1421`) and the router dispatches on the one that won, so a
+    /// dialer that could offer only one would be a node that could not reach a
+    /// peer whose first choice is not this dialer's first choice. At most
+    /// `quic_config.max_alpns` entries of 1..`quic_config.max_alpn_name_len`
+    /// bytes each, and `create` refuses by name — before it allocates — an
+    /// offer that breaks any of it.
+    alpns: []const []const u8,
     /// The SNI to send. A constant for every dial this project originates; see
     /// the module doc for what the field is and is not.
     server_name: []const u8 = default_server_name,
@@ -287,6 +304,30 @@ pub const Config = struct {
     /// `tlsConfigFor`, so no connection can be built that nobody can see is
     /// unpinned.
     require_peer_pin: bool = true,
+    /// Bytes this node advertises for a DATAGRAM frame, its type and length
+    /// fields included (RFC 9221 §3). Null advertises none.
+    ///
+    /// **The peer has to say the same.** Support comes up only when both ends
+    /// advertise a value (`connection.zig:3382`), so a dialer that wants
+    /// datagrams and a listener that does not get a connection with no
+    /// DATAGRAM on it at all, and every send on it is
+    /// `error.DatagramsNotEnabled`. It is here and not on the bridge because a
+    /// dialer and a bridge are different connections: the node is both ends.
+    max_datagram_frame_size: ?u64 = null,
+    /// How many peer-initiated unidirectional streams this node admits at
+    /// once, or null for the core's own default of 100.
+    ///
+    /// **A limit and not a promise** — RFC 9000 §4.6 grows it on MAX_STREAMS,
+    /// so this is the number in force before then. It is the bound
+    /// `Conn.openUni` refuses against.
+    initial_max_streams_uni: ?u64 = null,
+    /// Bytes this node lets the peer send on each unidirectional stream it
+    /// opens, or null for the core's own default of 1 MiB.
+    ///
+    /// **It is the bound `UniStream.write` refuses against.** RFC 9000 §4.1
+    /// raises it on MAX_STREAM_DATA, so a stream refused against it is "not
+    /// yet" and not wrong.
+    initial_max_stream_data_uni: ?u64 = null,
 };
 
 /// One target and the node behind it: a dial's whole reason to exist.
@@ -299,93 +340,8 @@ pub const Dial = struct {
     /// by `sweep` or by `Bridge.destroy`, never by the dialer.
     conn: Conn,
     /// The address the core was told, and what it stands for.
-    route: Route,
+    route: route_mod.Route,
 };
-
-/// The address a target is reached at, and the key behind it.
-pub const Route = struct {
-    /// The address the core is told. A synthetic RFC 4193 address for a relay
-    /// or a custom target, and the target's own address for a direct one.
-    socket: SocketAddr,
-    /// The key that owns `socket`, or null on a direct path: upstream never
-    /// puts an IP in the map, and this one does not either.
-    key: ?addr_map.Key,
-    /// Which synthetic subnet `socket` sits in, or null on a direct path, which
-    /// has none. This and `key` are both null exactly when `socket` is one of
-    /// the caller's own.
-    subnet: ?base_ula.Path,
-};
-
-/// What a target becomes: one address the core is told, and one key the caller
-/// keeps.
-///
-/// Direct targets do not allocate. Relay targets require `peer` and return
-/// `error.NoPeerId` when it is null. Custom targets copy their payload into the
-/// key and do not use `peer`. Allocation errors leave existing mappings intact,
-/// but may retain map capacity and consume random draws.
-pub fn resolveRoute(
-    gpa: std.mem.Allocator,
-    map: *addr_map.MappedAddrs,
-    transport: TransportAddr,
-    peer: ?NodeId,
-    random: std.Random,
-) Error!Route {
-    switch (transport) {
-        .ip => |socket| return .{ .socket = socket, .key = null, .subnet = null },
-        .relay => |url| return routeThrough(
-            gpa,
-            map,
-            .{ .relay = .{ .relay = url, .node = peer orelse return error.NoPeerId } },
-            .relay,
-            random,
-        ),
-        .custom => |custom| return routeThrough(
-            gpa,
-            map,
-            // `from` copies the data into the key. An entry outlives the frame
-            // that produced the address, so a key pointing into it would be
-            // read back over bytes already reused.
-            .{ .custom = try addr_map.CustomKey.from(custom) },
-            .custom,
-            random,
-        ),
-    }
-}
-
-/// The address a synthetic key is reached at, on the subnet its arm names.
-fn routeThrough(
-    gpa: std.mem.Allocator,
-    map: *addr_map.MappedAddrs,
-    key: addr_map.Key,
-    subnet: base_ula.Path,
-    random: std.Random,
-) Error!Route {
-    return .{
-        .socket = base_ula.socketAddrFor(
-            subnet,
-            addr_map.hostBitsOf(try map.get(gpa, key, random)),
-        ),
-        .key = key,
-        .subnet = subnet,
-    };
-}
-
-/// The key that owns `socket` on this node's map, or null.
-///
-/// The egress-side twin of what `Bridge.recv` computes on the way in
-/// (`quic_bridge.zig:574`). A sender has to answer the same two questions a
-/// receiver does — which subnet the address is in, and whose key stands behind
-/// it — to know which socket to put the datagram on, and `Conn.drain` hands
-/// over the address alone. It is the same `classify`-then-`lookup` the bridge
-/// makes; there is no seam to call there, so it is written out, and the two
-/// must agree about the three subnets or a dialled connection is sent on a
-/// socket it did not open.
-pub fn ownerOf(map: *const addr_map.MappedAddrs, socket: SocketAddr) ?addr_map.Key {
-    return switch (base_ula.classify(socket)) {
-        .ip => null,
-        .any_path, .relay, .custom => |octets| map.lookup(octets),
-    };
-}
 
 /// One identity, a `ConnectionManager` it dials through, and the strings its
 /// configurations point at.
@@ -421,13 +377,17 @@ pub const Dialer = struct {
     /// The one-element chain the core's config points at. It points into
     /// `spki`, which is why this struct lives on the heap.
     cert_chain: [1][]const u8,
-    /// The one-element ALPN list, for the same reason.
-    alpn_list: [1][]const u8,
+    /// The protocols this dialer offers, copied into this struct for the same
+    /// reason, and the first `alpn_count` of them.
+    alpn_list: [quic_config.max_alpns][]const u8,
+    /// How many of `alpn_list` are this dialer's. Never more than
+    /// `quic_config.max_alpns`, and zero only on a dialer `create` refused.
+    alpn_count: usize,
 
     /// A dialer presenting `config.secret`'s node, dialling through `bridge`.
     ///
     /// No `std.Io` and no generator, and the module doc says why there is
-    /// nothing for either to do. `config.alpn` and `config.server_name` are
+    /// nothing for either to do. `config.alpns` and `config.server_name` are
     /// borrowed: the core's configuration holds the slices for as long as the
     /// connection lives, so they must outlive every connection this dialer
     /// opens.
@@ -439,6 +399,11 @@ pub const Dialer = struct {
         bridge: *Bridge,
         config: Config,
     ) Error!*Dialer {
+        // The shared check, and it is the first thing this function does: before
+        // the dialer exists, before a byte is copied into it, and before the
+        // bridge is touched. A refusal therefore leaves no allocation to
+        // release and no truncated or unselectable offer for the core to see.
+        try quic_config.validateAlpns(config.alpns);
         const self = try gpa.create(Dialer);
         errdefer gpa.destroy(self);
         self.* = .{
@@ -450,10 +415,12 @@ pub const Dialer = struct {
             .spki = undefined,
             .cert_chain = undefined,
             .alpn_list = undefined,
+            .alpn_count = config.alpns.len,
         };
         self.spki = tls13.ed25519Spki(&self.node_id.toBytes());
         self.cert_chain = .{self.spki[0..]};
-        self.alpn_list = .{config.alpn};
+        self.alpn_list = undefined;
+        @memcpy(self.alpn_list[0..config.alpns.len], config.alpns);
         return self;
     }
 
@@ -501,7 +468,7 @@ pub const Dialer = struct {
             .cert_chain_der = &.{},
             .private_key_bytes = &.{},
             .private_key_algorithm = .ed25519,
-            .alpn = &self.alpn_list,
+            .alpn = self.alpn_list[0..self.alpn_count],
             // Read and then overwritten: `connectInto` copies this config and
             // assigns `server_name` from its own argument (`connection.zig:4667`).
             // Set anyway, so the value a caller reads back here is the value the
@@ -554,7 +521,7 @@ pub const Dialer = struct {
         // Before the map is touched, so a refused dial leaves no trace: no
         // host bits drawn, no entry allocated, nothing in the manager.
         if (expect_peer == null and self.config.require_peer_pin) return error.NoPeerPin;
-        const route = try resolveRoute(self.gpa, map, transport, expect_peer, random);
+        const route = try route_mod.resolveRoute(self.gpa, map, transport, expect_peer, random);
         const conn = try self.open(route.socket, local, self.tlsConfigFor(expect_peer), at, random);
         return .{ .conn = conn, .route = route };
     }
@@ -618,8 +585,8 @@ pub const Dialer = struct {
         // so these are read once by `Conn.drain` and then rewritten. They are
         // written at all because a `NetworkPath` starts `unset`, and `drain`
         // would refuse the first datagram it was ever asked for.
-        conn.paths[0].peer_addr = toCoreAddress(peer_addr);
-        conn.paths[0].local_addr = toCoreAddress(local);
+        conn.paths[0].peer_addr = quic_conn.toCoreAddress(peer_addr);
+        conn.paths[0].local_addr = quic_conn.toCoreAddress(local);
 
         const entry = try self.gpa.create(Entry);
         errdefer self.gpa.destroy(entry);
@@ -645,8 +612,22 @@ pub const Dialer = struct {
 /// server only, and a dial has no NEW_TOKEN to sign. The token a dial
 /// *presents* is `Config.initial_token`, and `connectInto` copies it into the
 /// connection's own buffer, so the caller's slice is not retained.
+///
+/// The two optionals are the core's own types, so a null here reaches the core
+/// as the null it is rather than as a value the core would have to be told to
+/// ignore. `initial_max_streams_uni` cannot be optional in the core — it is a
+/// count there, 100 by default (`connection.zig:926`) — so null is resolved
+/// here against that number rather than beside the field, where a change to
+/// the core would not show it.
 fn connectionConfig(config: Config) ConnectionConfig {
-    return .{ .max_idle_timeout = config.idle_timeout_ms };
+    return .{
+        .max_idle_timeout = config.idle_timeout_ms,
+        .max_datagram_frame_size = config.max_datagram_frame_size,
+        .initial_max_streams_uni = config.initial_max_streams_uni orelse 100,
+        // The core's own default is 1 MiB (`connection.zig:917`), written down
+        // for the same reason the count above is.
+        .initial_max_stream_data_uni = config.initial_max_stream_data_uni orelse 1_048_576,
+    };
 }
 
 /// Record `key` on `entry` so `removeConnection` takes it back out of the
@@ -663,21 +644,6 @@ fn noteCid(entry: *Entry, key: CidKey) Error!void {
     if (entry.registered_cid_count == entry.registered_cids.len) return error.CidPoolFull;
     entry.registered_cids[entry.registered_cid_count] = key;
     entry.registered_cid_count += 1;
-}
-
-/// This project's address as the core's own.
-///
-/// `quic_bridge.zig` has the same conversion for both directions and does not
-/// export it, so this is a second copy of one `switch` — the smallest
-/// duplication in the file, and it is here because a dial writes a path
-/// directly and the bridge's copy is not part of its own surface.
-fn toCoreAddress(socket: SocketAddr) quic.address.Address {
-    return switch (socket.ip) {
-        .v4 => |octets| quic.address.Address.initIpv4(octets, socket.port),
-        // The scope is zero because `SocketAddr` carries none; see
-        // `quic_bridge.toCoreAddress` for why that is the only honest value.
-        .v6 => |octets| quic.address.Address.initIpv6(octets, socket.port, 0),
-    };
 }
 
 const t = std.testing;
@@ -937,18 +903,18 @@ const Pair = struct {
         self.dialer_bridge = try Bridge.create(gpa, t.io, .{
             .secret = self.dialer_secret,
             .expect_peer = expect_peer,
-            .alpn = alpn,
+            .alpns = &.{alpn},
         }, self.engine.random());
         errdefer self.dialer_bridge.destroy();
         self.server_bridge = try Bridge.create(gpa, t.io, .{
             .secret = self.server_secret,
             .expect_peer = self.dialer_secret.nodeId(),
-            .alpn = alpn,
+            .alpns = &.{alpn},
         }, self.engine.random());
         errdefer self.server_bridge.destroy();
         self.dialer = try Dialer.create(gpa, self.dialer_bridge, .{
             .secret = self.dialer_secret,
-            .alpn = alpn,
+            .alpns = &.{alpn},
             .require_peer_pin = require_peer_pin,
         });
     }
@@ -1001,7 +967,7 @@ test "a relay target becomes one address the core is told, and the map says whos
     const peer = pair.server_secret.nodeId();
 
     var route_engine = Prng.init(2);
-    const route = try resolveRoute(
+    const route = try route_mod.resolveRoute(
         t.allocator,
         &pair.map,
         try relayTarget(),
@@ -1028,13 +994,13 @@ test "a relay target becomes one address the core is told, and the map says whos
     try t.expectEqual(expected_key, route.key.?);
     // And the map agrees, which is what lets a sender turn an `Egress` back
     // into a peer and a relay.
-    try t.expectEqual(route.key.?, ownerOf(&pair.map, route.socket).?);
+    try t.expectEqual(route.key.?, route_mod.ownerOf(&pair.map, route.socket).?);
 
     // Memoised: the same target answers with the same address for the life of
     // the map, so a second call draws no host bits and a second generator
     // cannot change the answer.
     var again_engine = Prng.init(999);
-    const again = try resolveRoute(
+    const again = try route_mod.resolveRoute(
         t.allocator,
         &pair.map,
         try relayTarget(),
@@ -1053,7 +1019,7 @@ test "a custom target is its own subnet, and the key owns the bytes" {
     var payload: [4]u8 = .{ 0xde, 0xad, 0xbe, 0xef };
     const custom: CustomAddr = .{ .id = 7, .data = payload[0..] };
     var route_engine = Prng.init(4);
-    const route = try resolveRoute(
+    const route = try route_mod.resolveRoute(
         t.allocator,
         &pair.map,
         .{ .custom = custom },
@@ -1084,7 +1050,7 @@ test "a direct target keeps its own address and never enters the map" {
     defer pair.deinit();
 
     var route_engine = Prng.init(6);
-    const route = try resolveRoute(
+    const route = try route_mod.resolveRoute(
         t.allocator,
         &pair.map,
         .{ .ip = direct_addr },
@@ -1099,7 +1065,7 @@ test "a direct target keeps its own address and never enters the map" {
         base_ula.Classification{ .ip = direct_addr },
         base_ula.classify(route.socket),
     );
-    try t.expectEqual(@as(?addr_map.Key, null), ownerOf(&pair.map, route.socket));
+    try t.expectEqual(@as(?addr_map.Key, null), route_mod.ownerOf(&pair.map, route.socket));
     // Nothing was allocated, in either direction of the map.
     try t.expectEqual(@as(usize, 0), pair.map.by_key.count());
     try t.expectEqual(@as(usize, 0), pair.map.by_addr.count());
@@ -1114,7 +1080,7 @@ test "a custom address too long for a key is refused, not truncated" {
     var route_engine = Prng.init(8);
     try t.expectError(
         error.DataTooLong,
-        resolveRoute(
+        route_mod.resolveRoute(
             t.allocator,
             &pair.map,
             .{ .custom = .{ .id = 1, .data = oversize[0..] } },
@@ -1333,7 +1299,7 @@ test "a dial runs initiated to connected as a function of datagrams and nothing 
         base_ula.Classification{ .relay = dial.route.socket.ip.v6 },
         base_ula.classify(dial.conn.peer().?),
     );
-    try t.expectEqual(dial.route.key.?, ownerOf(&pair.map, dial.conn.peer().?).?);
+    try t.expectEqual(dial.route.key.?, route_mod.ownerOf(&pair.map, dial.conn.peer().?).?);
 
     // The peer's identity, and the shape it has on a dial. `clientProcessCertificate`
     // lifts the 32 bytes out of the peer's `SubjectPublicKeyInfo`, compares
@@ -1571,12 +1537,12 @@ test "destroy wipes every retained secret copy before releasing its storage" {
     var engine = Prng.init(81);
     const bridge = try Bridge.create(alloc, t.io, .{
         .secret = secret,
-        .alpn = alpn,
+        .alpns = &.{alpn},
         .retry_token_key = @splat(0x12),
         .static_reset_key = @splat(0x34),
     }, engine.random());
     defer bridge.destroy();
-    const dialer = try Dialer.create(alloc, bridge, .{ .secret = secret, .alpn = alpn });
+    const dialer = try Dialer.create(alloc, bridge, .{ .secret = secret, .alpns = &.{alpn} });
     const secret_start = @intFromPtr(&dialer.config.secret) - @intFromPtr(&backing);
     const seed_start = @intFromPtr(&dialer.seed) - @intFromPtr(&backing);
     try dialer.destroy();
@@ -1645,14 +1611,14 @@ test "a refused dialer leaves no identity storage behind it" {
 
     const bridge = try Bridge.create(fixed.allocator(), t.io, .{
         .secret = peer_secret,
-        .alpn = alpn,
+        .alpns = &.{alpn},
     }, engine.random());
     defer bridge.destroy();
 
     var refusing = t.FailingAllocator.init(fixed.allocator(), .{ .fail_index = 0 });
     try t.expectError(
         error.OutOfMemory,
-        Dialer.create(refusing.allocator(), bridge, .{ .secret = secret, .alpn = alpn }),
+        Dialer.create(refusing.allocator(), bridge, .{ .secret = secret, .alpns = &.{alpn} }),
     );
     try t.expect(refusing.has_induced_failure);
     try t.expectEqual(@sizeOf(Bridge), fixed.end_index);
@@ -1664,7 +1630,7 @@ test "a refused dialer leaves no identity storage behind it" {
     // configuration still pointed at would answer with reused bytes.
     const dialer = try Dialer.create(fixed.allocator(), bridge, .{
         .secret = secret,
-        .alpn = alpn,
+        .alpns = &.{alpn},
     });
     try t.expect(@intFromPtr(dialer) - @intFromPtr(&backing) >= @sizeOf(Bridge));
     const block: []u8 = @as([*]u8, @ptrCast(dialer))[0..@sizeOf(Dialer)];
@@ -1677,6 +1643,90 @@ test "a refused dialer leaves no identity storage behind it" {
     // caller's key afterwards. A dialer that had taken a pointer to it would
     // have zeroed it here.
     try t.expectEqual(client_node.toBytes(), secret.nodeId().toBytes());
+}
+
+test "a dialer refuses an offer no selection could hold, and refuses it before it allocates" {
+    // A peer chooses this list, so it is where an unselectable name enters the
+    // node: `create` copies it into `alpn_list` and `tlsConfigFor` points the
+    // core at those entries. A name the core cannot record a selection for
+    // (`tls13.zig:4020`) can never be the protocol a dialled connection runs
+    // on, so it is refused by name here rather than offered to find out.
+    var secret = try SecretKey.fromSeed(client_seed);
+    defer secret.deinit();
+    var peer_secret = try SecretKey.fromSeed(server_seed);
+    defer peer_secret.deinit();
+    var engine = Prng.init(97);
+
+    // A fixed backing array is what makes "before it allocates" exact: its end
+    // index counts every byte handed out, so a refusal that had allocated
+    // would move it.
+    const alignment = @max(@alignOf(Bridge), @alignOf(Dialer));
+    var backing: [@sizeOf(Bridge) + 2 * @sizeOf(Dialer)]u8 align(alignment) = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    const alloc = fixed.allocator();
+
+    const bridge = try Bridge.create(alloc, t.io, .{
+        .secret = peer_secret,
+        .alpns = &.{alpn},
+    }, engine.random());
+    defer bridge.destroy();
+    const after_bridge = fixed.end_index;
+
+    // An entry that names nothing. RFC 7301 §3.1 types a `ProtocolName` as
+    // `1..2^8-1`, and an empty one is what a handshake that has not chosen yet
+    // reports (`tls13.zig:2040`) — a name nothing could be told apart from.
+    try t.expectError(error.NoAlpn, Dialer.create(alloc, bridge, .{
+        .secret = secret,
+        .alpns = &.{ alpn, "" },
+    }));
+
+    // And a name one byte over what a selection holds.
+    const too_long: [quic_config.max_alpn_name_len + 1]u8 = @splat('x');
+    try t.expectError(error.AlpnNameTooLong, Dialer.create(alloc, bridge, .{
+        .secret = secret,
+        .alpns = &.{ alpn, &too_long },
+    }));
+    // Nothing was taken for either refusal: the dialer is allocated first thing
+    // after this check, so a refusal that had reached it would have moved the
+    // index past the bridge's own bytes.
+    try t.expectEqual(after_bridge, fixed.end_index);
+
+    // What is still an offer is copied through unchanged, at every end of the
+    // bound: one protocol, a name of exactly `max_alpn_name_len` bytes, and a
+    // list filled to `max_alpns`.
+    const at_bound: [quic_config.max_alpn_name_len]u8 = @splat('x');
+    // A borrowed entry, which is what `Config.alpns` takes per name: the bytes
+    // stay in `at_bound` and only the pointer is copied into the dialer.
+    const at_bound_name: []const u8 = &at_bound;
+    const narrow = try Dialer.create(alloc, bridge, .{
+        .secret = secret,
+        .alpns = &.{at_bound_name},
+    });
+    // Awaited, not deferred-and-ignored: `destroy`'s only refusal is
+    // `DialedConnectionsLive`, which would mean this dialer still owns live
+    // connections. Nothing here dials, so a refusal is a fact about the state
+    // and is checked below rather than passed over as teardown.
+    var narrow_refusal: ?DestroyError = null;
+    defer narrow.destroy() catch |err| {
+        narrow_refusal = err;
+    };
+    const narrow_tls = narrow.tlsConfigFor(peer_secret.nodeId());
+    // The name is the bound and not a name near it: 32 bytes is inside, 33 is
+    // the refusal above, and this is the line that says which one this is.
+    try t.expectEqual(quic_config.max_alpn_name_len, narrow_tls.alpn[0].len);
+    try t.expectEqualSlices(u8, &at_bound, narrow_tls.alpn[0]);
+
+    const full: [quic_config.max_alpns][]const u8 = .{at_bound_name} ** quic_config.max_alpns;
+    const wide = try Dialer.create(alloc, bridge, .{ .secret = secret, .alpns = &full });
+    var wide_refusal: ?DestroyError = null;
+    defer wide.destroy() catch |err| {
+        wide_refusal = err;
+    };
+    const offered = wide.tlsConfigFor(peer_secret.nodeId()).alpn;
+    try t.expectEqual(quic_config.max_alpns, offered.len);
+    for (offered) |name| try t.expectEqualSlices(u8, &at_bound, name);
+    try t.expectEqual(@as(?DestroyError, null), wide_refusal);
+    try t.expectEqual(@as(?DestroyError, null), narrow_refusal);
 }
 
 /// How many allocating boundaries one pass's dial reached, in the allocator's
@@ -1779,8 +1829,8 @@ fn dialPass(failing: *t.FailingAllocator, refusal: t.FailingAllocator.Config) !D
         try expectEveryEntryRoutable(pair.dialer_bridge);
         try t.expectEqual(routes_before + 1, pair.map.by_key.count());
         try t.expectEqual(addresses_before + 1, pair.map.by_addr.count());
-        try t.expectEqual(fresh.route.key.?, ownerOf(&pair.map, fresh.route.socket).?);
-        try t.expectEqual(held_key, ownerOf(&pair.map, held_socket).?);
+        try t.expectEqual(fresh.route.key.?, route_mod.ownerOf(&pair.map, fresh.route.socket).?);
+        try t.expectEqual(held_key, route_mod.ownerOf(&pair.map, held_socket).?);
         try expectDialerOwnsItsTlsConfig(pair.dialer, fresh_peer);
         return passed;
     } else |err| {
@@ -1808,7 +1858,7 @@ fn dialPass(failing: *t.FailingAllocator, refusal: t.FailingAllocator.Config) !D
     // grew, or as an address resolving to a key the map never handed out.
     try t.expectEqual(routes_before, pair.map.by_key.count());
     try t.expectEqual(addresses_before, pair.map.by_addr.count());
-    try t.expectEqual(held_key, ownerOf(&pair.map, held_socket).?);
+    try t.expectEqual(held_key, route_mod.ownerOf(&pair.map, held_socket).?);
 
     // Pin state: the connection this node already had still runs on the pin it
     // was dialled with, and the dialer still hands out a configuration pinning
@@ -1839,7 +1889,7 @@ fn dialPass(failing: *t.FailingAllocator, refusal: t.FailingAllocator.Config) !D
     try expectEveryEntryRoutable(pair.dialer_bridge);
     try t.expectEqual(routes_before + 1, pair.map.by_key.count());
     try t.expectEqual(addresses_before + 1, pair.map.by_addr.count());
-    try t.expectEqual(retry.route.key.?, ownerOf(&pair.map, retry.route.socket).?);
+    try t.expectEqual(retry.route.key.?, route_mod.ownerOf(&pair.map, retry.route.socket).?);
     return passed;
 }
 

@@ -44,10 +44,17 @@
 //!
 //! Every seed below is a shape written here byte for byte from RFC 8446
 //! §4.1.2, §4.3.2 and §4.4.2, RFC 6066 §3 and RFC 8410 §3. None of them is a
-//! captured Rust vector, and none is labelled as one: this repository has run no
-//! live exchange with a Rust peer, so there is nothing captured to embed. The
-//! one seed carrying a 44-byte SPKI is that certificate written out from
-//! RFC 8410 §3, which is also exactly what `ed25519Spki` produces.
+//! captured Rust vector, and none is labelled as one: the datagram this
+//! repository holds from a Rust peer is a QUIC Initial, it belongs to the QUIC
+//! root rather than this one, and the two roots stay separate. That datagram
+//! is `test/corpus/rust_wire/rust_client_initial.hex`, decoded by
+//! `test/rust_wire_initial.zig`, held to by `test/rust_wire_initial_test.zig`
+//! and replayed as a seed of `test/quic_wire_fuzz.zig`. It is 1200 bytes of
+//! sealed QUIC payload — a whole
+//! datagram rather than a TLS flight — so this root keeps seeds written from
+//! the RFCs it decodes, and the window below stays at the width one flight
+//! needs. The one seed carrying a 44-byte SPKI is that certificate written out
+//! from RFC 8410 §3, which is also exactly what `ed25519Spki` produces.
 
 const std = @import("std");
 
@@ -75,14 +82,16 @@ const t = std.testing;
 // bytes alone and must not return it.
 //
 // A refused handshake is a closed production error judged by the oracle that
-// checks it: `HandshakeError` names fifteen arms that the hello leaf's verdict
-// predicts one for, and every arm a prediction covers is reported as a test
-// tag rather than passed on. The one it does not cover is the `.wait` arm —
-// a flight that has not all arrived, where `step` owes `wait_for_data` and no
-// reason — and that leaf's error set carries `HandshakeError` itself so the
-// arm that fired reaches the report instead of being flattened into a tag
-// that could not say which. `testOne` returns `anyerror!void`, so the name
-// arrives intact.
+// checks it: every arm of `HandshakeError` that the hello leaf's verdict
+// predicts is reported as a test tag rather than passed on, and the two are
+// compared by name against the error set itself rather than against a list of
+// arms written out beside it, so a refusal added to the set cannot leave a
+// count here quietly wrong. What the leaf does not predict is the `.wait` arm
+// — a flight that has not all arrived, where `step` owes `wait_for_data` and
+// no reason — and that leaf's error set carries `HandshakeError` itself so the
+// arm that fired reaches the report instead of being flattened into a tag that
+// could not say which. `testOne` returns `anyerror!void`, so the name arrives
+// intact.
 
 /// The seeds, one per shape the three families have a rule for.
 ///

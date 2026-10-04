@@ -92,30 +92,33 @@ const blobs = ozai.blobs_protocol;
 const range_spec = ozai.range_spec;
 const postcard = ozai.postcard;
 const batch = ozai.transport_batch;
-const bridge_mod = ozai.transport_quic_bridge;
-const dial_mod = ozai.transport_dial;
-const socket_mod = ozai.transport_socket;
-const addr_map = ozai.addr_map;
+const conn_mod = ozai.transport_quic_conn;
 
-const Bridge = bridge_mod.Bridge;
-const Conn = bridge_mod.Conn;
-const Egress = bridge_mod.Egress;
-const Instant = bridge_mod.Instant;
-const Dialer = dial_mod.Dialer;
-const Socket = socket_mod.Socket;
-const ControlBuffer = socket_mod.ControlBuffer;
-const NodeId = ozai.NodeId;
+const Instant = conn_mod.Instant;
+const Conn = conn_mod.Conn;
 const SecretKey = ozai.SecretKey;
-const SocketAddr = ozai.SocketAddr;
 
-/// A seeded generator's engine, kept beside every value handed out from it:
-/// `std.Random` is an interface over a pointer to the engine, so the engine
-/// has to outlive the connection it seeds.
-const Prng = std.Random.DefaultPrng;
+// The three support modules this root's own fixture code lives in: the
+// provider's bytes, the range plan derived from them, and the transport the
+// two halves meet on. Aliased back to the names the code below was written
+// with, because they were one file when it was and the names are its own.
+const store_mod = @import("blobs_transfer/store.zig");
+const plan_mod = @import("blobs_transfer/plan.zig");
+const wire_mod = @import("blobs_transfer/wire.zig");
 
-/// Where every socket binds, with port zero: the kernel picks, so a socket
-/// left over from the last run cannot collide with this one.
-const loopback: SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0 };
+const Store = store_mod.Store;
+const Plan = plan_mod.Plan;
+const Wire = wire_mod.Wire;
+const StreamBytes = wire_mod.StreamBytes;
+const max_spans = plan_mod.max_spans;
+const blob_hash = store_mod.blob_hash;
+const payload_length = store_mod.payload_length;
+const planSpec = plan_mod.planSpec;
+const planFromBoundaries = plan_mod.planFromBoundaries;
+const specOf = plan_mod.specOf;
+const queueOf = wire_mod.queueOf;
+const received = wire_mod.received;
+const freeSides = wire_mod.freeSides;
 
 /// Where virtual time starts. See the module doc: it only moves by `quantum`.
 const start_ns: u64 = 1000 * std.time.ns_per_s;
@@ -129,31 +132,6 @@ const quantum: u64 = std.time.ns_per_ms;
 /// Generous, because a round is a few syscalls and nothing here can block: the
 /// bound is a backstop against a run that never finishes, not a timer.
 const max_rounds = 512;
-
-/// The largest datagram a path is expected to carry, the same bound
-/// `quic_bridge.zig` and the vendored lossy-link test use.
-const max_datagram = 1500;
-
-/// How many socket writes one drain may hand back before the room is too
-/// small, and the room for them.
-///
-/// A burst of this blob's answer is bounded by the sender's congestion window
-/// rather than by a fixed count, so the room is sized for the whole answer and
-/// not for a guess about how many packets a burst holds.
-const max_egress = 512;
-const send_room: usize = max_egress * max_datagram;
-
-/// The core's own buffer: the datagram is copied into its front and a
-/// stateless reply is written behind it.
-const scratch_room: usize = 2 * max_datagram;
-
-/// Room for the largest list the kernel may coalesce into one read.
-const receive_room: usize = @as(usize, max_datagram) * batch.max_gro_segments_linux;
-
-/// The most byte ranges one answer may cover. A `RangeSpec` of a few widths
-/// yields a few spans, and a bound keeps the plan a value rather than an
-/// allocation.
-const max_spans = 8;
 
 /// The most jobs one link carries, and so the most decode storages.
 const max_jobs = 8;
@@ -173,33 +151,6 @@ const observe_room = 256;
 /// pretending it read the request.
 const decode_slots = 16;
 
-/// The provider's blob: 256 whole chunks and 700 bytes of a short one.
-///
-/// The size is chosen, not picked. Larger than one packet by three orders of
-/// magnitude, and larger than `batch.max_segments_linux` datagrams, so the send
-/// seam's segmentation is on the path rather than merely configured. The
-/// remainder is 700 rather than 1024 so the last chunk is short, which is the
-/// case `chunksToBytes` cannot answer exactly.
-const blob_length: usize = 256 * 1024 + 700;
-
-/// The blob's hash, and a request's hash is 32 raw bytes.
-///
-/// The first byte matters to one assertion in this file: overwriting a `get`
-/// frame's discriminant with `push`'s makes that byte the declared body
-/// length, and 0x5a is a one-byte varint for ninety — more than the frame has
-/// left. See the framing test.
-const blob_hash: [32]u8 = @splat(0x5a);
-
-/// The seeds of the blob's bytes and the payload's. Two, so a payload cannot
-/// be mistaken for a stretch of the blob.
-const blob_seed: u32 = 0x243f_6a88;
-const payload_seed: u32 = 0xb7e1_5162;
-
-/// The bao data a `push` writes after its request, on the same stream. Big
-/// enough that a reader which swallowed it into the request would hold more
-/// bytes than the request declares.
-const payload_length: usize = 1024;
-
 /// How much of a whole-blob answer the truncating provider stops after.
 const truncated_at: usize = 1000;
 
@@ -217,12 +168,9 @@ const tail_widths = [_]u64{ 254, 3 };
 // Transport
 // ---------------------------------------------------------------------------
 
-/// One endpoint's transport: an identity, a socket on an ephemeral loopback
-/// port, the bridge that runs its connections, and the buffers both seams need.
-///
-/// It carries no protocol state, because the two halves of this test want
-/// different state on top of exactly this.
-const Wire = struct {
+// The endpoint, its send-seam counters and its per-stream byte queues are
+// `blobs_transfer/wire.zig`'s. What is left here is the link that owns two of
+// them, the jobs it puts on them and the assertions that read the result back.
     name: []const u8,
     id: NodeId,
     secret: SecretKey,
@@ -269,14 +217,14 @@ const Wire = struct {
         self.bridge = try Bridge.create(t.allocator, t.io, .{
             .secret = secret,
             .expect_peer = expect_peer,
-            .alpn = alpn,
+            .alpns = &.{alpn},
             .retry_token_key = @splat(0x11),
             .static_reset_key = @splat(0x22),
         }, self.random());
         errdefer self.bridge.destroy();
         self.dialer = try Dialer.create(t.allocator, self.bridge, .{
             .secret = secret,
-            .alpn = alpn,
+            .alpns = &.{alpn},
         });
         errdefer self.dialer.destroy() catch @panic("new dialer has no live connections");
         // A bridge created a moment ago has no entry for `destroy` to refuse,

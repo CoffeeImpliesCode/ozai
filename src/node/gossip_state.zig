@@ -9,17 +9,20 @@
 //! **Nothing here counts, and that is the design rather than an omission.** What
 //! an action asked for is counted by the caller, in the caller's own vocabulary,
 //! through a `Tally` this file fills in: the counters a caller publishes are
-//! `Stats` in `node.zig` and this file has no business knowing them. What it
+//! `node_stats.Stats` and this file has no business knowing them. What it
 //! does own is what *happened* — the event reached the machine, it scheduled
 //! this timer at this instant, it named that peer — and the named-peer ring is
 //! kept here precisely because it is a record of what happened rather than a
 //! statistic of it.
 //!
-//! **The wire is still not wired.** `gossip/hyparview.zig` says of itself that it
-//! has no codec, so every `send_message` a `feed` produces is counted and the
-//! peer it names is kept, and nothing else happens to it. `Stats`
-//! `gossip_membership_asked` and `gossip_broadcast_asked` are where that gap is
-//! visible, and `namedPeers` is what says who.
+//! **This file performs nothing on a wire, and that is a split, not a gap.**
+//! `feed` leaves every request the state machine made in a list the caller
+//! owns, in the order the state machine made it: a `send_message` names a
+//! node id, and turning that id into a connection, a stream and bytes is a
+//! question about connections rather than about swarms. `topic_table` answers
+//! where a topic writes and `conn_index` answers which connection a peer is
+//! on; `node_gossip` asks both. What this file keeps is the timers, because a
+//! timer belongs to the topic and no other module knows when it was asked for.
 
 const std = @import("std");
 
@@ -30,6 +33,9 @@ const plumtree = @import("../gossip/plumtree.zig");
 const NodeId = base_key.NodeId;
 const Allocator = std.mem.Allocator;
 const Nanos = hyparview.Nanos;
+
+/// The caller's list of requests, which `feed` fills and the caller performs.
+const Actions = hyparview.Actions;
 
 /// What this file refuses: exactly what the topic's own `handle` returns, and
 /// nothing of its own.
@@ -131,28 +137,34 @@ pub fn State(comptime ring_depth: usize) type {
             self.timers.clearRetainingCapacity();
         }
 
-        /// Hand one event to the topic and do what it asks for, counting what it
-        /// asked into `tally`.
+        /// Hand one event to the topic, keep what belongs to the topic, and
+        /// leave the rest in `out` for the caller to perform.
         ///
-        /// **The tally is filled rather than owned**, so this file never reads
-        /// the node's counters; see the module doc for why that is the design.
+        /// **`out` is the caller's list and it is empty on entry**, which the
+        /// assertion proves rather than trusts: a caller that reused one would
+        /// find every entry below counted again for an event it never saw, and
+        /// `TopicState.handle` appends rather than replaces, so the tally
+        /// would be wrong without anything raising.
+        ///
+        /// **The sends and the disconnects stay in the list, in order.** The
+        /// state machine's ordering is load-bearing — see `TopicState.handle`
+        /// for the three passes — and a caller that re-sorted or filtered them
+        /// would change which peers a message reaches. So the walk below only
+        /// reads, and the caller walks the same list again to act.
+        ///
+        /// The tally is filled rather than owned, so this file never reads the
+        /// node's counters; see the module doc for why that is the design.
         pub fn feed(
             self: *Self,
-            gpa: Allocator,
             event: hyparview.InEvent,
             now: Nanos,
             tally: *Tally,
+            out: *Actions(hyparview.OutEvent),
         ) Error!void {
-            var out: hyparview.Actions(hyparview.OutEvent) = .init(gpa);
-            defer out.deinit();
-            try self.topic.handle(event, now, &out);
+            std.debug.assert(out.count() == 0);
+            try self.topic.handle(event, now, out);
             tally.events += 1;
             for (out.slice()) |produced| switch (produced) {
-                // **Not wired.** The gossip wire format does not exist in this
-                // project — `gossip/hyparview.zig` says of itself that it has no
-                // codec, and the only encoder in the tree is a test's. So the
-                // request is counted, split by the layer that asked, and the
-                // peer is named; nothing is sent. See the module doc.
                 .send_message => |send| {
                     self.note(send.to);
                     switch (send.message) {
@@ -160,19 +172,17 @@ pub fn State(comptime ring_depth: usize) type {
                         .gossip => tally.broadcast_asked += 1,
                     }
                 },
+                // The one request this file performs: a timer is the topic's
+                // own, and its due instant is `now` plus what was asked for.
                 .schedule_timer => |schedule| {
                     tally.timers_scheduled += 1;
-                    try self.timers.append(gpa, .{
+                    try self.timers.append(out.gpa, .{
                         .due = now + schedule.after,
                         .timer = schedule.timer,
                     });
                 },
-                // Also not wired, for the same reason: a `disconnect_peer` names
-                // a node, and a node finds a connection by an address its map or
-                // its dialer holds, never by an id. Counting it is the honest
-                // report; tearing a connection down by node id belongs with the
-                // codec, which is what would have carried the message the state
-                // machine is asking to be believed about.
+                // Counted, named, and left for the caller, which is the only
+                // module that can tell which connection a node id is on.
                 .disconnect_peer => |peer| {
                     tally.disconnects_asked += 1;
                     self.note(peer);
@@ -182,6 +192,8 @@ pub fn State(comptime ring_depth: usize) type {
                     .neighbor_down => tally.neighbor_down += 1,
                     .received => tally.broadcasts_received += 1,
                 },
+                // Contact data the caller stores against the topic; the bytes
+                // borrow the state, so it must copy before this call returns.
                 .peer_data => tally.peer_data_seen += 1,
             };
         }

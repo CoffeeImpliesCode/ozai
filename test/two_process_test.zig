@@ -123,7 +123,7 @@ const Roster = roster_mod.Roster;
 const Want = report.Want;
 
 /// Import the loop interval so watchdog arithmetic follows the node's cadence.
-const pass_ms: i64 = @intCast(ozai.node.poll_interval_ms);
+const pass_ms: i64 = @intCast(ozai.node_config.poll_interval_ms);
 
 /// Allow twice the nominal poll interval for scheduler contention.
 /// This allowance bounds a failed run. It does not prove that a state was reached.
@@ -1164,8 +1164,8 @@ test "a flag this program refuses exits 1, on one line, with no stack trace" {
 
     // And the one refusal that is about the relay flags disagreeing with each
     // other: a datagram for a node that has no relay to put it on. Left to the
-    // loop this would be a `NoRelay` out of `sendThrough` on its first pass,
-    // which is a stack trace rather than a line.
+    // loop this would be a `NoRelay` out of `node_relay_client.sendThrough` on
+    // its first pass, which is a stack trace rather than a line.
     const wireless = [_][]const u8{
         "--send",
         try std.fmt.allocPrint(arena.allocator(), "{s}:nowhere", .{held}),
@@ -1234,18 +1234,19 @@ test "a flag this program refuses exits 1, on one line, with no stack trace" {
 // The driver this program actually runs, on an error it can reach from a
 // command line.
 //
-// `Node.run` closes on every exit, but `src/node/main.zig`'s `drive` is a
-// second loop over the same node and once had no `errdefer` at all: a pass
+// `node_runtime.run` closes on every exit, but `src/node/main.zig`'s `drive` is
+// a second loop over the same node and once had no `errdefer` at all: a pass
 // that failed left `main` to return the error over a node still in `serving`,
-// and the `defer node.deinit()` behind it dropped it. So this asserts the
-// driver boundary rather than `Node.run`'s, which was never the broken one.
+// and the `defer node_lifecycle.deinit()` behind it dropped it. So this asserts
+// the driver boundary rather than `node_runtime.run`'s, which was never the
+// broken one.
 //
-// **`--peer` nine times is the failure, and it is a real one.** `Node.start`
-// refuses a bootstrap list longer than `hyparview.max_bootstrap` after it has
-// dialled, and `drive` calls `start` on its first pass — so the node exists,
-// the banner is printed and the loop is entered, and the failure is forced
-// after creation from the command line alone. Nothing here needs a flag this
-// program does not already have.
+// **`--peer` nine times is the failure, and it is a real one.**
+// `node_runtime.start` refuses a bootstrap list longer than
+// `hyparview.max_bootstrap` after it has dialled, and `drive` calls `start` on
+// its first pass — so the node exists, the banner is printed and the loop is
+// entered, and the failure is forced after creation from the command line
+// alone. Nothing here needs a flag this program does not already have.
 test "a driver that fails after the node exists winds the node down and keeps the failure" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
@@ -1315,9 +1316,10 @@ test "a driver that fails after the node exists winds the node down and keeps th
 
     // **And the node it was driving was wound down, which is the half that was
     // missing.** The claim is made from the one thing this failure actually
-    // prints. `main` registers `windDown` before it writes the banner, so a
-    // failing pass closes the node and hands the `defer node.deinit()` behind it
-    // a lease that is already `closed`. Dropped in `serving` instead, `deinit`
+    // prints. `main` registers `node_runtime.windDown` before it writes the
+    // banner, so a failing pass closes the node and hands the
+    // `defer node_lifecycle.deinit()` behind it a lease that is already
+    // `closed`. Dropped in `serving` instead, `node_lifecycle.deinit`
     // reports the abandonment at **error level**, on the stderr this run has
     // just proved carries the failure — and an error-level log from this
     // program's own teardown is a finding about the program, not a stray

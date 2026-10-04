@@ -24,6 +24,16 @@
 //! *refusal* rather than a token, that an `accept` which fails is a drop and not
 //! an error code, and that a shutdown is handlers, then cancel, then close.
 //!
+//! **What is in this file, and what is not.** The accept loop is the *machine*:
+//! which of the four verdicts ends an attempt, what a shutdown owes next, and
+//! when a slot is taken or freed. The window it takes them in is the *storage*,
+//! and it lives in `tasks.zig` — the dense table of held accepts and the
+//! per-protocol routing that says which configured protocol each one is under.
+//! The split is by runtime responsibility and nothing else crosses it: the
+//! machine decides, the storage holds, and the layer that owns the socket
+//! (`src/node/node_runtime.zig` for a node, `src/transport/` for the core
+//! beneath it) performs what the machine names.
+//!
 //! Nothing here opens a socket, reads a clock, or takes a runtime, and that is
 //! the reason the file has this shape rather than a limitation of it. The two
 //! operations that do need a runtime are the caller's: spawning a task and
@@ -34,28 +44,42 @@
 //! sleep, and a loop that can spawn is a loop that cannot be tested. The filter
 //! callback is the caller's for the same reason: it is application code, so
 //! `step` names the call (`Action.offer`) instead of making it, exactly as
-//! `router.dispatchStep` names `on_accepting` instead of calling it.
+//! `dispatch.dispatchStep` names `on_accepting` instead of calling it.
 //!
-//! One divergence from upstream is load-bearing and belongs in the
-//! `docs/ARCHITECTURE.md` list. Upstream's `Incoming::retry()`
-//! (`connection.rs:183-189`) is a per-attempt call into the QUIC core. The
-//! vendored core has no such call: it decides Retry from two manager-wide
-//! fields, `require_retry` and `retry_threshold`, inside the same call that
-//! accepts the connection and hands it the ClientHello
-//! (`vendor/quic/src/quic/connection_manager.zig:606-647`, `:662`), so a
-//! decision made by application code arrives after the point at which RFC 9000
-//! §17.2.5 permits a Retry at all. A retry verdict is therefore **refused**
-//! here, which is what upstream does when `incoming.retry()` fails: `if let
-//! Err(err) = incoming.retry() { err.into_incoming().refuse() }`
-//! (`protocol.rs:583-586`). Closing the gap is a change in `vendor/quic/` — the
-//! core has to grow a hook that runs before `acceptConnection` — so the token
-//! is not a thing this endpoint names.
+//! Where the Retry verdict is reached is the load-bearing divergence, and it
+//! belongs in the `docs/ARCHITECTURE.md` list. Upstream's
+//! `Incoming::retry()` (`connection.rs:183-189`) is a per-attempt call into the
+//! QUIC core, taken from the filter's answer. The vendored core had no such
+//! call: it decided Retry from two manager-wide fields, `require_retry` and
+//! `retry_threshold`, inside the same call that accepts the connection and
+//! hands it the ClientHello, so a decision made by application code arrived
+//! after the point at which RFC 9000 §17.2.5 permits a Retry at all.
+//!
+//! **It now has one.** `ConnectionManager.admission`
+//! (`vendor/quic/src/quic/connection_manager.zig`) is asked about every Initial
+//! that would open a connection, in the branch that decides whether to accept
+//! it, before `acceptConnection` and before any state is committed — so a
+//! `retry` verdict is answered with a real Retry packet on the same pass, and
+//! the flow that comes back carrying the token is the same flow arriving again
+//! with the core's validated bit set. That is upstream's position, not a later
+//! one: the filter runs before the handshake does any work.
+//!
+//! The arm below still turns a `send_retry` into `Action.refuse`, and it is
+//! right to: this loop only ever sees a connection that was **already**
+//! accepted, and by then there is no Initial left to answer, which is upstream's
+//! own ending for a Retry it cannot give (`if let Err(err) =
+//! incoming.retry() { err.into_incoming().refuse() }`, `protocol.rs:583-586`).
+//! A filter that is registered is asked pre-accept, where its retry verdict is
+//! a token rather than a refusal.
 
 const std = @import("std");
 const router = @import("../router/router.zig");
+const dispatch = @import("../router/dispatch.zig");
+const shutdown = @import("../router/shutdown.zig");
 const base_addr = @import("../base/addr.zig");
 const base_ula = @import("../base/ula.zig");
 const filter = @import("incoming_filter.zig");
+const task_table = @import("tasks.zig");
 
 const Incoming = filter.Incoming;
 const IncomingFilter = filter.IncomingFilter;
@@ -63,21 +87,11 @@ const Validation = filter.Validation;
 
 /// One long-lived `accept`, held as a value.
 ///
-/// Upstream spawns `token.run_until_cancelled(handle_connection(...))` onto a
-/// `JoinSet` (`protocol.rs:601-603`), and that future may outlive the handshake
-/// and the connection with it (`protocol.rs:258-261`). That is the whole reason
-/// the shutdown has an ordering, and it is why a task here is a value with an
-/// explicit lifetime rather than a thread: the caller drives `state` with the
-/// router's own `dispatchStep` and reports what happened, and the loop counts
-/// what is running so the cancel knows what it is cancelling.
-pub const Task = struct {
-    /// The core's connection id, which is what a reaped task is named by, and
-    /// never reused (`transport/quic_bridge.zig:230-233`).
-    id: u64,
-    /// The router's per-connection machine, running on this task. The caller
-    /// drives it while the task is held; the loop only ever reads the id.
-    state: router.ConnState,
-};
+/// The endpoint's public name for what `tasks.Task` is: the storage lives with
+/// the rest of the accept window, in the module that owns that responsibility,
+/// and this is where a caller holding `[max_accepts]endpoint.Task` reads it
+/// from.
+pub const Task = task_table.Task;
 
 /// How a task's future ended, which is all `join_next` hands back.
 pub const Reaped = struct {
@@ -122,6 +136,11 @@ pub const Event = union(enum) {
     arrived: Incoming,
     /// The filter answered (`:574`). Owed only while an attempt is pending.
     filtered: filter.Answer,
+    /// The handshake produced an ALPN for a held task, and the task is routed to
+    /// the configured protocol that claims it. Fed by the caller driving
+    /// `dispatch.dispatchStep`, which is where it learns the ALPN — see
+    /// `Routed`.
+    routed: Routed,
     /// A join-set entry came back (`:545`).
     reaped: Reaped,
     /// The run token fired, the application asked to close, a task panicked, or
@@ -135,6 +154,35 @@ pub const Event = union(enum) {
     accepts_cancelled,
     /// `endpoint.close().await` returned (`:613`).
     endpoint_closed,
+};
+
+/// One task's negotiated ALPN, and the connection it is for.
+///
+/// **The caller reports this, because the caller is what learns the ALPN.** A
+/// task's protocol is decided by the handshake, and the handshake is driven by
+/// the caller through `dispatch.dispatchStep` — the loop never reads a
+/// connection and so never sees the ALPN. So a caller that drove a task past
+/// the negotiation feeds this back, and the loop routes the task to the
+/// protocol the table claims.
+///
+/// **Owed only while a task is held, and owed nothing.** The step records the
+/// routing and answers `Action.none`: routing a task is bookkeeping the caller
+/// asked for, not a command it has to perform.
+///
+/// **An ALPN no configured protocol claims leaves the task unrouted and still
+/// owes nothing**, which is stated rather than left to be discovered: by the
+/// time an ALPN exists the connection is established and the layer that owns it
+/// is the caller's, so the refusal is the caller's to act on. `Router.dispatch`
+/// is where it reads, and `tasks.route` is what hands it back — the loop does
+/// not send an error code on a caller's behalf, which is the rule every action
+/// in this file follows. `peerOutcome` is `.nothing` for the same reason: a
+/// refusal here is upstream's warn-and-return (`protocol.rs:653-656`).
+pub const Routed = struct {
+    /// Which task negotiated the ALPN.
+    id: u64,
+    /// The ALPN the handshake produced, borrowed for this call and not stored:
+    /// what is kept is the index it claimed, which is a number.
+    alpn: []const u8,
 };
 
 /// The one thing the accept loop owes its caller.
@@ -171,7 +219,7 @@ pub const Action = union(enum) {
     /// `join_set.spawn` (`:601-603`).
     ///
     /// The caller drives the task — `Node` runs it through
-    /// `router.dispatchStep` and reports the outcome — and owes
+    /// `dispatch.dispatchStep` and reports the outcome — and owes
     /// `Event.reaped` when it ends, which is what frees the slot. A task the
     /// caller never reaps is a slot the loop will not reuse and a count it
     /// cannot get right at the close.
@@ -215,13 +263,13 @@ pub const Action = union(enum) {
 
 /// One step of the shutdown: the router's action, and what started it.
 ///
-/// The machine is `router.Shutdown`, so the ordering is the router's and not
+/// The machine is `shutdown.Shutdown`, so the ordering is the router's and not
 /// this file's. What is left to say is *why* the shutdown began, which upstream
 /// says with a log line and this says with a value: a panicked task is the only
 /// beginning that is not somebody's request.
 pub const ShutdownStep = struct {
     /// The one thing owed next, in the router's words.
-    action: router.Shutdown.Action,
+    action: shutdown.Shutdown.Action,
     /// The task that panicked, when a panic is what started this. Upstream
     /// `error!("Task panicked")` and then `break` (`:551-554`).
     ///
@@ -281,16 +329,16 @@ pub const Loop = struct {
     /// how an attempt is acted on once: upstream's four answers each consume the
     /// `Incoming` (`connection.rs:148`, `:175`, `:185`, `:192`).
     pending: ?Incoming,
-    /// The shutdown. `router.Shutdown` is the whole of it, so the ordering
+    /// The shutdown. `shutdown.Shutdown` is the whole of it, so the ordering
     /// cannot drift from the router's.
-    shutdown: router.Shutdown,
+    shutdown: shutdown.Shutdown,
 
     /// A loop over a table, a filter that may be absent, and a task table the
     /// caller sizes. The two counts are stated here and restated at the close,
     /// which is the only moment both can be right — see `beginShutdown`.
     /// **A table with no registrations is a legitimate endpoint, not an empty
     /// one.** Its `handlers` count is zero and its close therefore owes no
-    /// handler at all, which `router.Shutdown` answers on the first step rather
+    /// handler at all, which `shutdown.Shutdown` answers on the first step rather
     /// than waiting for a `handler_finished` nobody can send. An attempt that
     /// arrives is offered to the filter and, with no filter, accepted; it then
     /// spawns a task that the dispatch drops, saying nothing to the peer, because
@@ -299,15 +347,15 @@ pub const Loop = struct {
     pub fn init(
         router_table: *const router.Router,
         incoming_filter: ?IncomingFilter,
-        tasks: []Task,
+        task_slots: []Task,
     ) Loop {
         return .{
             .router = router_table,
             .incoming_filter = incoming_filter,
-            .tasks = tasks,
+            .tasks = task_slots,
             .live = 0,
             .pending = null,
-            .shutdown = router.Shutdown.init(handlerCount(router_table), 0),
+            .shutdown = shutdown.Shutdown.init(handlerCount(router_table), 0),
         };
     }
 
@@ -323,29 +371,52 @@ pub const Loop = struct {
     /// Aborting ungracefully" (`iroh/src/socket.rs:220-230`) — so dropping an
     /// endpoint without closing is a misuse and not a cleanup. Zig has no
     /// `Drop`, so the report moves to a handle whose
-    /// `deinit` is the single exit — and that handle is `router.Lease`, the same
+    /// `deinit` is the single exit — and that handle is `shutdown.Lease`, the same
     /// shape as `Clients.OnDisconnectGuard` in `relay/server.zig`, already
     /// specialised to the thing this endpoint has to report, which is a phase of
     /// the shutdown. It is not written again here: the lease reads the very
     /// `Shutdown` this loop drives, and a third copy of a struct with a
     /// `reported` flag would be a second place for two answers to disagree.
     ///
-    /// The report itself is `router.Lease.deinit`'s: `.closed` is the one good
+    /// The report itself is `shutdown.Lease.deinit`'s: `.closed` is the one good
     /// answer, `.abandoned` names the phase the loop was left in, and
     /// `.already_gone` is what a second copy of the lease says.
     ///
     /// The loop must not be copied elsewhere while a lease is held, because the
     /// lease reads through this one. Upstream's promise has the same shape and
     /// the same discipline.
-    pub fn acquire(self: *Loop) router.Lease {
-        return router.Lease.acquire(&self.shutdown);
+    pub fn acquire(self: *Loop) shutdown.Lease {
+        return shutdown.Lease.acquire(&self.shutdown);
     }
 
     /// The accept task for `id`, for the caller to drive. Null when there is
     /// none: before it was spawned, or after it was reaped.
     pub fn task(self: *Loop, id: u64) ?*Task {
-        const index = self.indexOf(id) orelse return null;
-        return &self.tasks[index];
+        return task_table.at(self.tasks, self.live, id);
+    }
+
+    /// How many held tasks are under the configured protocol at `index`.
+    ///
+    /// This is what a protocol's own close cancels: retiring one protocol while
+    /// the others keep serving owes the cancellation of exactly these tasks,
+    /// and the endpoint-wide shutdown's count is a different thing — it counts
+    /// the whole window, which is upstream's all-or-nothing close
+    /// (`protocol.rs:609-611`).
+    ///
+    /// `index` is a `Claim.index` from `Event.routed`, so a caller routes a
+    /// task by number and counts it by the same number.
+    pub fn laneCount(self: *const Loop, index: usize) usize {
+        return task_table.laneCount(self.tasks, self.live, index);
+    }
+
+    /// The ids of the held tasks under the configured protocol at `index`, into
+    /// storage the caller sizes, and how many were written.
+    ///
+    /// This is how one protocol's tasks are named for a cancellation that must
+    /// not touch another's; each id is reaped through the ordinary
+    /// `Event.reaped`, which is what frees its slot.
+    pub fn laneIds(self: *const Loop, index: usize, out: []u64) usize {
+        return task_table.laneIds(self.tasks, self.live, index, out);
     }
 
     /// One step. Pure, and the whole of the loop.
@@ -364,7 +435,7 @@ pub const Loop = struct {
             .serving => self.serving(event),
             // Once the shutdown has begun, every event belongs to the router's
             // machine, which already names each one in each phase
-            // (`router.zig:744-787`).
+            // (`router/shutdown.zig:162-198`).
             .draining_handlers,
             .cancelling_accepts,
             .closing_endpoint,
@@ -389,6 +460,7 @@ pub const Loop = struct {
                 break :blk .{ .loop = next, .action = .{ .offer = incoming } };
             },
             .filtered => |answer| self.filtered(answer),
+            .routed => |reported| self.route(reported),
             .reaped => |ended| self.reaped(ended),
             .close_requested => self.beginShutdown(null),
             // Nothing has been asked for yet, and a report from a phase the loop
@@ -409,7 +481,7 @@ pub const Loop = struct {
         // The endpoint's two edits to a verdict live in `decide` — the path says
         // what a retry is worth, the flow says whether it can be given one — and
         // what the router then owes is its own answer.
-        const routed = router.dispatchStep(
+        const routed = dispatch.dispatchStep(
             self.router,
             .incoming,
             .{ .filtered = filter.decide(answer, pending) },
@@ -425,15 +497,37 @@ pub const Loop = struct {
             .ignore => .{ .loop = next, .action = .ignore },
             // A verdict cannot produce anything else: in the `incoming` state
             // the router owes exactly the four actions above
-            // (`router.zig:539-553`).
+            // (`router/dispatch.zig:59-67`).
             .on_accepting, .accept, .await_handshake, .release, .drop, .none => next.hold(),
         };
+    }
+
+    /// The handshake produced an ALPN: the task is routed to the configured
+    /// protocol that claims it, which is how one protocol's tasks are told from
+    /// another's.
+    ///
+    /// **Nothing is owed back.** Routing is bookkeeping the caller asked for,
+    /// not a command, so the answer is `Action.none` — and `peerOutcome` of
+    /// that is `.nothing`, because a task's protocol is not something a peer is
+    /// told about.
+    ///
+    /// **An ALPN no configured protocol claims is refused by the caller, not
+    /// here.** The connection exists and the caller owns it, so the loop records
+    /// nothing and owes nothing; `tasks.route` hands the refusal to the caller,
+    /// which is the same value `router.dispatch` gives. See `Routed`.
+    ///
+    /// A task this loop is not holding is absorbed for the reason every other
+    /// event naming one is: the id is the core's, and a report for a task the
+    /// loop never took is a caller's bookkeeping error.
+    fn route(self: Loop, reported: Routed) Step {
+        _ = task_table.route(self.tasks, self.live, self.router, reported.id, reported.alpn);
+        return self.hold();
     }
 
     /// One task came back. Upstream's `join_next` arms (`:545-566`): three
     /// endings carry on and one runs the shutdown.
     fn reaped(self: Loop, ended: Reaped) Step {
-        if (self.indexOf(ended.id) == null) return self.hold();
+        if (task_table.indexOf(self.tasks, self.live, ended.id) == null) return self.hold();
         const next = self.forget(ended.id);
         if (ended.ended == .panicked) return next.beginShutdown(ended);
         return next.hold();
@@ -447,7 +541,7 @@ pub const Loop = struct {
         // Named so the arms below are one type rather than four inferred ones: a
         // bare enum literal inside an inferred struct is inferred per arm.
         const Mapped = struct {
-            shutdown_event: router.Shutdown.Event,
+            shutdown_event: shutdown.Shutdown.Event,
             loop: Loop,
         };
         const mapped: Mapped = switch (event) {
@@ -455,20 +549,23 @@ pub const Loop = struct {
                 .shutdown_event = .accept_finished,
                 .loop = self.forget(ended.id),
             },
-            // Intake and the filter have ended. Upstream is no longer calling
-            // `endpoint.accept()`, so a datagram arriving now is not accepted,
-            // and an answer to a question no longer being asked is not acted on.
-            // Both leave the peer with nothing, like every other local ending.
-            .arrived, .filtered => return self.hold(),
+            // Intake, the filter and the routing have ended. Upstream is no
+            // longer calling `endpoint.accept()` and no handshake is being
+            // driven for a new one, so a datagram arriving now is not accepted,
+            // an answer to a question no longer being asked is not acted on, and
+            // a task's protocol is not routed to a lane this close is retiring.
+            // All three leave the peer with nothing, like every other local
+            // ending.
+            .arrived, .filtered, .routed => return self.hold(),
             .close_requested => .{ .shutdown_event = .close_requested, .loop = self },
             .handler_finished => .{ .shutdown_event = .handler_finished, .loop = self },
             .accepts_cancelled => .{ .shutdown_event = .accepts_cancelled, .loop = self },
             .endpoint_closed => .{ .shutdown_event = .endpoint_closed, .loop = self },
         };
         var next = mapped.loop;
-        const shutdown = next.shutdown.step(mapped.shutdown_event);
-        next.shutdown = shutdown.shutdown;
-        const action: Action = switch (shutdown.action) {
+        const stepped = next.shutdown.step(mapped.shutdown_event);
+        next.shutdown = stepped.shutdown;
+        const action: Action = switch (stepped.action) {
             .none => .none,
             else => |router_owed| .{ .shutdown = .{ .action = router_owed, .panicked = null } },
         };
@@ -491,12 +588,12 @@ pub const Loop = struct {
         // about. The peer learns nothing, exactly as for every other local
         // ending.
         next.pending = null;
-        next.shutdown = router.Shutdown.init(handlerCount(self.router), self.live);
-        const shutdown = next.shutdown.step(.close_requested);
-        next.shutdown = shutdown.shutdown;
+        next.shutdown = shutdown.Shutdown.init(handlerCount(self.router), self.live);
+        const stepped = next.shutdown.step(.close_requested);
+        next.shutdown = stepped.shutdown;
         return .{
             .loop = next,
-            .action = .{ .shutdown = .{ .action = shutdown.action, .panicked = cause } },
+            .action = .{ .shutdown = .{ .action = stepped.action, .panicked = cause } },
         };
     }
 
@@ -507,33 +604,13 @@ pub const Loop = struct {
         return .{ .loop = self, .action = .none };
     }
 
-    fn indexOf(self: *const Loop, id: u64) ?usize {
-        var index: usize = 0;
-        while (index < self.live) : (index += 1) {
-            if (self.tasks[index].id == id) return index;
-        }
-        return null;
-    }
-
     /// One task's slot, freed, and the count down. Absorbs a reap for a task the
     /// loop is not holding: the id is the core's and never reused, so a reap for
     /// one the loop never took is a caller's bookkeeping error, and the honest
     /// answer is the state the caller already has.
     fn forget(self: Loop, id: u64) Loop {
-        const index = self.indexOf(id) orelse return self;
         var next = self;
-        // The table is dense, so the last task fills the hole: a bounded scan per
-        // reap and no free list to keep in step with the count.
-        //
-        // `indexOf` names a slot only when the table holds one, so `live` is
-        // already positive — but that proof is inside the scan and the read is
-        // here, so the bound is restated in the expression the read sits in.
-        // An empty table has no last task to move, and removing from one is
-        // then the no-op the count already says it is.
-        if (next.live > 0) {
-            next.tasks[index] = next.tasks[next.live - 1];
-            next.live -= 1;
-        }
+        next.live = task_table.forget(self.tasks, self.live, id);
         return next;
     }
 };
@@ -542,7 +619,7 @@ pub const Loop = struct {
 ///
 /// Upstream's `join_set.spawn` (`protocol.rs:601-603`) spawns a future that
 /// starts by awaiting the handshake, which is the router's `negotiating` state
-/// and so the state the task is born in.
+/// and so the state `task_table.hold` writes.
 ///
 /// A table with no room refuses the connection, and that is a departure worth
 /// naming: upstream's `JoinSet` is unbounded and never runs out, so upstream
@@ -552,47 +629,30 @@ pub const Loop = struct {
 /// its own capacity (`vendor/quic/src/quic/connection_manager.zig:602-604`), and
 /// a client answered with nothing waits for a timeout that cannot arrive.
 fn spawn(next: Loop, id: u64) Step {
-    if (next.live == next.tasks.len) return .{ .loop = next, .action = .refuse };
-    var spawned = next;
-    spawned.tasks[spawned.live] = .{ .id = id, .state = .negotiating };
-    spawned.live += 1;
-    return .{
-        .loop = spawned,
-        .action = .{ .spawn = spawned.tasks[spawned.live - 1] },
-    };
+    const held = task_table.hold(next.tasks, next.live, id) orelse
+        return .{ .loop = next, .action = .refuse };
+    var holding = next;
+    holding.live += 1;
+    return .{ .loop = holding, .action = .{ .spawn = held.* } };
 }
 
 /// How many `shutdown` calls a close owes.
 ///
-/// Upstream awaits one future per *map value* (`protocol.rs:404-407`), and a
-/// map holds one value per ALPN: a handler registered twice is shut down once,
-/// as the newer one, because the older one is unreachable
-/// (`protocol.rs:385-394`, which `router.Builder.push` reproduces). So the count
-/// is the number of distinct ALPNs in the table.
-///
-/// It is counted here rather than read from the router because the router
-/// exposes its entries and not the count, and the count is load-bearing in both
-/// directions: one too high waits for a `handler_finished` that never comes, and
-/// one too low cancels the accepts while a handler is still using the
-/// connections its own `accept` is holding.
+/// **This is a fact about the table, so it is counted there** —
+/// `Router.protocolCount` — and read here rather than counted a second time.
+/// The count is load-bearing in both directions: one too high waits for a
+/// `handler_finished` that never comes, and one too low cancels the accepts
+/// while a handler is still using the connections its own `accept` is holding.
+/// Upstream awaits one future per *map value* (`protocol.rs:404-407`), and a map
+/// holds one value per ALPN, so it is the number of distinct ALPNs in the table
+/// and not the number of registrations.
 ///
 /// **Zero is a real answer.** A table with no registrations hands back a
-/// `Shutdown` that owes no handler, and `router.Shutdown` takes that as the
+/// `Shutdown` that owes no handler, and `shutdown.Shutdown` takes that as the
 /// cancel being owed immediately — so a caller must not read zero as "wait for
 /// a report" and must not hold the close back for one.
 pub fn handlerCount(router_table: *const router.Router) usize {
-    var distinct: usize = 0;
-    for (router_table.entries, 0..) |entry, index| {
-        var first = true;
-        for (router_table.entries[0..index]) |earlier| {
-            if (std.mem.eql(u8, earlier.alpn, entry.alpn)) {
-                first = false;
-                break;
-            }
-        }
-        if (first) distinct += 1;
-    }
-    return distinct;
+    return router_table.protocolCount();
 }
 
 const t = std.testing;
@@ -696,6 +756,26 @@ const Proving = struct {
     }
 };
 
+/// A task as the loop holds it the moment it is spawned: negotiating, with no
+/// protocol yet, because the handshake is what names one.
+fn spawned(id: u64) Task {
+    return .{ .id = id, .state = .negotiating, .protocol = null };
+}
+
+/// A table with one handler per ALPN, in order, over the caller's entries.
+fn threeProtocols(
+    entries: []router.Entry,
+    first: *Handler,
+    second: *Handler,
+    third: *Handler,
+) !router.Router {
+    var builder = router.Builder.init(entries);
+    _ = try builder.accept("/one", first.handler());
+    _ = try builder.accept("/two", second.handler());
+    _ = try builder.accept("/three", third.handler());
+    return builder.build();
+}
+
 /// A direct-path attempt: a real socket address, nothing proved.
 fn direct(id: u64) Incoming {
     const remote: base_addr.SocketAddr = .{
@@ -732,7 +812,10 @@ fn host(id: u64) base_ula.HostBits {
 /// The second attempt on a flow, carrying the token the first one was sent.
 fn withToken(previous: Incoming) Incoming {
     var next = previous;
-    next.validation = filter.proved(next.classification, next.remote);
+    // The core's own answer, as the real admission path reads it: this attempt
+    // opened with a valid token, so the bit is set. A test with no core says so
+    // explicitly rather than through a value that would have to be inferred.
+    next.validation = filter.proved(next.classification, next.remote, true);
     return next;
 }
 
@@ -753,9 +836,9 @@ fn offer(loop: *Loop, incoming: Incoming) !Step {
 
 /// The shutdown action a step owes, or null when the step owes no shutdown. It
 /// keeps the tests about the ordering from being about the wrapper.
-fn owed(action: Action) ?router.Shutdown.Action {
+fn owed(action: Action) ?shutdown.Shutdown.Action {
     return switch (action) {
-        .shutdown => |shutdown| shutdown.action,
+        .shutdown => |step| step.action,
         .offer, .spawn, .refuse, .ignore, .none => null,
     };
 }
@@ -796,7 +879,7 @@ test "a connection is offered to the filter and then dispatched" {
 
     // An accepted attempt becomes a task that owes the handshake, and the loop
     // holds it: this is the connection the caller now drives.
-    try t.expectEqual(Task{ .id = 1, .state = .negotiating }, step.action.spawn);
+    try t.expectEqual(spawned(1), step.action.spawn);
     try t.expectEqual(@as(usize, 1), step.loop.live);
     // Nothing was told to the peer and no handler ran: an accepted attempt is a
     // handshake that has not finished.
@@ -807,11 +890,11 @@ test "a connection is offered to the filter and then dispatched" {
     // value, but the table it points at is the caller's own array and is not
     // moved, so the pointer stays the pointer the loop would hand back.
     const held = loop.task(1) orelse return error.TestUnexpectedResult;
-    try t.expectEqual(Task{ .id = 1, .state = .negotiating }, held.*);
+    try t.expectEqual(spawned(1), held.*);
 
     // The handshake produces the ALPN the peer negotiated, which is what finds
     // the handler, and the handler takes the connection over.
-    var routed = router.dispatchStep(&table, held.state, .{
+    var routed = dispatch.dispatchStep(&table, held.state, .{
         .outcome = .{ .alpn = "/echo" },
     });
     held.state = routed.state;
@@ -827,7 +910,7 @@ test "a connection is offered to the filter and then dispatched" {
     try t.expectEqual(@as(usize, 1), handler.on_accepting_calls);
     try t.expectEqual(@as(usize, 0), handler.accept_calls);
 
-    routed = router.dispatchStep(&table, held.state, .{
+    routed = dispatch.dispatchStep(&table, held.state, .{
         .outcome = .{ .connection = connection },
     });
     held.state = routed.state;
@@ -840,7 +923,7 @@ test "a connection is offered to the filter and then dispatched" {
 
     // It returns, the connection goes back to the endpoint, and the task comes
     // back to the loop.
-    const finished = router.dispatchStep(&table, held.state, .{
+    const finished = dispatch.dispatchStep(&table, held.state, .{
         .outcome = .finished,
     });
     try t.expectEqual(router.DispatchAction.release, finished.action);
@@ -859,7 +942,7 @@ test "the filter's four answers, and what each one does to the loop" {
         // The handshake is owed and a task is held. Nothing reaches a peer.
         .{
             .answer = .accept,
-            .action = .{ .spawn = .{ .id = 1, .state = .negotiating } },
+            .action = .{ .spawn = spawned(1) },
             .peer = .nothing,
         },
         // A retry is a refusal, and that is the surprise worth a row of its
@@ -918,7 +1001,7 @@ test "a retry cannot be sent, so it ends in a refusal on either path" {
     const proved_direct = withToken(direct(1));
     try t.expectEqual(Validation{ .validated = direct(1).remote }, proved_direct.validation);
     step = try offer(&loop, proved_direct);
-    try t.expectEqual(Task{ .id = 1, .state = .negotiating }, step.action.spawn);
+    try t.expectEqual(spawned(1), step.action.spawn);
     try t.expectEqual(@as(usize, 1), step.loop.live);
     // Two attempts, and the filter has been asked twice.
     try t.expectEqual(@as(usize, 2), proving.calls);
@@ -969,10 +1052,10 @@ test "a failing accept drops the connection and sends no error code" {
     // All the way to a running accept.
     const step = try offer(&loop, direct(1));
     loop = step.loop;
-    const negotiated = router.dispatchStep(&table, step.action.spawn.state, .{
+    const negotiated = dispatch.dispatchStep(&table, step.action.spawn.state, .{
         .outcome = .{ .alpn = "/echo" },
     });
-    const running = router.dispatchStep(&table, negotiated.state, .{
+    const running = dispatch.dispatchStep(&table, negotiated.state, .{
         .outcome = .{ .connection = .{ .ptr = &entries } },
     });
     try t.expectEqual(router.ConnState{ .accepting = handler.handler() }, negotiated.state);
@@ -989,7 +1072,7 @@ test "a failing accept drops the connection and sends no error code" {
         runAccept(running.action.accept, .{ .ptr = &entries }),
     );
     const drop: router.Drop = .{ .failed = .{ .accept = error.NotAllowed } };
-    const failed = router.dispatchStep(&table, running.state, .{
+    const failed = dispatch.dispatchStep(&table, running.state, .{
         .outcome = .{ .failed = .{ .accept = error.NotAllowed } },
     });
     try t.expectEqual(router.ConnState{ .dropped = drop }, failed.state);
@@ -1040,11 +1123,11 @@ test "several accept tasks are held at once and torn down in the router's order"
     var step = loop.step(.close_requested);
     loop = step.loop;
     try t.expectEqual(
-        router.Shutdown.Action{ .shutdown_handlers = 3 },
+        shutdown.Shutdown.Action{ .shutdown_handlers = 3 },
         owed(step.action).?,
     );
     try t.expectEqual(@as(?Reaped, null), step.action.shutdown.panicked);
-    try t.expectEqual(router.Shutdown.Phase.draining_handlers, loop.shutdown.phase);
+    try t.expectEqual(shutdown.Shutdown.Phase.draining_handlers, loop.shutdown.phase);
     // The accepts are all still running, and the loop says how many: cancelling
     // them now would cut a graceful close in half.
     try t.expectEqual(@as(usize, 3), loop.live);
@@ -1055,20 +1138,20 @@ test "several accept tasks are held at once and torn down in the router's order"
     const jumping = [_]Event{ .accepts_cancelled, .endpoint_closed, .close_requested };
     for (jumping) |early| {
         const held = loop.step(early);
-        try t.expectEqual(router.Shutdown.Action.none, owed(held.action) orelse .none);
-        try t.expectEqual(router.Shutdown.Phase.draining_handlers, held.loop.shutdown.phase);
+        try t.expectEqual(shutdown.Shutdown.Action.none, owed(held.action) orelse .none);
+        try t.expectEqual(shutdown.Shutdown.Phase.draining_handlers, held.loop.shutdown.phase);
     }
     // One handler of three back out: still nothing owed.
     step = loop.step(.handler_finished);
     loop = step.loop;
-    try t.expectEqual(router.Shutdown.Action.none, owed(step.action) orelse .none);
+    try t.expectEqual(shutdown.Shutdown.Action.none, owed(step.action) orelse .none);
     try t.expectEqual(@as(usize, 2), loop.shutdown.handlers);
 
     // A task finishing in the middle of the drain counts down and advances
     // nothing: upstream takes it out of the set and goes back to the `select!`.
     step = loop.step(.{ .reaped = .{ .id = 2, .ended = .cancelled } });
     loop = step.loop;
-    try t.expectEqual(router.Shutdown.Action.none, owed(step.action) orelse .none);
+    try t.expectEqual(shutdown.Shutdown.Action.none, owed(step.action) orelse .none);
     try t.expectEqual(@as(usize, 2), loop.live);
     try t.expectEqual(@as(usize, 2), loop.shutdown.accepts);
     try t.expect(loop.task(2) == null);
@@ -1077,28 +1160,28 @@ test "several accept tasks are held at once and torn down in the router's order"
     // the count decides, not how many reports have gone by.
     step = loop.step(.handler_finished);
     loop = step.loop;
-    try t.expectEqual(router.Shutdown.Action.none, owed(step.action) orelse .none);
+    try t.expectEqual(shutdown.Shutdown.Action.none, owed(step.action) orelse .none);
     try t.expectEqual(@as(usize, 1), loop.shutdown.handlers);
 
     // The last handler, and only now are the accepts cancelled.
     step = loop.step(.handler_finished);
     loop = step.loop;
-    try t.expectEqual(router.Shutdown.Action.cancel_accepts, owed(step.action).?);
-    try t.expectEqual(router.Shutdown.Phase.cancelling_accepts, loop.shutdown.phase);
+    try t.expectEqual(shutdown.Shutdown.Action.cancel_accepts, owed(step.action).?);
+    try t.expectEqual(shutdown.Shutdown.Phase.cancelling_accepts, loop.shutdown.phase);
     // The two accepts still running are what the cancel is for, and the one that
     // was reaped mid-drain is not counted any more.
     try t.expectEqual(@as(usize, 2), loop.live);
     try t.expectEqual(@as(usize, 0), loop.shutdown.handlers);
     // The close cannot come before the cancellation has landed.
     const too_early = loop.step(.endpoint_closed);
-    try t.expectEqual(router.Shutdown.Action.none, owed(too_early.action) orelse .none);
-    try t.expectEqual(router.Shutdown.Phase.cancelling_accepts, too_early.loop.shutdown.phase);
+    try t.expectEqual(shutdown.Shutdown.Action.none, owed(too_early.action) orelse .none);
+    try t.expectEqual(shutdown.Shutdown.Phase.cancelling_accepts, too_early.loop.shutdown.phase);
 
     // The cancellation lands, and only now is the endpoint closed.
     const closing = loop.step(.accepts_cancelled);
     loop = closing.loop;
-    try t.expectEqual(router.Shutdown.Action.close_endpoint, owed(closing.action).?);
-    try t.expectEqual(router.Shutdown.Phase.closing_endpoint, loop.shutdown.phase);
+    try t.expectEqual(shutdown.Shutdown.Action.close_endpoint, owed(closing.action).?);
+    try t.expectEqual(shutdown.Shutdown.Phase.closing_endpoint, loop.shutdown.phase);
 
     // Upstream's `abort_all` drain: a task still reports, the loop still counts
     // it down, and nothing else is owed.
@@ -1111,7 +1194,7 @@ test "several accept tasks are held at once and torn down in the router's order"
     const closed = loop.step(.endpoint_closed);
     loop = closed.loop;
     try t.expectEqual(Action.none, closed.action);
-    try t.expectEqual(router.Shutdown.Phase.closed, loop.shutdown.phase);
+    try t.expectEqual(shutdown.Shutdown.Phase.closed, loop.shutdown.phase);
     // An attempt arriving after the close is not accepted: upstream is no longer
     // asking `endpoint.accept()`.
     const late = loop.step(.{ .arrived = direct(9) });
@@ -1131,7 +1214,7 @@ test "an endpoint with nothing registered still cancels its accepts and closes" 
     var tasks: [1]Task = undefined;
     var loop = Loop.init(&table, null, &tasks);
     try t.expectEqual(@as(usize, 0), loop.shutdown.handlers);
-    try t.expectEqual(router.Shutdown.Phase.serving, loop.shutdown.phase);
+    try t.expectEqual(shutdown.Shutdown.Phase.serving, loop.shutdown.phase);
 
     // One attempt, offered and answered with no filter to ask. It is accepted
     // and dispatched, and the dispatch finds no ALPN to send it to — upstream
@@ -1139,7 +1222,7 @@ test "an endpoint with nothing registered still cancels its accepts and closes" 
     // (`protocol.rs:653-656`).
     var step = try offer(&loop, direct(1));
     loop = step.loop;
-    try t.expectEqual(router.Shutdown.Phase.serving, loop.shutdown.phase);
+    try t.expectEqual(shutdown.Shutdown.Phase.serving, loop.shutdown.phase);
     try t.expectEqual(@as(usize, 1), loop.live);
 
     // The close, and the whole of it in the two reports it owes: with no
@@ -1147,8 +1230,8 @@ test "an endpoint with nothing registered still cancels its accepts and closes" 
     // the close asks for.
     step = loop.step(.close_requested);
     loop = step.loop;
-    try t.expectEqual(router.Shutdown.Action.cancel_accepts, owed(step.action).?);
-    try t.expectEqual(router.Shutdown.Phase.cancelling_accepts, loop.shutdown.phase);
+    try t.expectEqual(shutdown.Shutdown.Action.cancel_accepts, owed(step.action).?);
+    try t.expectEqual(shutdown.Shutdown.Phase.cancelling_accepts, loop.shutdown.phase);
     // The accept the table could not dispatch is still running, and the cancel
     // is what reaps it.
     try t.expectEqual(@as(usize, 1), loop.live);
@@ -1163,17 +1246,17 @@ test "an endpoint with nothing registered still cancels its accepts and closes" 
     // in the walk.
     step = loop.step(.accepts_cancelled);
     loop = step.loop;
-    try t.expectEqual(router.Shutdown.Action.close_endpoint, owed(step.action).?);
-    try t.expectEqual(router.Shutdown.Phase.closing_endpoint, loop.shutdown.phase);
+    try t.expectEqual(shutdown.Shutdown.Action.close_endpoint, owed(step.action).?);
+    try t.expectEqual(shutdown.Shutdown.Phase.closing_endpoint, loop.shutdown.phase);
     step = loop.step(.endpoint_closed);
     loop = step.loop;
     try t.expectEqual(Action.none, step.action);
-    try t.expectEqual(router.Shutdown.Phase.closed, loop.shutdown.phase);
+    try t.expectEqual(shutdown.Shutdown.Phase.closed, loop.shutdown.phase);
 
     // So the lease reports the close rather than an endpoint dropped open: the
     // one good answer, reached on the path that owes no handler.
     var lease = loop.acquire();
-    try t.expectEqual(router.Release.closed, lease.deinit());
+    try t.expectEqual(shutdown.Release.closed, lease.deinit());
 }
 
 test "an endpoint dropped without close is reported" {
@@ -1188,22 +1271,22 @@ test "an endpoint dropped without close is reported" {
     // error, not a cleanup. The phase is in the answer, because "you forgot to
     // close" and "you closed in the wrong order" are different bugs.
     var lease = loop.acquire();
-    try t.expectEqual(router.Release{ .abandoned = .serving }, lease.deinit());
+    try t.expectEqual(shutdown.Release{ .abandoned = .serving }, lease.deinit());
     // The mark is set before the report, so a second exit finds nothing to do
     // and a copy deinited after the original reports the same thing once.
-    try t.expectEqual(router.Release.already_gone, lease.deinit());
+    try t.expectEqual(shutdown.Release.already_gone, lease.deinit());
     var copy = lease;
-    try t.expectEqual(router.Release.already_gone, copy.deinit());
+    try t.expectEqual(shutdown.Release.already_gone, copy.deinit());
 
     // And an endpoint that was closed properly reports the close, once.
     loop = loop.step(.close_requested).loop;
     loop = loop.step(.handler_finished).loop;
     loop = loop.step(.accepts_cancelled).loop;
     loop = loop.step(.endpoint_closed).loop;
-    try t.expectEqual(router.Shutdown.Phase.closed, loop.shutdown.phase);
+    try t.expectEqual(shutdown.Shutdown.Phase.closed, loop.shutdown.phase);
     var closed_lease = loop.acquire();
-    try t.expectEqual(router.Release.closed, closed_lease.deinit());
-    try t.expectEqual(router.Release.already_gone, closed_lease.deinit());
+    try t.expectEqual(shutdown.Release.closed, closed_lease.deinit());
+    try t.expectEqual(shutdown.Release.already_gone, closed_lease.deinit());
 }
 
 test "a panicked task starts the shutdown, and the loop says which" {
@@ -1219,9 +1302,9 @@ test "a panicked task starts the shutdown, and the loop says which" {
     const reaped: Reaped = .{ .id = 1, .ended = .panicked };
     const step = loop.step(.{ .reaped = reaped });
     try t.expectEqual(@as(usize, 0), step.loop.live);
-    try t.expectEqual(router.Shutdown.Action{ .shutdown_handlers = 1 }, owed(step.action).?);
+    try t.expectEqual(shutdown.Shutdown.Action{ .shutdown_handlers = 1 }, owed(step.action).?);
     try t.expectEqual(Reaped{ .id = 1, .ended = .panicked }, step.action.shutdown.panicked.?);
-    try t.expectEqual(router.Shutdown.Phase.draining_handlers, step.loop.shutdown.phase);
+    try t.expectEqual(shutdown.Shutdown.Phase.draining_handlers, step.loop.shutdown.phase);
 }
 
 test "a full task table refuses the connection rather than losing the peer" {
@@ -1329,7 +1412,7 @@ test "a reap for a task the loop never took changes nothing" {
     const stranger = loop.step(.{ .reaped = .{ .id = 99, .ended = .finished } });
     try t.expectEqual(Action.none, stranger.action);
     try t.expectEqual(@as(usize, 1), stranger.loop.live);
-    try t.expectEqual(router.Shutdown.Phase.serving, stranger.loop.shutdown.phase);
+    try t.expectEqual(shutdown.Shutdown.Phase.serving, stranger.loop.shutdown.phase);
 }
 
 test "a handler registered twice is shut down once" {
@@ -1346,6 +1429,180 @@ test "a handler registered twice is shut down once" {
     try t.expectEqual(@as(usize, 2), table.entries.len);
     try t.expectEqual(@as(usize, 1), handlerCount(&table));
     var tasks: [1]Task = undefined;
-    const loop = Loop.init(&table, null, &tasks);
+    var loop = Loop.init(&table, null, &tasks);
     try t.expectEqual(@as(usize, 1), loop.shutdown.handlers);
+
+    // **And the close completes on such a table**, which is the consumer
+    // outcome rather than a count: a caller that walked the registrations and
+    // shut each one down owed two reports where the machine wants one, and
+    // comparing those two numbers is what panicked at close. Driving the loop
+    // through with the count it stated is what makes a duplicated ALPN a table
+    // that closes rather than one that cannot.
+    const close = loop.step(.close_requested);
+    try t.expectEqual(shutdown.Shutdown.Action{ .shutdown_handlers = 1 }, owed(close.action).?);
+    loop = close.loop;
+    const drained = loop.step(.handler_finished);
+    try t.expectEqual(shutdown.Shutdown.Action.cancel_accepts, owed(drained.action).?);
+    loop = drained.loop;
+    const cancelled = loop.step(.accepts_cancelled);
+    try t.expectEqual(shutdown.Shutdown.Action.close_endpoint, owed(cancelled.action).?);
+    loop = cancelled.loop;
+    const done = loop.step(.endpoint_closed);
+    try t.expectEqual(shutdown.Shutdown.Phase.closed, done.loop.shutdown.phase);
+}
+
+test "each task is routed to the protocol its handshake named" {
+    // Three configured protocols and three attempts, so a lane has more than
+    // one task and more than one lane has one. This is the shape the
+    // single-ALPN runtime could not express at all: `node_protocol.max_alpns`,
+    // the registration bound in `src/node/node_protocol.zig`, is the
+    // restriction being replaced, and everything here is what it becomes.
+    var one: Handler = .{};
+    var two: Handler = .{};
+    var three: Handler = .{};
+    var entries: [3]router.Entry = undefined;
+    const table = try threeProtocols(&entries, &one, &two, &three);
+
+    var slots: [3]Task = undefined;
+    var loop = Loop.init(&table, null, &slots);
+    for (1..4) |id| {
+        _ = (try offer(&loop, direct(@intCast(id)))).loop;
+    }
+    try t.expectEqual(@as(usize, 3), loop.live);
+
+    // Nothing is routed yet: an accepted attempt is a handshake that has not
+    // finished, and the protocol is what that handshake produces.
+    for (0..3) |index| {
+        try t.expectEqual(@as(?usize, null), loop.tasks[index].protocol);
+    }
+    for (0..3) |index| {
+        try t.expectEqual(@as(usize, 0), loop.laneCount(index));
+    }
+
+    // The caller drives each handshake and reports what it produced: one peer
+    // negotiated `/one`, one `/three`, and two negotiated `/two`.
+    const alpn_for = [_][]const u8{ "/one", "/two", "/three" };
+    var index: usize = 0;
+    for (1..4) |id| {
+        const step = loop.step(.{
+            .routed = .{ .id = @intCast(id), .alpn = alpn_for[index] },
+        });
+        // Routing is bookkeeping the caller asked for, and it owes nothing back.
+        try t.expectEqual(Action.none, step.action);
+        try t.expectEqual(router.PeerOutcome.nothing, Action.peerOutcome(step.action));
+        loop = step.loop;
+        index += 1;
+    }
+    try t.expectEqual(@as(?usize, 0), loop.tasks[0].protocol);
+    try t.expectEqual(@as(?usize, 1), loop.tasks[1].protocol);
+    try t.expectEqual(@as(?usize, 2), loop.tasks[2].protocol);
+
+    // So the lanes count and name their own tasks, which is what retiring one
+    // protocol without touching the others needs.
+    try t.expectEqual(@as(usize, 1), loop.laneCount(0));
+    try t.expectEqual(@as(usize, 1), loop.laneCount(1));
+    try t.expectEqual(@as(usize, 1), loop.laneCount(2));
+    try t.expectEqual(@as(usize, 0), loop.laneCount(3));
+    var ids: [3]u64 = undefined;
+    try t.expectEqual(@as(usize, 1), loop.laneIds(1, &ids));
+    try t.expectEqual(@as(u64, 2), ids[0]);
+    // An under-sized output is a short count and not an index panic: the caller
+    // sizes the array it can hold.
+    var one_id: [1]u64 = undefined;
+    try t.expectEqual(@as(usize, 1), loop.laneIds(2, &one_id));
+    try t.expectEqual(@as(u64, 3), one_id[0]);
+
+    // And a lane's cancellation is the ordinary reap, so closing one protocol
+    // frees its slot without disturbing the others.
+    const reaped = loop.step(.{ .reaped = .{ .id = 2, .ended = .cancelled } });
+    loop = reaped.loop;
+    try t.expectEqual(Action.none, reaped.action);
+    try t.expectEqual(@as(usize, 2), loop.live);
+    try t.expectEqual(@as(usize, 0), loop.laneCount(1));
+    try t.expectEqual(@as(usize, 1), loop.laneCount(0));
+    try t.expectEqual(@as(usize, 1), loop.laneCount(2));
+}
+
+test "an ALPN no configured protocol claims leaves the task unrouted" {
+    var handler: Handler = .{};
+    var entries: [1]router.Entry = undefined;
+    const table = try oneHandler("/echo", &entries, &handler);
+    var slots: [1]Task = undefined;
+    var loop = Loop.init(&table, null, &slots);
+    _ = (try offer(&loop, direct(1))).loop;
+
+    // The peer negotiated something this endpoint does not serve. The task is
+    // in no lane and the loop owes nothing: the connection is established and
+    // the caller owns it, so the refusal is `Router.dispatch`'s to read and the
+    // caller's to act on — this loop never sends an error code on a caller's
+    // behalf. `peerOutcome` is `.nothing` for the same reason every other local
+    // ending is (invariant 19).
+    const refused = loop.step(.{
+        .routed = .{ .id = 1, .alpn = "/nope" },
+    });
+    try t.expectEqual(Action.none, refused.action);
+    try t.expectEqual(router.PeerOutcome.nothing, Action.peerOutcome(refused.action));
+    loop = refused.loop;
+    try t.expectEqual(@as(?usize, null), loop.tasks[0].protocol);
+    try t.expectEqual(@as(usize, 0), loop.laneCount(0));
+    try t.expectEqual(@as(usize, 1), loop.live);
+
+    // And a routing report for a task the loop never took changes nothing, for
+    // the reason every other event naming one does.
+    const stranger = loop.step(.{ .routed = .{ .id = 99, .alpn = "/echo" } });
+    try t.expectEqual(Action.none, stranger.action);
+    try t.expectEqual(@as(usize, 1), stranger.loop.live);
+    try t.expectEqual(@as(?usize, null), stranger.loop.tasks[0].protocol);
+
+    // Once the shutdown has begun the routing has ended with it, so a report
+    // that arrives then is absorbed like every other event from a phase the
+    // loop has left.
+    var closed = loop.step(.close_requested).loop;
+    closed = closed.step(.handler_finished).loop;
+    closed = closed.step(.accepts_cancelled).loop;
+    closed = closed.step(.endpoint_closed).loop;
+    const late = closed.step(.{ .routed = .{ .id = 1, .alpn = "/echo" } });
+    try t.expectEqual(Action.none, late.action);
+    try t.expectEqual(shutdown.Shutdown.Phase.closed, late.loop.shutdown.phase);
+}
+
+test "a task re-routed to an ALPN no protocol claims leaves the lane it was in" {
+    // The same refusal as the test above, on a task that is already in a lane.
+    // That is the case the refusal has to clear: leaving the protocol behind
+    // keeps the task counted under a protocol whose handshake it no longer
+    // completed, so retiring that protocol would cancel a connection that now
+    // belongs to no lane, and the lane would hold a task the endpoint never
+    // offered to it.
+    var gossip: Handler = .{};
+    var blobs: Handler = .{};
+    var entries: [2]router.Entry = undefined;
+    var builder = router.Builder.init(&entries);
+    _ = try builder.accept("/gossip", gossip.handler());
+    _ = try builder.accept("/blobs", blobs.handler());
+    const table = builder.build();
+    var slots: [1]Task = undefined;
+    var loop = Loop.init(&table, null, &slots);
+    _ = (try offer(&loop, direct(1))).loop;
+
+    const claimed = loop.step(.{ .routed = .{ .id = 1, .alpn = "/gossip" } });
+    loop = claimed.loop;
+    try t.expectEqual(@as(usize, 1), loop.laneCount(0));
+    var ids: [1]u64 = undefined;
+    try t.expectEqual(@as(usize, 1), loop.laneIds(0, &ids));
+    try t.expectEqual(@as(u64, 1), ids[0]);
+
+    // The second report names something this endpoint does not serve, so the
+    // task is in no lane at all afterwards — not in the lane it was in.
+    const refused = loop.step(.{ .routed = .{ .id = 1, .alpn = "/nope" } });
+    loop = refused.loop;
+    try t.expectEqual(@as(?usize, null), loop.tasks[0].protocol);
+    try t.expectEqual(@as(usize, 0), loop.laneCount(0));
+    try t.expectEqual(@as(usize, 0), loop.laneCount(1));
+    try t.expectEqual(@as(usize, 0), loop.laneIds(0, &ids));
+    try t.expectEqual(@as(usize, 0), loop.laneIds(1, &ids));
+
+    // It is still held, because the caller owns the connection and is the one
+    // who drops it: leaving the window is a reap, and nothing here reaped it.
+    try t.expectEqual(@as(usize, 1), loop.live);
+    try t.expectEqual(@as(u64, 1), loop.task(1).?.id);
 }

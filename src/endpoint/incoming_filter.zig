@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const router = @import("../router/router.zig");
+const dispatch = @import("../router/dispatch.zig");
 const base_addr = @import("../base/addr.zig");
 const ula = @import("../base/ula.zig");
 
@@ -35,7 +36,7 @@ const Retry = router.Retry;
 /// `Arc<dyn Fn(&Incoming) -> IncomingFilterOutcome + Send + Sync>`, held by the
 /// router builder and called once per attempt. A vtable is the same thing with
 /// no allocation and no `anyerror` in its type, and `ProtocolHandler`
-/// (`router.zig:42-84`) is already one, so a project that made that a vtable
+/// (`router.zig:102-153`) is already one, so a project that made that a vtable
 /// does not invent a second idiom for the other.
 ///
 /// The filter is *not* optional here; the absence of one is
@@ -115,9 +116,9 @@ pub const Answer = enum {
 /// It is called by whoever is driving the loop here — `endpoint.zig`'s
 /// `Action.offer` is the step that says to — because a function that calls
 /// application code cannot be stepped twice and get the same answer, and
-/// `docs/ARCHITECTURE.md` asks for that of every machine. `router.dispatchStep`
-/// makes the same move: `DispatchAction.on_accepting` names the call rather
-/// than making it.
+/// `docs/ARCHITECTURE.md` asks for that of every machine.
+/// `dispatch.dispatchStep` makes the same move:
+/// `DispatchAction.on_accepting` names the call rather than making it.
 ///
 /// The answer is the filter's own; nothing has been done to it yet.
 ///
@@ -158,7 +159,7 @@ pub fn decide(answer: Answer, incoming: Incoming) Verdict {
 /// of a classification. A datagram that arrived at a real socket address is a
 /// direct path and has no synthetic address of its own, so it is asked about as
 /// the peer's own — which is what `any_path` is (`base/ula.zig:55-57`) and what
-/// `retryMeaning` already treats as direct (`router.zig:309-317`).
+/// `retryMeaning` already treats as direct (`router.zig:491-499`).
 fn retryMeaning(classification: ula.Classification) Retry {
     return router.retryMeaning(switch (classification) {
         .relay => .relay,
@@ -198,27 +199,29 @@ pub const Validation = union(enum) {
 /// What a core that says a flow's address is proved means on each path.
 ///
 /// The core keeps one bit for this too — `NetworkPath.is_validated`, set when a
-/// connection opens with a valid Retry token
-/// (`vendor/quic/src/quic/connection.zig:825-829`) — and it is worth the same
-/// two things. This is where the core's one bit becomes one of the two facts,
-/// and it is the only place in the project that decides it.
+/// connection opens with a valid Retry token and lifted again when the peer
+/// answers on that path (`vendor/quic/src/quic/connection.zig`) — and it is
+/// worth the same two things. `core_validated` is that bit, read through
+/// `quic_conn.Conn.isValidated`. This is where the core's one bit becomes one
+/// of the two facts, and it is the only place in the project that decides it.
 ///
-/// An attempt the core proved nothing about is `.unvalidated`, which the caller
-/// writes itself: there is nothing to decide in that direction.
+/// **A false bit is `.unvalidated`, on every path.** That is the whole reason
+/// the parameter exists: a caller with nothing proved must not answer with an
+/// identity it cannot back, and `.cooperated` on a relay is as much an identity
+/// as `.validated` on a direct path. A token the endpoint never saw validated
+/// buys it nothing, so nothing proved is the conservative answer, and it is the
+/// one this returns.
 ///
-/// One gap is worth naming here, because it is where this fact comes from.
-/// `quic_bridge.Conn` exposes `id`, `peer`, `local`, `established`, `closed` and
-/// `drain`, and nothing that reports the path's validated bit
-/// (`transport/quic_bridge.zig:226-320`), so upstream's
-/// `Incoming::remote_addr_validated()` has no ozai counterpart yet. Until it
-/// does, this function is how a caller turns what the core told it into the
-/// fact a filter reads, and a caller with nothing to report must write
-/// `.unvalidated` — which is the conservative answer, because a token the
-/// endpoint never saw being validated buys it nothing.
+/// What proved the address is not recorded: the core lifts the same bit for a
+/// Handshake packet from the peer. For the question this answers — may one more
+/// Retry be sent on this flow — both routes give the same answer, because QUIC
+/// permits one Retry per flow.
 pub fn proved(
     classification: ula.Classification,
     remote: base_addr.SocketAddr,
+    core_validated: bool,
 ) Validation {
+    if (!core_validated) return .unvalidated;
     return switch (classification) {
         // The relay vouched for the origin already, so a token bought a round
         // trip and a client that obeyed it.
@@ -438,7 +441,7 @@ test "the filter's four answers, and only a refusal reaches the peer" {
         var handler: Handler = .{};
         var entries: [1]router.Entry = undefined;
         const table = try oneHandler("/echo", &entries, &handler);
-        const step = router.dispatchStep(&table, .incoming, .{ .filtered = decided });
+        const step = dispatch.dispatchStep(&table, .incoming, .{ .filtered = decided });
         switch (answer) {
             .accept => try t.expectEqual(router.DispatchAction.negotiate_alpn, step.action),
             .retry => try t.expectEqual(
@@ -473,15 +476,36 @@ test "a retry is source validation on a direct path and a cost on a relay" {
         .ip = .{ .v4 = .{ 203, 0, 113, 9 } },
         .port = 443,
     };
-    try t.expectEqual(Validation{ .validated = peer }, proved(.{ .ip = peer }, peer));
+    try t.expectEqual(Validation{ .validated = peer }, proved(.{ .ip = peer }, peer, true));
     try t.expectEqual(
         Validation{ .validated = peer },
-        proved(ula.classify(peer), peer),
+        proved(ula.classify(peer), peer, true),
     );
     try t.expectEqual(
         Validation.cooperated,
-        proved(ula.classify(ula.socketAddrFor(.relay, host(9))), peer),
+        proved(ula.classify(ula.socketAddrFor(.relay, host(9))), peer, true),
     );
+
+    // **The negative space, and it is the whole point of the third
+    // parameter.** A core that proved nothing about the flow yields
+    // `.unvalidated` on every path, and in particular not the identity that
+    // path would otherwise have earned: the direct path is not `.validated`,
+    // and the relay is not `.cooperated`. A caller that reached for
+    // `.cooperated` because the datagram arrived through a relay would be
+    // reporting a client that cooperated when nothing said so.
+    //
+    // Every arm is reached through `classify` on a real address rather than
+    // written as a tag: all four carry a payload, and none of them is a value
+    // that can be named without one.
+    const paths = [_]ula.Classification{
+        ula.classify(ula.socketAddrFor(.any_path, host(9))),
+        ula.classify(ula.socketAddrFor(.relay, host(9))),
+        ula.classify(ula.socketAddrFor(.custom, host(9))),
+        ula.classify(peer),
+    };
+    for (paths) |classification| {
+        try t.expectEqual(Validation.unvalidated, proved(classification, peer, false));
+    }
 }
 
 test "a filter cannot retry a flow that has already proved itself" {

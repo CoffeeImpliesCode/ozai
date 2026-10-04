@@ -82,22 +82,18 @@ pub fn runGroups(
                 result.detail,
             });
             failed = !steps.gatePassed(step, result) or failed;
-            // A fuzz run that found a crashing input is a failure the exit
-            // status does not carry, so it is read out of the report and the
-            // verdict is corrected here rather than inherited from the child.
-            if (std.mem.eql(u8, step.label, "fuzz") and steps.fuzzReportedFailure(result.stdout)) {
-                try results.append(gpa, .{
-                    .label = "fuzz:reported-failure",
-                    .argv = result.argv,
-                    .exit_code = 1,
-                    .status = .fail,
-                    .requirement = .required,
-                    .detail = "the bounded run reported a failing input",
+            // A fuzz run that found a crashing input, or that never reached the
+            // bound it was given, is a failure the exit status does not carry.
+            // It is read out of the report the run produced and the verdict is
+            // corrected here rather than inherited from the child.
+            if (try steps.reportResult(gpa, step, result, inputs.fuzz_runs)) |reported| {
+                try results.append(gpa, reported);
+                try text.print("gate: {s} {s} ({s}) — {s}\n", .{
+                    reported.label,
+                    @tagName(reported.status),
+                    @tagName(reported.requirement),
+                    reported.detail,
                 });
-                try text.print(
-                    "gate: fuzz:reported-failure fail (required) — a bounded run reported a failing input\n",
-                    .{},
-                );
                 failed = true;
             }
             // Triaged whenever the tool actually ran, empty output included: a

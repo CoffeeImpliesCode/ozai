@@ -3193,6 +3193,7 @@ pub const Connection = struct {
                     error.NoApplicationProtocol => tls.Alert.Description.no_application_protocol,
                     error.MissingExtension => tls.Alert.Description.missing_extension,
                     error.HandshakeFailure => tls.Alert.Description.handshake_failure,
+                    error.UnsupportedCertificate => tls.Alert.Description.unsupported_certificate,
                     error.CertificateRequired => tls.Alert.Description.certificate_required,
                     error.IllegalParameter => tls.Alert.Description.illegal_parameter,
                     else => tls.Alert.Description.internal_error,
@@ -5253,6 +5254,18 @@ pub const Connection = struct {
     /// Return the local address on the active path.
     pub fn localAddress(self: *const Connection) *const address.Address {
         return &self.paths[self.active_path_idx].local_addr;
+    }
+
+    /// Whether the active path's address has been proved.
+    ///
+    /// Set when the flow opened with a valid Retry or NEW_TOKEN
+    /// (`acceptInto`) and, for a server, lifted again once a Handshake packet
+    /// from the peer arrived. It is the amplification-limit fact
+    /// (`canSend`), and it is also what an endpoint needs to know before it
+    /// decides whether one more Retry is worth anything: QUIC allows one per
+    /// flow, so a proved path cannot be asked again.
+    pub fn isPathValidated(self: *const Connection) bool {
+        return self.paths[self.active_path_idx].is_validated;
     }
 
     /// The NEW_TOKEN the peer sent, for reuse on a later connection, or `null`

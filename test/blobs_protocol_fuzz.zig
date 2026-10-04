@@ -21,8 +21,9 @@
 //!    is a legal second spelling of the same value. Framing is part of the
 //!    value, so the oracles also check that a `push` stops exactly at the offset
 //!    its length prefix names, that the offset is one discriminant plus the
-//!    canonical prefix plus the declared body, and that a request which ran to
-//!    the end of the stream consumed the whole message and has no payload.
+//!    prefix as the frame spelled it plus the declared body, and that a request
+//!    which ran to the end of the stream consumed the whole message and has no
+//!    payload.
 //! 2. **Response**, through `BaoResponse` and `ObserveResponse`. This is the
 //!    path with no error frame in it: a provider that cannot answer closes its
 //!    side and the bytes simply stop. So the oracles here are the two states a
@@ -37,7 +38,12 @@
 //!    application code sent beside the stream, so the varint rules that decide
 //!    how it is read are the ones the request path uses, and a code this build
 //!    has no arm for is `error.UnknownClose` rather than a default — a default
-//!    arm would report a close nobody sent.
+//!    arm would report a close nobody sent. The code is checked against its own
+//!    shortest spelling and against one group more of it, and never against the
+//!    bytes that carried it: postcard does not enforce canonicalization and a
+//!    QUIC varint need not be minimal either, so `[0x80, 0x00]` and `[0x00]` are
+//!    the same close and a decoder that demanded the shorter spelling would be
+//!    refusing a peer whose encoder was not this project's.
 //!
 //! The two captured `Get` vectors and the three `Closed` codes are seeds and are
 //! named here, so a corpus entry is live only once it is.
@@ -72,6 +78,17 @@ const t = std.testing;
 /// discriminants on purpose: the close path and the request path read the same
 /// bytes and must not agree about what they are.
 ///
+/// `noncanonical_push_length` and `noncanonical_close_zero` are the two places
+/// the wire carries one number in more groups than its shortest form takes: a
+/// `push` length and a close code. Neither format requires the shortest
+/// spelling — postcard's `wire-format.md` ("Canonicalization", commit
+/// 872b908) lists `[0x80, 0x00]` as *accepted* and merely non-canonical for
+/// zero, and RFC 9000 section 16 says integers "do not need to be encoded on
+/// the minimum number of bytes necessary" — so both are here as the consumer
+/// regression for the edges a fuzzer reaches by accident rather than by design.
+/// `noncanonical_close_zero` is the byte string the bounded run crashed on: it
+/// is what the length prefix of `0400000080004580` names.
+///
 /// `test/corpus/blobs_protocol/` is the record, and a file there is live only
 /// once it is named here.
 const corpus = [_][]const u8{
@@ -80,6 +97,7 @@ const corpus = [_][]const u8{
     @embedFile("corpus/blobs_protocol/captured_get_all"), // upstream: GetRequest::all
     @embedFile("corpus/blobs_protocol/captured_push"), // derived: the same body, framed
     @embedFile("corpus/blobs_protocol/push_with_payload"), // a push and the bao data behind it
+    @embedFile("corpus/blobs_protocol/noncanonical_push_length"), // 38 in two groups
     @embedFile("corpus/blobs_protocol/get_many"), // two hashes and one sequence
     @embedFile("corpus/blobs_protocol/observe"), // an ObserveRequest
     @embedFile("corpus/blobs_protocol/observe_item"), // one item, as a provider frames it
@@ -95,6 +113,7 @@ const corpus = [_][]const u8{
     @embedFile("corpus/blobs_protocol/closed_stream_dropped"), // Closed 0, as a QUIC varint
     @embedFile("corpus/blobs_protocol/closed_provider_terminating"), // Closed 1
     @embedFile("corpus/blobs_protocol/closed_request_received"), // Closed 2
+    @embedFile("corpus/blobs_protocol/noncanonical_close_zero"), // Closed 0 in two groups
 };
 
 /// Long enough for the longest seed — a `get_many` over two hashes is 72 bytes —
@@ -212,27 +231,32 @@ fn checkRequest(bytes: []const u8) !void {
                 bytes[framed.payload_offset..],
                 request.payload(&reader),
             );
-            // Oracle: the offset is exactly one discriminant, the canonical
-            // spelling of the declared length, and that many bytes of body. The
+            // Oracle: the offset is exactly one discriminant, the length
+            // prefix as the frame spelled it, and that many bytes of body. The
             // length is read back out of the frame rather than taken from the
             // value, so this checks the prefix against the framing rather than
-            // the framing against itself.
+            // the framing against itself, and the prefix width is counted off
+            // the continuation bits rather than predicted from the length —
+            // postcard does not enforce canonicalization, so a peer may spell
+            // a length in more groups than its shortest form takes.
             const declared = declaredLength(bytes);
             try t.expect(declared <= blobs.max_message_size);
+            var prefix = postcard.Reader.init(bytes[1..]);
+            try t.expectEqual(declared, try prefix.readU64());
+            try t.expectEqual(varintSpan(bytes[1..]), prefix.offset);
             try t.expectEqual(
-                1 + varintWidth(declared) + @as(usize, @intCast(declared)),
+                1 + prefix.offset + @as(usize, @intCast(declared)),
                 framed.payload_offset,
             );
-            // And those bytes are the canonical spelling of that number, so a
-            // non-canonical prefix in the input is not what the framing kept.
-            var scratch: [postcard.varintMax(u64)]u8 = undefined;
-            var writer = postcard.Writer.init(&scratch);
-            try writer.writeU64(declared);
-            try t.expectEqualSlices(
-                u8,
-                writer.finish(),
-                bytes[1 .. 1 + varintWidth(declared)],
-            );
+            // And the encoder's spelling of that number is the shorter of the
+            // two, so a frame can be wider than it needs to be and never
+            // narrower than the value it carries.
+            try t.expect(varintWidth(declared) <= prefix.offset);
+            // Oracle: canonical fixed point and stability. The shortest
+            // spelling of `declared` reads back to `declared` and so does one
+            // group more of it, so the framing a caller keeps is a fact about
+            // the number rather than about how this peer wrote it down.
+            try checkWiderSpelling(declared);
         },
     }
 
@@ -394,6 +418,55 @@ fn varintWidth(value: u64) usize {
     return count;
 }
 
+/// How many bytes the `varint(u64)` at the front of `bytes` occupies, counted
+/// off its continuation bits rather than asked of the decoder, so a check that
+/// uses it is on the bytes and not on the same reader twice.
+///
+/// This is the width a frame was written with, which is not the width its value
+/// needs: postcard does not enforce canonicalization, so the same number may
+/// arrive one group wider than `varintWidth` says. Called only where the
+/// prefix is known to have decoded, and total anyway — a varint with no
+/// terminating byte in `bytes` measures the whole of `bytes`.
+fn varintSpan(bytes: []const u8) usize {
+    var width: usize = 0;
+    while (width < bytes.len and bytes[width] & 0x80 != 0) : (width += 1) {}
+    return @min(width + 1, bytes.len);
+}
+
+/// `value` read back from its shortest spelling and from one group more of it:
+/// the canonical fixed point and the stability of one number across the two
+/// spellings a peer may choose between.
+///
+/// Both are the same number by construction and both are accepted by
+/// `postcard.Reader`; the fixed point is what makes two peers that disagree
+/// about the spelling agree about the value, which is the property a decoder
+/// that rejected the longer spelling would refuse and this one keeps.
+///
+/// Nothing when the type has no room for the extra group: a value whose
+/// shortest spelling is already `varintMax(u64)` wide has no wider spelling
+/// that is an encoding of it rather than an encoding error.
+fn checkWiderSpelling(value: u64) !void {
+    var scratch: [postcard.varintMax(u64)]u8 = undefined;
+    var writer = postcard.Writer.init(&scratch);
+    try writer.writeU64(value);
+    const canonical = writer.finish();
+    if (canonical.len + 1 > postcard.varintMax(u64)) return;
+
+    var canonical_reader = postcard.Reader.init(canonical);
+    try t.expectEqual(value, try canonical_reader.readU64());
+    try canonical_reader.finish();
+
+    // One group more of the same value: the last group's continuation bit set
+    // and a zero group behind it, which carries no value of its own.
+    var spelling: [postcard.varintMax(u64)]u8 = undefined;
+    @memcpy(spelling[0..canonical.len], canonical);
+    spelling[canonical.len - 1] |= 0x80;
+    spelling[canonical.len] = 0x00;
+    var wider_reader = postcard.Reader.init(spelling[0 .. canonical.len + 1]);
+    try t.expectEqual(value, try wider_reader.readU64());
+    try wider_reader.finish();
+}
+
 /// The two paths a provider's answer takes, and the boundary between them.
 fn checkResponse(bytes: []const u8) !void {
     // Oracle: EOF is a value and it is exactly "no bytes". `BaoResponse` has no
@@ -457,13 +530,20 @@ fn checkClose(bytes: []const u8) !void {
         try t.expectEqual(closed.toVarInt(), code);
         try t.expect(code < 3);
         try t.expect(closed.reason().len > 0);
-        // Oracle: the spelling that produced the code is the canonical one, so
-        // the value read out of the frame re-encodes to the same bytes and the
-        // reader consumed exactly that many.
-        var scratch: [postcard.varintMax(u64)]u8 = undefined;
-        var writer = postcard.Writer.init(&scratch);
-        try writer.writeU64(code);
-        try t.expectEqualSlices(u8, writer.finish(), bytes[0..consumed]);
+        // Oracle: the reader stopped at the end of the spelling and no further,
+        // so the code is read out of the varint the frame carried rather than
+        // out of a wider window, and it reads back the same way.
+        var again = postcard.Reader.init(bytes[0..consumed]);
+        try t.expectEqual(code, try again.readU64());
+        try again.finish();
+        // Oracle: canonical fixed point and stability, and deliberately never
+        // a comparison against the bytes. The shortest spelling of the code
+        // reads back to the code and so does one group more of it, which is
+        // what makes the two spellings the same close: postcard does not
+        // enforce canonicalization (its `wire-format.md`, "Canonicalization",
+        // commit 872b908, accepts `[0x80, 0x00]` for zero) and RFC 9000
+        // section 16 does not require a QUIC varint to be minimal either.
+        try checkWiderSpelling(code);
     } else |err| {
         // Oracle: a code with no arm is named rather than defaulted, and it is a
         // code rather than a broken encoding — every number from three upwards is

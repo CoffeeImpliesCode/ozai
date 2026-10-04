@@ -35,12 +35,9 @@ would break if it moved.
 
 Wire codecs and network state machines consume caller-supplied bytes, state,
 time and entropy. They do not fetch a clock, environment or hidden allocator.
-`SecretKey.generate` is an explicit entropy edge: it borrows the caller's
-`std.Io` rather than hiding a process random source. That is an ownership
-property, not a strength one — the draw is `Io.random`, which Zig 0.16.0
-documents as seeded by `Io.randomSecure` *or by a less secure mechanism when
-that fails* (`lib/std/Io.zig:2462-2469`). A caller that needs the guarantee
-passes an `Io` whose `random` is `randomSecure`.
+`SecretKey.generate` borrows the caller's `std.Io` and draws from `io.randomSecure`.
+It erases the temporary seed with `std.crypto.secureZero` on every exit.
+An unavailable secure entropy source returns an error. There is no fallback to `io.random`.
 
 The socket and node drivers borrow `std.Io` per operation. Its backend and
 userdata must outlive the operation and any task that uses them.
@@ -52,14 +49,12 @@ datagram in Zig 0.16.0 (`lib/std/Io/Uring.zig:5042-5054`), and `Io.Evented` is
 `Io.Uring` on Linux (`lib/std/Io.zig:31-37`). Neither runtime owns this stack's
 send path.
 
-**One boundary the runtime still violates.** `Node.create` initializes
-`std.Random.DefaultPrng` from a `u64` the caller passes, and `ozai-node` passes
-the fixed public constant `0x6f7a_69`. That generator reaches the TLS
-handshake's ephemeral scalars, the relay admission challenges and the QUIC
-connection-id and path-validation draws, so the production randomness is
-predictable even though `ozai.base`'s seam is not. Identity keys do not come
-from it. This is the first Wave 0 repair in [`PLAN.md`](PLAN.md) and it is not
-yet made.
+**Wave 0 repaired production entropy.** `ozai.node_lifecycle.create` draws a 32-byte seed
+from `io.randomSecure` into an owned ChaCha `Csprng`.
+It erases the temporary with `std.crypto.secureZero`.
+The generator supplies TLS ephemeral scalars, relay challenges, QUIC connection IDs, and path-validation draws.
+`ozai-node` no longer accepts `--seed`.
+Pure state machines still take explicit `std.Random` values for deterministic tests.
 
 ## Module tree
 
@@ -72,6 +67,189 @@ The diagram names responsibilities, not import routes. The package registers
 namespaces. Owning declarations state each result's lifetime and release duty.
 Reachable fields are not private, and copying an owner does not duplicate its
 resources. Allocating owners require exactly one teardown.
+
+The transport APIs have separate owning namespaces:
+
+| Namespace | Responsibility |
+|---|---|
+| `ozai.transport_quic_conn` | `Conn`, `Egress`, `Instant`, `min_datagram`, and the `toCoreAddress` / `fromCoreAddress` translators |
+| `ozai.transport_quic_config` | `Config`, `AlpnError`, `CreateError`, `max_alpns`, `max_alpn_name_len`, `spki_length`, `validateAlpns`, `demandsPeerCertificate`, `connectionConfig`, and `drawKey` |
+| `ozai.transport_quic_error` | The transport `Error` union |
+| `ozai.transport_quic_stream` | Borrowed views `Stream`, `UniStream`, and `RecvUni`, plus `max_drain_runs`, `openBidi`, `openUni`, and `acceptUni` over `*quic.connection.Connection` |
+| `ozai.transport_quic_datagram` | `max_payload`, `Error`, `enabled`, `maxPayload`, `queued`, `send`, and `recv` |
+| `ozai.transport_retry` | `RetryToken`, `Gate`, `Verdict`, `Error`, `InitialHeader`, `initialHeader`, and the token-length, connection-id, age, and tracking bounds |
+| `ozai.transport_dial_route` | `Route`, `Error`, `resolveRoute`, and `ownerOf` |
+
+`Bridge` owns the endpoint. It does not re-export those types, helpers, or modules.
+`Conn.close(application_error, reason, at)` queues an application close.
+The reason remains borrowed until reaping. The caller must drain the close before freeing the connection owner.
+
+The node separates data from operations. `src/root.zig` registers the data
+owner and the twenty-one processor namespaces anchored to it; nothing else is a
+node route.
+
+| Namespace | Responsibility |
+|---|---|
+| `ozai.node` | Stable `Node` data, `Stop`, `Lane`, and `Answer` |
+| `ozai.node_config` | `Config`, peers, relay roles, and storage bounds |
+| `ozai.node_protocol` | `Protocol`, `Handler`, `Connection`, `Turn`, `LaneStats`, `max_alpns`, and the ALPN constants |
+| `ozai.node_error` | Node `Error` |
+| `ozai.node_stats` | `Stats` and send-report counters |
+| `ozai.node_lifecycle` | `create`, `register`, and `deinit` |
+| `ozai.node_runtime` | `start`, `step`, `wait`, `run`, `windDown`, `dispose`, and `instantOf` |
+| `ozai.node_close` | `close`, `finish`, `retire`, `cancelLane`, `protocols`, and `laneStats` |
+| `ozai.node_relay_client` | Relay-client passes, delivery storage, `sendThrough`, `clientCount`, and `queueDepth` |
+| `ozai.node_framing` | Relay stream framing and inbox boundaries |
+| `ozai.node_lane` | Handler callback execution and lane shutdown |
+| `ozai.node_dispatch` | Endpoint event intake, concrete actions, shutdown steps, and socket release |
+| `ozai.node_accept` | Admission, accept-task driving, and lane continuations |
+| `ozai.node_connection_close` | Application close on one or every connection, and the egress it produces |
+| `ozai.node_ingress` | Datagram intake and delivery |
+| `ozai.node_egress` | Outbound datagrams and connection expiry |
+| `ozai.node_gossip` | Gossip passes, event feed, and peer departure |
+| `ozai.node_relay_serve_admit` | The serving pass, its admission walk, and the handshake machine |
+| `ozai.node_relay_serve_read` | The read of every client slot, and the rules for what its stream still means |
+| `ozai.node_relay_serve` | The datagram frames a client sends, forwarding, and the queue drain |
+| `ozai.node_relay_registry` | Relay registration, replacement, and release |
+| `ozai.node_report` | Driver reports |
+
+Each row owns its operations outright. `ozai.node` owns the free functions
+`nodeId`, `address`, `generator`, `establishedCount`, `namedPeers` and
+`connFor`, and `Node` carries no forwarding method, nested processor namespace
+or moved-type alias. There is no second spelling of any of these operations:
+no compatibility facade, alias module or shim survived the cutover, so a
+caller reaching for a retired method form finds nothing.
+
+Lifecycle allocates and releases the stable owner, runtime drives the pass
+order, and close owns shutdown order. Each protocol owns its handler state.
+
+### The module graph
+
+The graph is acyclic apart from the serving-relay half, and its direction is
+fixed by ownership.
+`node_error`, `node_stats` and `node_framing` import no node namespace at all.
+`node_protocol` imports `node_error`, `node_config` imports `node_protocol`,
+and `node.zig` imports only the three owners it embeds, so data reaches no
+operation. The only importers of `node_runtime` are the CLI driver and the
+node's own test module, which is what makes "lower processors do not call
+back into the runtime" a property of the imports rather than a convention.
+
+The processor-to-processor edges are few and fixed:
+
+- `node_runtime` → `node_accept`, `node_close`, `node_egress`,
+  `node_ingress`, `node_relay_client`, `node_relay_serve_admit`
+- `node_close` → `node_dispatch`, `node_lane`, `node_connection_close`
+- `node_dispatch` → `node_lane`, `node_connection_close`
+- `node_accept` → `node_dispatch`
+- `node_egress` → `node_dispatch`, `node_gossip`
+- `node_lane` → `node_relay_registry`
+- `node_relay_serve_admit` → `node_relay_registry`, `node_relay_serve_read`,
+  `node_relay_serve`
+- `node_relay_serve_read` → `node_relay_serve_admit`, `node_relay_serve`
+- `node_relay_serve` → `node_relay_serve_admit`, `node_relay_serve_read`
+- `node_report` → `node_relay_client`
+
+The serving-relay half is the one cycle, and it is one pass rather than a
+layering: the admission walk spends a slot, the read drains its stream, and
+the datagram half serves the frames and drains the queues, and each of the
+three calls back into the other two for the next step of that same pass.
+`serveAdmit` and `serveRead` both offer events to `serveHandshake`,
+`serveRead` hands the inbox to `serveMessages`, and `serveMessage` offers a
+frame back to `serveHandshake`. Splitting the pass by responsibility is what
+made the cycle visible at file level; it was inside one file before, and no
+module in it can drop an edge without the pass losing a step.
+
+One of those crosses a role boundary: `node_relay_serve_admit` →
+`node_relay_client` (`node_relay_serve_admit.zig:21`, `:97-98`). It exists for
+`queueDepth` alone, a read of the serve role's configured queue depth that
+sizes the queues and the ring of a newly admitted client. It hands no state
+across, and
+`node_relay_client` imports only `node`, `node_config`, `node_error` and
+`node_framing` in return, so the cycle a role-crossing edge could have closed
+does not exist.
+
+### The public call shape
+
+A required `std.Io` is a leading argument, not a trailing one. Where one
+followed the node or another argument it moved in front of it, and every
+non-Io argument kept its order:
+
+```zig
+ozai.node_runtime.step(io, node, at, random)
+ozai.node_runtime.wait(io, node, timeout_ms)
+ozai.node_runtime.run(io, node, stop)
+ozai.node_runtime.windDown(io, node, last)
+ozai.node_accept.admit(io, node, at, random)
+ozai.node_accept.runTask(io, node, at, random, &task, conn)
+ozai.node_ingress.take(io, node, at, random)
+ozai.node_egress.expire(io, node, at, random)
+ozai.node_connection_close.closeConnections(io, node, at, random)
+ozai.node_close.close(io, node, at, random)
+ozai.node_close.retire(io, node, alpn, at)
+ozai.node_close.cancelLane(io, node, at, index)
+```
+
+Internal calls use the same order. `node_runtime.step` reads
+`ingress.take(io, self, at, random)`, `accept.admit(io, self, at, random)`,
+`egress.drain(io, self, at, random)` and `gossip.gossip(self, at)`, and
+`node_close.cancelLane` calls
+`connection_close.closeOne(io, self, conn, at)`.
+
+Two shapes do not move, and the reason is the same in each:
+
+- **Allocator first, I/O next.**
+  `ozai.node_lifecycle.create(gpa, io, config)` allocates the owner it
+  returns, so the allocator leads and `io` follows it.
+- **An optional runtime stays put.** `io: ?std.Io` is a value the caller may
+  not have rather than a backend it borrows, so it keeps its position after
+  the node: `ozai.node_close.finish(node, io, at, random)` is what
+  `dispose(node)` calls as `finish(node, null, null, generator)`, and
+  `ozai.node_dispatch.feed`, `perform` and `performShutdown` keep
+  `(node, io, …)`.
+
+An operation with no runtime keeps its own shape: `runtime.start(node, at,
+random)`, `runtime.instantOf(io)`, `runtime.dispose(node)`,
+`gossip.gossip(node, at)`, `relay_client.converse(node, at, random)`,
+`relay_serve.serve(node, at, random)`, `lane.shutdownLane(node, index)`, and
+`report.report(&writer, node, holding, close)`, whose first argument is a
+writer and not a runtime.
+
+One runtime pass performs ingress, sweep, admission, accept driving, relay work, egress, expiry, and gossip.
+Sweep precedes indexed admission. Relay writes precede egress in the same pass.
+A failed pass requires closure, not a replay.
+`run` closes on every exit. `windDown` protects cleanup without replacing the original driver error.
+Close the owner before `deinit`. Keep its allocator alive and deinitialize exactly once.
+Stop requests do not join the driver. Wait for `run` before releasing the stop or node.
+
+### What the data owner keeps
+
+The I/O cutover moved no field. `src/node/node.zig` declares `Node` with 30
+fields, from `gpa` to `stats`, and that field set is the node's stable shape: a
+pointer into it is what a lane, the router table and the relay registry hold,
+so changing it changes every borrower at once.
+
+- **One heap.** `gpa` is the only allocator the struct carries.
+  `node_lifecycle.create` calls `gpa.create(Node)` once, and every buffer,
+  map and the node itself is released through that same allocator by
+  `deinit`, exactly once.
+- **Lane owner.** Lanes are embedded as `lanes: [max_alpns]Lane`, so
+  `Lane.owner` points back at the node rather than copying it, and the router
+  table stores `*Lane`. `node_lifecycle.register` writes `.owner = self` for
+  each configured protocol.
+- **Borrowed ALPN.** `Lane.alpn` holds `registration.alpn` unchanged. ALPN
+  bytes, custom handler state and peer payloads are borrowed for the node's
+  lifetime, so the caller keeps them alive.
+
+### Two sweep roots, and what each excludes
+
+The native root `src/unit_test.zig` references the whole `ozai` module and
+reaches `node/node_tests.zig` exactly once, which is why that module is not
+imported anywhere else. The socket-free root `src/portable_test.zig` names
+its modules explicitly and imports only `node_stats` and `node_framing` from
+the node: the other eighteen node namespaces reach the Linux socket adapters
+through `node_error` or the `Node` data owner, so their declarations and their
+live tests stay in the native root. That split is the platform boundary, and
+relocating a test must not move it.
 
 | Zig | Rust upstream | Why |
 |---|---|---|
@@ -108,6 +286,43 @@ same path answer with the same address again lives here.
 
 **The router owns ALPN dispatch and nothing else.** It turns a negotiated ALPN
 into a handler call. It does not know what any protocol does.
+
+**The offer list and dispatch table use one bounded registration set.**
+`ozai.node_config.Config.protocols` supplies each ALPN and its handler selection.
+`Router.offers` and `Router.dispatch` use those registrations.
+Each negotiated protocol reaches its own handler.
+An empty ALPN intersection fails the handshake before router dispatch.
+A separately configured table can still return `Drop.refused_protocol`.
+
+**A protocol owns its handler state.** `ozai.node_protocol` owns registrations and handler contracts.
+Each registration selects `.standard` or a custom `Handler`.
+The protocol slice, ALPN bytes, and custom handler context must outlive the node.
+The node calls handler callbacks inside `ozai.node_runtime.step`.
+Callbacks must not re-enter `step` or call `ozai.node_close.close`.
+The supplied connection is borrowed for that turn. Core reaping invalidates borrowed connections and streams.
+`Turn.more` retains the task for another call to the same handler.
+`Turn.finished` completes it.
+`ozai.node_close.retire` withdraws the ALPN first, calls that lane's shutdown once, and cancels only that lane's accepts.
+It also queues the lane's connection closes. Other protocols remain active.
+
+**Where Wave 1 stands.** The ownership cutover is in the tree, and seven actual
+native↔Rust exchanges have run against the current Debug build: the receipts
+`<scratch>/evidence/resume-w1-live-*.json` record three payload runs —
+positives in both role orders plus one `--require-retry` run — exiting 0/0 with
+mutually authenticated exact peer ids, the negotiated ALPN `/ozai/w1-fixture`,
+and all six distinct bidirectional, uni-stream and datagram payloads verified
+by both ends, and four typed refusals exiting 1/1 on alert 42 (wrong peer) or
+120 (ALPN), with no payload owed and none verified. **A peer id is keyed by
+role, not by implementation:** LISTENER secret seed `0x11` is `d04ab232…` and
+DIALER secret seed `0x22` is `a09aa5f4…`, and the native peer holds each role in
+a different receipt, so "the native peer id" names no property of the build.
+That is evidence about seven observed runs and nothing else. **The full gate
+and runtime verification for Wave 1 are pending** against the current bytes, so
+no wave is green and no required lint or static result is claimed here; a
+pending gate is not recorded as a failed one, and the earlier red lint and
+static figures belong to older bytes. The standard relay carrier, Bao and blob
+transfer, production gossip send and disconnect actions, and live I/O remain
+unimplemented; those are Waves 2–4.
 
 ## Invariants
 

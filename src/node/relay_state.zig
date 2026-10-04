@@ -31,10 +31,12 @@
 const std = @import("std");
 
 const base_key = @import("../base/key.zig");
-const bridge_mod = @import("../transport/quic_bridge.zig");
-const relay_frame = @import("../relay/frame.zig");
+const quic_stream = @import("../transport/quic_stream.zig");
+const relay_frame = @import("../relay/frame_types.zig");
 const relay_client = @import("../relay/client.zig");
-const relay_server = @import("../relay/server.zig");
+const relay_handshake = @import("../relay/server_handshake.zig");
+const relay_queue = @import("../relay/server_queue.zig");
+const relay_registry = @import("../relay/server_registry.zig");
 
 const NodeId = base_key.NodeId;
 const Allocator = std.mem.Allocator;
@@ -47,10 +49,11 @@ const Allocator = std.mem.Allocator;
 /// out has to be a copy or it is a view of a buffer that has moved on.
 ///
 /// **Two lifetimes, and they are not the same one.** The payload is owned until
-/// the node's `clearDelivered` gives it back — or until `deinit`, which frees
-/// whatever is still listed — and that allocator is the one that frees it. The
-/// list it sits in does not survive the next delivery: appending to it may move
-/// it. `Node.delivered` says which is which from the outside.
+/// the node's `node_relay_client.clearDelivered` gives it back — or until
+/// `deinit`, which frees whatever is still listed — and that allocator is the
+/// one that frees it. The list it sits in does not survive the next delivery:
+/// appending to it may move it. `node_relay_client.delivered` says which is
+/// which from the outside.
 pub const Delivered = struct {
     /// The node id the relay says this datagram came from. Copied, and so
     /// independent of the payload and of every other item on the list.
@@ -124,7 +127,7 @@ pub const Spoke = struct {
     /// handshake is through. So the stream is opened on the first pass where the
     /// connection is established, which is also the first pass where anything
     /// could be written on it.
-    stream: ?bridge_mod.Stream,
+    stream: ?quic_stream.Stream,
     /// The client half of the handshake, from the dial.
     handshake: relay_client.State,
     /// What has been read and is not yet a whole message.
@@ -135,7 +138,7 @@ pub const Spoke = struct {
     /// Retain one datagram the relay handed this node.
     ///
     /// **The copy is taken from `gpa`, and the guard for it is taken before the
-    /// list is.** `relay_frame.decode` borrows a frame's datagrams out of the
+    /// list is.** `relay/frame_codec.zig`'s `decode` borrows a frame's datagrams out of the
     /// bytes that frame was read from, and those bytes are reused by the next
     /// read, so a payload handed to a caller has to be copied rather than
     /// pointed at. Copying makes it an allocation the caller owns from that
@@ -173,6 +176,34 @@ pub const Spoke = struct {
         for (self.delivered.items) |item| gpa.free(item.data);
         self.delivered.clearRetainingCapacity();
     }
+
+    /// Whether this relay client has nothing more to say.
+    ///
+    /// **The machine's terminal outcome, read rather than remembered.**
+    /// `relay_client.step` reaches a terminal state in exactly two ways:
+    /// `.denied` for a refusal, and `.failed` for a frame out of order or a
+    /// stream that ended (`client.zig:465,515`). Both arrive with the `.close`
+    /// action `node_relay_client.converseClose` carries out, and a terminal
+    /// state folds itself into every later step and answers no action, so a
+    /// second close is already impossible, and a flag to prevent one would only
+    /// restate the state it reads.
+    ///
+    /// **`.established` is terminal too and is deliberately not named.** An
+    /// admitted handshake has said everything it will say, but the stream this
+    /// node writes on is the one it opened to answer, and the relay reads that
+    /// one whatever it has done with the stream it opened to send on. Only a
+    /// refusal, and a handshake its stream ended before it finished, take the
+    /// stream away from this node.
+    ///
+    /// **Not the transport's `finished`,** which is the relay's FIN on the
+    /// stream it sends on: that is a fact about the wire, read by whoever holds
+    /// the stream. This is what the relay said about this client.
+    pub fn ended(self: *const Spoke) bool {
+        return switch (self.handshake) {
+            .denied, .failed => true,
+            else => false,
+        };
+    }
 };
 
 /// One client a serving relay holds.
@@ -190,16 +221,16 @@ fn ClientSlot(comptime displaced: usize) type {
         /// The relay half of the handshake, from the moment the connection is
         /// established. `.admitted` is where a client stops being a handshake
         /// and starts being a client.
-        handshake: relay_server.State = .opened,
+        handshake: relay_handshake.State = .opened,
         /// The handle that ends this client, and the only way out of the
         /// registry. Null is a client that has not been admitted, and must not
         /// be reported as gone: `Registry.unregister` is not public, so a client
         /// with no handle has no exit at all.
-        guard: ?relay_server.Registry(displaced).OnDisconnectGuard = null,
+        guard: ?relay_registry.Registry(displaced).OnDisconnectGuard = null,
         /// The node id the handshake proved, or null until it has.
         node_id: ?NodeId = null,
         /// The two queues, over storage this struct owns.
-        queues: relay_server.Connection = undefined,
+        queues: relay_queue.Connection = undefined,
         /// The bytes a queued datagram borrows: one fixed slot per queue
         /// position, so a `Packet` points at the slot its own ring position
         /// names and the slot is free the moment it is popped.
@@ -217,23 +248,21 @@ fn ClientSlot(comptime displaced: usize) type {
         /// relay that waited for the client's stream could not send the challenge
         /// that makes the client write on it. The serving pass finds the other
         /// half each time it reads.
-        out: bridge_mod.Stream = undefined,
+        out: quic_stream.Stream = undefined,
         /// What has been read off that stream and is not yet a whole message.
         inbox: std.ArrayList(u8) = .empty,
-        /// Whether the client has been told there is nothing more.
-        ended: bool = false,
     };
 }
 
 /// One client's two queues, cut out of storage every client shares.
 fn cutQueues(
-    packets: []relay_server.Packet,
-    messages: []relay_server.Control,
+    packets: []relay_queue.Packet,
+    messages: []relay_queue.Control,
     depth: usize,
     index: usize,
-) relay_server.Connection {
+) relay_queue.Connection {
     const base = index * depth;
-    return relay_server.Connection.init(
+    return relay_queue.Connection.init(
         packets[base..][0..depth],
         messages[base..][0..depth],
     );
@@ -255,7 +284,7 @@ fn cutRing(ring: []u8, depth: usize, datagram: usize, index: usize) []u8 {
 pub fn State(comptime table_slots: usize, comptime displaced: usize) type {
     return struct {
         const Self = @This();
-        const registry_type = relay_server.Registry(displaced);
+        const registry_type = relay_registry.Registry(displaced);
 
         /// One client a serving relay holds, and the type the slot array holds.
         pub const client_type = ClientSlot(displaced);
@@ -271,8 +300,8 @@ pub fn State(comptime table_slots: usize, comptime displaced: usize) type {
         /// cut into one client's depth apiece. One allocation for all of them,
         /// because a per-client allocation is a pointer chase on the hot path
         /// and the sizes are all the same.
-        packets: []relay_server.Packet,
-        messages: []relay_server.Control,
+        packets: []relay_queue.Packet,
+        messages: []relay_queue.Control,
         /// One fixed datagram slot per queue position of every client, laid out
         /// the same way.
         ring: []u8,
@@ -306,9 +335,9 @@ pub fn State(comptime table_slots: usize, comptime displaced: usize) type {
         /// **Initialised in place, and never returned by value.** `registry_type.init`
         /// hands back a registry that points at the caller's slot array, so a
         /// `Self` returned from here would carry a pointer into a stack frame
-        /// that is gone by the time the caller has it. `Node.create` therefore
-        /// calls this on the node's own field, which is heap-allocated and
-        /// never moves.
+        /// that is gone by the time the caller has it. `node_lifecycle.create`
+        /// therefore calls this on the node's own field, which is heap-allocated
+        /// and never moves.
         ///
         /// **The operator's numbers are the caller's to validate**, against
         /// the bound that sizes `table_slots`, so a refusal is the node's own
@@ -340,9 +369,9 @@ pub fn State(comptime table_slots: usize, comptime displaced: usize) type {
             const per_client = size.clients * size.queue_depth;
             const clients = try gpa.alloc(client_type, size.clients);
             errdefer gpa.free(clients);
-            const packets = try gpa.alloc(relay_server.Packet, per_client);
+            const packets = try gpa.alloc(relay_queue.Packet, per_client);
             errdefer gpa.free(packets);
-            const messages = try gpa.alloc(relay_server.Control, per_client);
+            const messages = try gpa.alloc(relay_queue.Control, per_client);
             errdefer gpa.free(messages);
             const ring = try gpa.alloc(u8, per_client * size.datagram);
             errdefer gpa.free(ring);
@@ -458,7 +487,7 @@ pub fn State(comptime table_slots: usize, comptime displaced: usize) type {
             self: *const Self,
             depth: usize,
             index: usize,
-        ) relay_server.Connection {
+        ) relay_queue.Connection {
             return cutQueues(self.packets, self.messages, depth, index);
         }
 

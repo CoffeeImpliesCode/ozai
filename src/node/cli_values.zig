@@ -6,9 +6,9 @@
 //! `cli.zig` — so each of these is on its own the grammar for one `<...>` in
 //! the usage text.
 //!
-//! The types returned are the ones the program hands to `Node.create`, so
+//! The types returned are the ones the program hands to `node_lifecycle.create`, so
 //! nothing is converted between a command line and the node it asks for: the
-//! `Peer` here is `node.Peer`, and the datagram ceiling below is the one the
+//! `Peer` here is `node_config.Peer`, and the datagram ceiling below is the one the
 //! node itself refuses over.
 
 const std = @import("std");
@@ -36,7 +36,7 @@ pub const ValueError = ozai.base32.DecodeError || ozai.KeyError ||
     /// `--send` with no payload after the node id, or with a colon and nothing
     /// behind it. A datagram of no bytes is a flag that said nothing.
     SendWithoutBytes,
-    /// `--send` with a payload longer than `Node.max_datagram`. A relay
+    /// `--send` with a payload longer than `node_config.max_datagram`. A relay
     /// forwards datagrams and that is the length of one, so a longer one is a
     /// flag asking for something this program will not send.
     SendTooLong,
@@ -54,7 +54,7 @@ pub const ValueError = ozai.base32.DecodeError || ozai.KeyError ||
 /// `url` borrows the argument bytes it was cut from.
 pub const RelayPeer = struct {
     url: []const u8,
-    peer: ozai.node.Peer,
+    peer: ozai.node_config.Peer,
 };
 
 /// One datagram to put on the relay wire, and the peer it is for.
@@ -104,7 +104,7 @@ pub fn send(text: []const u8) ValueError!Send {
     // Refused here rather than becoming a `DatagramTooLarge` out of
     // `sendThrough` on a pass of the loop: same mistake, and only one of them
     // is a line.
-    if (bytes.len > ozai.node.max_datagram) return error.SendTooLong;
+    if (bytes.len > ozai.node_config.max_datagram) return error.SendTooLong;
     return .{ .peer = try ozai.NodeId.parseZ32(text[0..colon]), .bytes = bytes };
 }
 
@@ -129,7 +129,7 @@ pub fn socket(text: []const u8) ValueError!ozai.SocketAddr {
 /// The two halves keep their own refusals: a node id that is not on the curve
 /// and an address with no port are different mistakes, and one name for both
 /// would leave the caller guessing which one it typed.
-pub fn peer(text: []const u8) ValueError!ozai.node.Peer {
+pub fn peer(text: []const u8) ValueError!ozai.node_config.Peer {
     const at = std.mem.indexOfScalar(u8, text, '@') orelse return error.PeerWithoutAddress;
     const address = socket(text[at + 1 ..]) catch return error.PeerAddressUnreachable;
     return .{ .id = try ozai.NodeId.parseZ32(text[0..at]), .addr = .{ .ip = address } };

@@ -7,6 +7,10 @@
   [Execution record](#execution-record-of-2026-09-30), which names what is
   still open. Item 3 of that list closed after M8; see
   [Still open](#still-open-after-m8).
+  **Updated 2026-10-05** against the parent's final Wave 1 runs: the live exchange
+  now has receipts from one current binary, the vendored core and the first-party
+  suite are both green, and item 8 has closed. Item 9 is still open — see
+  [Still open](#still-open-after-m8), where the three remaining names are.
 - **The decision is unchanged.** What moved is the price, twice over.
   quic-zig is still the substrate; the work to make it ozai's is 60 hidden-input
   call sites threaded through, plus a 7,194-line layer that was never copied,
@@ -47,7 +51,14 @@ Three requirements decide this, in order:
    against more than one independent implementation. **Corrected**: quic-zig
    passes the cases this record names, but not the whole matrix, and the matrix
    does not pin to the commit we would vendor. See
-   [Interop](#interop-the-one-claim-that-got-worse).
+   [Interop](#interop-the-one-claim-that-got-worse). **Where Wave 1 left it, as
+   of 2026-10-05**: the native Rust partner leg runs against the **patched** tree
+   and completes — **both role orders**, exits 0 and 0, exact peer ids, the agreed
+   ALPN, all six declared payloads each way — and the `--require-retry` run and
+   all four typed refusals are receipts of that **same** binary,
+   `70567c34fdd0f513dde3c21391c50cc74e03757c2304e3f971768aef1c64c399`. The
+   **upstream matrix leg is still open** and is still not reproducible from this
+   repository. See [item 2](#still-open-after-m8).
 
 ## Options considered
 
@@ -440,6 +451,29 @@ permanently.
 **No QUIC v2, no DPLPMTUD on the vendored path.** `SPEC/STATUS.md` marks QUIC v2
 (RFC 9369) ✅ Complete. DPLPMTUD is not claimed. Neither blocks an iroh peer.
 
+**A TLS server over TCP, written rather than reused.** Wave 2's relay carrier
+is RFC 6455 binary messages over an HTTP upgrade with TLS (`docs/PLAN.md`,
+slice A). Upstream's TLS-over-TCP stack was never copied here, so that slice
+inherits no server and writes one. It is the one exclusion in `VENDORED.md`
+with a bill attached, and the bill is that slice's rather than the transport's.
+
+**The reason this decision gave for the exclusion was too broad, and is
+corrected here.** `src/http1` does own sockets, and its socket-owning files are
+the real socket exclusions. Upstream's four files of `src/tls` do not. At the
+pinned `14b9dc3e`, `src/tls/common.zig:1-3` names itself the helpers of "the
+sans-IO TLS 1.3 `tls_server` and `tls_client`", and `src/tls/server.zig:1-8`
+says "`Conn` never touches a socket: the caller feeds it the ciphertext it read,
+flushes `pendingOutput()` to the peer, and moves plaintext with `read` /
+`write`". No `socket`, `bind`, `listen` or `accept` appears in that file. They
+were left behind with the protocol layers, and what an eventual port has to
+lift is their ambient `../sys.zig` calls — `sys.randomBytes` and
+`sys.realtimeSeconds`, through the single import at `server.zig:37` — into
+injected entropy and an injected clock. That is port work, not socket work,
+and `src/sys.zig` is gone from this module, so the seam those calls sit on does
+not exist here either. **No TLS-over-TCP server and no HTTPS server exists in
+this repository.** The bill stands and is Wave 2's to pay; nothing here offers
+it back.
+
 ### Multipath, measured 2026-10-01
 
 **How this was measured.** Driven directly over `Connection` with hand-built
@@ -647,8 +681,16 @@ matrix is reproducible only by initialising the submodule and running
   [Still open](#still-open-after-m8).
 - **Requirement 3 has to be discharged.** It is discharged against this fork or
   not at all, because upstream's interop runner is a git submodule outside the
-  published package. Until the matrix is run at our SHA the substrate has never
-  spoken to an implementation that is not its own test suite.
+  published package. There are two legs and they now stand differently. The
+  upstream matrix leg needs that submodule plus a node with Docker and
+  `quic-network-simulator`, neither of which is here, and it is **open**. The
+  native `iroh = "=1.3.0"` partner leg needs neither and **has run against the
+  patched tree in both roles**: exits 0 and 0, exact peer ids, the agreed ALPN
+  and all six declared payloads each way, with the typed refusals and a Retry
+  receipted against the same partner — and since 2026-10-05 all seven of those
+  runs are receipts of one build, `70567c34…`, rather than of two. So the revisit
+  trigger is now the matrix alone, and the honest shape of this item is *one leg
+  met, one leg unmeasured*.
 
 ## Correction of 2026-09-30
 
@@ -772,38 +814,67 @@ only the walk reached: `certificateWellFormed`, `Certificate.parse`,
 `verifyHostName`, `verifyPeerChain`, `clientLeafUsageOk`, the extension parsers
 and `ChainError`, plus `TlsConfig.skip_cert_verify`, `ClientAuth.ca_bundle` and
 `TlsConfig.keylog_file`. The only surviving mention of `certificateWellFormed`
-is a test comment at `tls13.zig:4254-4258` explaining why the bounds guard it
+is a test comment at `tls13.zig:6276` explaining why the bounds guard it
 provided is no longer needed.
 
 What replaced them:
 
-- **`liftEd25519Spki`** (`tls13.zig:188`) — 44 bytes in, 32 out, by TLV walk,
+- **`liftEd25519Spki`** (`tls13.zig:234`) — 44 bytes in, 32 out, by TLV walk,
   failing only with `error.MalformedSubjectPublicKeyInfo` or
   `error.UnsupportedSubjectPublicKeyInfo`. The length is fixed, so the length
-  check at `:191` is also the whole bounds check; there is nothing after it that
+  check at `:237` is also the whole bounds check; there is nothing after it that
   can index out of the buffer.
-- **`lifted_key_algo`** (`tls13.zig:224`) — one `const` of type
+- **`lifted_key_algo`** (`tls13.zig:270`) — one `const` of type
   `Certificate.AlgorithmCategory` set to `.curveEd25519` *by construction*. This
   is what the record identified as the thing that would make
   `verifyCertificateVerifySignature`'s unreachable `.ed25519` arm reachable, and
   it turned out to be a line rather than a patch.
-- **`TlsConfig.expect_peer_node_id: ?[32]u8`** (`tls13.zig:730`), compared with
-  `crypto.timing_safe.eql` at `tls13.zig:1466`. Null accepts any key, and the
-  doc comment at `:726-729` says plainly what that gives up.
-- **`ClientAuth.expect_node_id`** (`tls13.zig:264`), the same comparison on the
-  server at `tls13.zig:2085`, and `peer_node_id` as the key the
-  CertificateVerify is checked against at `tls13.zig:2110`.
-- **Both CertificateVerify checks are now unconditional** — `tls13.zig:1513` and
-  `:2117`, guarded by neither a flag nor `leaf_pub_key_len`. That is the "split
+- **`TlsConfig.expect_peer_node_id: ?[32]u8`** (`tls13.zig:1459`), compared with
+  `crypto.timing_safe.eql` at `tls13.zig:2794`. Null accepts any key, and the
+  doc comment above the field says plainly what that gives up.
+- **`ClientAuth.expect_node_id`** (`tls13.zig:476`), the same comparison on the
+  server at `tls13.zig:3529`, and `peer_node_id` (`:1890`) as the key the
+  CertificateVerify is checked against.
+- **Both CertificateVerify checks are now unconditional** — `tls13.zig:2841` and
+  `:3561`, guarded by neither a flag nor `leaf_pub_key_len`. That is the "split
   the bit" the record asked for, arrived at by removing the bit.
 - **`signCertificateVerify` no longer draws.** Upstream read 32 bytes before it
   knew which scheme it was signing with and handed them to the Ed25519 arm,
-  which needs no nonce. `tls13.zig:4211` is a test that counts the draws and
+  which needs no nonce. `tls13.zig:6232` is a test that counts the draws and
   expects zero for Ed25519 and exactly one for P-256 — a test that merely
   passed would not have noticed the difference.
 
 `cert_hashes` survived deliberately: the WebTransport leaf-fingerprint bargain
-needs no chain either, and `tls13.zig:731-734` says so.
+needs no chain either, and `tls13.zig:1461` says so.
+
+**The wire contract this section did not ask for, added afterwards.** Deleting
+the walk made the *payload* right and left the *wire* wrong: nothing on it said
+the `Certificate` body was a `SubjectPublicKeyInfo` rather than an X.509
+certificate, so a peer built on rustls — which is what an iroh peer is — had no
+way to learn this stack could read one. Upstream negotiated no certificate type
+either, so this is the upstream gap rather than something a fork dropped.
+RFC 7250 is now implemented in both roles: the `CertificateType` registry, the
+offer and selection codecs, the two parsers, and a fail-closed refusal in each
+direction. It is a vendor patch, and `vendor/quic/VENDORED.md` §10 carries it in
+full with its test anchors, §11 with its state.
+
+Three things about it belong in this record rather than only there. Both offers
+are **mandatory** rather than merely supported, because this stack has exactly
+one certificate type and a client that does not offer it has nothing in common
+with this server. A server that does not ask for a client certificate omits
+`client_certificate_type` from EncryptedExtensions, which RFC 7250 §4.2
+requires and which would not hold for a project that authenticates both ends.
+And **it was unverified against the patched tree when this was first written.**
+A real iroh peer had been driven against an unpatched baseline in both
+directions and failed both times with `IncorrectCertificateTypeExtension` and
+alert 40. That is the failure this patch answers, and on its own it confirmed
+nothing. **Both native receipts of 2026-10-04 now close that**: the patched tree
+completed a handshake with the real partner in both roles, exits 0 and 0, exact
+peer ids, the agreed ALPN and all six declared payloads each way. So the row
+above moved from "landed, unverified" to landed and verified against one peer —
+one peer, not two. `vendor/quic/VENDORED.md` §10 carries the one captured
+datagram, §11 every receipt, and it says plainly what that capture does not give:
+nothing past the Initial, and no key material anywhere.
 
 Net effect on the two largest files: `tls13.zig` went 4,866 upstream → 4,809,
 and `connection.zig` 6,666 → 6,762. The line counts barely moved because the
@@ -846,31 +917,36 @@ file being absent rather than on lazy analysis never reaching it.
 
 ### The `now_s` clock base — a divergence
 
-`Tls13Handshake.step(now_s: i64, random: std.Random)` (`tls13.zig:1118`) is
-documented at `tls13.zig:1098-1116` as **a second on the caller's clock, not on
+`Tls13Handshake.step(now_s: i64, random: std.Random)` (`tls13.zig:2367`) is
+documented immediately above itself as **a second on the caller's clock, not on
 the epoch**. The connection supplies a monotonic instant, and the sans-IO
 invariant forbids TLS reading one to find out.
 
 Recorded as a divergence because the parameter is spelled `now_s` and sits in a
 file that once read `sys.realtimeSeconds`, so a reader who assumes wall-clock
-seconds here will eventually be wrong about something. The argument, from
-`tls13.zig:1102-1116`:
+seconds here will eventually be wrong about something. The argument:
 
-- The one value written from it is a session ticket's `creation_time`
-  (`tls13.zig:2154`), and the ticket is sealed with AES-128-GCM under
-  `ticket_key`, so the peer receives opaque bytes and cannot read the base.
+- The one value written from it into a ticket is `creation_time`. The server
+  seals it at `tls13.zig:3603`
+  (`std.mem.writeInt(i64, ticket_plain[32..40], now_s, .big)`), and the ticket
+  is sealed with AES-128-GCM under `ticket_key`, so the peer receives opaque
+  bytes and cannot read the base.
 - It is not read back on the issuing side. A resuming server recovers only the
   PSK; the **client** stamps its own `creation_time` from its own `now_s` when
-  it parses the ticket (`tls13.zig:2404`).
-- So the only subtraction is inside one client process — resumption instant
-  minus parse instant, `tls13.zig:2666` — and both sides come off one clock.
+  it opens the ticket to offer it (`tls13.zig:3917`).
+- There are exactly two subtractions of `now_s - creation_time`, and both are
+  differences off one clock. The library takes one at `tls13.zig:4306`, for the
+  RFC 8446 §4.2.11 obfuscated ticket age. `SessionTicket.isExpired`
+  (`:1074-1075`) holds the other and **the library does not call it** — only its
+  own tests at `:5447` and `:5451` do. This record previously said the only
+  subtraction was inside one client process; it is not, and neither of these is
+  a comparison against anything epoch-derived.
 - A monotonic base that restarts with the process could only mis-age a ticket
   that outlived the clock that stamped it, and a process cannot outlive its own
   clock.
 
 The rule for anyone who touches this: **nothing may compare `now_s` against an
-epoch-derived quantity.** `SessionTicket.isExpired(now_s)` (`tls13.zig:574-575`)
-is a difference, never a comparison.
+epoch-derived quantity.**
 
 ### Measured cost against predicted cost
 
@@ -896,18 +972,34 @@ of those paths a way for `realtimeSeconds` to come back through.
 Items are kept after they close, each marked where it stands. Item 3 was
 closed after M8 and is marked below. Item 4 was added on 2026-09-30, when a
 measurement turned item 1 from "untidy" into a trap; item 1's reason was
-corrected in the same pass and its conclusion was not.
+corrected in the same pass and its conclusion was not. Items 1, 2 and 4 were
+re-read on 2026-10-04 against the tree, when the repair item 4 names had landed
+and the native partner leg existed; item 6 was added the same day. Line numbers
+inside an item that quotes a measurement are the numbers that measurement used.
 
-**1. 0-RTT, and the verifier identity. Open.** The M8 requirement was to keep
-the client's session ticket and the server's sealing key stable across config
-construction. The old `TlsConfig.session_ticket` and `TlsConfig.ticket_key`
-fields are now the `.client` and `.server` cases of `TlsConfig.resumption`;
-each role has one value to retain. That cutover does not acquire a resumed
-client's authenticated identity. *Closes when* one acquisition path exists that
-resumption does not skip, and a test resumes with a stable server key and
-enforces the client pin on the second connection. Until then, treat
-**authenticated client-identity early data** as unimplemented, not the
-standalone unauthenticated PSK/0-RTT path.
+**1. 0-RTT, and the verifier identity. The bypass is closed; the RFC-compatible
+design is Wave 4 and is open.** The M8 requirement was to keep the client's
+session ticket and the server's sealing key stable across config construction.
+The old `TlsConfig.session_ticket` and `TlsConfig.ticket_key` fields are the
+`.client` and `.server` cases of `TlsConfig.resumption`; each role has one value
+to retain. That cutover did not acquire a resumed client's authenticated
+identity, and the amendment below is the measurement of why. **That half has
+since landed**: `serverBuildEncryptedExtensions` (`tls13.zig:3314`) routes on
+one value, `request_client_certificate` (`:3324`), instead of on `using_psk`,
+and both writers of `.connected` ask `serverIdentityEstablished` (`:3487`),
+which refuses a policy in force with no identity. A resumed connection under a
+pin therefore asks for the client certificate exactly as a full one does, and a
+server that gets none fails with `certificate_required` (`:3495`). See
+`vendor/quic/VENDORED.md` §6 for the patch and its four tests.
+
+What remains open is the *shape*, not the hole. TLS 1.3 sends no
+CertificateRequest on a PSK handshake (RFC 8446 Appendix E.3), so what landed
+is a **recorded RFC 8446 deviation** — a flight a conforming peer reads as a
+protocol error — and not an RFC-compatible authenticated resumption. That
+replacement is Wave 4. Until it lands, treat **authenticated client-identity
+early data** as unimplemented rather than the standalone unauthenticated
+PSK/0-RTT path, and treat a session ticket as bearer material rather than as an
+identity.
 
 **Amended 2026-09-30: the reason this item gave was the wrong one.** It read
 `ClientAuth`'s doc at `tls13.zig:253-259` — "Session tickets are neither issued
@@ -947,23 +1039,170 @@ The guard is live code over a live policy.
 Removing the guard is a trap rather than a chore, and item 4 is the
 measurement.
 
-**2. Interop, and therefore requirement 3. Open.** The matrix this record relied
-on was upstream's, run at `4988228` rather than the pinned commit, and it is
-**not reproducible from this repository**: upstream's runner is a git submodule
-outside `build.zig.zon`'s `.paths`. M8 did not re-run it. Requirement 3 is
-re-established against this fork or not at all.
+**Superseded 2026-10-04, as this item's header says.** The structure above is
+what the repair had to survive and it is kept as measured, but `serverBuildEncryptedExtensions`
+no longer tests `using_psk` at all and `peer_node_id` is no longer written by
+one path alone, so the mutual exclusion this paragraph concludes with is gone.
+Read it as the pre-repair state.
 
-There is a second blocker, independent of the first, and it is about the node
-rather than the package: **the matrix cannot be run here at all.** Of the
+**2. Interop, and therefore requirement 3. One leg closed, one open.**
+The matrix this record relied on was upstream's, run at `4988228` rather than the
+pinned commit, and it is **not reproducible from this repository**: upstream's
+runner is a git submodule outside `build.zig.zon`'s `.paths`. M8 did not re-run
+it, and neither has anything since.
+
+That leg has a second blocker, independent of the first, and it is about the
+node rather than the package: **the matrix cannot be run here at all.** Of the
 three tools it needs, `tshark` is present and `docker` and
-`quic-network-simulator` are both absent. So this is not a case of a runner
-that could be wired up locally; it needs a machine that has the simulator's
-toolchain.
-*Closes when* the matrix is run against this tree **on a node that has
-Docker and `quic-network-simulator`** — initialise the submodule outside the
-package, run `interop/runner/matrix.sh`, and record the result against our
-SHA. Until then the honest statement is the one already in this record: ten of
-88 cells red upstream, one open, and ours unmeasured.
+`quic-network-simulator` are both absent. So this is not a runner that could be
+wired up locally; it needs a machine that has the simulator's toolchain.
+*Closes when* the matrix is run against this tree **on such a node** —
+initialise the submodule outside the package, run `interop/runner/matrix.sh`,
+and record the result against our SHA. Until then the honest statement is the
+one already in this record: ten of 88 cells red upstream, one open, and ours
+unmeasured.
+
+**The native leg needs none of that, and it has now run against the patched
+tree, in both roles.** Wave 1 built it: `test/rust_partner/` is a partner pinned
+to `iroh = "=1.3.0"`, and `test/interop_peer.zig`, `interop_options.zig`,
+`interop_runtime.zig` and `interop_transfer.zig` are the other end of one
+command-line contract, over a real socket and the real `Bridge`. A build is not
+an exchange, so the two are kept apart — the partner compiling
+`--release --locked --offline` and its `--help` running established the
+contract, not interoperability.
+
+It did not work at first. Against a pinned unpatched baseline — parent
+`6ad2f697…`, old Node `39b7cdfd…`, Debug 5/5 exit 0 — driven through a loopback
+UDP proxy that copied exact bytes before forwarding them unchanged, **both**
+directions failed. The partner exited 1 with
+`IncorrectCertificateTypeExtension` and alert 40; this side exited 0 having
+closed at `0x128`, after 75 datagrams and 90,000 bytes one way and 2 datagrams
+and 1,303 bytes the other. Both receipts are in `vendor/quic/VENDORED.md` §11.
+That run discharged nothing by itself — it proved the failure was real and
+reachable, which is what made the RFC 7250 patch a repair rather than a guess —
+and it said nothing at all about the patched tree.
+
+**The patched tree then spoke to the same partner, and both roles work.** On
+2026-10-04, against the locked Rust fixture `748f0fca…` and the immutable
+binary `0b95f541…`, two receipts: `evidence/w1-native-listener-after-role-predicate-fix.json`
+and `evidence/w1-native-dialer-after-role-predicate-fix.json`. Each is exits 0
+and 0, each end authenticated the exact node id it was configured with
+(`d04ab232…` as `1111…`, `a09aa5f4…` as `2222…`), both agreed on
+`2f6f7a61692f77312d66697874757265` = `/ozai/w1-fixture`, and all **six** declared
+payloads crossed and were compared in both directions — bidi 5 B, uni 4 B,
+DATAGRAM 4 B, each way. The ozai side reports `0 dropped, 0 foreign, 0 degraded,
+0 codepoints lost`, and each run wrote a capture with its own `wire.manifest`.
+
+**Four typed negatives in both roles, from that same partner.** Wrong peer gives
+`error.BadCertificate` here and alert 42 there; ALPN mismatch gives
+`error.NoApplicationProtocol` here and alert 120 there, with the partner logging
+`CONNECTION_CLOSE error_code=0x178`. Receipts
+`w1-live-sdk-{listen,dial}-{wrong-peer,alpn-mismatch}.json`, all four exiting 1
+on both sides with `payload_proofs_complete: false`. These are RFC 7250 §4.1/§4.2
+and RFC 7301 §3.2 read off an independent implementation rather than a fixture.
+Retry is receipted too: `w1-live-sdk-listen-retry.json` runs the ozai listener
+with `--require-retry` and completes in 0.48 s, exits 0 and 0, all six payloads.
+
+**Which build ran what, recorded from the receipts.** Seven runs, two digests.
+Each row's digest is the `binary_sha256` field for `install/bin/ozai-interop-peer`
+inside the receipt that row names — not a remembered pairing.
+
+| Receipt | Run | ozai binary | Exit |
+|---|---|---|---|
+| `w1-native-listener-after-role-predicate-fix.json` | both roles, six payloads | `0b95f54121abc6eb1ce38d8699abf7a410ab3891f5d222c9b46de5e45f1c4e7d` | 0 / 0 |
+| `w1-native-dialer-after-role-predicate-fix.json` | both roles, six payloads | `0b95f541…` | 0 / 0 |
+| `w1-live-sdk-listen-wrong-peer.json` | wrong peer, listen | `764dbfd837dbe11173cc8b098e11694adaef92a2403c42d65c9fd80d4b1561a2` | 1 / 1 |
+| `w1-live-sdk-dial-wrong-peer.json` | wrong peer, dial | `764dbfd8…` | 1 / 1 |
+| `w1-live-sdk-listen-alpn-mismatch.json` | ALPN mismatch, listen | `764dbfd8…` | 1 / 1 |
+| `w1-live-sdk-dial-alpn-mismatch.json` | ALPN mismatch, dial | `764dbfd8…` | 1 / 1 |
+| `w1-live-sdk-listen-retry.json` | `--require-retry`, listen | `764dbfd8…` | 0 / 0 |
+
+So the two both-role exchanges ran `0b95f541…` and the four negatives and the
+Retry run ran `764dbfd8…`. **Two distinct binaries, and neither is claimed as
+the other**: the negative rows say nothing about the build the six payloads
+crossed on, and the six payloads say nothing about the build the refusals came
+from. The Rust partner `748f0fca…` is the same fixture in all seven.
+
+**And since 2026-10-05 one build has produced all seven.** The freshly built
+`70567c34fdd0f513dde3c21391c50cc74e03757c2304e3f971768aef1c64c399` ran the whole
+set against the same locked partner
+`748f0fca9dd2fa1b802b382e25f0eb2af6a12cd2ea7613b16ad9e7399ec80b65`, and each of
+the seven receipts records both digests in its own `binary_sha256`:
+
+| Receipt | Case | native | This side | Partner | Exit |
+|---|---|---|---|---|---|
+| `w1-live-final-listen-positive.json` | positive, native listens | listen | 6 of 6 payloads each way, ALPN `2f6f7a61…` = `/ozai/w1-fixture` | 6 of 6 | 0 / 0 |
+| `w1-live-final-dial-positive.json` | positive, native dials | dial | 6 of 6 each way, same ALPN | 6 of 6 | 0 / 0 |
+| `w1-live-final-listen-retry.json` | `--require-retry`, native listens | listen | 6 of 6, one Retry answered | 6 of 6 | 0 / 0 |
+| `w1-live-final-listen-wrong-peer.json` | wrong peer, native listens | listen | `error.BadCertificate` | `the cryptographic handshake failed: error 42` | 1 / 1 |
+| `w1-live-final-dial-wrong-peer.json` | wrong peer, native dials | dial | `error.BadCertificate` | `error 42` | 1 / 1 |
+| `w1-live-final-listen-alpn-mismatch.json` | ALPN mismatch, native listens | listen | `error.NoApplicationProtocol` | `error 120` | 1 / 1 |
+| `w1-live-final-dial-alpn-mismatch.json` | ALPN mismatch, native dials | dial | `error.NoApplicationProtocol` | `error 120`, and the native side reads the peer's `CONNECTION_CLOSE error_code=0x178, frame_type=0x0` | 1 / 1 |
+
+Every positive receipt is `payload_proofs_complete: true` and every refusal is
+`false` — a refusal that transferred anything would be a different finding. The
+six payloads are bidi 5 B, uni 4 B and DATAGRAM 4 B, each way, each named by a
+`verified_*` line on both ends. The native listener's own counters on the
+positive run are `10 in, 10 out, 0 replies, 0 degraded, 0 codepoints lost` and
+`ingress: 10 processed, 0 dropped, 0 foreign`; the `--require-retry` run is
+`11 in, 12 out, 1 replies` with the same zero counters, so the Retry the run
+asked for is the reply it counted. On the dial order the native side prints no
+counter line and records the peer's clean
+`ApplicationClose { error_code: 0, reason: b"" }` instead, so none is quoted for
+it.
+
+**The older rows above are kept, not replaced.** A receipt is evidence about the
+build in its own `binary_sha256`, so `0b95f541…`, `764dbfd8…` and `70567c34…` are
+three separate claims and a reader has to be able to tell which binary produced
+which run. `vendor/quic/VENDORED.md` §11 carries the same seven rows with the
+per-case detail.
+
+**And one vector is now captured rather than authored.** The Rust client's first
+Initial is in the tree: `test/corpus/rust_wire/rust_client_initial.hex`, 1,200
+bytes on the wire, `sha256
+473b53b1926dce2f9841718684b76792059ab02ba2fd7770f6b53e7315876f7d`, from
+`evidence/capture-w1-native-listener-after-role-predicate-fix/datagrams/000000-peer-inbound.bin`.
+It is one datagram of one flight, and it is the *Initial*, which is the only
+part of a flight whose keys come from the connection id alone (RFC 9001 §5.2).
+**It authenticates.** A probe through the vendored core's own derivation —
+`packet.parseQuicHeader`, then `PacketNumSpace.setupInitial(dcid, version,
+true)`, then `packet.decrypt` — exits 0 with `VERDICT opened, plaintext 1145
+bytes / frames=2 crypto_frames=1 first_crypto_offset=0`
+(`evidence/w1-probe-captured-rust-initial-authenticity.log`), so its payload
+opens under the keys derived from its own connection id and its first CRYPTO
+frame begins at offset 0. That is the core's own `decrypt`, not an independent
+reimplementation of RFC 9001: a hand-rolled brute force whose associated-data
+handling had drifted reported the opposite, and a reimplementation that
+disagrees is evidence about the reimplementation.
+
+Nothing past that Initial is readable from this file or from this tree. The `keys` column
+of a `wire.manifest` is a label naming which connection id a header carries and
+not a secret, and there is no keylog anywhere in the project — `TlsConfig.keylog_file`
+was deleted with the X.509 walk and nothing replaced it. **So: one captured
+vector, not a corpus.** Every other vector in this record is still written
+against a peer this project produced itself.
+
+*Closes when* — the native leg does now, on these two receipts and on the seven
+current-build ones above. What is left on requirement 3 is the upstream matrix
+leg above, and it is unchanged.
+**This is still not a green Wave 1, and it is not a claim that the gate is
+red either.** The first-party suite was green on 2026-10-05 —
+`zig build test -Doptimize=Debug` and `zig build test -Doptimize=ReleaseSafe` each
+reported **28/28 steps succeeded; 790/790 tests passed**, exit 0 in both modes
+(`evidence/w1-full-debug-suite-wave1-union-verification.log`,
+`evidence/w1-full-release-safe-suite-wave1.log`) — and the vendored core was green
+on its own artifact, `zig build quic-test` at **3/3 steps, 560/560**, exit 0.
+**Those are two different numbers and are not interchangeable.** Against the
+current bytes the **full gate result is pending** (item 9): the required source
+lint fixes have landed and no gate group has been run over them, so a pending
+group is recorded as pending and not as a failure, and the red lint and static
+figures behind older bytes are not carried forward. Two focused legs are green
+against the current bytes — the vendored TLS decode at 1/1 and the QUIC
+wire-decode corpus at 1/1 — and a focused decode leg is not the fuzz gate. The
+zbc disposition ledger is re-merged at 32 source proofs and 60 records,
+byte-idempotent on a second emission. Multipath, the standard relay carrier
+and RFC-compatible resumption are Waves 3 and 4 and remain unimplemented. A
+substrate that talks to iroh is not a project that has passed its gates.
 
 **3. Nothing under `src/` imports `quic`. Closed 2026-09-30, after M8.**
 `src/transport/quic_bridge.zig` closed it: it imports `quic` (`:99`), owns a
@@ -985,7 +1224,10 @@ asked for, without one. Those two gaps are what `TODO.md`'s *Next* now names,
 and they are invisible from a module list that otherwise looks connected.
 
 **4. Lifting item 1's guard turns a pinned server into one that authenticates
-nobody, and the repair that makes it not look broken is what does it. Open.**
+nobody, and the repair that makes it not look broken is what does it. Measured;
+the defect it describes is closed, and what replaced it is item 1's remaining
+open work.** The measurement below is kept as it was taken and it still reads
+true; it is what the repair had to survive.
 
 A measurement, not a proposal. Taken on a throwaway copy of
 `vendor/quic/src/quic/tls13.zig` on 2026-09-30, restored byte-exact afterwards,
@@ -1054,6 +1296,16 @@ either carries a verified client identity or fails the handshake, and a test
 in this tree says which. Until then, treat the two `client_auth == null`
 guards as load-bearing, and do not "fix" `:2027` before the guard above it.
 
+**Where this stands.** Closed, and by a different mechanism than the one this
+item was groping at: the routing at `:2027` was never "fixed" in place, because
+`serverBuildEncryptedExtensions` now decides the CertificateRequest from
+`client_auth` alone and both `.connected` writers go through
+`serverIdentityEstablished`, so the question item 1 asks — does a resumed
+connection carry a verified identity or fail — has one answer and a test in
+`vendor/quic/src/quic/tls13.zig` states it. The two guards this item called
+load-bearing are still load-bearing; what changed is that nothing above them
+disagrees any more.
+
 **5. A peer that uses both paths concurrently is broken, and this is the
 measurement of how. Open.** Added 2026-10-01; full method and numbers in
 [Multipath, measured 2026-10-01](#multipath-measured-2026-10-01). Recorded
@@ -1096,3 +1348,508 @@ connection from two addresses at once and asserts both are carried and neither
 restarts slow start. Until then, operate the two-path peer as two peers, each on
 one path, and see [the follow-up's scope](#the-follow-up-and-its-honest-size)
 before pricing it as a small change.
+
+**6. A server that offers no protocol at all must still refuse. Closed 2026-10-04
+with Wave 1, on a wire receipt.** The guard landed, the TLS parent is 9 of 9,
+and the refusal has been seen arriving as CRYPTO_ERROR `0x178`.
+
+RFC 7301 §3.2: "In the event that the server supports no protocols that the
+client advertises, then the server SHALL respond with a fatal
+no_application_protocol alert." An offer list with nothing in it supports none,
+so that is the case, and the answer must not be a completed handshake.
+
+The vendored guard was `if (!matched and self.config.alpn.len > 0)`, and the
+second half exempted exactly that: a server whose configured list was empty
+matched nothing, skipped the refusal, and completed with no protocol selected.
+Retiring a node's last configured protocol leaves an offer list in that state,
+so the case is reachable from configuration rather than from a hostile peer. It
+is now `if (!matched) return error.NoApplicationProtocol`
+(`vendor/quic/src/quic/tls13.zig:3123`): the condition is the walk's own result
+and the exemption is gone.
+
+**The premise needed its own vendor fix first, and that fix has landed.**
+`initClientInto` (`tls13.zig:2124`) and `initServerInto` (`:2239`) construct
+into caller-owned storage and write every field by hand, so the struct's own
+default for `selected_alpn_len` never ran and a handshake that had selected
+nothing sliced `selected_alpn` with a length nothing had set. Both now store
+zero (`:2175`, `:2290`). That is a second Wave 1 vendor patch, separate from
+the guard and not cosmetic — it was what made the other half of RFC 7301's
+rule, a ClientHello naming no protocol, fail for a reason that was not about
+protocols. It is carried in `vendor/quic/VENDORED.md` §11 with its rationale.
+
+With it landed, both RFC 7301 vectors pass — the present-offer refusal at
+`test/tls_wire/hello.zig:1105` and the absent-extension answer at `:1162`, which
+the change deliberately does not touch. A hello carrying no ALPN extension never
+reaches the arm that refuses, because nothing was advertised and so nothing is
+echoed; that is one behaviour unchanged, not a second obligation left open. The
+pre-fix red that motivated the change is kept as the run's own log,
+`evidence/w1-empty-alpn-valid-premise-red.log`.
+
+**What this closes, and what it does not.** The unfiltered
+`test/tls_wire/hello.zig` parent now runs **exit 0, 9 of 9**, on the 0.16
+toolchain as
+`zig test --dep quic -Mroot=test/tls_wire/hello.zig -Mquic=vendor/quic/src/lib.zig`,
+logged at
+`evidence/w1-full-tls-hello-after-driving-to-the-public-wait-verdict.log`.
+
+The four failures an earlier run reported were premise faults in the test
+fixture rather than in the stack. `takeHandshakeKeys` stopped on `_continue`,
+which is an action the caller is handed and not a loop of its own, so the walk
+ended one step early and fed the next message an answer about keys rather than a
+verdict on that message. The fixture now drives to the public `wait_for_data`
+(`driveUntilWaiting`, `hello.zig:629`), bounded, and refusing a `send_data` or
+`complete` as a walk that went past the message under test. **No production
+EncryptedExtensions policy changed.** The wrong-peer vector dropped an
+incidental state assertion — the premise that bug broke — and still refuses an
+actual foreign `SubjectPublicKeyInfo` with `error.BadCertificate`.
+
+Two earlier runs, which are not one. Before the guard, a run of just the two
+RFC 7301 vectors exited 1 with one failure — the present-offer refusal red, the
+absent-extension half green — and that log is
+`evidence/w1-empty-alpn-valid-premise-red.log`; it is the red that motivated this
+guard. Later and separately, an unfiltered parent run exited 1 at 5 of 9 with
+four premise failures red, logged
+`evidence/w1-full-tls-hello-after-empty-offer-root-fix.log`. Neither log is this
+tree's current state.
+
+*Closes when* — and it does now, on the wire. The runtime parent
+`w1-runtime-handlers-three-real-refusals-accounted.log` exits 0 with 3 of 3 steps
+and 5 of 5 tests: three `no_application_protocol` refusals, and one RECEIVED
+`CONNECTION_CLOSE` frame carrying **0x178**, between real `Socket` and `Bridge`
+peers. `test/runtime_handlers_test.zig:830-831` is the assertion — a close that
+is transport (`!refused.application`) with `code == 0x100 + 120`, read off the
+peer's `local_err` (`:478-479`) before timers can reap it. The retirement lane is
+a different shape: `:745-746` requires an application close with `code == 0`,
+and the last-lane peer must never establish while the handler and turn counts
+hold (`:786-802`).
+
+**What that closes, and what it is not.** The RFC 7301 §3.2 obligation is
+discharged end to end, and this item was reopened only because the earlier close
+had asserted a wire code nobody had seen. **Those peers are Zig/Zig, and that is
+still what this particular receipt is.** The independent-implementation evidence
+is item 2's, and it is separate: the real partner's own alert for this same
+refusal is 120, in both roles, on the native run, and
+`test/corpus/rust_wire/rust_client_initial.hex` now carries one captured
+datagram — the client's first Initial, and nothing past it. The two missed
+`Streams` signatures that once blocked this build are fixed, and that is history
+rather than a current state.
+
+Every vendor patch this record names is carried in `vendor/quic/VENDORED.md` §11,
+which records them as landed. One of them — recorded below, and previously
+recorded nowhere — alters **which protocol a successful handshake settles on**
+rather than whether it completes, so it carries its own row, its own anchors and
+**No Wave 1 overall green is claimed here.** The integrated suite was green as of
+2026-10-05 — 790/790 over 28/28 steps, in Debug and in ReleaseSafe — and the
+**full gate result against the current bytes is pending**: the required source
+lint fixes have landed, no gate group has been run over them, and a pending gate
+is recorded as pending rather than as a failed one. The zbc disposition ledger
+is no longer outstanding — it is re-merged at 32 source proofs and 60 records,
+byte-idempotent on a second emission. Waves 2–4 —
+including multipath, the standard relay carrier and RFC-compatible resumption —
+remain unimplemented.
+
+**The selection order, and which list decides** — row four of §11's table, where
+the base, the anchors, the rationale, the tests and the wire deviation are
+carried. The ClientHello ALPN walk
+(`vendor/quic/src/quic/tls13.zig:3139-3167`) had its loops swapped: the outer walk
+is now `self.config.alpn` — this server's own configured preference order — and
+the inner one walks the client's advertised list (`:3156-3167`), taking the first
+of ours the peer also named and leaving both with `break :selection` (`:3166`).
+The write is unchanged (`:3163-3164` copies the matched name whole into
+`selected_alpn`), and so is the refusal below it (`:3178`), which reads the same
+`matched` flag either way.
+
+**At the pinned base it was the other way round, and the anchors are upstream's
+own lines.** At `14b9dc3e5e8429d07e7ed18619c7b4f4baaa3719` the outer walk is the
+peer's — `while (alpn_pos < 2 + list_len and alpn_pos + 1 <= elen)` at upstream
+`tls13.zig:2129` — with `for (self.config.alpn) |our_proto|` inside it (`:2134`)
+under upstream's comment "Parse client's ALPN list and try to match with our
+configured ALPNs" (`:2124`), and upstream's own test said `// The client's order
+wins; both sides must agree on it.` at `:3886` while asserting `moqt-17`. **So
+the direction is not in doubt: a client offering `["moqt-17", "moqt-18"]` against
+a server configured `["moqt-18", "moqt-17"]` now settles on `moqt-18`, where the
+base settled on `moqt-17`.** A reader who takes this the other way round builds a
+client that expects its own preference to survive.
+
+**RFC 7301 §3.2 is the rationale, and it is the section's own first sentence.**
+"It is expected that a server will have a list of protocols that it supports, in
+preference order, and will only select a protocol if the client supports it. In
+that case, the server SHOULD select the most highly preferred protocol that it
+supports and that is also advertised by the client." Where the two lists
+disagree, the most highly preferred protocol *the server* supports and the client
+also advertises is the server's own first of them. §4 gives the design reason:
+"By placing ownership of protocol selection on the server, ALPN facilitates
+scenarios in which certificate selection or connection rerouting may be based on
+the negotiated protocol."
+
+**The test anchor is the vendored expectation, rewritten in the same pass, and
+nothing else in this tree can see the difference.** `tls13.zig:5211`, `loopback
+handshake: the server answers with the one ALPN it chose`, keeps upstream's two
+lists (`:5222` server, `:5227` client), says "This side's order decides where the
+lists disagree" (`:5232-5233`), and asserts `moqt-18` on both ends
+(`:5234-5235`). `test/tls_wire/hello.zig:106` offers the single name `ozai` to
+both ends, and every peer built by `test/runtime_handlers_test.zig`'s `addPeer`
+(`:691`, `:692`, `:754`, `:792`, `:808`, `:834`, `:859`, `:878`, `:967`) and by
+`test/relay_wire_test.zig:1127-1134` advertises exactly one protocol, so the
+vendored unit test is the only vector in the tree where the two orders disagree.
+**No red against the old order was ever witnessed and none is manufactured here:**
+the walk and its expectation moved together. The file is now `sha256
+`2f6d8be4197d0d8f6cd4412c1db79b807b73115a545bcb6eabb5a37678510e9c`, 7,889 lines —
+not `aee3cd4a…` / 7,890, which is the file every 560/560 and 13-of-13 figure in
+this record was taken against, so none of those figures covers this swap.
+
+**A later vendored green exists and does not narrow that.** `zig build quic-test`
+ran green again against the admission-hook bytes — **3/3 steps succeeded, 560/560
+tests passed**, exit 0 (`evidence/w1-quic-test-after-admission-hook.log`). **That
+leg carries no `tls13.zig` digest**: it is named by what landed in it, so this
+record cannot say which of the four states above it covered and does not claim it
+covered this swap. The digest a vendored green is anchored to by name here is
+`aee3cd4a…`, and `aee3cd4a…` is not these bytes.
+
+**The wire deviation.** A handshake whose client and server rank a shared
+protocol differently now settles on the **server's** configured order rather than
+the **client's** advertised order. Where both lists name the same set — every
+configuration in this project, since a caller offers what it serves — nothing
+moves and no expectation changes. The selection is still the one name echoed in
+EncryptedExtensions (`tls13.zig:3381-3382`), so no byte's format, length or
+position changes: what moves is which name fills it.
+
+**7. A DATAGRAM at the advertised size never left the queue. Closed 2026-10-04,
+red and green observed; the reason it matters is the advertisement.**
+`packSinglePacket` measures every write against `effective_max`
+(`vendor/quic/src/quic/packet_packer.zig:583`), which is a **plaintext** budget —
+`buf.len -| AEAD_TAG_LEN`, the tag already taken off once. The DATAGRAM arm
+charged it a second time at `:957`, and that arm is the only writer where the
+term *refuses* rather than bounds.
+
+`Connection.maxDatagramPayloadSize` (`vendor/quic/src/quic/connection.zig:4857`)
+advertises the ceiling by subtracting that tag exactly once: with a 1200-byte
+path MTU and an 8-byte connection id, `1200 − (1 + 8 + 4 + 16) − 3 = 1168`. A
+peer sending exactly what it was told reaches `:957` needing `fbs.seek ≤ 13`; a
+1-RTT header alone is 9 plus a packet number. With the second charge the
+condition is unreachable, the arm breaks, the datagram stays queued and the
+advertised maximum does not cross. So this was a transport-parameter promise
+this stack did not keep, which is a different class of defect from a slow path.
+
+**The fix is one line and shrinks nothing.** `:957` now reads
+`if (fbs.seek + frame_size > effective_max) break;`. The payload ceiling is not
+clamped and no advertised number was lowered to match the refusal; the
+conservative room guards at `:722`, `:764`, `:832`, `:872`, `:876`, `:910`,
+`:914`, the padding guards at `:615`, `:1008`, `:1150` and the peer's
+`max_datagram_frame_size` clamp at `connection.zig:4872-4873` are all untouched.
+The tree had already stated the invariant the fix restores, at
+`packet_packer.zig:2067-2070`.
+
+`PacketPacker: a DATAGRAM at the advertised payload budget crosses the wire`
+(`packet_packer.zig:2750`) packs the advertised 1168 with a follower behind it
+over two passes and decrypts both to compare — and only a green run reached by
+the **filtered** invocation `zig test vendor/quic/src/test_all.zig -lc
+--test-filter …` counts: `zig build quic-test -- --test-filter …` does not
+forward the filter and reported 560/560 with the test present. Red
+(`w1-vendor-datagram-advertised-budget-red-direct.log`, exit 1 at `:2819`) and
+green (`…-green.log`, `All 2 tests passed`). Full rationale in
+`vendor/quic/VENDORED.md` §12.
+
+**Two caller-side repairs recorded with it, neither a vendor patch.** A
+preferred-address oracle in `test/quic_wire/transport_params.zig` copied the
+stateless reset token from an offset one past the end of a buffer the line above
+had proved complete — `@memcpy(…, value[41 + cid_len ..])`, a length mismatch
+that panics in Debug and ReleaseSafe and zeroed the token under elision; now
+`value[25 + cid_len ..][0..16]`, red and green in
+`w1-preferred-address-oracle-valid-wire-{red,green}.log`. **No fuzz entry ever
+reached that line** — the seed's zero-length connection id is refused one line
+earlier — so the green fuzz run was never evidence for it. And the ALPN name
+bound is now derived once from the core's own selection storage
+(`src/transport/quic_config.zig:33`, `comptime`-asserted 32, not RFC 7301's 255)
+and enforced before allocation by `validateAlpns` on both `Bridge.create` and
+`Dialer.create`. `vendor/quic/VENDORED.md` §13 carries both.
+
+**Companion TLS ALPN and client-auth pin work. Reported by its owner, partly
+re-run by the parent, still out of the landed table.** Owned by
+`VendorAlpnPinFailClosed`: a zero-length
+`ProtocolName` refused in the offer and in the selection, and a pin demanding
+identity in every client-auth mode. **The production hunk is in the tree** —
+authorised by the parent once the owner's reds were reported — **and its four
+regressions exist**, and the owner reports a red and a green on the same test
+bytes. `vendor/quic/src/quic/tls13.zig` has moved through four states —
+`cd73f07ec01375c5751c726e0aebfaabb1eb809b4dc18b4419db4238f66929e2` (7,792 lines,
+pre-hunk) gave 10 passed and 3 failed; `d2c98d0a23707e29801d78caa3bcbe4f59f91e18f832de9ace4d3fb321209c2d`
+(7,854, after the hunk) gave all 13 of `test/tls_wire/hello.zig` passing;
+`12d5346941a9b512cab144203bc6c1f8e49f9e77495d341aa3c0987f3edb8944` (7,884, after
+the `parseCertificateRequest` widening, its vector and the ordering comment)
+gave all 13 again; and current `aee3cd4a5290d8278f92aea3d46ba16d2360f70cc154de881dd9d116afcf5e17`
+(7,890) gave all 13 a third time. `test/tls_wire/hello.zig`
+(`ee454b334a38f99de9418034440ed62534a6ca4d581433b991de07881648ee3a`, 1,556 lines,
+13 tests) is **unchanged across all four**, which is the point: the test bytes
+were fixed while the core moved under them. **That stability is ending.**
+`hello.zig` **has left** `ee454b33…` / 1,556 lines: the two rows held below — the
+`:369` `u16` widening and the `:804` `msg[4..]` guard, each with its comment —
+landed, owned by `FuzzRootQuotaAndOracleTrap`. **`ee454b33…` describes the bytes
+every green above was taken against and no later ones, and is not a digest of the
+current file**; `evidence/w1-merge-static-dispositions.log` records the move
+(`reviewer read ee454b334a38, now e45344235410`), which is one of the twelve
+whole-file digests that stopped the ledger merge. No full digest for the file
+that moved is written here, because this record is not where one is computed: the
+shortened pair above is the log's own. Every `:369` and `:804` citation in this
+record moved with the file.
+
+**Those digests, every line count and the 13-test count were re-read from the
+files after each report.** The fourth link is a shape change and nothing more —
+`StaticTlsReview` flagged the vector's `undefined`-plus-writes form as exactly
+what the use-undefined rule fires on, and it is now a `comptime` literal, a
+constant with no unwritten bytes to reason about. The parent has since run the
+`hello.zig` parent itself against these bytes, so that row is no longer
+single-witness; the landed table in `vendor/quic/VENDORED.md` §11 still does not
+list this hunk, and no green is claimed for it here.
+
+**A near miss belongs in the record too.** An edit call in that work deleted the
+`required,` member of the vendored `ClientAuth.Mode` enum, and **the compile and
+the 13 of 13 were green against the damaged file**. The owner's own post-edit
+read caught it and repaired it before anything was recorded. That is not a defect
+in the code — the enum is intact — it is a fact about how the evidence was
+produced, and a reader of "13/13 green" is entitled to know that the suite had
+nothing to say about what went wrong and that reading is what caught it.
+
+**Two rows landed with no run behind them, two landed with no red behind them, and
+one that must never be called closed.** Every one moves a digest, so a green
+recorded against `aee3cd4a…` describes those bytes and no later ones — which is
+why the two `hello.zig` rows must be read as moving the *test* digest too, which
+they now have.
+
+| Item | State | Condition |
+|---|---|---|
+| `parseCertificateRequest`'s `readU16(data) + 2 != data.len` addition on a `u16` | **landed** in `12d5346…`, with its nine-byte vector; vector reshaped in `aee3cd4a…` | **no red exists and none is recorded.** The pre-fix failure was an integer-overflow ABORT rather than a failed tag, and it was never witnessed: fix and vector landed in one authorised pass. The green is real; a red for it would be a fiction |
+| the same trap in the oracle at `test/tls_wire/hello.zig:369` | **landed**, with its comment — `FuzzRootQuotaAndOracleTrap` | **`zig build fuzz` has not been re-run since the repair, so there is no green behind it.** Landing the row is what moved the `hello.zig` digest above |
+| unguarded `msg[4..]` at `test/tls_wire/hello.zig:804` (`clientHelloBlockAt`) | **landed**, with its comment — same owner | the same two facts: same digest consequence, and the same unrun `zig build fuzz`. **804, not the 722 first reported** — 722 was a pre-hunk line passed on unchecked, so any row citing it was already stale |
+| the offer-side refusal's *ordering invariant* | **landed, invariant-documented** | the comment is in the file; the invariant is still not in code |
+
+**The offer-side refusal is landed, its invariant is now documented, and it is
+not closed.** The empty-name refusal lives in the pre-pass that reads every
+offered entry (`tls13.zig:3118-3133`); the selection walk below it
+(`:3135-3155`) does not repeat the check, so "the pre-pass runs first" is what
+makes the walk sound — move either and the selection path would accept a
+zero-length name. That ordering is now stated in the file, at
+`tls13.zig:3142-3148`: the walk does not repeat the refusal, a zero-length
+`ProtocolName` is refused before the walk can reach it, including in a list of
+nothing but empty entries, which is that rather than the
+`no_application_protocol` below. **3148 is the last line of that comment** — 3149
+is blank and 3150 opens a different one, about an entry too long for
+`selected_alpn`, which is a different rule about a different thing.
+`Rfc7250WireSpecReview` raised the gap on its own re-read and asked for exactly
+this comment. **Documented is not closed**: the dependency is still carried by
+reading order and prose, not by an assertion the compiler or the suite checks.
+
+**Credit for that review's four findings.** Findings 2 (zero-length *selected*
+`ProtocolName`) and 3 (`expect_node_id` under `.optional`) belong to this patch.
+Finding 1 (a zero-length name in a caller's *configured* list) belongs to the
+concurrent `quic_config.validateAlpns` at `src/transport/quic_config.zig:84-91`
+called from `quic_bridge.zig:212` and `dial.zig:406`, **not** to this patch,
+which touched neither file. Finding 4 (the accept path dispatching on the
+`negotiatedAlpn` fallback when nothing was selected) was **open and unowned**
+here, narrowed to what `node_accept.zig:141-155` does with an unnegotiated value.
+**It is now found, repaired on the accept path, and proved by a consumer
+regression.**
+
+**What it was.** The accept path dispatched on `Connection.negotiatedAlpn`, which
+answers `config.alpn[0]` whenever the handshake selected nothing
+(`vendor/quic/src/quic/tls13.zig:2060-2063`), and whose own note calls that
+fallback "not a negotiated protocol and nothing treats it as one"
+(`:2057-2059`). On a server that is this node's own first configured protocol, so
+a peer advertising no protocol at all would have been handed to whichever handler
+that name belongs to, on a protocol it never named.
+
+**The reachability proof, which is what made it a defect rather than a
+latent one.** The core's `no_application_protocol` refuses an empty intersection
+of an offer that *was* made, and it lives inside the ALPN extension's own parse —
+`tls13.zig:3115` is the `if (elen >= 2)` that arms it, `:3178` is the refusal —
+so a ClientHello carrying **no** extension never reaches it and the handshake
+**completes**. The core states that itself: "the extension is then absent in both
+directions, `negotiatedAlpn` answers `""`, and neither end fails"
+(`tls13.zig:1433-1435`), and it answers EncryptedExtensions with an empty
+selection rather than with whatever length the storage held (`:2304-2310`,
+`:3379-3396`). The present-offer guard above was never about this case, and
+nothing had closed the other half.
+
+**What was repaired.** `node_accept.zig` asks the handshake rather than the
+fallback, through the one canonical method: `Conn.negotiatedAlpn`
+(`src/transport/quic_conn.zig:80-107`), which takes only the receiver — no
+`Conn` argument, and no private copy left in the node file — reads
+`selected_alpn[0..selected_alpn_len]` (written by the selection walk and by
+nothing else, `tls13.zig:3163-3164`), and answers null for a zero length.
+`runTask` calls it at `node_accept.zig:144` and then refuses **both** causes —
+selected a protocol no registration claims, and selected nothing at all — with
+the outcome an unroutable connection already got: counted, warned, dropped
+without a peer response, no `Event.routed` fed. Nothing was invented for it.
+
+**Which regression proves it.** `test/runtime_handlers_test.zig:882`, `a peer that
+negotiates no protocol reaches no handler` — a real `Socket` + `Bridge` +
+`Dialer` peer with `alpn_count` emptied after the configuration check has run, so
+`buildClientHello` puts a ClientHello with no ALPN extension on the wire. The
+half with teeth is the lane: `protocols_refused` 1, `tasks_routed` 0, and
+`node_close.laneStats(node, 0)`'s finished and turns both **0**, because
+`config.alpn[0]` there is the gossip ALPN and the old dispatch would have driven
+the gossip handler. A peer that does negotiate is served afterwards on the same
+node, so the refusal is this connection's and not this node's.
+
+**The serve half is a different file, and it has landed too.** `serveAdmit`
+compares against `relay_alpn`, so a serving node listing the relay ALPN first
+was reading `Connection.negotiatedAlpn` — its own first configured protocol —
+against a peer that named none, and spending a client slot and a
+`ServerChallenge` on it. It now asks the handshake the way the accept walk does
+(`src/node/node_relay_serve.zig:53`, the same `Conn.negotiatedAlpn` at
+`src/transport/quic_conn.zig:80-107`), and null is the walk's own skip: no slot,
+no stream, nothing written. Its regression
+is `test/relay_wire_test.zig:1674`, `a peer that negotiates no protocol spends no
+client slot`. **Written, and no result observed for it here** — written is not
+run, and run is not observed until the receipt says so.
+
+**The parent has now run these itself, so they are no longer single-witness.**
+Against `aee3cd4a…`, `zig build quic-test -j2 --prefix …/install` gives **Build
+Summary: 3/3 steps succeeded; 560/560 tests passed**, exit 0, 52.54 s
+(`evidence/w1-quic-test-after-tls-hunk.log`). **560 is the whole artifact, not a
+filtered subset** — a build-step `--test-filter` does not forward on this tree, so
+every filtered claim here is a direct `zig test` line and this one is not.
+
+**The vendored core's green, and what that green is named by.** A second leg gives
+**3/3 steps succeeded, 560/560 tests passed**, exit 0 against the admission-hook
+bytes (`evidence/w1-quic-test-after-admission-hook.log`, the same summary line).
+**That leg carries no `tls13.zig` digest** — it is named by what landed in it — so
+the digest a vendored green is anchored to by name in this record is `aee3cd4a…`,
+and this record does not guess one for the second leg. Two earlier `quic-test`
+runs from the owner's session, against `d2c98d0a…` and `12d5346…`, are **stale and
+discounted**; neither describes `aee3cd4a…`, and nothing is claimed for them after
+it.
+
+**The first-party figure is a different artifact and is not interchangeable with
+560.** `zig build test -Doptimize=Debug` and `-Doptimize=ReleaseSafe` each report
+**28/28 steps succeeded; 790/790 tests passed**, exit 0 in both modes, with the
+same per-artifact counts in each — unit 678, integration 3, loopback 24,
+protocol-loopback 5, blobs-transfer 6, two-process 11, relay-wire 11,
+runtime-handlers 6, rust-wire-initial 23, expected-log-verdict 15, coverage 8.
+`quic-test` compiles `vendor/quic/src/test_all.zig` and counts 560; `test` runs
+this project's own roots and counts 790, carrying `test/vendored_invariants.zig` —
+the vendored no-socket, no-clock, no-global-RNG scanner — inside the unit
+artifact's 678.
+
+The parent also ran, on its own account rather than as a restatement: the
+`hello.zig` parent → **All 13 tests passed**; the §12 datagram regression → **All
+2 tests passed**, so that patch's test still holds after everything else moved;
+and `test/quic_wire/transport_params.zig` → **1/1 passed**, `RFC 9000 §9.6: a valid
+preferred address keeps its id and reset token`, which is §13's oracle.
+
+**Two absences are deliberate and will stay explicit.** No red exists for the
+`parseCertificateRequest` vector and none will be manufactured: the pre-fix
+failure was an integer-overflow abort rather than a failed expectation, the fix
+and the vector landed in one authorised pass, and a red that was never witnessed
+would be a fiction — **an explicit absence is worth more to a reader than a
+constructed one.** And the offer-side ordering invariant stays **landed,
+invariant-documented, not closed**: a comment that says what the ordering
+guarantees is worth having, and calling it closed would claim a machine check
+that does not exist.
+
+The `u16`-addition rationale now has a third instance, phrased alike on purpose —
+`messages.zig:139-142` for an `extensions` block, and `parseCertificateRequest`
+for `SignatureScheme supported_signature_algorithms`: RFC 8446 §4.2.3 measures
+each against a byte count, so the peer's length is read as a `usize`, because a
+peer writing `ff ff` names something longer than any buffer and adding to it in a
+`u16` would overflow before the comparison could answer.
+
+**8. The unit artifact's expected-log accounting for two new ALPN-refusal lanes.
+Closed 2026-10-05, by the wiring plus a run that fills the row.** These are **not**
+the configuration refusals. Item 7's `validateAlpns` returns
+`quic_config.AlpnError` — `error.NoAlpn` for an empty list or an empty entry,
+`error.AlpnNameTooLong` for an over-long name — at configuration time from
+`Bridge.create` and `Dialer.create`, before anything allocates. **They are not
+logs and they never reach the expected-log runner**; they are asserted by the
+`Dialer.create` and `Bridge.create` refusal regressions on the fixed-buffer
+allocator's `end_index`, which is the right place for them.
+
+**What needed the accounting were the two ALPN-withdrawal vectors in
+`quic_bridge.zig`**: handshakes that legitimately end in
+`no_application_protocol`, one whose offer leaves only a withdrawn protocol and
+the other offering a withdrawn one alone. They live in the **unit** artifact, root
+`src/unit_test.zig`, which reaches `node_tests` and `node_retirement_tests` by
+`refAllDecls`.
+
+**The loopback artifact must not be touched to absorb them, and was not.** It has
+its own runner and its own `BadCertificate` / `NoApplicationProtocol` rows
+(`build.zig:282-295`); the unit artifact's rows are the unit artifact's rows and
+nowhere else, which is per-artifact accounting stated as a rule and kept as one.
+
+**The wiring that was missing is in the tree.** The unit artifact runs through
+`build_support.addTestRun` with its own row (`build.zig:228-239`):
+`TLS 1.3 handshake error: error.NoApplicationProtocol`, scope `default`,
+**`.count = 2`**. One row and not two rows is the correct shape, and the reason is
+the runner's own: a command line that names one message twice is refused before
+any test runs (`test/expected_log_runner.zig:46-50`), so a count is how an
+artifact says the same refusal arrived twice.
+
+**And a run has filled it.** The runner's contract is exact: the count is the
+claim and not a ceiling, a refusal arriving once more than the row declares fails
+the run, and a row nothing matched fails it as the stale expectation it then is
+(`test/expected_log_runner.zig:34-38`, `:52-56`). Both
+`zig build test -Doptimize=Debug` and `zig build test -Doptimize=ReleaseSafe`
+report the unit artifact green at 678 of 678, exit 0
+(`evidence/w1-full-debug-suite-wave1-union-verification.log`,
+`evidence/w1-full-release-safe-suite-wave1.log`). **So both lanes ran, both were
+refused the way the row says, and the artifact carrying them is green in both
+safety modes.** The count that was deliberately not written here before the
+artifact ran is now a receipt rather than a claim, which is the only change of
+kind this record permits on a number.
+
+**9. The Wave 1 gate itself. Open, and Wave 1.** **No green is claimed here.** One
+part of it closed on 2026-10-05: `zig build test -Doptimize=Debug` and
+`zig build test -Doptimize=ReleaseSafe` each reported **28/28 steps succeeded;
+790/790 tests passed**, exit 0 in both modes
+(`evidence/w1-full-debug-suite-wave1-union-verification.log`,
+`evidence/w1-full-release-safe-suite-wave1.log`) over the unioned tree, with the
+same per-artifact counts in each. Those receipts describe the bytes of that run,
+and they are a targeted run rather than a gate result.
+
+**Against the current bytes the full gate result is pending.** The required
+source lint fixes have landed and no gate group has been run over them, so a
+pending group is recorded here as pending and **not** as a failure. The red lint
+and static figures in `evidence/w1-lint-and-static-current-findings.log` belong
+to older bytes.
+
+**Two of the three items named when this was written have moved, and one has
+not.**
+
+**1. The TLS decode leg is green; the fuzz gate is pending.** The 1/1 failure is
+kept: `evidence/resume-w1-tls-focused-before.log` fails at
+`test/tls_wire/messages.zig:330` in `certificateTypeShapes`, reached from `check`
+and `test/tls_fuzz.zig`, and `evidence/resume-w1-tls-focused-after.log` is 1/1
+passing. **The cause recorded here is corrected: it was not the `u16` overflow
+in the TLS oracle.** It was the certificate-type oracle table, which carried one
+exclusive `shape` column per body and so forced RFC 7250 §3's counted offer and
+§4.2's single-value selection into one verdict — `&.{0}` labelled neither when
+it is no offer at all and a whole x509 selection, `&.{1,2}` a whole offer with
+no selection the one-byte grammar can hold. Both production decoders in
+`tls13.zig` were correct and were not changed; the table now carries one column
+per role, `offer` and `selection`. The comptime branch quota in the
+captured-golden decode is a separate repair and this correction does not touch
+it. `evidence/resume-w1-quic-wire-corpus-replay.log` is 1/1 on the QUIC wire
+decode under the correct filter; a command that ran zero tests is not evidence.
+**A focused decode leg is not the fuzz gate.**
+
+**2. The zbc disposition ledger is re-merged.** It now holds **32 source proofs
+and 60 records**, byte-idempotent on a second emission
+(`evidence/resume-w1-ledger-idempotence-canonical.log`: `0 old records dropped,
+0 new; identical to gate_zbc_dispositions.zig`, both emitted files SHA256
+`3fbaa189…`), with the helper suffix the gate calls preserved and both controls
+behaving — the conflicting-kind control refuses rather than counting two reads
+as a vote, and the current-defect control refuses until repaired source is
+re-read. `evidence/w1-merge-static-dispositions.log` and its
+`12 problem(s); ledger NOT rewritten` are why `test/tls_wire/hello.zig` is
+recorded above as having left `ee454b33…`; that log is now history, because the
+ledger describes the current bytes.
+
+**3. The full lint, static and fuzz gate result is pending**, for the reason at
+the head of this item. Nothing here reports it as failed, and nothing here
+reports it as green either.
+
+So every receipt in items 2, 6 and 7 is still a targeted run rather than a gate
+result. *Closes when* the lint, static and fuzz gate groups have been run over
+this tree and their receipts are green. Waves 2–4 —
+multipath, the standard relay carrier, RFC-compatible resumption — remain
+unimplemented and are not what this item is waiting on.
