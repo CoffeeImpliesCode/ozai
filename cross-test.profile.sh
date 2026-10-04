@@ -7,7 +7,8 @@
 CROSS_BUILD_STEP=test
 # Keep the 6.3 MB receive-window burst intact. Its isolated GNU AArch64 run
 # takes minutes under QEMU; bound parallelism and allow emulated execution.
-CROSS_JOBS=2
+CROSS_JOBS=8
+CROSS_BUILD_JOBS=8
 CROSS_TIMEOUT=900
 CROSS_BUILD_TIMEOUT=2700
 CROSS_MATRIX=(

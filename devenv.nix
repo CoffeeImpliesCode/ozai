@@ -94,6 +94,8 @@ in
     # has no business writing to, and the refusal is the whole point.
     TMP = zigScratch;
     TEMP = zigScratch;
+    CROSS_JOBS = "8";
+    CROSS_BUILD_JOBS = "8";
 
     LD_LIBRARY_PATH = lib.makeLibraryPath packages;
     INCLUDE_DIRECTORIES = lib.makeIncludePath packages;

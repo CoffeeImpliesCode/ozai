@@ -1856,18 +1856,18 @@ test "the trailing sections are walked, and none of them is this question's answ
     });
 }
 
-/// How many allocations one answer of these shapes takes.
+/// How many allocator operations one answer of these shapes needs.
 ///
-/// Discovered by walking the failure index up until one index reaches no
-/// allocation at all, rather than written down as a count: a sweep bounded by
-/// a number in the test stops covering the decoder the first time it allocates
-/// one thing more than it used to, and that is exactly the change a sweep is
-/// for.
+/// Discovered by walking the number of operations that are allowed up until
+/// one number leaves the decoder with no memory at all, rather than written
+/// down as a count: a sweep bounded by a number in the test stops covering the
+/// decoder the first time it asks for one thing more than it used to, and that
+/// is exactly the change a sweep is for.
 fn answerAllocations(message: []const u8, expected: []const u8) !usize {
-    var index: usize = 0;
-    while (index < allocation_ceiling) : (index += 1) {
-        const refusal = try answerAtIndex(message, index, expected);
-        if (refusal == null) return index;
+    var allowed: usize = 0;
+    while (allowed < allocation_ceiling) : (allowed += 1) {
+        const refusal = try answerAtIndex(message, allowed, expected);
+        if (refusal == null) return allowed;
     }
     return error.MoreAllocationsThanTheCeilingAllows;
 }
@@ -1878,24 +1878,120 @@ fn answerAllocations(message: []const u8, expected: []const u8) !usize {
 /// reallocations. Sixty-four is well past it.
 const allocation_ceiling = 64;
 
-/// One `readAnswer` at a fixed allocation index, and the exact bytes it
-/// published if it published any.
+/// An allocator that refuses every operation past the `allowed`th.
+///
+/// `std.testing.FailingAllocator` counts allocations and resizes in two
+/// sequences, and one index into both steps over operations rather than
+/// refusing them. An answer runs both: it grows an `ArrayList`, and
+/// `toOwnedSlice` then asks to `remap` that buffer down to the bytes it used
+/// and falls back to a fresh allocation when the remap is refused. With one
+/// index for both sequences the fallback arrives as an operation the sweep
+/// never asked about, and the count of operations it reports depends on
+/// whether the target's allocator could remap in place — two targets, two
+/// counts, one of them too small to sweep the last step. Counting every call
+/// in one sequence is what "fail the Nth allocation" has to mean here, and it
+/// makes the sweep the same argument on every target.
+const FailAfterOp = struct {
+    inner: std.mem.Allocator,
+    allowed: usize,
+    operations: usize = 0,
+    allocated_bytes: usize = 0,
+    freed_bytes: usize = 0,
+
+    fn allocator(self: *FailAfterOp) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = opAlloc,
+            .resize = opResize,
+            .remap = opRemap,
+            .free = opFree,
+        } };
+    }
+
+    /// Whether this operation is past the allowance, counting it when it is not.
+    fn pastAllowance(self: *FailAfterOp) bool {
+        if (self.operations < self.allowed) {
+            self.operations += 1;
+            return false;
+        }
+        return true;
+    }
+
+    /// The tail of a buffer that grew or shrank is memory this account does not
+    /// hold, so the difference either way is what the caller now owes or has
+    /// been given back.
+    fn recordLengthChange(self: *FailAfterOp, before: usize, after: usize) void {
+        if (after < before) self.freed_bytes += before - after else self.allocated_bytes += after - before;
+    }
+
+    fn opAlloc(
+        ctx: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *FailAfterOp = @ptrCast(@alignCast(ctx));
+        if (self.pastAllowance()) return null;
+        const memory = self.inner.rawAlloc(len, alignment, return_address) orelse return null;
+        self.allocated_bytes += len;
+        return memory;
+    }
+
+    fn opResize(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        len: usize,
+        return_address: usize,
+    ) bool {
+        const self: *FailAfterOp = @ptrCast(@alignCast(ctx));
+        if (self.pastAllowance()) return false;
+        if (!self.inner.rawResize(memory, alignment, len, return_address)) return false;
+        self.recordLengthChange(memory.len, len);
+        return true;
+    }
+
+    fn opRemap(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        len: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *FailAfterOp = @ptrCast(@alignCast(ctx));
+        if (self.pastAllowance()) return null;
+        const moved = self.inner.rawRemap(memory, alignment, len, return_address) orelse
+            return null;
+        self.recordLengthChange(memory.len, len);
+        return moved;
+    }
+
+    fn opFree(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *FailAfterOp = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, return_address);
+        self.freed_bytes += memory.len;
+    }
+};
+
+/// One `readAnswer` with every allocator operation past the `allowed`th
+/// refused, and the exact bytes it published if it published any.
 ///
 /// `expected` is the record block an accepted message must produce, and null
 /// for a message this decoder refuses: a refusal that reached `expected` would
 /// have published a partial answer, which is the one thing no error path may
-/// do. The balance is checked at every index, so a refusal that skipped its
+/// do. The balance is checked at every allowance, so a refusal that skipped its
 /// `defer` shows up on its own line rather than as a leak the suite's
 /// allocator reports somewhere later.
 fn answerAtIndex(
     message: []const u8,
-    fail_index: usize,
+    allowed: usize,
     expected: ?[]const u8,
 ) !?Error {
-    var failing = t.FailingAllocator.init(t.allocator, .{
-        .fail_index = fail_index,
-        .resize_fail_index = fail_index,
-    });
+    var failing: FailAfterOp = .{ .inner = t.allocator, .allowed = allowed };
     var owner: [max_name_length]u8 = undefined;
     var refusal: ?Error = null;
     if (readAnswer(failing.allocator(), message, sweep_name, 0, &owner)) |answer| {
