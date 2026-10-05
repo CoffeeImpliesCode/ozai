@@ -173,6 +173,39 @@ pub const Options = struct {
 /// named. `std.Io.net.Stream.Reader` holds its `Io` the same way; the difference
 /// is that this file does not keep it past the call that set it.
 ///
+/// The alignment the two borrowed fields of `Client` carry.
+///
+/// `streamIn` and `streamOut` recover a `*Client` with `@fieldParentPtr`, and
+/// the vtable that hands them their field pointer types it as a plain
+/// `*std.Io.Reader`. On a 32-bit target that is four-byte aligned while this
+/// struct is eight, because the driver is, and `@fieldParentPtr` will not widen
+/// a pointer's alignment by itself. It refuses with `@fieldParentPtr increases
+/// pointer alignment`, which is the whole reason `riscv32-linux-musl`,
+/// `arm-linux-musleabi`, `thumb-linux-musleabi` and the other 32-bit rows fail
+/// to build. The handshake is fine; nothing about it is at fault.
+///
+/// Declaring the two borrowed fields with this alignment is what makes the
+/// recovery sound. Each offset is padded to a multiple of the largest alignment
+/// in the struct, and a struct value satisfies that alignment by its own type,
+/// so a field at such an offset really is aligned to match. `streamIn` and
+/// `streamOut` still widen the field pointer before recovering, because the
+/// vtable's signature gives them no way to know it, and that widening is backed
+/// by the `comptime` block below rather than by trust: a field added or
+/// reordered in a way that breaks the invariant fails the build instead of
+/// quietly reading a misaligned `Link`.
+///
+/// The maximum is taken over every field, the two borrowed ones included at
+/// their natural alignment, so it is this struct's own alignment and does not
+/// depend on the declaration order or on the layout algorithm.
+const borrowed_alignment = @max(
+    @alignOf(tcp.Tcp),
+    @alignOf(tls.Client),
+    @alignOf(Link),
+    @alignOf(*Certificate.Bundle),
+    @alignOf(std.Io.Reader),
+    @alignOf(std.Io.Writer),
+);
+
 /// Keep this value at its original address: the driver's reader and writer borrow
 /// fields of it. Serialize reads and writes; only `stop` may run concurrently.
 pub const Client = struct {
@@ -186,9 +219,9 @@ pub const Client = struct {
     /// `std.crypto.tls.Client`'s own reader, reached by pointer so a caller
     /// reads with `readSliceAll` and `takeDelimiterInclusive` rather than
     /// through a second copy of the driver's API.
-    reader: std.Io.Reader,
+    reader: std.Io.Reader align(borrowed_alignment),
     /// The plaintext writer: the request bytes, encrypted on the way out.
-    writer: std.Io.Writer,
+    writer: std.Io.Writer align(borrowed_alignment),
     /// The raw binding the two vtables reach the socket through, and the one
     /// place an `Io` appears. See the type's doc.
     link: Link,
@@ -337,6 +370,30 @@ pub const Client = struct {
     }
 };
 
+// The proof `streamIn` and `streamOut` rest on.
+//
+// Both recover a `*Client` from a field pointer, and both widen that field
+// pointer to `borrowed_alignment` first. The vtable's own signature hands over
+// a plain `*std.Io.Reader`, which is four-byte aligned on a 32-bit target,
+// while `Client` is eight-byte aligned because the driver is;
+// `@fieldParentPtr` refuses to increase a pointer's alignment by itself, so
+// the refusal is a compile error and never undefined behaviour: the build
+// stops with `@fieldParentPtr increases pointer alignment`, which is what
+// stopped every 32-bit row in the native profile from building. Do not
+// simplify the widening below away; it is what lets that refusal be satisfied
+// while keeping the pointer genuinely aligned.
+//
+// The widening is sound only because the two offsets are multiples of that
+// alignment, and they are because the fields declare it: a struct value
+// satisfies `borrowed_alignment` by its own type, so a field sitting at such
+// an offset is aligned to match. Checked here rather than trusted, so a field
+// added or reordered in a way that breaks the invariant fails the build
+// instead of quietly reading a misaligned `Link`.
+comptime {
+    std.debug.assert(@offsetOf(Client, "reader") % borrowed_alignment == 0);
+    std.debug.assert(@offsetOf(Client, "writer") % borrowed_alignment == 0);
+}
+
 /// The binding from the driver's reader and writer to the raw socket.
 ///
 /// `stream` and `io` are written by `Client.open` and refreshed by every
@@ -388,7 +445,8 @@ fn streamIn(
     w: *std.Io.Writer,
     limit: std.Io.Limit,
 ) std.Io.Reader.StreamError!usize {
-    const self: *Client = @fieldParentPtr("reader", r);
+    const field: *align(borrowed_alignment) std.Io.Reader = @alignCast(r);
+    const self: *Client = @fieldParentPtr("reader", field);
     const dest = limit.slice(try w.writableSliceGreedy(1));
     const got = self.link.stream.read(self.link.io, dest, self.link.timeout_ms) catch
         return error.ReadFailed;
@@ -410,7 +468,8 @@ fn streamOut(
     data: []const []const u8,
     splat: usize,
 ) std.Io.Writer.Error!usize {
-    const self: *Client = @fieldParentPtr("writer", w);
+    const field: *align(borrowed_alignment) std.Io.Writer = @alignCast(w);
+    const self: *Client = @fieldParentPtr("writer", field);
     const buffered = w.buffered();
     if (buffered.len != 0) try writeAll(self, buffered);
     w.end = 0;
