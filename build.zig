@@ -9,6 +9,8 @@ const std = @import("std");
 /// `test/vendored_invariants.zig` instead compiles to an error about an embed
 /// path, which says nothing about the invariant that was actually broken.
 const vendored_invariants = @import("test/vendored_invariants.zig");
+const vendored_file_list = @import("vendored_file_list.zig");
+const examples = @import("examples.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -90,37 +92,11 @@ pub fn build(b: *std.Build) void {
     // the scanner's coverage and nothing more: it says nothing about which
     // files carry test blocks or whether `quic-test` discovers them, which is
     // what the root above is for.
-    checkVendoredFileList(b);
+    vendored_file_list.checkVendoredFileList(b);
 
     // Examples are separate executables, never part of the library: an example
     // that only exists as a doc comment has never been run.
-    const examples = [_]struct { name: []const u8, file: []const u8 }{
-        .{ .name = "ozai-node-id", .file = "src/examples/node_id.zig" },
-    };
-
-    const examples_step = b.step("examples", "Build every example");
-    for (examples) |example| {
-        const module = b.createModule(.{
-            .root_source_file = b.path(example.file),
-            .target = target,
-            .optimize = optimize,
-        });
-        module.addImport("ozai", lib_mod);
-
-        const executable = b.addExecutable(.{
-            .name = example.name,
-            .root_module = module,
-        });
-        examples_step.dependOn(&b.addInstallArtifact(executable, .{}).step);
-
-        const run = b.addRunArtifact(executable);
-        run.step.dependOn(b.getInstallStep());
-        if (b.args) |args| run.addArgs(args);
-        b.step(
-            b.fmt("run-{s}", .{example.name}),
-            b.fmt("Run {s}", .{example.name}),
-        ).dependOn(&run.step);
-    }
+    examples.addExamples(b, lib_mod, target, optimize);
 
     // The first program in the project. A separate module rooted at
     // `src/node/main.zig` and not an entry under `examples`, because it is not
@@ -187,7 +163,10 @@ pub fn build(b: *std.Build) void {
     });
     portable_test_mod.addImport("quic", quic_mod);
     const run_portable_tests = b.addRunArtifact(b.addTest(.{ .root_module = portable_test_mod }));
-    const portable_step = b.step("test-portable", "Run socket-free protocol and state-machine tests");
+    const portable_step = b.step(
+        "test-portable",
+        "Run socket-free protocol and state-machine tests",
+    );
     portable_step.dependOn(&run_portable_tests.step);
 
     // Integration tests live outside `src/` and get their own module: Zig only
@@ -476,84 +455,4 @@ pub fn build(b: *std.Build) void {
 // analyses is not a slow test, it is no test at all, and the run still exits 0.
 test {
     _ = vendored_invariants;
-}
-
-/// Every `.zig` file under `vendor/quic/src`, relative to that root. Walked
-/// here and nowhere else: the gate runs on every `zig build test` and may not
-/// read the filesystem, because it audits a tree by embedding it.
-fn collectVendoredSources(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    dir: std.Io.Dir,
-    prefix: []const u8,
-    out: *std.ArrayList([]const u8),
-) !void {
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind == .directory) {
-            var sub = try dir.openDir(io, entry.name, .{ .iterate = true });
-            defer sub.close(io);
-            try collectVendoredSources(gpa, io, sub, try std.fmt.allocPrint(gpa, "{s}{s}/", .{
-                prefix,
-                entry.name,
-            }), out);
-            continue;
-        }
-        if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
-        try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, entry.name }));
-    }
-}
-
-/// Fails the configure when the gate's file list and the tree disagree, in
-/// either direction. `@embedFile` cannot glob, so that list is the gate's
-/// entire coverage: a file missing from it is a file nothing reads, and the
-/// gate would keep reporting full coverage while proving nothing about it.
-fn checkVendoredFileList(b: *std.Build) void {
-    const root = "vendor/quic/src";
-    const gpa = b.allocator;
-    const io = b.graph.io;
-
-    var found: std.ArrayList([]const u8) = .empty;
-    defer found.deinit(gpa);
-    var dir = b.build_root.handle.openDir(io, root, .{ .iterate = true }) catch |err| {
-        std.debug.panic("cannot read {s}: {s}", .{ root, @errorName(err) });
-    };
-    defer dir.close(io);
-    collectVendoredSources(gpa, io, dir, "", &found) catch |err| {
-        std.debug.panic("cannot walk {s}: {s}", .{ root, @errorName(err) });
-    };
-
-    for (found.items) |relative| {
-        const wanted = std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, relative }) catch @panic("oom");
-        const listed = for (vendored_invariants.vendored_files) |entry| {
-            if (std.mem.eql(u8, entry, wanted)) break true;
-        } else false;
-        if (!listed) {
-            std.debug.panic(
-                \\
-                \\{s}/{s} exists but is not in `vendored_files` in
-                \\test/vendored_invariants.zig, so the invariant gate never reads
-                \\it. That is the failure this check exists for: a file the gate
-                \\does not read is a file nothing is watching, and the gate still
-                \\reports full coverage of the tree.
-                \\
-                \\Add the path to `vendored_files`, in sorted order.
-            , .{ root, relative });
-        }
-    }
-    for (vendored_invariants.vendored_files) |entry| {
-        const relative = entry[root.len + 1 ..];
-        const present = for (found.items) |name| {
-            if (std.mem.eql(u8, name, relative)) break true;
-        } else false;
-        if (!present) {
-            std.debug.panic(
-                \\
-                \\`vendored_files` in test/vendored_invariants.zig lists {s},
-                \\which is not in {s}. Delete the entry — or restore the file.
-                \\Left alone, @embedFile fails on it with an error that names the
-                \\path and none of the reasoning above.
-            , .{ entry, root });
-        }
-    }
 }

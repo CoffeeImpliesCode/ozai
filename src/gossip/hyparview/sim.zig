@@ -34,7 +34,6 @@
 //! same number of broadcast deliveries, the same synchrony. Those come from
 //! the reference's own test expectations, captured from its source at the
 //! commit named at the top of this file.
-
 //! # What is in this directory, and why
 //!
 //! This is the namespace upstream's `proto/sim.rs` is one `mod` for. It is

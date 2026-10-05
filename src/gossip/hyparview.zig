@@ -80,7 +80,6 @@
 //! container the caller hands in. The simulator allocates, because a test
 //! harness is allowed to, and it takes its allocator as an argument like
 //! everything else here.
-
 //! # What is in `hyparview/`, and why
 //!
 //! This file is the module callers import and the whole public surface: every

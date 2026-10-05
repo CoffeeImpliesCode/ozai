@@ -94,7 +94,6 @@
 //!   until the next `handle` on the same state, and a driver that keeps an
 //!   output list across a call must copy. That is the one lifetime rule in
 //!   this module, and it is stated on `Gossip` as well as here.
-
 //! # What is in `plumtree/`, and why
 //!
 //! This file is the module callers import and the only public surface: every

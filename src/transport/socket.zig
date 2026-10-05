@@ -1,90 +1,118 @@
-//! The UDP socket underneath `transport/batch.zig`: a `Send` in, datagrams out.
+//! The UDP socket a `batch.Send` goes out on: the descriptor, the stop, and
+//! the whole surface re-exported.
 //!
-//! `batch.zig` is the specification — what a socket write may be handed, what
-//! it may refuse, and which of those refusals is permanent. This file is the
-//! only place under `src/` that turns those values into syscalls, and it was
-//! left thin on purpose until the batcher above it had decided what a batch is.
+//! The whole surface is re-exported here, so every caller outside
+//! `src/transport/` keeps importing one name and no caller changes. The
+//! declarations live in six modules named for what they are responsible for,
+//! and the split is by responsibility rather than by size:
 //!
-//! # Why `std.c` and not `std.Io.net`
+//! - `socket_cmsg.zig` — the bytes a control message is made of.
+//! - `socket_addr.zig` — an address in the kernel's own layout.
+//! - `socket_error.zig` — every way this surface refuses.
+//! - `socket_open.zig` — opening the descriptor, and asking what it can do.
+//! - `socket_msg.zig` — the two message syscalls, `sendmsg` and `recvmsg`.
+//! - `socket_send.zig` — the batch policy, over any writer.
 //!
-//! `docs/DECISIONS/0002-async-substrate.md` names both gaps in the stock
-//! surface, and this file is the answer to them:
+//! What stays here is the descriptor itself — `Socket`, the recovery that ends
+//! a stop, and the tests below. A struct's methods cannot be split across
+//! files, which is why the two message syscalls are free functions over the
+//! descriptor rather than the methods they were, and why `Socket` is here
+//! rather than in a module of its own.
 //!
-//! 1. **Control messages.** `std.Io.net` has `OutgoingMessage.control` and
-//!    `IncomingMessage.control` in the type, and `Io.Threaded` lowers a
-//!    receive to one `recvmsg` with that buffer. Its send path goes through
-//!    `netSend`, which folds `errno` into a dozen named answers, and a socket
-//!    that cannot tell `EMSGSIZE` from `EAGAIN` has backpressure it invented.
-//!    `std.posix` has no `sendmsg` at all. `std.c` has both, and the errno is
-//!    the caller's to read.
-//! 2. **Socket options.** `BindOptions` carries `ip6_only` and
-//!    `allow_broadcast` and nothing else, and `SO_REUSEPORT` only counts when
-//!    it is set *before* the bind. A socket created through `netBindIp` cannot
-//!    be given one, so the descriptor is created here and no `Io` ever learns
-//!    it.
+//! # The original module doc, unchanged
 //!
-//! # Where `io` is, and where it is not
-//!
-//! `DECISIONS/0002`: "`rt.io()` is never stored. It is a parameter to the
-//! functions that need it." So `Socket` holds descriptors and no `Io`, and
-//! every operation that can be cancelled takes one. What the runtime is asked
-//! for is cancellation and nothing else — `Io.Threaded.checkCancel` is an
-//! atomic load — because a descriptor this module opened is a descriptor no
-//! `Io` backend can poll, and handing it to one would be a claim that only
-//! holds for `Threaded`. The wait before a receive is a `poll` on the
-//! descriptor for the same reason, and a task cancelled inside the `recvmsg`
-//! is not seen until that call returns.
-//!
-//! # The second descriptor, and the wait it ends
-//!
-//! `Socket` owns two of them: the socket, and an `eventfd` that exists to be
-//! woken. It is the first thing besides the socket this struct holds, and it
-//! is here because a `poll` is asleep in the kernel — there is nowhere to
-//! consult a flag from, so a wait that has to be *ended* rather than run to
-//! the end of its slice needs a descriptor to become readable. An `eventfd`
-//! rather than a self-pipe: one descriptor instead of two, a counter instead
-//! of a byte buffer, and `EFD_SEMAPHORE` makes a read take one wake off the
-//! counter rather than all of them.
-//!
-//! What a wake means belongs to `Socket.stop`, and its two halves are in
-//! different places on purpose. `stop` raises the wake with one store and one
-//! `write`; `discovery/lookup_live.zig` uses it when a lookup is cancelled.
-//! The waiter owns queue cleanup, because the cancellation callback may run
-//! while the socket is being polled. A send spends any remaining wake before
-//! making the socket usable again.
-//! The CLI's signal handler only calls `Stop.request`: it does not raise
-//! this wake, so a node notices its stop at the next poll timeout.
-//!
-//! # Linux, and only Linux
-//!
-//! `batch.zig` names its option numbers out of `std.os.linux` and says a
-//! platform without them answers `Capability.none`. The same is true here:
-//! `SOL_UDP` has no `std` spelling at all and the whole control-message path
-//! below is written against the Linux `cmsghdr`. This is ozai's socket, not
-//! the vendored core's — `test/vendored_invariants.zig` guards `vendor/`,
-//! where neither a socket nor a libc is allowed.
-//!
-//! # `link_libc`, and what does not cover this file
-//!
-//! `socket`, `bind`, `getsockname`, `setsockopt`, `sendmsg`, `recvmsg`,
-//! `eventfd`, `read`, `write` and `close` are libc's here, so an artifact that
-//! calls any of them needs `linkLibC()`. Nothing above them is: the layout
-//! work is arithmetic on bytes, which is why every test here reaches libc's
-//! code without leaving a syscall behind. The one that names `setsockopt`
-//! proves a refusal, and the refusal comes before the call.
-//!
-//! The other half of that was a gate that did not exist. Zig analyses a
-//! function body when it is called, not when it is referenced, so
-//! `std.testing.refAllDecls` checks the *signatures* here and none of the
-//! bodies below — `create`, `send`, `recvmsg`, the probes. The whole syscall
-//! layer went uncompiled until `test/integration_test.zig` opened a socket on
-//! loopback, and `build.zig` puts `link_libc` on the module that runs it, so
-//! removing either half turns into a link error rather than a silent hole.
+// The UDP socket underneath `transport/batch.zig`: a `Send` in, datagrams out.
+//
+// `batch.zig` is the specification — what a socket write may be handed, what
+// it may refuse, and which of those refusals is permanent. This file is the
+// only place under `src/` that turns those values into syscalls, and it was
+// left thin on purpose until the batcher above it had decided what a batch is.
+//
+// # Why `std.c` and not `std.Io.net`
+//
+// `docs/DECISIONS/0002-async-substrate.md` names both gaps in the stock
+// surface, and this file is the answer to them:
+//
+// 1. **Control messages.** `std.Io.net` has `OutgoingMessage.control` and
+//    `IncomingMessage.control` in the type, and `Io.Threaded` lowers a
+//    receive to one `recvmsg` with that buffer. Its send path goes through
+//    `netSend`, which folds `errno` into a dozen named answers, and a socket
+//    that cannot tell `EMSGSIZE` from `EAGAIN` has backpressure it invented.
+//    `std.posix` has no `sendmsg` at all. `std.c` has both, and the errno is
+//    the caller's to read.
+// 2. **Socket options.** `BindOptions` carries `ip6_only` and
+//    `allow_broadcast` and nothing else, and `SO_REUSEPORT` only counts when
+//    it is set *before* the bind. A socket created through `netBindIp` cannot
+//    be given one, so the descriptor is created here and no `Io` ever learns
+//    it.
+//
+// # Where `io` is, and where it is not
+//
+// `DECISIONS/0002`: "`rt.io()` is never stored. It is a parameter to the
+// functions that need it." So `Socket` holds descriptors and no `Io`, and
+// every operation that can be cancelled takes one. What the runtime is asked
+// for is cancellation and nothing else — `Io.Threaded.checkCancel` is an
+// atomic load — because a descriptor this module opened is a descriptor no
+// `Io` backend can poll, and handing it to one would be a claim that only
+// holds for `Threaded`. The wait before a receive is a `poll` on the
+// descriptor for the same reason, and a task cancelled inside the `recvmsg`
+// is not seen until that call returns.
+//
+// # The second descriptor, and the wait it ends
+//
+// `Socket` owns two of them: the socket, and an `eventfd` that exists to be
+// woken. It is the first thing besides the socket this struct holds, and it
+// is here because a `poll` is asleep in the kernel — there is nowhere to
+// consult a flag from, so a wait that has to be *ended* rather than run to
+// the end of its slice needs a descriptor to become readable. An `eventfd`
+// rather than a self-pipe: one descriptor instead of two, a counter instead
+// of a byte buffer, and `EFD_SEMAPHORE` makes a read take one wake off the
+// counter rather than all of them.
+//
+// What a wake means belongs to `Socket.stop`, and its two halves are in
+// different places on purpose. `stop` raises the wake with one store and one
+// `write`; `discovery/lookup_live.zig` uses it when a lookup is cancelled.
+// The waiter owns queue cleanup, because the cancellation callback may run
+// while the socket is being polled. A send spends any remaining wake before
+// making the socket usable again.
+// The CLI's signal handler only calls `Stop.request`: it does not raise
+// this wake, so a node notices its stop at the next poll timeout.
+//
+// # Linux, and only Linux
+//
+// `batch.zig` names its option numbers out of `std.os.linux` and says a
+// platform without them answers `Capability.none`. The same is true here:
+// `SOL_UDP` has no `std` spelling at all and the whole control-message path
+// below is written against the Linux `cmsghdr`. This is ozai's socket, not
+// the vendored core's — `test/vendored_invariants.zig` guards `vendor/`,
+// where neither a socket nor a libc is allowed.
+//
+// # `link_libc`, and what does not cover this file
+//
+// `socket`, `bind`, `getsockname`, `setsockopt`, `sendmsg`, `recvmsg`,
+// `eventfd`, `read`, `write` and `close` are libc's here, so an artifact that
+// calls any of them needs `linkLibC()`. Nothing above them is: the layout
+// work is arithmetic on bytes, which is why every test here reaches libc's
+// code without leaving a syscall behind. The one that names `setsockopt`
+// proves a refusal, and the refusal comes before the call.
+//
+// The other half of that was a gate that did not exist. Zig analyses a
+// function body when it is called, not when it is referenced, so
+// `std.testing.refAllDecls` checks the *signatures* here and none of the
+// bodies below — `create`, `send`, `recvmsg`, the probes. The whole syscall
+// layer went uncompiled until `test/integration_test.zig` opened a socket on
+// loopback, and `build.zig` puts `link_libc` on the module that runs it, so
+// removing either half turns into a link error rather than a silent hole.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const batch = @import("batch.zig");
 const base_addr = @import("../base/addr.zig");
+const cmsg = @import("socket_cmsg.zig");
+const socket_addr = @import("socket_addr.zig");
+const socket_error = @import("socket_error.zig");
+const open = @import("socket_open.zig");
+const msg = @import("socket_msg.zig");
+const socket_send = @import("socket_send.zig");
 
 const posix = std.posix;
 const c = std.c;
@@ -97,16 +125,6 @@ const linux = std.os.linux;
 const names = batch.linux;
 
 const socklen_t = c.socklen_t;
-
-/// Control integers use native byte order. `UDP_SEGMENT` sends a `u16`,
-/// `UDP_GRO` returns an integer, and traffic classes arrive as a byte or an integer.
-const endian = builtin.cpu.arch.endian();
-
-/// How many times one syscall is retried after a signal before the call is
-/// declared interrupted. A signal is not a fact about a datagram and retrying
-/// is the only correct answer; the bound is what stops a storm of them from
-/// becoming a hang.
-pub const max_syscall_attempts = 4;
 
 /// The counter an `eventfd` counts in, which the kernel fixes at eight bytes
 /// and both `read` and `write` want all of. It is a value rather than a count
@@ -131,522 +149,67 @@ pub const max_discarded = 64;
 /// exactly the way a real stop would and nothing else would take it off.
 pub const max_wakes_spent = 64;
 
-// 80 display columns; the rule counts UTF-8 bytes, three per box character.
-// ziglint-ignore: Z024
-// ────────────────────────────────────────────────────── control-message layout
+// The whole surface is re-exported below, in the order the sections of the
+// original file were in, so a caller outside `src/transport/` keeps importing
+// this one name and no caller changes.
 
-/// The boundary a control message is padded to, and the one number in this
-/// file that decides where a message ends and the next one begins.
-///
-/// It is `sizeof(size_t)` and not the alignment of a `cmsghdr`, and on musl
-/// those are two different numbers: `CMSG_ALIGN` in musl's `sys/socket.h`
-/// and in the kernel's `include/linux/socket.h` both round a length up to a
-/// word, while glibc declares `cmsg_len` a `size_t`, so its struct is
-/// eight-byte aligned and the two agree there. musl aims at POSIX and
-/// declares the same field a `socklen_t` with four bytes of padding above it,
-/// which makes its struct four-byte aligned and sixteen bytes wide while
-/// `CMSG_ALIGN` still rounds to eight — `std/c.zig` says as much over
-/// `posix_cmsghdr`.
-///
-/// Rounding by the struct instead is not cosmetic. The buffer below is ten
-/// bytes short of the two messages a coalesced read carries, and the kernel
-/// answers a control buffer it cannot fill with `MSG_CTRUNC`; a send's second
-/// message lands four bytes before the offset the kernel's own `CMSG_NXTHDR`
-/// walks to, so what it reads there is padding rather than a header.
-const cmsg_boundary: usize = @sizeOf(usize);
+/// See `socket_msg.max_syscall_attempts`.
+pub const max_syscall_attempts = msg.max_syscall_attempts;
 
-/// `CMSG_ALIGN`: a length rounded up to that boundary. The 0.16 std tree
-/// carries no `CMSG_*` macro — a search for `CMSG_LEN` across `lib/std`
-/// finds nothing — so the three arithmetic facts are here once and every
-/// message below is written and read through them.
-pub fn cmsgAlign(length: usize) usize {
-    return std.mem.alignForward(usize, length, cmsg_boundary);
-}
+/// See `socket_cmsg.cmsgAlign`.
+pub const cmsgAlign = cmsg.cmsgAlign;
+/// See `socket_cmsg.cmsgLen`.
+pub const cmsgLen = cmsg.cmsgLen;
+/// See `socket_cmsg.cmsgSpace`.
+pub const cmsgSpace = cmsg.cmsgSpace;
+/// See `socket_cmsg.control_size`.
+pub const control_size = cmsg.control_size;
+/// See `socket_cmsg.ControlBuffer`.
+pub const ControlBuffer = cmsg.ControlBuffer;
+/// See `socket_cmsg.ControlError`.
+pub const ControlError = cmsg.ControlError;
+/// See `socket_cmsg.writeCmsg`.
+pub const writeCmsg = cmsg.writeCmsg;
+/// See `socket_cmsg.CmsgRead`.
+pub const CmsgRead = cmsg.CmsgRead;
+/// See `socket_cmsg.readCmsg`.
+pub const readCmsg = cmsg.readCmsg;
 
-/// `CMSG_LEN`: the aligned header plus the value, and nothing else. The
-/// length a message reports about itself, and the length the kernel checks
-/// a value against — a message that reports the padded length instead is a
-/// message whose value is two bytes wider than the one that was written.
-pub fn cmsgLen(width: usize) usize {
-    return cmsgAlign(@sizeOf(c.cmsghdr)) + width;
-}
+/// See `socket_addr.writeSockaddr`.
+pub const writeSockaddr = socket_addr.writeSockaddr;
+/// See `socket_addr.readSockaddr`.
+pub const readSockaddr = socket_addr.readSockaddr;
 
-/// `CMSG_SPACE`: `cmsgLen` rounded up, which is what a buffer must hold for
-/// this message to be followed by another one.
-pub fn cmsgSpace(width: usize) usize {
-    return cmsgAlign(cmsgLen(width));
-}
+/// See `socket_error.OptionError`.
+pub const OptionError = socket_error.OptionError;
+/// See `socket_error.OpenError`.
+pub const OpenError = socket_error.OpenError;
+/// See `socket_error.SendError`.
+pub const SendError = socket_error.SendError;
+/// See `socket_error.ReceiveError`.
+pub const ReceiveError = socket_error.ReceiveError;
 
-/// Room for a traffic class and either UDP_SEGMENT's u16 or UDP_GRO's int.
-/// The receive integer is wider, so it bounds the shared control buffer.
-pub const control_size: usize = cmsgSpace(batch.tos_width) + cmsgSpace(@sizeOf(c_int));
+/// See `socket_open.Options`.
+pub const Options = open.Options;
+/// See `socket_msg.Received`.
+pub const Received = msg.Received;
 
-/// The width `msg_controllen` is spelled in: POSIX says `socklen_t` and musl
-/// says POSIX, while glibc follows the kernel and spells it a `size_t`.
-const ControlExtent = @FieldType(c.msghdr_const, "controllen");
+// Four helpers that are private to the modules which own them now, named here
+// for the tests at the bottom of this file — they are their only callers, and
+// nothing above this line reaches into a module for one of them.
+const endian = cmsg.endian;
+const putHeader = cmsg.putHeader;
+const setOption = open.setOption;
+const sendBatch = socket_send.sendBatch;
 
-comptime {
-    // The bound every narrowing of a control length is taken against. No
-    // buffer this file hands to a syscall is longer than `control_size` —
-    // `writeCmsg` cannot return more of a `ControlBuffer` than it holds —
-    // so this is what proves `sendmsg`'s own narrowing cannot lose a bit.
-    std.debug.assert(control_size <= std.math.maxInt(ControlExtent));
-}
-
-/// The bytes a `sendmsg` writes its control messages into, and the bytes a
-/// `recvmsg` reads them back out of.
-///
-/// One traffic-class message and one `UDP_GRO` message is every message a
-/// socket asked for: `IP_PKTINFO` and `SO_TIMESTAMP` are not set, so the
-/// kernel has no other reason to send one. The struct carries its own
-/// alignment, because the kernel writes these headers at `cmsg_boundary` and
-/// a bare `[]u8` does not promise it.
-pub const ControlBuffer = extern struct {
-    bytes: [control_size]u8 align(cmsg_boundary),
-};
-
-/// Why a set of control messages would not fit.
-pub const ControlError = error{
-    /// The buffer cannot hold what it was handed. A control message that
-    /// stops halfway is a different message, not a shorter one: the kernel
-    /// reads `cmsg_len` bytes whatever the buffer holds.
-    BufferTooSmall,
-    /// A field the ABI's own type cannot hold: a header's length past what
-    /// `socklen_t` spells, a level or an option past what an `int` spells, or
-    /// a control buffer longer than `msg_controllen` can say. The truncated
-    /// field would be a header pointing at bytes that are not there, so it is
-    /// refused instead of written.
-    FieldTooWide,
-};
-
-/// Write `messages` into `out` in the order given, and hand back the part of
-/// it that was used.
-///
-/// The order is `batch.cmsg`'s — traffic class, then segment size — and it is
-/// the caller's list that fixes it: the seam above decides what a send
-/// carries and this function only lays it out.
-pub fn writeCmsg(messages: []const batch.Cmsg, out: *ControlBuffer) ControlError![]const u8 {
-    var used: usize = 0;
-    for (messages) |message| {
-        const width: usize = message.value.width();
-        const space = cmsgSpace(width);
-        if (used + space > out.bytes.len) return error.BufferTooSmall;
-        const at = out.bytes[used..];
-        try putHeader(at, .{
-            .length = cmsgLen(width),
-            .level = message.level,
-            .kind = message.kind,
-        });
-        putValue(at, message.value);
-        used += space;
-    }
-    return out.bytes[0..used];
-}
-
-/// What one blob of received control data said, in the model's vocabulary.
-pub const CmsgRead = struct {
-    /// The `UDP_GRO` stride, or null when no such message arrived. A read
-    /// with no stride is uncoalesced, and a coalesced read of exactly one
-    /// datagram carries the buffer's own length — the same value, which is
-    /// what `batch.Recv.init` treats as the same read.
-    stride: ?usize,
-    /// The codepoint the traffic class carried, or null for a datagram that
-    /// carried none. Zero is not-ECT and not a missing message, which is why
-    /// this is a value and not the absence of one.
-    ecn: ?batch.Ecn,
-    /// Whether the blob ended inside a message. This is the one way a
-    /// coalesced read can arrive looking uncoalesced, and a caller that cannot
-    /// tell has a buffer it must not read as one datagram.
-    truncated: bool,
-};
-
-/// Read the `UDP_GRO` stride and the traffic class out of a received blob and
-/// ignore every other message in it.
-///
-/// A message this seam did not ask for is skipped rather than ended on: a
-/// socket may carry options that add messages, and stopping at the first one
-/// nobody recognises would lose the stride that came after it.
-pub fn readCmsg(blob: []const u8) CmsgRead {
-    var read: CmsgRead = .{ .stride = null, .ecn = null, .truncated = false };
-    const value_at = cmsgAlign(@sizeOf(c.cmsghdr));
-    var at: usize = 0;
-    while (at < blob.len) {
-        const rest = blob[at..];
-        if (rest.len < @sizeOf(c.cmsghdr)) {
-            read.truncated = rest.len != 0;
-            break;
-        }
-        const length: usize = getLength(rest);
-        if (length < @sizeOf(c.cmsghdr) or length > rest.len) {
-            read.truncated = true;
-            break;
-        }
-        takeValue(rest, value_at, length, &read);
-        at += cmsgAlign(length);
-    }
-    return read;
-}
-
-const Header = struct {
-    length: usize,
-    level: u32,
-    kind: u32,
-};
-
-// A header is read and written as bytes, never through a `*cmsghdr`. The
-// buffer a caller supplies is a `[]u8` and carries no alignment, so a pointer
-// to a header inside it would be a claim the type cannot make; the offsets come
-// from the struct itself, which is what makes the ABIs that spell `cmsg_len` as
-// a `socklen_t` work without a second spelling of any of this.
-
-fn putHeader(at: []u8, header: Header) ControlError!void {
-    // Three narrowings, none of them proved anywhere above: the C header
-    // spells `cmsg_len` a `socklen_t` under musl and a `size_t` under glibc,
-    // spells its level and type an `int`, and a bare `@intCast` panics in
-    // Debug on a value that does not fit rather than writing a defined one.
-    // Each is narrowed here, where the bound is, and a header the ABI cannot
-    // spell is refused rather than written with a field that describes
-    // something else.
-    const ControlLength = @FieldType(c.cmsghdr, "len");
-    const length = std.math.cast(ControlLength, header.length) orelse return error.FieldTooWide;
-    const level = std.math.cast(c_int, header.level) orelse return error.FieldTooWide;
-    const kind = std.math.cast(c_int, header.kind) orelse return error.FieldTooWide;
-    // The word that goes out is the kernel's and not the C struct's. `struct
-    // cmsghdr` in `include/linux/socket.h` spells `cmsg_len` a
-    // `__kernel_size_t` at offset zero of a sixteen-byte header, and
-    // `__sys_sendmsg` copies that whole word out of this buffer before
-    // `sock_cmsg_send` and `udp_cmsg_send` read it back and check it against
-    // `CMSG_OK` and `CMSG_LEN(sizeof(u16))`. musl's own header spells the
-    // same field a `socklen_t` and puts four bytes of padding around it —
-    // above the field on a little-endian host, below it on a big-endian one —
-    // inside that same word. So the word is zeroed and the field written into
-    // the middle of it: writing the field alone would hand the kernel a
-    // length with whatever the stack held inside it, and whether a send is
-    // refused at all would come to depend on that.
-    const len_at = @offsetOf(c.cmsghdr, "len");
-    const control_width = @sizeOf(ControlLength);
-    @memset(at[0..@sizeOf(usize)], 0);
-    std.mem.writeInt(ControlLength, at[len_at..][0..control_width], length, endian);
-    const word = @sizeOf(c_int);
-    const level_at = @offsetOf(c.cmsghdr, "level");
-    const kind_at = @offsetOf(c.cmsghdr, "type");
-    std.mem.writeInt(c_int, at[level_at..][0..word], level, endian);
-    std.mem.writeInt(c_int, at[kind_at..][0..word], kind, endian);
-}
-
-/// The length a header reports, read in the width the kernel wrote it.
-///
-/// One word at offset zero of the header, which is where the kernel's own
-/// `__kernel_size_t` is and which therefore holds musl's `socklen_t` and its
-/// padding together. The C struct's field offset would be the same number on
-/// a little-endian host and would read into the level that follows the length
-/// on a big-endian one, so it is the word and not the field that is read.
-fn getLength(at: []const u8) usize {
-    return std.mem.readInt(usize, at[0..@sizeOf(usize)], endian);
-}
-
-/// The level or the option a header names, which are an `int` on every ABI
-/// here — `getLength` is the one field that is not the same width twice.
-fn getHeader(comptime field: []const u8, at: []const u8) u32 {
-    const offset = @offsetOf(c.cmsghdr, field);
-    const word = @sizeOf(c_int);
-    return @bitCast(std.mem.readInt(c_int, at[offset..][0..word], endian));
-}
-
-fn putValue(at: []u8, value: batch.Value) void {
-    const start = cmsgAlign(@sizeOf(c.cmsghdr));
-    switch (value) {
-        .bits => |bits| {
-            const word = @sizeOf(c_int);
-            std.mem.writeInt(c_int, at[start..][0..word], @intCast(bits), endian);
-        },
-        .short => |short| {
-            std.mem.writeInt(u16, at[start..][0..@sizeOf(u16)], short, endian);
-        },
-    }
-}
-
-fn takeValue(header: []const u8, value_at: usize, length: usize, read: *CmsgRead) void {
-    const value = header[value_at..length];
-    const level = getHeader("level", header);
-    const kind = getHeader("type", header);
-    if (level == names.udp_level and kind == names.gro) {
-        // The receive ABI is a full native int, unlike UDP_SEGMENT's u16.
-        if (value.len < @sizeOf(c_uint)) return;
-        read.stride = std.mem.readInt(c_uint, value[0..@sizeOf(c_uint)], endian);
-        return;
-    }
-    const carries_class = (level == names.ip_level and kind == names.ipv4_tos) or
-        (level == names.ipv6_level and kind == names.ipv6_tclass);
-    if (!carries_class) return;
-    read.ecn = trafficClass(value);
-}
-
-/// The codepoint a traffic-class message carried, or null for a value that
-/// carries no byte at all.
-///
-/// The width here is not `batch.tos_width`, and the difference is the whole
-/// reason this function exists. `batch.tos_width` is the width the *option*
-/// takes, and it is what a send writes: `ip_cmsg_send` reads
-/// `*(int *)CMSG_DATA(cmsg)`, so four bytes on Linux and one on the two BSDs
-/// that declare the option a `c_uchar`. A *read* is a different ABI: Linux's
-/// `ip_cmsg_put` writes `cmsg_len = CMSG_LEN(sizeof(u8))` and one byte, while
-/// the BSDs write one byte too. So on Linux the message that arrives is two
-/// bytes shorter than the message that left, and a reader that insists on
-/// `tos_width` reads every IPv4 datagram as not-ECT and says nothing.
-///
-/// Both spellings put the two bits in the low byte on every ABI this builds
-/// for, so the value is read at the width the message actually arrived at.
-fn trafficClass(value: []const u8) ?batch.Ecn {
-    if (value.len == 0) return null;
-    if (value.len < @sizeOf(c_int)) return batch.Recv.ecnFromBits(value[0]);
-    // The wire carries two bits and the rest of the word is other people's
-    // traffic. `batch.Recv.ecnFromBits` masks; zero is not-ECT, not nothing.
-    const word = @sizeOf(c_int);
-    const raw = std.mem.readInt(c_int, value[0..word], endian);
-    return batch.Recv.ecnFromBits(@truncate(@as(u32, @bitCast(raw))));
-}
-
-// 79 display columns; the rule counts UTF-8 bytes, three per box character.
-// ziglint-ignore: Z024
-// ───────────────────────────────────────────────────────────── address layout
-
-/// Write `address` into `out` in the kernel's own layout and say how many
-/// bytes of `out` are the address.
-///
-/// The port goes out in network order. The IPv4 address does not get the
-/// same treatment, and the reason is worth writing down: `s_addr` is a word
-/// whose four bytes *are* the address in wire order, so a bit cast is the
-/// conversion and a byte swap would reverse the octets. Everything else
-/// about an address belongs to the path and not to the socket.
-pub fn writeSockaddr(address: base_addr.SocketAddr, out: *c.sockaddr.storage) socklen_t {
-    switch (address.ip) {
-        .v4 => |octets| {
-            const target: *c.sockaddr.in = @ptrCast(@alignCast(out));
-            target.* = .{
-                .family = linux.AF.INET,
-                .port = std.mem.nativeToBig(u16, address.port),
-                .addr = @bitCast(octets),
-            };
-            return @sizeOf(c.sockaddr.in);
-        },
-        .v6 => |octets| {
-            const target: *c.sockaddr.in6 = @ptrCast(@alignCast(out));
-            target.* = .{
-                .family = linux.AF.INET6,
-                .port = std.mem.nativeToBig(u16, address.port),
-                .flowinfo = 0,
-                .addr = octets,
-                .scope_id = 0,
-            };
-            return @sizeOf(c.sockaddr.in6);
-        },
-    }
-}
-
-/// Read a name the kernel filled, or null when it is not an address this
-/// module speaks — an `AF_UNIX` peer, which a UDP socket can still be handed
-/// by a caller that used the wrong type.
-pub fn readSockaddr(raw: *const c.sockaddr.storage) ?base_addr.SocketAddr {
-    const name: *const c.sockaddr = @ptrCast(@alignCast(raw));
-    return switch (name.family) {
-        linux.AF.INET => v4: {
-            const peer: *const c.sockaddr.in = @ptrCast(@alignCast(raw));
-            break :v4 base_addr.SocketAddr{
-                .ip = .{ .v4 = @bitCast(peer.addr) },
-                .port = std.mem.bigToNative(u16, peer.port),
-            };
-        },
-        linux.AF.INET6 => v6: {
-            const peer: *const c.sockaddr.in6 = @ptrCast(@alignCast(raw));
-            break :v6 base_addr.SocketAddr{
-                .ip = .{ .v6 = peer.addr },
-                .port = std.mem.bigToNative(u16, peer.port),
-            };
-        },
-        else => null,
-    };
-}
-
-// 79 display columns; the rule counts UTF-8 bytes, three per box character.
-// ziglint-ignore: Z024
-// ───────────────────────────────────────────────────────────────── error sets
-
-/// Why a `setsockopt` was refused. `Unsupported` is the whole of a capability
-/// probe and nothing else: the option is not here, which for `UDP_SEGMENT` and
-/// `UDP_GRO` is an answer and for anything else is a problem.
-pub const OptionError = error{
-    /// `EINVAL`: the kernel would not take the value.
-    InvalidValue,
-    /// `ENOPROTOOPT` or `EOPNOTSUPP`: no such option at this level.
-    Unsupported,
-    /// `ENOBUFS` or `ENOMEM`.
-    ResourcesExhausted,
-    /// `EACCES` or `EPERM`.
-    PermissionDenied,
-    /// `EBADF`, `ENOTSOCK`, or an errno this list does not name.
-    Unexpected,
-};
-
-/// Why a socket could not be opened.
-pub const OpenError = error{
-    /// `EACCES` or `EPERM`: a capability bit or a sandbox, not the address.
-    PermissionDenied,
-    /// `EAFNOSUPPORT`: this kernel has no IPv4 or no IPv6.
-    AddressFamilyUnsupported,
-    /// `EPROTONOSUPPORT`: UDP is not a protocol this kernel has.
-    ProtocolUnsupported,
-    /// `ESOCKTNOSUPPORT`: no datagram socket.
-    SocketModeUnsupported,
-    /// `EINVAL`: a flag or an option value the kernel would not take, which
-    /// for a socket call is this module writing something wrongly.
-    InvalidArgument,
-    /// `EMFILE` or `ENFILE`: the process or the system is out of descriptors.
-    DescriptorQuotaExceeded,
-    /// `ENOBUFS` or `ENOMEM`.
-    ResourcesExhausted,
-    /// `EADDRINUSE`: the port is taken, and no reuse option was asked for.
-    AddressInUse,
-    /// `EADDRNOTAVAIL`: the address is not one of this host's.
-    AddressNotAvailable,
-    /// A congestion option this socket cannot be given. There is no fallback
-    /// for it: a socket that was never asked for the codepoint reports every
-    /// read as not-ECT, which is a silently wrong answer rather than a
-    /// missing one.
-    CongestionOptionUnsupported,
-    /// A reuse option this platform does not have.
-    OptionUnsupported,
-    /// `EBADF`, `ENOTSOCK`, `ENOSPC`, or anything else.
-    Unexpected,
-};
-
-/// Why a send did not go out.
-///
-/// `WouldBlock` and `MessageTooLarge` are the two that must never share a
-/// name: the first is backpressure, which the caller waits out or absorbs, and
-/// the second is a datagram this path will never carry, which retrying turns
-/// into a stall. Collapsing them is how a congestion signal becomes a hung
-/// socket. `ControlError` is in the set because a set names every way a call
-/// can fail and not only the ones that are convenient; `batch.cmsg` builds at
-/// most two messages out of the model's own constants and `ControlBuffer`
-/// holds exactly two, so a caller cannot reach either of `ControlError`'s two
-/// members through `Socket.send`.
-pub const SendError = batch.Error || ControlError || error{
-    /// The task was cancelled before the datagram left. A socket that sends
-    /// after its caller has given up is a socket nobody is waiting for.
-    Canceled,
-    /// `EAGAIN`: the socket's send queue is full and nothing left the host.
-    WouldBlock,
-    /// `EMSGSIZE`: the payload is larger than the path carries.
-    MessageTooLarge,
-    /// `ENETUNREACH`: no route to the network.
-    NetworkUnreachable,
-    /// `EHOSTUNREACH`: no route to that host.
-    HostUnreachable,
-    /// `ENETDOWN`: the interface that would carry it is down.
-    NetworkDown,
-    /// `ECONNREFUSED`: a previous send drew an ICMP port unreachable and the
-    /// kernel held it back for exactly this call.
-    PortUnreachable,
-    /// `EADDRNOTAVAIL`: the destination is not one this host may send to.
-    AddressNotAvailable,
-    /// `EACCES` or `EPERM`.
-    PermissionDenied,
-    /// `ENOBUFS` or `ENOMEM`: the kernel could not build the datagram.
-    ResourcesExhausted,
-    /// `EDESTADDRREQ` or `ENOTCONN`.
-    SocketUnusable,
-    /// `EIO` or `EINVAL` on a run carrying no control message this module is
-    /// willing to drop, and on a family whose traffic class is a core option.
-    /// The kernel refused a send there without saying which half it disliked,
-    /// and guessing would be worse than saying so.
-    UnknownControlMessage,
-    /// The kernel took fewer bytes than the payload held. UDP has no such
-    /// answer, so this is the kernel disagreeing about where the datagram
-    /// ends, and the caller has to know that it did.
-    PartialDatagram,
-    /// A bound on this call ran out: `EINTR` on every attempt the refused run
-    /// had, or a stop whose queue or wake counter a send could not empty within
-    /// `max_discarded` and `max_wakes_spent`.
-    ///
-    /// The bound is on the call and not on the batch. A batch is one
-    /// `sendmsg` per run, and every run that finished before this one left the
-    /// socket: nothing the refused run carried went out, while datagrams ahead
-    /// of it may have. Which is why `Socket.send` returns no sent-prefix count
-    /// and why the caller is the one that decides about duplicates — the same
-    /// residue every other error here leaves, and this one is no exception.
-    ///
-    /// A stop this send did not deal with leaves the socket stopped, so asking
-    /// again is what drains the rest and makes progress.
-    Interrupted,
-    /// Anything else.
-    Unexpected,
-};
-
-/// Why a receive did not produce a datagram.
-pub const ReceiveError = error{
-    /// The task was cancelled before the datagram was taken.
-    Canceled,
-    /// `EAGAIN`: the queue was empty. From `tryReceive` that is the answer to
-    /// the question that was asked; from `receive` it means another task took
-    /// the datagram between the wait and the read.
-    WouldBlock,
-    /// `MSG_TRUNC`: the buffer was smaller than the datagram, so the bytes in
-    /// it are a prefix and not the datagram.
-    MessageTooLarge,
-    /// An error a previous send drew, reported on the next read.
-    PortUnreachable,
-    NetworkUnreachable,
-    HostUnreachable,
-    NetworkDown,
-    /// `ENOBUFS` or `ENOMEM`.
-    ResourcesExhausted,
-    /// `MSG_CTRUNC`, or a blob that ended inside a message: the control data
-    /// did not fit, so a coalesced read cannot be told from an uncoalesced
-    /// one and the buffer is not safe to read. The datagram is here and must
-    /// not be taken as one.
-    ControlTruncated,
-    /// `EINTR` on every attempt in the budget.
-    Interrupted,
-    /// `ENOTCONN`, `EDESTADDRREQ`, `EBADF`, `ENOTSOCK`, or anything else.
-    Unexpected,
-};
+// `Socket.sendRun` names the send syscall unqualified: the qualified spelling
+// pushes the line past the column limit, and a local alias of a function is a
+// name rather than a wrapper.
+const sendmsg = msg.sendmsg;
 
 // 80 display columns; the rule counts UTF-8 bytes, three per box character.
 // ziglint-ignore: Z024
 // ────────────────────────────────────────────────────────────────────── socket
-
-/// What to set on a socket before the bind.
-pub const Options = struct {
-    /// `SO_REUSEADDR`, for a rebind inside the reuse window. On by default
-    /// because an endpoint that comes back on the port it held is the case it
-    /// exists for, and it costs nothing when nothing else is bound there.
-    reuse_addr: bool = true,
-    /// `SO_REUSEPORT`, for a v4 and a v6 socket sharing one port. Off by
-    /// default: it lets a second descriptor take the same address and port
-    /// and a share of the datagrams, which is a decision to make on purpose.
-    reuse_port: bool = false,
-};
-
-/// One datagram, or a list coalesced into one buffer.
-pub const Received = struct {
-    /// `bytes` borrows the caller's receive buffer. Reusing or releasing that
-    /// buffer invalidates it. The other fields are independent values.
-    /// The bytes the kernel wrote.
-    bytes: []const u8,
-    /// Who sent them.
-    from: base_addr.SocketAddr,
-    /// The `UDP_GRO` stride, or null when the read was not coalesced.
-    stride: ?usize,
-    /// The codepoint the datagram carried, or null for none.
-    ecn: ?batch.Ecn,
-
-    /// The read as `batch.Recv` wants it, which is where a stride is checked
-    /// against the buffer it claims to describe.
-    pub fn toRecv(self: Received) batch.Error!batch.Recv {
-        return batch.Recv.init(self.bytes, self.stride, self.ecn);
-    }
-};
 
 /// A bound UDP socket that speaks `batch`.
 ///
@@ -690,36 +253,36 @@ pub const Socket = struct {
     /// nothing reports it.
     pub fn create(address: base_addr.SocketAddr, options: Options) OpenError!Socket {
         const family: batch.Family = batch.Family.of(address.ip);
-        const handle = try createSocket(family);
+        const handle = try open.createSocket(family);
         errdefer _ = c.close(handle);
         // Reuse options first and the congestion option after, because both
         // take effect before the bind: the port is not the socket's until
         // `bind` answers.
         if (options.reuse_addr) {
-            setFlag(handle, linux.SOL.SOCKET, linux.SO.REUSEADDR, true) catch |err| {
-                return openFromOption(err);
+            open.setFlag(handle, linux.SOL.SOCKET, linux.SO.REUSEADDR, true) catch |err| {
+                return open.openFromOption(err);
             };
         }
         if (options.reuse_port) {
-            setFlag(handle, linux.SOL.SOCKET, linux.SO.REUSEPORT, true) catch |err| {
-                return openFromOption(err);
+            open.setFlag(handle, linux.SOL.SOCKET, linux.SO.REUSEPORT, true) catch |err| {
+                return open.openFromOption(err);
             };
         }
-        const caps = try probe(handle, family);
+        const caps = try open.probe(handle, family);
         // After the probe: a socket refused on its own options never reached
         // the point of having a wait to wake.
-        const wake = try createWake();
+        const wake = try open.createWake();
         errdefer _ = c.close(wake);
         var name: c.sockaddr.storage = undefined;
         const length = writeSockaddr(address, &name);
-        try bindSocket(handle, &name, length);
+        try open.bindSocket(handle, &name, length);
         return .{
             .handle = handle,
             .wake = wake,
             .stopped = .init(false),
             .family = family,
             .caps = caps,
-            .address = try boundAddress(handle),
+            .address = try open.boundAddress(handle),
         };
     }
 
@@ -793,7 +356,7 @@ pub const Socket = struct {
         // What a stop leaves behind is dealt with first, and it is a whole of
         // its own: `restart` drains the queue and spends the wake.
         try restart(self, io);
-        return sendBatch(self, io, dest, payload, &self.caps);
+        return socket_send.sendBatch(self, io, dest, payload, &self.caps);
     }
 
     /// Take whatever is queued, or answer that nothing is.
@@ -811,7 +374,7 @@ pub const Socket = struct {
         buffer: []u8,
         control: *ControlBuffer,
     ) ReceiveError!Received {
-        return self.recvmsg(io, buffer, control);
+        return msg.recvmsg(self.handle, io, buffer, control);
     }
 
     /// Wait for a datagram and take it. A `timeout_ms` of null waits as long
@@ -830,15 +393,22 @@ pub const Socket = struct {
         timeout_ms: ?i32,
     ) ReceiveError!Received {
         try self.awaitReadable(io, timeout_ms);
-        return self.recvmsg(io, buffer, control);
+        return msg.recvmsg(self.handle, io, buffer, control);
     }
 
-    // One `sendmsg` per run of `payload` is `walkRuns`, and the two passes
-    // deciding what a refused batch costs is `sendBatch`; both are functions
-    // of their writer rather than methods, and this is where the batch ends.
+    // `walkRuns` and `sendBatch` — the one `sendmsg` per run, and the two
+    // passes that decide what a refused batch costs — are functions of their
+    // writer rather than methods and live in `socket_send.zig`. The writer is
+    // therefore the seam between the two, and this socket is the real one.
 
     /// One run, and what it cost.
-    fn sendRun(
+    ///
+    /// The seam `socket_send` monomorphises over, and `pub` because that is
+    /// another file: the policy calls this once per run. A caller wants
+    /// `send`, which runs the policy. Calling this instead puts a run on the
+    /// wire without lowering the capability a refused segmentation asked to
+    /// lower, and without sending the runs behind it.
+    pub fn sendRun(
         self: *Socket,
         io: std.Io,
         dest: base_addr.SocketAddr,
@@ -850,7 +420,7 @@ pub const Socket = struct {
         var messages: [batch.max_cmsg]batch.Cmsg = undefined;
         var control: ControlBuffer = undefined;
         const written = try writeCmsg(batch.cmsg(run, family, &messages), &control);
-        if (try self.sendmsg(io, run.contents, &name, name_length, written) == .accepted) {
+        if (try sendmsg(self.handle, io, run.contents, &name, name_length, written) == .accepted) {
             return .none;
         }
         // `EIO` and `EINVAL` are one answer from the kernel and two from here.
@@ -861,77 +431,16 @@ pub const Socket = struct {
         // of the three (`noq-udp/src/unix.rs:608-630`).
         if (run.isSegmented()) return .segmentation;
         if (family != .v4) return error.UnknownControlMessage;
-        const retried = try self.sendmsg(io, run.contents, &name, name_length, written[0..0]);
+        const retried = try sendmsg(
+            self.handle,
+            io,
+            run.contents,
+            &name,
+            name_length,
+            written[0..0],
+        );
         if (retried == .accepted) return .unknown_control_message;
         return error.UnknownControlMessage;
-    }
-
-    /// What one `sendmsg` said, before the model's name is put on it.
-    const Outcome = enum {
-        /// Every byte of the payload left as one message.
-        accepted,
-        /// `EIO` or `EINVAL`. Only the run can tell a driver that will not
-        /// segment from a kernel that does not know an option.
-        refused,
-    };
-
-    fn sendmsg(
-        self: *const Socket,
-        io: std.Io,
-        bytes: []const u8,
-        name: *const c.sockaddr.storage,
-        name_length: socklen_t,
-        control: []const u8,
-    ) SendError!Outcome {
-        var vectors = [_]c.iovec_const{.{ .base = bytes.ptr, .len = bytes.len }};
-        // The length narrowed where the bound is, rather than by a bare
-        // `@intCast` that traps in Debug on a value which does not fit: under
-        // musl `msg_controllen` is a `socklen_t` and a slice length is a
-        // `usize`. It cannot fail, because `writeCmsg` hands back no more of a
-        // `ControlBuffer` than it holds and `control_size` is proved against
-        // this very field at comptime — but the proof is that assertion, and
-        // this is the cast that reads it.
-        const control_length = std.math.cast(ControlExtent, control.len) orelse
-            return error.FieldTooWide;
-        const control_ptr: ?*const anyopaque = if (control_length == 0) null else control.ptr;
-        var header: c.msghdr_const = .{
-            .name = @as(?*const c.sockaddr, @ptrCast(name)),
-            .namelen = name_length,
-            .iov = vectors[0..].ptr,
-            .iovlen = vectors.len,
-            .control = control_ptr,
-            .controllen = control_length,
-            .flags = 0,
-        };
-        var attempt: usize = 0;
-        while (attempt < max_syscall_attempts) : (attempt += 1) {
-            // A signal arrived before the datagram did. Asking again is the
-            // only correct answer, and the loop is also where a cancellation
-            // lands. `NOSIGNAL` because a UDP send to a port nobody is on has
-            // to raise `ECONNREFUSED` here rather than `SIGPIPE` there.
-            try io.checkCancel();
-            const rc = c.sendmsg(self.handle, &header, linux.MSG.NOSIGNAL);
-            switch (c.errno(rc)) {
-                .SUCCESS => {
-                    if (@as(usize, @intCast(rc)) != bytes.len) return error.PartialDatagram;
-                    return .accepted;
-                },
-                .INTR => continue,
-                .AGAIN => return error.WouldBlock,
-                .MSGSIZE => return error.MessageTooLarge,
-                .IO, .INVAL => return .refused,
-                .DESTADDRREQ, .NOTCONN => return error.SocketUnusable,
-                .ACCES, .PERM => return error.PermissionDenied,
-                .ADDRNOTAVAIL => return error.AddressNotAvailable,
-                .HOSTUNREACH => return error.HostUnreachable,
-                .NETUNREACH => return error.NetworkUnreachable,
-                .NETDOWN => return error.NetworkDown,
-                .CONNREFUSED => return error.PortUnreachable,
-                .NOMEM, .NOBUFS => return error.ResourcesExhausted,
-                else => return error.Unexpected,
-            }
-        }
-        return error.Interrupted;
     }
 
     /// Wait for the descriptor to be readable, or for a stop to end the wait.
@@ -1071,55 +580,6 @@ pub const Socket = struct {
         }
         return error.Interrupted;
     }
-
-    fn recvmsg(
-        self: *const Socket,
-        io: std.Io,
-        buffer: []u8,
-        control: *ControlBuffer,
-    ) ReceiveError!Received {
-        var name: c.sockaddr.storage = undefined;
-        var vectors = [_]c.iovec{.{ .base = buffer.ptr, .len = buffer.len }};
-        var header: c.msghdr = .{
-            .name = @as(*c.sockaddr, @ptrCast(&name)),
-            .namelen = @sizeOf(c.sockaddr.storage),
-            .iov = vectors[0..].ptr,
-            .iovlen = vectors.len,
-            .control = @as(?*anyopaque, @ptrCast(control.bytes[0..].ptr)),
-            .controllen = control.bytes.len,
-            .flags = 0,
-        };
-        var attempt: usize = 0;
-        while (attempt < max_syscall_attempts) : (attempt += 1) {
-            try io.checkCancel();
-            const rc = c.recvmsg(self.handle, &header, linux.MSG.DONTWAIT);
-            switch (c.errno(rc)) {
-                .SUCCESS => {
-                    if (header.flags & linux.MSG.TRUNC != 0) return error.MessageTooLarge;
-                    const used = @min(header.controllen, control.bytes.len);
-                    const read = readCmsg(control.bytes[0..used]);
-                    if (read.truncated or header.flags & linux.MSG.CTRUNC != 0) {
-                        return error.ControlTruncated;
-                    }
-                    return .{
-                        .bytes = buffer[0..@intCast(rc)],
-                        .from = readSockaddr(&name) orelse return error.Unexpected,
-                        .stride = read.stride,
-                        .ecn = read.ecn,
-                    };
-                },
-                .INTR => continue,
-                .AGAIN => return error.WouldBlock,
-                .CONNREFUSED => return error.PortUnreachable,
-                .HOSTUNREACH => return error.HostUnreachable,
-                .NETUNREACH => return error.NetworkUnreachable,
-                .NETDOWN => return error.NetworkDown,
-                .NOMEM, .NOBUFS => return error.ResourcesExhausted,
-                else => return error.Unexpected,
-            }
-        }
-        return error.Interrupted;
-    }
 };
 
 /// End the stopped state this socket is in: take the queue, then spend the
@@ -1159,284 +619,6 @@ fn restart(context: anytype, io: std.Io) error{ Canceled, Interrupted, Unexpecte
     // raising one, and a stop that arrives after this line writes its own unit
     // instead of finding one to take.
     if (context.stopped.load(.acquire)) context.stop();
-}
-
-/// What one pass over a batch left behind.
-///
-/// The refusal is the codepoint one when there was one, because a codepoint
-/// dropped from a run is not on the next one either; a refused segmentation is
-/// not a refusal of the codepoint at all and is reported by `tail` being there
-/// rather than by being ranked against a loss.
-const Pass = struct {
-    /// What the runs drew. `.none` when every one of them went out.
-    refused: batch.Refused = .none,
-    /// The payload from the refused run onwards, and null when there is none:
-    /// a run that went out took its datagrams with it, so a pass that refused
-    /// nothing has nothing to send again, and a pass that refused one leaves
-    /// the tail starting on that run rather than behind it.
-    tail: ?batch.Send = null,
-};
-
-/// Send `payload` to `dest`, and say what it carried.
-///
-/// One pass over the runs, and a second over the runs that did not go out when
-/// one of them was refused for segmentation. Every datagram reaches the wire
-/// once: the runs before the refused one are already there, so the tail starts
-/// on the refused run itself and the retry cannot put a second copy of
-/// anything on it.
-///
-/// `context` is the writer the runs go out on, and not the socket type: the
-/// refusals below come from the driver, and a driver that refuses a segmented
-/// run is a node a test may not be running on. Monomorphised rather than
-/// erased, so the production call is `Socket.sendRun` and saying it costs
-/// nothing at run time.
-fn sendBatch(
-    context: anytype,
-    io: std.Io,
-    dest: base_addr.SocketAddr,
-    payload: batch.Send,
-    caps: *batch.Capability,
-) SendError!batch.Report {
-    const family = batch.Family.of(dest.ip);
-    const first = try walkRuns(context, io, dest, payload, caps.*);
-    const tail = first.tail orelse return batch.report(payload, family, first.refused);
-    // Found by sending, not by asking, and permanent: noq lowers the cap and
-    // never raises it (`noq-udp/src/unix.rs:436-445`), because a driver that
-    // could segment on the next send would fail it again on the one after.
-    caps.* = caps.*.withoutSegmentation();
-    // Nothing behind that refusal was segmented, so the retry draws no second
-    // segmentation and cannot leave a tail of its own.
-    const second = try walkRuns(context, io, dest, tail, caps.*);
-
-    // `batch.report` is given the refusal no retry can undo: a codepoint either
-    // pass dropped is on the wire without it, and nothing downstream can get it
-    // back. A refused segmentation is answered by the retry above and is not a
-    // report about the codepoint at all — that fact is `degraded`, below.
-    const unrecoverable = if (first.refused == .unknown_control_message)
-        first.refused
-    else
-        second.refused;
-    var report = batch.report(payload, family, unrecoverable);
-    // The degradation is the other fact and the retry does not undo it: it is
-    // the reason there was a retry, and a batch that went out one datagram per
-    // `sendmsg` went out that way whatever the retry found. Same rule
-    // `batch.report` uses — one datagram is one `sendmsg` either way.
-    report.degraded = payload.datagramCount() > 1;
-    return report;
-}
-
-/// One `context.sendRun` per run of `payload`, and what the pass left behind.
-///
-/// Stops at the first run refused for segmentation: that run carried nothing,
-/// and every run behind it is one this socket will refuse the same way — the
-/// cap is lowered by the caller, not argued with here.
-fn walkRuns(
-    context: anytype,
-    io: std.Io,
-    dest: base_addr.SocketAddr,
-    payload: batch.Send,
-    caps: batch.Capability,
-) SendError!Pass {
-    var runs = try batch.Runs.init(payload, caps);
-    var pass: Pass = .{};
-    // The bytes already sent, which is where a refused run starts: the runs
-    // before it left the socket, so the tail is everything behind them.
-    var on_wire: usize = 0;
-    while (runs.next()) |run| {
-        const refused = try context.sendRun(io, dest, run);
-        if (refused == .segmentation) {
-            // The tail starts on the refused run and not behind it: that run
-            // carried nothing, so a tail measured from its end drops it.
-            pass.tail = .{
-                .ecn = payload.ecn,
-                .contents = payload.contents[on_wire..],
-                .segment_size = payload.segment_size,
-            };
-            return pass;
-        }
-        // Both answers that are not a refused segmentation left the socket.
-        on_wire += run.contents.len;
-        // Sticky: the run went out, and it went out without the codepoint. The
-        // runs behind it carry their own, so nothing here clears this.
-        if (refused == .unknown_control_message) pass.refused = refused;
-    }
-    return pass;
-}
-
-fn createSocket(family: batch.Family) OpenError!c.fd_t {
-    // A value, not a type alias: `c_uint` is what the switch below evaluates
-    // to, and `domain` is the address family this descriptor is opened for.
-    // zwanzig-disable-next-line: identifier-style
-    const domain: c_uint = switch (family) {
-        .v4 => linux.AF.INET,
-        .v6 => linux.AF.INET6,
-    };
-    // `NONBLOCK` in the type rather than an `fcntl` afterwards, so there is no
-    // window in which the descriptor exists and blocks.
-    const kind: c_uint = linux.SOCK.DGRAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
-    const rc = c.socket(domain, kind, linux.IPPROTO.UDP);
-    if (rc >= 0) return rc;
-    return switch (c.errno(rc)) {
-        .ACCES, .PERM => error.PermissionDenied,
-        .AFNOSUPPORT => error.AddressFamilyUnsupported,
-        .PROTONOSUPPORT => error.ProtocolUnsupported,
-        .SOCKTNOSUPPORT => error.SocketModeUnsupported,
-        .INVAL => error.InvalidArgument,
-        .MFILE, .NFILE => error.DescriptorQuotaExceeded,
-        .NOMEM, .NOBUFS => error.ResourcesExhausted,
-        else => error.Unexpected,
-    };
-}
-
-/// The descriptor a stop wakes a wait on, or a refusal to have one.
-///
-/// A refusal refuses the socket. A socket whose wait cannot be ended is the
-/// failure this descriptor exists to prevent, and a caller that opened one
-/// anyway would be handed a cancellation that arrives a slice late with nothing
-/// to say that it had.
-fn createWake() OpenError!c.fd_t {
-    const flags = linux.EFD.SEMAPHORE | linux.EFD.NONBLOCK | linux.EFD.CLOEXEC;
-    const handle = c.eventfd(0, flags);
-    if (handle >= 0) return handle;
-    return switch (c.errno(handle)) {
-        .ACCES, .PERM => error.PermissionDenied,
-        .INVAL => error.InvalidArgument,
-        .MFILE, .NFILE => error.DescriptorQuotaExceeded,
-        .NOMEM, .NOBUFS => error.ResourcesExhausted,
-        else => error.Unexpected,
-    };
-}
-
-fn bindSocket(handle: c.fd_t, name: *const c.sockaddr.storage, length: socklen_t) OpenError!void {
-    const rc = c.bind(handle, @as(*const c.sockaddr, @ptrCast(name)), @intCast(length));
-    switch (c.errno(rc)) {
-        .SUCCESS => {},
-        .ACCES, .PERM => return error.PermissionDenied,
-        .ADDRINUSE => return error.AddressInUse,
-        .ADDRNOTAVAIL => return error.AddressNotAvailable,
-        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-        .INVAL => return error.InvalidArgument,
-        .MFILE, .NFILE => return error.DescriptorQuotaExceeded,
-        .NOMEM, .NOBUFS => return error.ResourcesExhausted,
-        else => return error.Unexpected,
-    }
-}
-
-fn boundAddress(handle: c.fd_t) OpenError!base_addr.SocketAddr {
-    var name: c.sockaddr.storage = undefined;
-    var length: socklen_t = @sizeOf(c.sockaddr.storage);
-    const rc = c.getsockname(handle, @as(*c.sockaddr, @ptrCast(&name)), &length);
-    if (c.errno(rc) != .SUCCESS) return error.Unexpected;
-    return readSockaddr(&name) orelse error.AddressNotAvailable;
-}
-
-/// What this socket can do, asked once, at open.
-///
-/// `batch.socketOptions` names the two answers that matter: the congestion
-/// option and `UDP_GRO`. Asking for `UDP_GRO` *is* the probe for it, because
-/// a socket that refuses it has said the kernel does not have it and there is
-/// nothing to ask twice. The congestion option has no such reading, so a
-/// refusal there refuses the socket.
-fn probe(handle: c.fd_t, family: batch.Family) OpenError!batch.Capability {
-    const requested = batch.socketOptions(family, true);
-    try requireCongestionOption(handle, requested[0]);
-    const recv = trySetFlag(handle, requested[1]) catch |err| return openFromOption(err);
-    const send = probeSegmentation(handle) catch |err| return openFromOption(err);
-    return batch.capability(send, recv);
-}
-
-/// The congestion option has no fallback, so a refusal refuses the socket: a
-/// socket never asked for the codepoint reports every read as not-ECT, which
-/// is a silently wrong answer rather than a missing one.
-fn requireCongestionOption(handle: c.fd_t, option: batch.SocketOption) OpenError!void {
-    setFlag(handle, option.level, option.name, option.value) catch |err| {
-        return switch (err) {
-            error.Unsupported => error.CongestionOptionUnsupported,
-            error.InvalidValue => error.InvalidArgument,
-            error.ResourcesExhausted => error.ResourcesExhausted,
-            error.PermissionDenied => error.PermissionDenied,
-            error.Unexpected => error.Unexpected,
-        };
-    };
-}
-
-fn openFromOption(err: OptionError) OpenError {
-    return switch (err) {
-        error.Unsupported => error.OptionUnsupported,
-        error.InvalidValue => error.InvalidArgument,
-        error.ResourcesExhausted => error.ResourcesExhausted,
-        error.PermissionDenied => error.PermissionDenied,
-        error.Unexpected => error.Unexpected,
-    };
-}
-
-/// Whether `UDP_SEGMENT` is an option this kernel has, asked the way noq asks
-/// (`noq-udp/src/linux.rs:19-46`): set it to a value, read the value back, and
-/// leave it at zero so that only a control message segments a send. A socket
-/// that refuses it is not an error — it is the one-segment answer a
-/// `Capability` already has a name for.
-///
-/// The width here is an `int` and not the `u16` `batch.Value.short` carries,
-/// and the two are not the same ABI: `do_udp_setsockopt` opens with
-/// `if (optlen < sizeof(int)) return -EINVAL;`, while `udp_cmsg_send` demands
-/// `cmsg_len == CMSG_LEN(sizeof(u16))` and copies two bytes. A probe that
-/// hands the option a `u16` is refused with `EINVAL` on a kernel that has the
-/// feature, which reads as "this platform cannot segment" and silently costs
-/// every batch its segmentation.
-fn probeSegmentation(handle: c.fd_t) OptionError!batch.Probe {
-    const trial: c_int = 1;
-    setOption(handle, names.udp_level, names.segment, std.mem.asBytes(&trial)) catch |err| {
-        switch (err) {
-            error.Unsupported => return .unsupported,
-            else => |e| return e,
-        }
-    };
-    var readback: c_int = undefined;
-    var length: socklen_t = @sizeOf(c_int);
-    // `getsockopt` spells its level as an `int` and the model names levels as
-    // `u32`, so the narrowing is proved here rather than left to a cast that
-    // panics in Debug on a level that does not fit.
-    const level = std.math.cast(c_int, names.udp_level) orelse return error.InvalidValue;
-    if (c.getsockopt(handle, level, names.segment, &readback, &length) != 0) {
-        return error.Unexpected;
-    }
-    if (length != @sizeOf(c_int)) return error.InvalidValue;
-    // Cleared, and checked: a socket left at one would segment every send that
-    // did not ask for it, which is a worse fault than a socket that cannot
-    // segment at all.
-    const cleared: c_int = 0;
-    try setOption(handle, names.udp_level, names.segment, std.mem.asBytes(&cleared));
-    return if (readback == trial) .accepted else .unsupported;
-}
-
-fn trySetFlag(handle: c.fd_t, option: batch.SocketOption) OptionError!batch.Probe {
-    setFlag(handle, option.level, option.name, option.value) catch |err| switch (err) {
-        error.Unsupported => return .unsupported,
-        else => |e| return e,
-    };
-    return .accepted;
-}
-
-fn setFlag(handle: c.fd_t, level: u32, name: u32, value: bool) OptionError!void {
-    const flag: c_int = if (value) 1 else 0;
-    return setOption(handle, level, name, std.mem.asBytes(&flag));
-}
-
-fn setOption(handle: c.fd_t, level: u32, name: u32, value: []const u8) OptionError!void {
-    // The level is an `int`; the length can be wider than `socklen_t`.
-    // Reject unrepresentable values before the syscall rather than trapping
-    // during a narrowing cast.
-    const option_level = std.math.cast(c_int, level) orelse return error.InvalidValue;
-    const option_length = std.math.cast(socklen_t, value.len) orelse return error.InvalidValue;
-    const rc = c.setsockopt(handle, option_level, name, value.ptr, option_length);
-    switch (c.errno(rc)) {
-        .SUCCESS => {},
-        .INVAL => return error.InvalidValue,
-        .NOPROTOOPT, .OPNOTSUPP => return error.Unsupported,
-        .NOMEM, .NOBUFS => return error.ResourcesExhausted,
-        .ACCES, .PERM => return error.PermissionDenied,
-        else => return error.Unexpected,
-    }
 }
 
 // 78 display columns; the rule counts UTF-8 bytes, three per box character.
@@ -1842,7 +1024,10 @@ const Scripted = struct {
     /// How many there have been.
     sends: usize = 0,
 
-    fn sendRun(
+    // `pub` because `socket_send.walkRuns` calls it from another file, and it
+    // widens nothing beyond this file: `Scripted` is not `pub`, so no caller
+    // outside this one can name the type this method belongs to.
+    pub fn sendRun(
         self: *Scripted,
         io: std.Io,
         dest: base_addr.SocketAddr,

@@ -89,116 +89,13 @@ const ozai = @import("ozai");
 const t = std.testing;
 
 const blobs = ozai.blobs_protocol;
-const range_spec = ozai.range_spec;
 const postcard = ozai.postcard;
 const batch = ozai.transport_batch;
-const bridge_mod = ozai.transport_quic_bridge;
-const dial_mod = ozai.transport_dial;
-const socket_mod = ozai.transport_socket;
-const addr_map = ozai.addr_map;
 
-const Bridge = bridge_mod.Bridge;
-const Conn = bridge_mod.Conn;
-const Egress = bridge_mod.Egress;
-const Instant = bridge_mod.Instant;
-const Dialer = dial_mod.Dialer;
-const Socket = socket_mod.Socket;
-const ControlBuffer = socket_mod.ControlBuffer;
-const NodeId = ozai.NodeId;
-const SecretKey = ozai.SecretKey;
-const SocketAddr = ozai.SocketAddr;
-
-/// A seeded generator's engine, kept beside every value handed out from it:
-/// `std.Random` is an interface over a pointer to the engine, so the engine
-/// has to outlive the connection it seeds.
-const Prng = std.Random.DefaultPrng;
-
-/// Where every socket binds, with port zero: the kernel picks, so a socket
-/// left over from the last run cannot collide with this one.
-const loopback: SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0 };
-
-/// Where virtual time starts. See the module doc: it only moves by `quantum`.
-const start_ns: u64 = 1000 * std.time.ns_per_s;
-
-/// How far the clock moves per round. A round is a handful of syscalls, so
-/// this is a clock and not a delay: nothing in this file waits for it.
-const quantum: u64 = std.time.ns_per_ms;
-
-/// How many rounds a phase may take before it is called stalled.
-///
-/// Generous, because a round is a few syscalls and nothing here can block: the
-/// bound is a backstop against a run that never finishes, not a timer.
-const max_rounds = 512;
-
-/// The largest datagram a path is expected to carry, the same bound
-/// `quic_bridge.zig` and the vendored lossy-link test use.
-const max_datagram = 1500;
-
-/// How many socket writes one drain may hand back before the room is too
-/// small, and the room for them.
-///
-/// A burst of this blob's answer is bounded by the sender's congestion window
-/// rather than by a fixed count, so the room is sized for the whole answer and
-/// not for a guess about how many packets a burst holds.
-const max_egress = 512;
-const send_room: usize = max_egress * max_datagram;
-
-/// The core's own buffer: the datagram is copied into its front and a
-/// stateless reply is written behind it.
-const scratch_room: usize = 2 * max_datagram;
-
-/// Room for the largest list the kernel may coalesce into one read.
-const receive_room: usize = @as(usize, max_datagram) * batch.max_gro_segments_linux;
-
-/// The most byte ranges one answer may cover. A `RangeSpec` of a few widths
-/// yields a few spans, and a bound keeps the plan a value rather than an
-/// allocation.
-const max_spans = 8;
-
-/// The most jobs one link carries, and so the most decode storages.
-const max_jobs = 8;
-
-/// Room for one encoded request, and for the `push` arm's length-prefixed body
-/// scratch. A `get` is 39 bytes and a `push` one varint more.
-const request_room = 512;
-
-/// Room for one encoded `ObserveItem` and for the length in front of it.
-const observe_room = 256;
-
-/// Slots one blobs decode borrows into.
-///
-/// The counts are this file's own bounds, not the protocol's: a request longer
-/// than any of them is a frame this artifact cannot hold, and
-/// `RangeSpecSeq.parse` reports that as `error.BufferFull` rather than
-/// pretending it read the request.
-const decode_slots = 16;
-
-/// The provider's blob: 256 whole chunks and 700 bytes of a short one.
-///
-/// The size is chosen, not picked. Larger than one packet by three orders of
-/// magnitude, and larger than `batch.max_segments_linux` datagrams, so the send
-/// seam's segmentation is on the path rather than merely configured. The
-/// remainder is 700 rather than 1024 so the last chunk is short, which is the
-/// case `chunksToBytes` cannot answer exactly.
-const blob_length: usize = 256 * 1024 + 700;
-
-/// The blob's hash, and a request's hash is 32 raw bytes.
-///
-/// The first byte matters to one assertion in this file: overwriting a `get`
-/// frame's discriminant with `push`'s makes that byte the declared body
-/// length, and 0x5a is a one-byte varint for ninety — more than the frame has
-/// left. See the framing test.
-const blob_hash: [32]u8 = @splat(0x5a);
-
-/// The seeds of the blob's bytes and the payload's. Two, so a payload cannot
-/// be mistaken for a stretch of the blob.
-const blob_seed: u32 = 0x243f_6a88;
-const payload_seed: u32 = 0xb7e1_5162;
-
-/// The bao data a `push` writes after its request, on the same stream. Big
-/// enough that a reader which swallowed it into the request would hold more
-/// bytes than the request declares.
-const payload_length: usize = 1024;
+const job_ns = @import("transfer_jobs.zig");
+const link_ns = @import("transfer_link.zig");
+const ranges_mod = @import("transfer_ranges.zig");
+const wire = @import("transfer_wire.zig");
 
 /// How much of a whole-blob answer the truncating provider stops after.
 const truncated_at: usize = 1000;
@@ -213,936 +110,78 @@ const disjoint_widths = [_]u64{ 2, 3, 4, 5 };
 /// short last chunk.
 const tail_widths = [_]u64{ 254, 3 };
 
-// ---------------------------------------------------------------------------
-// Transport
-// ---------------------------------------------------------------------------
+// -- the report ---------------------------------------------------------
 
-/// One endpoint's transport: an identity, a socket on an ephemeral loopback
-/// port, the bridge that runs its connections, and the buffers both seams need.
-///
-/// It carries no protocol state, because the two halves of this test want
-/// different state on top of exactly this.
-const Wire = struct {
-    name: []const u8,
-    id: NodeId,
-    secret: SecretKey,
-    socket: Socket,
-    bridge: *Bridge,
-    dialer: *Dialer,
-    map: addr_map.MappedAddrs,
-    engine: Prng,
-    egress: []Egress,
-    out: []u8,
-    scratch: []u8,
-    buf: []u8,
-    control: ControlBuffer,
-    stats: Counters = .{},
-
-    fn init(
-        self: *Wire,
-        name: []const u8,
-        secret: SecretKey,
-        expect_peer: ?NodeId,
-        alpn: []const u8,
-        seed: u64,
-    ) !void {
-        self.* = .{
-            .name = name,
-            .id = secret.nodeId(),
-            .secret = secret,
-            .socket = undefined,
-            .bridge = undefined,
-            .dialer = undefined,
-            .map = addr_map.MappedAddrs.init(),
-            .engine = Prng.init(seed),
-            .egress = &.{},
-            .out = &.{},
-            .scratch = &.{},
-            .buf = &.{},
-            .control = undefined,
-        };
-        errdefer self.map.deinit(t.allocator);
-        self.socket = try Socket.create(loopback, .{});
-        errdefer self.socket.close();
-        // Both transport keys are supplied rather than drawn from `t.io`: a
-        // test whose Retry key differs on every run has failures that move.
-        self.bridge = try Bridge.create(t.allocator, t.io, .{
-            .secret = secret,
-            .expect_peer = expect_peer,
-            .alpn = alpn,
-            .retry_token_key = @splat(0x11),
-            .static_reset_key = @splat(0x22),
-        }, self.random());
-        errdefer self.bridge.destroy();
-        self.dialer = try Dialer.create(t.allocator, self.bridge, .{
-            .secret = secret,
-            .alpn = alpn,
-        });
-        errdefer self.dialer.destroy() catch @panic("new dialer has no live connections");
-        // A bridge created a moment ago has no entry for `destroy` to refuse,
-        // so this fires only on an allocation that followed it.
-        self.egress = try t.allocator.alloc(Egress, max_egress);
-        errdefer t.allocator.free(self.egress);
-        self.out = try t.allocator.alloc(u8, send_room);
-        errdefer t.allocator.free(self.out);
-        self.scratch = try t.allocator.alloc(u8, scratch_room);
-        errdefer t.allocator.free(self.scratch);
-        self.buf = try t.allocator.alloc(u8, receive_room);
-    }
-
-    /// Unwind order matters, and it is `Dialer.destroy`'s: a dialled
-    /// connection's handshake points at the dialer's own seed, so every
-    /// connection this dialer opened has to leave the manager before the
-    /// dialer goes, and the manager has to outlive both.
-    fn deinit(self: *Wire) void {
-        // Backwards, because `removeConnection` swap-removes and a forward
-        // walk would skip an entry and leave a freed one behind.
-        var index = self.bridge.manager.entries.items.len;
-        while (index > 0) {
-            index -= 1;
-            const entry = self.bridge.manager.entries.items[index];
-            if (!entry.conn.is_server) self.bridge.manager.removeConnection(entry);
-        }
-        self.bridge.sweep();
-        // Only server entries can survive: the bridge never dials, and no code
-        // between the removal walk and destroy can add another connection.
-        self.dialer.destroy() catch @panic("dialer retained a connection after removal");
-        self.bridge.destroy();
-        t.allocator.free(self.egress);
-        t.allocator.free(self.out);
-        t.allocator.free(self.scratch);
-        t.allocator.free(self.buf);
-        self.map.deinit(t.allocator);
-        self.socket.close();
-        self.secret.deinit();
-        self.* = undefined;
-    }
-
-    fn random(self: *Wire) std.Random {
-        return self.engine.random();
-    }
-
-    /// Take everything queued on this socket and hand it to the bridge.
-    ///
-    /// A read is not one datagram: `UDP_GRO` may have coalesced a burst into
-    /// one buffer, so the stride is what says how many packets there are and
-    /// the bridge is handed them one at a time.
-    fn take(self: *Wire, at: Instant) !bool {
-        var moved = false;
-        while (true) {
-            const sock = &self.socket;
-            const got = sock.tryReceive(t.io, self.buf, &self.control) catch |err| switch (err) {
-                // The socket is non-blocking from the moment it was created,
-                // and an empty queue is a fact the loop acts on.
-                error.WouldBlock => break,
-                else => return err,
-            };
-            const recv = try got.toRecv();
-            self.stats.in += recv.datagramCount();
-            var position: usize = 0;
-            while (position < recv.datagramCount()) : (position += 1) {
-                const ingress = try self.bridge.recv(&self.map, .{
-                    // The loop's bound is `recv.datagramCount()`, and
-                    // `Recv.datagram` answers null only past that count.
-                    // zwanzig-disable-next-line: optional-unwrap
-                    .bytes = recv.datagram(position).?,
-                    .from = got.from,
-                    .local = self.socket.address,
-                    .ecn = recv.ecn,
-                }, self.scratch, at, self.random());
-                moved = true;
-                switch (ingress.outcome) {
-                    // Nothing to do here: this connection is drained by the
-                    // next `flush`, which finds it by index.
-                    .processed => {},
-                    // A stateless reply is a send, back out of the same socket
-                    // to the address the datagram came from.
-                    .reply => |reply| {
-                        self.stats.out += 1;
-                        self.stats.note(reply, sock.caps);
-                        _ = try sock.send(t.io, ingress.source.socket, reply);
-                    },
-                    .dropped, .foreign => {},
-                }
-            }
-        }
-        return moved;
-    }
-
-    /// Drain every connection and write each datagram out, then run the timers.
-    fn flush(self: *Wire, at: Instant) !bool {
-        var moved = false;
-        var index: usize = 0;
-        while (self.bridge.connectionAt(index)) |conn| : (index += 1) {
-            for (try conn.drain(self.egress, self.out, at, self.random())) |egress| {
-                self.stats.out += 1;
-                // Counted before the write, because the accounting is about
-                // what the bridge handed over and not about whether the kernel
-                // took it.
-                self.stats.note(egress.send, self.socket.caps);
-                const report = try self.socket.send(t.io, egress.to, egress.send);
-                if (!report.ecnSurvived()) self.stats.dropped_ecn += 1;
-                moved = true;
-            }
-        }
-        var scan: usize = 0;
-        while (self.bridge.connectionAt(scan)) |conn| : (scan += 1) {
-            if (self.bridge.tick(conn, at, self.random()) == .finished) self.stats.finished += 1;
-        }
-        return moved;
-    }
-
-    /// One pass of the whole link: everything this side has, then everything
-    /// its peer has.
-    fn exchange(self: *Wire, at: Instant) !bool {
-        const mine = try self.take(at);
-        return (try self.flush(at)) or mine;
-    }
-};
-
-/// What one side moved, and how the send seam cut it up.
-///
-/// The datagram counts are not a claim about the protocol; they are the
-/// measurement the plan asks for, because a transfer this size has to go out
-/// as segmented sends and only the seam knows how many datagrams there were.
-const Counters = struct {
-    out: usize = 0,
-    in: usize = 0,
-    finished: usize = 0,
-    /// `batch.Send` values handed to the socket.
-    sends: usize = 0,
-    /// `sendmsg` calls those sends were cut into, at the socket's own
-    /// capability: a batch of more than `max_segments_linux` datagrams is more
-    /// than one `sendmsg` may carry.
-    runs: usize = 0,
-    /// Datagrams inside those sends.
-    datagrams: usize = 0,
-    /// The most datagrams in one send, which is what says whether the batch
-    /// boundary was crossed inside a single batch.
-    widest: usize = 0,
-    /// Sends the batcher segmented rather than passing as one datagram.
-    segmented: usize = 0,
-    /// Sends whose traffic class the kernel did not carry.
-    dropped_ecn: usize = 0,
-
-    /// Account for one `batch.Send`, cut with the capability the socket will
-    /// use.
-    fn note(counter: *Counters, send: batch.Send, caps: batch.Capability) void {
-        counter.sends += 1;
-        const datagrams = send.datagramCount();
-        counter.datagrams += datagrams;
-        counter.widest = @max(counter.widest, datagrams);
-        if (send.isSegmented()) counter.segmented += 1;
-        var runs = batch.Runs.init(send, caps) catch return;
-        while (runs.next()) |_| counter.runs += 1;
-    }
-};
-
-// ---------------------------------------------------------------------------
-// The provider's half
-// ---------------------------------------------------------------------------
-
-/// What the provider holds: one blob, its hash, and the bao data a `push`
-/// carries behind its request.
-const Store = struct {
-    bytes: []u8,
-    payload: []u8,
-    hash: [32]u8 = blob_hash,
-
-    fn init(alloc: std.mem.Allocator) !Store {
-        const bytes = try alloc.alloc(u8, blob_length);
-        errdefer alloc.free(bytes);
-        const payload = try alloc.alloc(u8, payload_length);
-        errdefer alloc.free(payload);
-        fill(bytes, blob_seed);
-        fill(payload, payload_seed);
-        return .{ .bytes = bytes, .payload = payload };
-    }
-
-    fn deinit(store: Store, alloc: std.mem.Allocator) void {
-        alloc.free(store.payload);
-        alloc.free(store.bytes);
-    }
-
-    /// How many chunks the blob has: the input every range walk is read
-    /// against, and the protocol's own rounding rather than a ceiling written
-    /// out here. `chunkAfterByte` is the first chunk at or past a byte offset,
-    /// which for a blob's own length is its chunk count.
-    fn chunkCount(store: Store) u64 {
-        return blobs.chunkAfterByte(store.bytes.len);
-    }
-};
-
-/// The bytes of `out`, from a xorshift32 rather than a repeated byte.
-///
-/// A transfer test that moved `0x5a` from one buffer to another would pass
-/// against a send path that duplicated one byte 256 times, and against one
-/// that wrote the first quarter over the last. The period here is 2^32 - 1,
-/// so no alignment repeats inside a blob of this size.
-fn fill(out: []u8, seed: u32) void {
-    var state: u32 = seed;
-    for (out) |*byte| {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        byte.* = @truncate(state);
-    }
-}
-
-/// The byte ranges one answer covers, and the chunk boundaries they came from.
-///
-/// The boundaries are kept beside the byte ranges because the two directions of
-/// the conversion are the property: the plan goes chunks to bytes, and an
-/// `observe` reports the same spans as a `ChunkRangeSet` for the getter to go
-/// the other way.
-const Plan = struct {
-    ranges: [max_spans]blobs.ByteRange = @splat(.{ .start = 0, .end = 0 }),
-    len: usize = 0,
-    boundaries: [max_spans * 2]u64 = @splat(0),
-    boundary_len: usize = 0,
-
-    /// How many bytes the plan covers in total.
-    fn total(plan: Plan) usize {
-        var sum: usize = 0;
-        for (plan.ranges[0..plan.len]) |range| sum += @intCast(range.end - range.start);
-        return sum;
-    }
-
-    fn boundariesSlice(plan: *const Plan) []const u64 {
-        return plan.boundaries[0..plan.boundary_len];
-    }
-};
-
-/// Walk a spec against the store and fill `plan`.
-///
-/// Every step is the protocol's own: `RangeSpec.resolve` is upstream's
-/// `to_chunk_ranges` read against a blob, and `chunksToBytes` is the other
-/// direction of the conversion. The clip at the end is this file's, and it is
-/// required rather than tidy: a blob whose length is not a multiple of 1024
-/// has a short last chunk, so the byte count the chunk arithmetic returns for
-/// a range ending in it is the first byte *past* that chunk.
-fn planSpec(plan: *Plan, spec: range_spec.RangeSpec, store: Store) error{TooManySpans}!void {
-    plan.* = .{};
-    var spans = spec.resolve(store.chunkCount());
-    while (spans.next()) |span| {
-        if (plan.len == max_spans) return error.TooManySpans;
-        const end = span.offset +| span.size;
-        const bytes = blobs.chunksToBytes(.{ .start = span.offset, .end = end });
-        plan.ranges[plan.len] = .{
-            .start = @min(bytes.start, store.bytes.len),
-            .end = @min(bytes.end, store.bytes.len),
-        };
-        plan.len += 1;
-        // The parity `ChunkRangeSet` documents: an even position starts a
-        // range and an odd one ends it.
-        plan.boundaries[plan.boundary_len] = span.offset;
-        plan.boundary_len += 1;
-        plan.boundaries[plan.boundary_len] = end;
-        plan.boundary_len += 1;
-    }
-}
-
-/// The byte ranges a boundary list names, read against the size it arrived
-/// with.
-///
-/// The direction `planSpec` did not take, and the one a getter has to take to
-/// know what an answer will cover. The clip is the same rule: the last chunk
-/// of a blob is short and the boundary list does not know that.
-fn planFromBoundaries(boundaries: []const u64, size: u64) Plan {
-    var plan: Plan = .{};
-    var slot: usize = 0;
-    while (slot + 1 < boundaries.len) : (slot += 2) {
-        if (plan.len == max_spans) break;
-        const bytes = blobs.chunksToBytes(.{
-            .start = boundaries[slot],
-            .end = boundaries[slot + 1],
-        });
-        plan.ranges[plan.len] = .{
-            .start = @min(bytes.start, size),
-            .end = @min(bytes.end, size),
-        };
-        plan.len += 1;
-    }
-    return plan;
-}
-
-/// The spec a decoded `get`'s sequence puts on the store's one blob.
-///
-/// The walk is `RangeSpecSeq.iter`, upstream's `ChunkRangesSeqIter`: one spec
-/// per blob, and a pair the walk has not reached yet leaves the current spec in
-/// place. The store holds one blob, so the first pair is the whole of it — and
-/// for a whole-blob request that first pair is followed by the terminator
-/// naming a blob that is not here.
-fn specOf(request: blobs.GetRequest) range_spec.RangeSpec {
-    var walk = request.ranges.iter();
-    return walk.next() orelse range_spec.RangeSpec.empty;
-}
-
-/// The spec a decoded request carries for the store's one blob, whatever
-/// framing it arrived in. A `push` is a newtype over a `GetRequest`, so its
-/// body is the same shape and its first pair is the same pair.
-fn requestSpec(job: *const Job) error{ GetManyUnsupported, NoRequestSeen }!range_spec.RangeSpec {
-    return switch (job.seen orelse return error.NoRequestSeen) {
-        .to_eof => |request| switch (request) {
-            .get => |value| specOf(value),
-            .observe => |value| value.ranges,
-            .get_many => return error.GetManyUnsupported,
-        },
-        .length_prefixed => |framed| framed.request.get.ranges.items[0].spec,
-    };
-}
-
-// ---------------------------------------------------------------------------
-// Jobs
-// ---------------------------------------------------------------------------
-
-/// Which of the four request types a job puts on the wire.
-const Kind = enum {
-    get,
-    observe,
-    push,
-
-    fn discriminant(kind: Kind) blobs.RequestType {
-        return switch (kind) {
-            .get => .get,
-            .observe => .observe,
-            .push => .push,
-        };
-    }
-};
-
-/// One request the getter makes, what the provider made of it, and the
-/// bookkeeping a stall report needs.
-const Job = struct {
-    /// Named in the stall report. A stall that does not say which request
-    /// stalled is a stall that has to be reproduced before it can be read.
-    name: []const u8,
-    kind: Kind = .get,
-    /// The widths of the range spec, in chunks. A `get` puts them in a
-    /// sequence and an `observe` in a spec; both carry the same widths.
-    widths: []const u64 = &.{},
-    /// Write the module's own whole-blob sequence rather than a sequence of
-    /// this file's, so the constructor upstream uses is on the path.
-    whole: bool = false,
-    /// How many bytes of the plan the provider writes, and null for all of
-    /// them. A number below the total is the truncated case.
-    truncate_to: ?usize = null,
-    /// Write nothing at all, and close: the provider has nothing, which is EOF
-    /// on the wire.
-    empty: bool = false,
-
-    /// The bytes the getter encoded, and the request the provider decoded off
-    /// the socket from them.
-    frame_len: usize = 0,
-    frame: [request_room]u8 = undefined,
-    seen: ?blobs.Request = null,
-    /// Where the decode said the payload starts, for a `push`.
-    payload_offset: usize = 0,
-    /// The byte ranges the provider derived, and the ones the test expects.
-    plan: Plan = .{},
-    expected: Plan = .{},
-
-    stream: u64 = 0,
-    asked: bool = false,
-    served: bool = false,
-    storage: DecodeStorage = .{},
-
-    /// The byte ranges this request must produce, as the test states them.
-    fn expect(job: *Job, ranges: []const blobs.ByteRange) error{TooManySpans}!void {
-        if (ranges.len > max_spans) return error.TooManySpans;
-        job.expected = .{};
-        job.expected.len = ranges.len;
-        for (ranges, 0..) |range, index| job.expected.ranges[index] = range;
-    }
-
-    fn spec(job: *const Job) range_spec.RangeSpec {
-        return .{ .widths = job.widths };
-    }
-};
-
-/// Scratch a blobs decode borrows into.
-///
-/// The arrays are fields rather than constants because a decode writes through
-/// them, and `Storage`'s slices have to point at the same memory — so `init`
-/// points them at `self` rather than returning one. A `DecodeStorage` that was
-/// returned by value and had its slices cut from the local copy left every
-/// later decode reading a frame that had already unwound, which a debug build
-/// hides and a release build does not.
-const DecodeStorage = struct {
-    items: [decode_slots]range_spec.Item = @splat(.{ .delta = 0, .spec = .empty }),
-    widths: [decode_slots]u64 = @splat(0),
-    hashes: [decode_slots][32]u8 = @splat(@splat(0)),
-    boundaries: [decode_slots]u64 = @splat(0),
-    inner: blobs.Storage = undefined,
-
-    fn init(self: *DecodeStorage) void {
-        self.inner = .{
-            .items = self.items[0..],
-            .widths = self.widths[0..],
-            .hashes = self.hashes[0..],
-            .boundaries = self.boundaries[0..],
-        };
-    }
-};
-
-/// One stream's received bytes, as a queue a caller may push to and read from
-/// but never take the storage of.
-///
-/// A named type rather than a bare `ArrayList` so the storage cannot escape:
-/// `push` and `slice` are the only ways in and out. `Link` used to answer a
-/// reader with `list.items` and nothing else, which reads as a handover of the
-/// list and is not one — and which is exactly the question `zbc` raised. The
-/// answer is a borrow: the map owns the queue and `freeSides` frees it, so
-/// `toOwnedSlice` would have been the bug rather than the fix, moving the
-/// bytes out from under a map that still held the entry.
-///
-/// The count a reader sees is the count `push` advanced, never the room behind
-/// it. `std.ArrayList` holds `items` as `ptr[0..len]` with `len` the written
-/// count and keeps the allocation's length in a field of its own
-/// (`lib/std/array_list.zig:31-35`); `allocatedSlice` at `:534` is what hands
-/// back the room, and the comment above it says exactly that. So `room` and
-/// `slice().len` are two different numbers and the test at the bottom of this
-/// file is what holds them apart.
-const StreamBytes = struct {
-    queued: std.ArrayList(u8) = .empty,
-
-    /// A queue holding nothing, which is what a `getOrPut` that missed leaves
-    /// to be written to. Named so the two call sites say the same thing.
-    const empty: StreamBytes = .{};
-
-    fn deinit(self: *StreamBytes) void {
-        self.queued.deinit(t.allocator);
-        self.* = undefined;
-    }
-
-    fn push(self: *StreamBytes, chunk: []const u8) !void {
-        try self.queued.appendSlice(t.allocator, chunk);
-    }
-
-    /// The bytes written so far.
-    fn slice(self: *const StreamBytes) []const u8 {
-        return self.queued.items;
-    }
-
-    /// How many more bytes fit without a reallocation. Never the count.
-    fn room(self: *const StreamBytes) usize {
-        return self.queued.capacity;
-    }
-};
-
-/// The queue one side's copy of a stream sits in, or null for a stream that
-/// has arrived nothing.
-///
-/// Null and an empty slice are two different answers and both are wanted: the
-/// first says the stream is not in the map and the second says it is and
-/// carried nothing, and a stall report that cannot tell them apart is a stall
-/// report that has to be reproduced before it can be read.
-fn queueOf(
-    bytes: *const std.AutoHashMap(u64, StreamBytes),
-    stream: u64,
-) ?*const StreamBytes {
-    return bytes.getPtr(stream);
-}
-
-/// The bytes a side has read off one stream, borrowed, or the empty slice.
-fn received(
-    bytes: *const std.AutoHashMap(u64, StreamBytes),
-    stream: u64,
-) []const u8 {
-    const queued = queueOf(bytes, stream) orelse return &.{};
-    return queued.slice();
-}
-
-/// Free every queue a side accumulated, before the map that holds them goes.
-fn freeSides(map: *std.AutoHashMap(u64, StreamBytes)) void {
-    var it = map.valueIterator();
-    while (it.next()) |queued| queued.deinit();
-}
-
-// ---------------------------------------------------------------------------
-// The link
-// ---------------------------------------------------------------------------
-
-/// The two endpoints a blobs transfer needs: a provider that has the bytes and
-/// a getter that does not, one connection, one round loop.
-const Link = struct {
-    getter: Wire,
-    provider: Wire,
-    store: Store,
-    jobs: [max_jobs]Job = @splat(.{ .name = "unused" }),
-    now: u64 = start_ns,
-
-    /// What the provider read off each stream, and whether each saw its FIN.
-    provider_bytes: std.AutoHashMap(u64, StreamBytes),
-    provider_fin: std.AutoHashMap(u64, bool),
-    getter_bytes: std.AutoHashMap(u64, StreamBytes),
-    getter_fin: std.AutoHashMap(u64, bool),
-
-    /// The `push` arm's length-prefixed body scratch, which `Request.write`
-    /// needs because a varint length cannot be backpatched once its width is
-    /// known.
-    body: [request_room]u8 = undefined,
-    /// Scratch the getter decodes an `observe` run into. Separate from every
-    /// job's, because the run's items are compared after the run is over and
-    /// the job's storage belongs to the provider.
-    seen: DecodeStorage = .{},
-
-    /// The connection the getter's dial opened, held so the assertions can read
-    /// the identity the pin produced off the handshake.
-    dialled: Conn,
-
-    fn init(link: *Link) !void {
-        const store = try Store.init(t.allocator);
-        errdefer store.deinit(t.allocator);
-        link.* = .{
-            .getter = undefined,
-            .provider = undefined,
-            .store = store,
-            .provider_bytes = .init(t.allocator),
-            .provider_fin = .init(t.allocator),
-            .getter_bytes = .init(t.allocator),
-            .getter_fin = .init(t.allocator),
-            .dialled = undefined,
-        };
-        link.seen.init();
-        for (&link.jobs) |*job| job.storage.init();
-        errdefer link.deinitBuffers();
-        // Both ends pin the other, because a pair has one peer and
-        // `Bridge.Config.expect_peer` is a value rather than a list.
-        const getter_seed: [SecretKey.seed_length]u8 = @splat(0xc1);
-        const provider_seed: [SecretKey.seed_length]u8 = @splat(0xc2);
-        var getter_secret = try SecretKey.fromSeed(getter_seed);
-        var provider_secret = try SecretKey.fromSeed(provider_seed);
-        // Both wires *copy* their key: `Wire.init` keeps it in `self.secret`,
-        // and the bridge and the dialer each derive their own seed bytes from
-        // the `Config` they are handed. These two stack copies are therefore
-        // the ones no owner shares, which makes `defer` — not `errdefer` —
-        // their guard.
-        defer getter_secret.deinit();
-        defer provider_secret.deinit();
-        try link.getter.init("getter", getter_secret, null, blobs.alpn, 31);
-        // From here each wire owns a socket, a bridge, a dialer, an address map
-        // and four buffers, so every step below unwinds through the wires that
-        // are already up.
-        errdefer link.getter.deinit();
-        try link.provider.init(
-            "provider",
-            provider_secret,
-            getter_secret.nodeId(),
-            blobs.alpn,
-            32,
+/// What a stall has to say. It names the request, the range and the byte
+/// count, because a stall without all three is a stall that has to be
+/// reproduced before it can be read.
+pub fn report(link: *link_ns.Link, reason: []const u8) void {
+    std.debug.print("\nblobs transfer stalled: {s}\n", .{reason});
+    for (&link.jobs) |*job| {
+        if (std.mem.eql(u8, job.name, "unused")) continue;
+        std.debug.print(
+            "  {s}: {t} {f} on stream {d}\n",
+            .{ job.name, job.kind, job.spec(), job.stream },
         );
-        errdefer link.provider.deinit();
-        // One dial, pinned to the provider's node id, so the handshake proves
-        // who was dialled rather than merely that somebody answered. The id is
-        // named before the dial because the dial writes into `link` and both
-        // keys are wiped when this function returns: a value read off a wiped
-        // key is a value that has to have been read before, not after.
-        const provider_id = provider_secret.nodeId();
-        link.dialled = (try link.getter.dialer.dial(
-            .{ .ip = link.provider.socket.address },
-            provider_id,
-            link.getter.socket.address,
-            &link.getter.map,
-            @intCast(link.now),
-            link.getter.random(),
-        )).conn;
-    }
-
-    /// Put a job on the link and point its decode storage at its own arrays.
-    ///
-    /// Assigning a `Job` wholesale replaces the storage, so this is where the
-    /// slices get pointed again; a decode through a `Storage` whose arrays are
-    /// not the ones it names reads whatever is in a frame that has unwound.
-    fn put(link: *Link, index: usize, job: Job) void {
-        link.jobs[index] = job;
-        link.jobs[index].storage.init();
-    }
-
-    fn deinitBuffers(link: *Link) void {
-        freeSides(&link.provider_bytes);
-        freeSides(&link.getter_bytes);
-        link.provider_fin.deinit();
-        link.provider_bytes.deinit();
-        link.getter_fin.deinit();
-        link.getter_bytes.deinit();
-    }
-
-    fn deinit(link: *Link) void {
-        link.deinitBuffers();
-        link.store.deinit(t.allocator);
-        link.provider.deinit();
-        link.getter.deinit();
-        link.* = undefined;
-    }
-
-    /// One round: the clock moves, both sides take and flush, both sides drain
-    /// their streams, and the provider answers whatever has arrived whole.
-    fn round(link: *Link) !bool {
-        link.now += quantum;
-        const at: Instant = @intCast(link.now);
-        var moved = try link.getter.exchange(at);
-        moved = (try link.provider.exchange(at)) or moved;
-        moved = (try link.drain(&link.getter, &link.getter_bytes, &link.getter_fin)) or moved;
-        moved = (try link.drain(&link.provider, &link.provider_bytes, &link.provider_fin)) or moved;
-        moved = (try link.serve()) or moved;
-        return moved;
-    }
-
-    /// Copy every stream's readable bytes into a buffer per stream, and note
-    /// which streams have seen their FIN.
-    ///
-    /// `allReceived` rather than `fin_received` alone: a FIN behind a hole is
-    /// not the end of the stream, and treating it as one is how a `get` decodes
-    /// a truncated request instead of waiting for the rest of it.
-    fn drain(
-        _: *Link,
-        side: *Wire,
-        bytes: *std.AutoHashMap(u64, StreamBytes),
-        fin: *std.AutoHashMap(u64, bool),
-    ) !bool {
-        const conn = side.bridge.connectionAt(0) orelse return false;
-        if (!conn.established()) return false;
-        var moved = false;
-        var it = conn.entry.conn.streams.streams.iterator();
-        while (it.next()) |entry| {
-            const id = entry.key_ptr.*;
-            const stream = entry.value_ptr.*;
-            const gop = try bytes.getOrPut(id);
-            if (!gop.found_existing) gop.value_ptr.* = StreamBytes.empty;
-            while (stream.recv.read()) |chunk| {
-                // The same handover `Wire.take` uses: the append is what
-                // copies, and the chunk is the caller's from the `try` on.
-                defer t.allocator.free(chunk);
-                moved = true;
-                try gop.value_ptr.push(chunk);
-            }
-            if (stream.recv.allReceived()) try fin.put(id, true);
+        std.debug.print("    plan:", .{});
+        for (job.plan.ranges[0..job.plan.len]) |range| {
+            std.debug.print(" [{d},{d})", .{ range.start, range.end });
         }
-        return moved;
+        std.debug.print(
+            " ({d} bytes), asked {}, answered {}\n",
+            .{ job.plan.total(), job.asked, job.served },
+        );
+        const got = job_ns.received(&link.getter_bytes, job.stream);
+        std.debug.print(
+            "    {d} of {d} bytes arrived, fin {}\n",
+            .{ got.len, job.expected.total(), link.finished(&link.getter_fin, job.stream) },
+        );
     }
-
-    fn finished(
-        _: *Link,
-        fin: *const std.AutoHashMap(u64, bool),
-        stream: u64,
-    ) bool {
-        return fin.get(stream) orelse false;
+    for (0..2) |which| {
+        const side: *wire.Wire = if (which == 0) &link.getter else &link.provider;
+        std.debug.print(
+            "  {s} ({f}) at {f}: {d} datagrams out, {d} in," ++
+                " {d} runs in {d} sends, widest {d}, {d} segmented," ++
+                " {d} finished, {d} ecn dropped\n",
+            .{
+                side.name,
+                side.id,
+                side.socket.address,
+                side.stats.out,
+                side.stats.in,
+                side.stats.runs,
+                side.stats.sends,
+                side.stats.widest,
+                side.stats.segmented,
+                side.stats.finished,
+                side.stats.dropped_ecn,
+            },
+        );
     }
-
-    // -- the getter's half --------------------------------------------------
-
-    /// The `Request` a job puts on the wire.
-    ///
-    /// The `get` and `push` bodies carry a one-pair sequence, and it borrows an
-    /// array the caller owns, so it is built and encoded in the same call:
-    /// nothing that outlives the frame keeps a pointer into it.
-    fn buildRequest(
-        job: *const Job,
-        items: *[1]range_spec.Item,
-        hash: [32]u8,
-    ) blobs.Request {
-        items[0] = .{ .delta = 0, .spec = job.spec() };
-        return switch (job.kind) {
-            .get => if (job.whole)
-                .{ .to_eof = .{ .get = blobs.GetRequest.blob(hash) } }
-            else
-                .{ .to_eof = .{ .get = .{
-                    .hash = hash,
-                    .ranges = .{ .items = items[0..] },
-                } } },
-            .observe => .{ .to_eof = .{ .observe = .{
-                .hash = hash,
-                .ranges = job.spec(),
-            } } },
-            .push => .{ .length_prefixed = .{
-                .request = blobs.PushRequest.new(hash, .{ .items = items[0..] }),
-            } },
-        };
-    }
-
-    /// Open a stream for `job`, write its request, and close the send side.
-    fn ask(link: *Link, job: *Job) !void {
-        const stream = try link.dialled.entry.conn.openStream();
-        job.stream = stream.stream_id;
-        var items: [1]range_spec.Item = undefined;
-        var writer = postcard.Writer.init(&job.frame);
-        try buildRequest(job, &items, link.store.hash).write(&writer, &link.body);
-        job.frame_len = writer.finish().len;
-        try stream.send.writeData(job.frame[0..job.frame_len]);
-        // A `push` is the one request with bytes behind it, and they are on the
-        // same stream: that is what `LengthPrefixedFraming` exists to make
-        // unambiguous, and it is why the payload is written here rather than
-        // after the provider has answered.
-        if (job.kind == .push) try stream.send.writeData(link.store.payload);
-        // The `to_eof` framing is the whole stream, and the `push` framing is
-        // the stream minus its payload, so both are closed by a FIN and not by
-        // a length.
-        stream.send.close();
-        job.asked = true;
-    }
-
-    // -- the provider's half ------------------------------------------------
-
-    /// Answer every job whose request has arrived whole and has not been
-    /// answered yet.
-    fn serve(link: *Link) !bool {
-        var moved = false;
-        for (&link.jobs) |*job| {
-            if (job.served or !job.asked) continue;
-            if (!link.finished(&link.provider_fin, job.stream)) continue;
-            const conn = link.provider.bridge.connectionAt(0) orelse continue;
-            // The request as it came off the socket, decoded by the one reader
-            // `Request.read` dispatches to.
-            var reader = postcard.Reader.init(received(&link.provider_bytes, job.stream));
-            const seen = try blobs.Request.read(&reader, &job.storage.inner);
-            job.seen = seen;
-            const stream = conn.entry.conn.streams.getStream(job.stream) orelse
-                return error.NoStream;
-            job.served = true;
-            moved = true;
-            switch (seen) {
-                .to_eof => |request| {
-                    // The `to_eof` rule, and it applies to that arm alone: the
-                    // request is the whole stream, so a byte after it is a
-                    // stream that carried something else.
-                    try reader.finish();
-                    switch (request) {
-                        .get => |get| {
-                            try planSpec(&job.plan, specOf(get), link.store);
-                            try link.writeAnswer(job, stream);
-                        },
-                        .observe => |observe| {
-                            try planSpec(&job.plan, observe.ranges, link.store);
-                            try link.writeObserve(job, stream);
-                        },
-                        .get_many => return error.GetManyUnsupported,
-                    }
-                },
-                .length_prefixed => |framed| {
-                    // No `finish` here, and that is the whole difference
-                    // between the two framings: the reader is left on the
-                    // payload, and that is where the bao data starts.
-                    job.payload_offset = framed.payload_offset;
-                    stream.send.close();
-                },
-            }
-        }
-        return moved;
-    }
-
-    /// The bao data of a `get`: the planned ranges, in order, and nothing else.
-    fn writeAnswer(link: *Link, job: *Job, stream: anytype) !void {
-        if (!job.empty) {
-            var budget = job.truncate_to orelse std.math.maxInt(usize);
-            for (job.plan.ranges[0..job.plan.len]) |range| {
-                if (budget == 0) break;
-                const start: usize = @intCast(range.start);
-                const take: usize = @intCast(@min(budget, range.end - range.start));
-                try stream.send.writeData(link.store.bytes[start .. start + take]);
-                budget -= take;
-            }
-        }
-        stream.send.close();
-    }
-
-    /// A run of `ObserveItem`s: what the provider has, as a `ChunkRangeSet`.
-    ///
-    /// Length-prefixed, because a run has no other boundary — the same
-    /// `write_length_prefixed` a `push` request is written with, and for the
-    /// same reason. The body goes into its own buffer rather than being built
-    /// inside the frame, because the two must not be the same bytes.
-    fn writeObserve(link: *Link, job: *Job, stream: anytype) !void {
-        var body_room: [observe_room]u8 = undefined;
-        var framed_room: [observe_room]u8 = undefined;
-        var body = postcard.Writer.init(&body_room);
-        const item: blobs.ObserveItem = .{
-            .size = link.store.bytes.len,
-            .ranges = .{ .boundaries = job.plan.boundariesSlice() },
-        };
-        try item.write(&body);
-        const framed = body.finish();
-        var writer = postcard.Writer.init(&framed_room);
-        try writer.writeU64(framed.len);
-        @memcpy(writer.buffer[writer.length..][0..framed.len], framed);
-        writer.length += framed.len;
-        try stream.send.writeData(writer.finish());
-        stream.send.close();
-    }
-
-    // -- the report ---------------------------------------------------------
-
-    /// What a stall has to say. It names the request, the range and the byte
-    /// count, because a stall without all three is a stall that has to be
-    /// reproduced before it can be read.
-    fn report(link: *Link, reason: []const u8) void {
-        std.debug.print("\nblobs transfer stalled: {s}\n", .{reason});
-        for (&link.jobs) |*job| {
-            if (std.mem.eql(u8, job.name, "unused")) continue;
-            std.debug.print(
-                "  {s}: {t} {f} on stream {d}\n",
-                .{ job.name, job.kind, job.spec(), job.stream },
-            );
-            std.debug.print("    plan:", .{});
-            for (job.plan.ranges[0..job.plan.len]) |range| {
-                std.debug.print(" [{d},{d})", .{ range.start, range.end });
-            }
-            std.debug.print(
-                " ({d} bytes), asked {}, answered {}\n",
-                .{ job.plan.total(), job.asked, job.served },
-            );
-            const got = received(&link.getter_bytes, job.stream);
-            std.debug.print(
-                "    {d} of {d} bytes arrived, fin {}\n",
-                .{ got.len, job.expected.total(), link.finished(&link.getter_fin, job.stream) },
-            );
-        }
-        for (0..2) |which| {
-            const side: *Wire = if (which == 0) &link.getter else &link.provider;
-            std.debug.print(
-                "  {s} ({f}) at {f}: {d} datagrams out, {d} in," ++
-                    " {d} runs in {d} sends, widest {d}, {d} segmented," ++
-                    " {d} finished, {d} ecn dropped\n",
-                .{
-                    side.name,
-                    side.id,
-                    side.socket.address,
-                    side.stats.out,
-                    side.stats.in,
-                    side.stats.runs,
-                    side.stats.sends,
-                    side.stats.widest,
-                    side.stats.segmented,
-                    side.stats.finished,
-                    side.stats.dropped_ecn,
-                },
-            );
-        }
-        std.debug.print("  virtual time {d} ms; round bound {d}\n", .{
-            link.now / std.time.ns_per_ms,
-            max_rounds,
-        });
-    }
-};
+    std.debug.print("  virtual time {d} ms; round bound {d}\n", .{
+        link.now / std.time.ns_per_ms,
+        wire.max_rounds,
+    });
+}
 
 /// Run rounds until `goal` holds, or until the bound is reached.
-fn drive(link: *Link, phase: []const u8, goal: fn (*Link) bool) !void {
+pub fn drive(link: *link_ns.Link, phase: []const u8, goal: fn (*link_ns.Link) bool) !void {
     var round: usize = 0;
-    while (round < max_rounds) : (round += 1) {
+    while (round < wire.max_rounds) : (round += 1) {
         if (goal(link)) return;
         _ = try link.round();
     }
     if (goal(link)) return;
-    link.report(phase);
+    report(link, phase);
     return error.Stalled;
 }
 
-fn handshaken(link: *Link) bool {
+pub fn handshaken(link: *link_ns.Link) bool {
     const accepted = link.provider.bridge.connectionAt(0) orelse return false;
     return link.dialled.established() and accepted.established();
 }
 
-fn allServed(link: *Link) bool {
+pub fn allServed(link: *link_ns.Link) bool {
     for (&link.jobs) |*job| {
         if (std.mem.eql(u8, job.name, "unused")) continue;
         if (!job.served) return false;
@@ -1150,7 +189,7 @@ fn allServed(link: *Link) bool {
     return true;
 }
 
-fn allComplete(link: *Link) bool {
+pub fn allComplete(link: *link_ns.Link) bool {
     for (&link.jobs) |*job| {
         if (std.mem.eql(u8, job.name, "unused")) continue;
         if (!link.finished(&link.getter_fin, job.stream)) return false;
@@ -1160,12 +199,12 @@ fn allComplete(link: *Link) bool {
 
 /// The two ends proved who they are to each other by the handshake, not by the
 /// configuration.
-fn checkIdentity(link: *Link) !void {
+pub fn checkIdentity(link: *link_ns.Link) !void {
     const getter_conn = link.dialled;
     const provider_conn = link.provider.bridge.connectionAt(0) orelse
         return error.NoConnection;
     if (!getter_conn.established() or !provider_conn.established()) {
-        link.report("the blobs handshake did not finish");
+        report(link, "the blobs handshake did not finish");
         return error.Stalled;
     }
     try t.expectEqual(
@@ -1185,8 +224,8 @@ fn checkIdentity(link: *Link) !void {
 
 /// The answer on one stream, as `BaoResponse` reads it: everything that is
 /// left, which is the whole of what a `get`'s answer is.
-fn answerOf(link: *Link, job: *Job) blobs.BaoResponse {
-    var reader = postcard.Reader.init(received(&link.getter_bytes, job.stream));
+pub fn answerOf(link: *link_ns.Link, job: *job_ns.Job) blobs.BaoResponse {
+    var reader = postcard.Reader.init(job_ns.received(&link.getter_bytes, job.stream));
     return blobs.BaoResponse.read(&reader);
 }
 
@@ -1196,7 +235,7 @@ fn answerOf(link: *Link, job: *Job) blobs.BaoResponse {
 /// hands back a short buffer, and comparing what arrived against what was read
 /// rather than against what was asked for would make that pass. This is the
 /// predicate a caller would write, and the truncating test asserts it is false.
-fn covers(store: Store, plan: Plan, answer: blobs.BaoResponse) bool {
+pub fn covers(store: ranges_mod.Store, plan: ranges_mod.Plan, answer: blobs.BaoResponse) bool {
     var at: usize = 0;
     for (plan.ranges[0..plan.len]) |range| {
         const want = store.bytes[@intCast(range.start)..@intCast(range.end)];
@@ -1212,7 +251,7 @@ fn covers(store: Store, plan: Plan, answer: blobs.BaoResponse) bool {
 // ---------------------------------------------------------------------------
 
 test "a whole blob crosses a real socket, and the send seam segments it" {
-    var link: Link = undefined;
+    var link: link_ns.Link = undefined;
     try link.init();
     defer link.deinit();
 
@@ -1228,7 +267,7 @@ test "a whole blob crosses a real socket, and the send seam segments it" {
     const job = &link.jobs[0];
     link.put(0, .{ .name = "whole blob", .kind = .get, .whole = true });
     try job.expect(&.{.{ .start = 0, .end = link.store.bytes.len }});
-    try link.ask(job);
+    try job_ns.ask(&link, job);
     try drive(&link, "the whole-blob request never arrived whole", allServed);
     try drive(&link, "the whole blob never finished arriving", allComplete);
 
@@ -1242,7 +281,7 @@ test "a whole blob crosses a real socket, and the send seam segments it" {
         },
         .length_prefixed => return error.NotAnEofRequest,
     };
-    try t.expectEqualSlices(u8, &blob_hash, &get.hash);
+    try t.expectEqualSlices(u8, &ranges_mod.blob_hash, &get.hash);
     // The plan came from the decoded sequence rather than from the test's
     // widths, so this is the range algebra the wire carried: one selected span
     // over every chunk, cut at the blob's real length because the last chunk is
@@ -1293,7 +332,7 @@ test "a whole blob crosses a real socket, and the send seam segments it" {
 // ---------------------------------------------------------------------------
 
 test "disjoint ranges and a whole blob return exactly the bytes asked for" {
-    var link: Link = undefined;
+    var link: link_ns.Link = undefined;
     try link.init();
     defer link.deinit();
 
@@ -1330,7 +369,7 @@ test "disjoint ranges and a whole blob return exactly the bytes asked for" {
     try link.jobs[2].expect(&tail_expected);
     try link.jobs[4].expect(&whole_expected);
 
-    for (0..jobs) |index| try link.ask(&link.jobs[index]);
+    for (0..jobs) |index| try job_ns.ask(&link, &link.jobs[index]);
     try drive(&link, "a range request never arrived whole", allServed);
     try drive(&link, "a range answer never finished arriving", allComplete);
 
@@ -1345,7 +384,7 @@ test "disjoint ranges and a whole blob return exactly the bytes asked for" {
         const job = &link.jobs[index];
         const seen = job.seen orelse return error.NoRequestSeen;
         try t.expectEqual(job.kind.discriminant(), seen.discriminant());
-        var check: [request_room]u8 = undefined;
+        var check: [job_ns.request_room]u8 = undefined;
         var writer = postcard.Writer.init(&check);
         try seen.write(&writer, &link.body);
         try t.expectEqualSlices(u8, job.frame[0..job.frame_len], writer.finish());
@@ -1363,13 +402,13 @@ test "disjoint ranges and a whole blob return exactly the bytes asked for" {
             .length_prefixed => null,
         };
         if (get) |value| {
-            try t.expectEqualSlices(u8, &blob_hash, &value.hash);
+            try t.expectEqualSlices(u8, &ranges_mod.blob_hash, &value.hash);
             try t.expectEqual(
                 @intFromPtr(&job.storage.items[0]),
                 @intFromPtr(value.ranges.items.ptr),
             );
         }
-        const spec = try requestSpec(job);
+        const spec = try ranges_mod.requestSpec(job);
         if (job.whole) {
             // The module's own whole-blob sequence: one selected spec and the
             // terminator that stops the walk. Its spec is `RangeSpec.all`,
@@ -1428,7 +467,7 @@ test "disjoint ranges and a whole blob return exactly the bytes asked for" {
     // the `get` above.
     {
         const job = &link.jobs[3];
-        var reader = postcard.Reader.init(received(&link.getter_bytes, job.stream));
+        var reader = postcard.Reader.init(job_ns.received(&link.getter_bytes, job.stream));
         var run = blobs.ObserveResponse.read(&reader, &link.seen.inner);
         const item = (try run.next()) orelse return error.NoObserveItem;
         try t.expectEqual(link.store.bytes.len, item.size);
@@ -1440,7 +479,7 @@ test "disjoint ranges and a whole blob return exactly the bytes asked for" {
 
         // The ranges those boundaries name, read against the size that came
         // with them — the other direction of the conversion, and the getter's.
-        const derived = planFromBoundaries(item.ranges.boundaries, item.size);
+        const derived = ranges_mod.planFromBoundaries(item.ranges.boundaries, item.size);
         try t.expectEqual(@as(usize, 2), derived.len);
         try t.expectEqual(disjoint_expected[0], derived.ranges[0]);
         try t.expectEqual(disjoint_expected[1], derived.ranges[1]);
@@ -1455,7 +494,7 @@ test "disjoint ranges and a whole blob return exactly the bytes asked for" {
 // ---------------------------------------------------------------------------
 
 test "a push body cannot be read as a get body, on the wire" {
-    var link: Link = undefined;
+    var link: link_ns.Link = undefined;
     try link.init();
     defer link.deinit();
 
@@ -1475,8 +514,8 @@ test "a push body cannot be read as a get body, on the wire" {
     };
     try link.jobs[1].expect(&disjoint_expected);
 
-    try link.ask(&link.jobs[0]);
-    try link.ask(&link.jobs[1]);
+    try job_ns.ask(&link, &link.jobs[0]);
+    try job_ns.ask(&link, &link.jobs[1]);
     try drive(&link, "a framed request never arrived whole", allServed);
     try drive(&link, "a framed stream never finished", allComplete);
 
@@ -1490,7 +529,7 @@ test "a push body cannot be read as a get body, on the wire" {
         .length_prefixed => |value| value,
         .to_eof => return error.PushReadAsEof,
     };
-    const received_push = received(&link.provider_bytes, push.stream);
+    const received_push = job_ns.received(&link.provider_bytes, push.stream);
     // The payload is the kilobyte the getter wrote and not a byte of the
     // request: it starts where the decode said it starts, and the getter's
     // frame was exactly that many bytes.
@@ -1518,7 +557,7 @@ test "a push body cannot be read as a get body, on the wire" {
     // leaving the caller to know which framing it was handed.
     {
         const get_seen = get.seen orelse return error.NoRequestSeen;
-        var reader = postcard.Reader.init(received(&link.provider_bytes, get.stream));
+        var reader = postcard.Reader.init(job_ns.received(&link.provider_bytes, get.stream));
         try t.expectEqualSlices(u8, "", get_seen.payload(&reader));
     }
     // The `get` on the same ranges got the bytes, which says the push did not
@@ -1544,7 +583,7 @@ test "a push body cannot be read as a get body, on the wire" {
     // cannot be part of it. This is the confusion in one comparison, and both
     // halves are the push's own bytes rather than a frame this file invented.
     {
-        var clean_frame: [request_room]u8 = undefined;
+        var clean_frame: [job_ns.request_room]u8 = undefined;
         var clean_writer = postcard.Writer.init(&clean_frame);
         try clean_writer.writeU8(@intFromEnum(blobs.RequestType.get));
         try framed.request.write(&clean_writer);
@@ -1553,13 +592,13 @@ test "a push body cannot be read as a get body, on the wire" {
         // `Request.read`, which is the one reader that chooses between the two
         // framings. Handing it the body is the point of the type, and handing
         // it a frame is a different call.
-        var clean_storage: DecodeStorage = .{};
+        var clean_storage: job_ns.DecodeStorage = .{};
         clean_storage.init();
         {
             var clean_reader = postcard.Reader.init(clean_bytes[1..]);
             const clean = try blobs.EofFraming.read(.get, &clean_reader, &clean_storage.inner);
             try t.expectEqual(blobs.RequestType.get, clean.discriminant());
-            try t.expectEqualSlices(u8, &blob_hash, &clean.get.hash);
+            try t.expectEqualSlices(u8, &ranges_mod.blob_hash, &clean.get.hash);
             try t.expectEqualSlices(
                 u64,
                 &disjoint_widths,
@@ -1567,7 +606,7 @@ test "a push body cannot be read as a get body, on the wire" {
             );
         }
         {
-            var wide: [request_room + payload_length]u8 = undefined;
+            var wide: [job_ns.request_room + ranges_mod.payload_length]u8 = undefined;
             @memcpy(wide[0..clean_bytes.len], clean_bytes);
             @memcpy(
                 wide[clean_bytes.len..][0..link.store.payload.len],
@@ -1591,7 +630,7 @@ test "a push body cannot be read as a get body, on the wire" {
     // its own captured hash; which named error it is depends on the bytes, and
     // that it is an error rather than a request does not.)
     {
-        var swapped: [request_room + payload_length]u8 = undefined;
+        var swapped: [job_ns.request_room + ranges_mod.payload_length]u8 = undefined;
         @memcpy(swapped[0..received_push.len], received_push);
         swapped[0] = @intFromEnum(blobs.RequestType.get);
         var reader = postcard.Reader.init(swapped[1..]);
@@ -1604,8 +643,8 @@ test "a push body cannot be read as a get body, on the wire" {
     // the hash's first byte is the declared body length. 0x5a is a one-byte
     // varint for ninety, and the frame has thirty-seven bytes left of it.
     {
-        const received_get = received(&link.provider_bytes, get.stream);
-        var swapped: [request_room]u8 = undefined;
+        const received_get = job_ns.received(&link.provider_bytes, get.stream);
+        var swapped: [job_ns.request_room]u8 = undefined;
         @memcpy(swapped[0..received_get.len], received_get);
         swapped[0] = @intFromEnum(blobs.RequestType.push);
         var reader = postcard.Reader.init(swapped[0..received_get.len]);
@@ -1635,7 +674,7 @@ test "a push body cannot be read as a get body, on the wire" {
 // ---------------------------------------------------------------------------
 
 test "a truncated answer is not a complete transfer, and no answer is EOF" {
-    var link: Link = undefined;
+    var link: link_ns.Link = undefined;
     try link.init();
     defer link.deinit();
 
@@ -1665,8 +704,8 @@ test "a truncated answer is not a complete transfer, and no answer is EOF" {
     try link.jobs[0].expect(&whole_expected);
     try link.jobs[1].expect(&disjoint_expected);
 
-    try link.ask(&link.jobs[0]);
-    try link.ask(&link.jobs[1]);
+    try job_ns.ask(&link, &link.jobs[0]);
+    try job_ns.ask(&link, &link.jobs[1]);
     try drive(&link, "a truncation request never arrived whole", allServed);
     try drive(&link, "a truncated answer never finished arriving", allComplete);
 
@@ -1721,14 +760,14 @@ test "a truncated answer is not a complete transfer, and no answer is EOF" {
 // ---------------------------------------------------------------------------
 
 test "a stream's received count is the count written, below and above its room" {
-    var bytes: std.AutoHashMap(u64, StreamBytes) = .init(t.allocator);
+    var bytes: std.AutoHashMap(u64, job_ns.StreamBytes) = .init(t.allocator);
     defer {
-        freeSides(&bytes);
+        job_ns.freeSides(&bytes);
         bytes.deinit();
     }
 
     const gop = try bytes.getOrPut(1);
-    if (!gop.found_existing) gop.value_ptr.* = StreamBytes.empty;
+    if (!gop.found_existing) gop.value_ptr.* = job_ns.StreamBytes.empty;
     const short = [_]u8{ 1, 2, 3 };
     try gop.value_ptr.push(&short);
 
@@ -1738,7 +777,7 @@ test "a stream's received count is the count written, below and above its room" 
     // first stop happened to be, so the count and the room cannot coincide and
     // the line below has teeth: an accessor that handed back the room instead
     // of the count fails exactly here and nowhere else in the file.
-    try t.expectEqual(@as(usize, short.len), received(&bytes, 1).len);
+    try t.expectEqual(@as(usize, short.len), job_ns.received(&bytes, 1).len);
     try t.expect(gop.value_ptr.room() > gop.value_ptr.slice().len);
 
     // ── above it ──
@@ -1753,15 +792,15 @@ test "a stream's received count is the count written, below and above its room" 
     const room_before = gop.value_ptr.room();
     try gop.value_ptr.push(bulk);
 
-    try t.expectEqual(short.len + bulk.len, received(&bytes, 1).len);
-    try t.expect(received(&bytes, 1).len > room_before);
+    try t.expectEqual(short.len + bulk.len, job_ns.received(&bytes, 1).len);
+    try t.expect(job_ns.received(&bytes, 1).len > room_before);
     try t.expect(gop.value_ptr.room() > room_before);
 
     // The count being right while the bytes are not is the other half of this
     // accessor, so the bytes are checked at both ends: the short answer, which
     // is where a count taken from the room would be visibly wrong, and the
     // bulk that followed it.
-    const whole = received(&bytes, 1);
+    const whole = job_ns.received(&bytes, 1);
     try t.expectEqualSlices(u8, &short, whole[0..short.len]);
     try t.expectEqualSlices(u8, bulk, whole[short.len..]);
 
@@ -1770,8 +809,8 @@ test "a stream's received count is the count written, below and above its room" 
     // answers a slice: the two questions are different and a caller asking for
     // the count of a stream it has never seen should not have to tell them
     // apart.
-    try t.expect(queueOf(&bytes, 2) == null);
-    try t.expectEqual(@as(usize, 0), received(&bytes, 2).len);
+    try t.expect(job_ns.queueOf(&bytes, 2) == null);
+    try t.expectEqual(@as(usize, 0), job_ns.received(&bytes, 2).len);
 }
 
 // ---------------------------------------------------------------------------

@@ -1047,7 +1047,11 @@ test "a non-exhaustive enum accepts a tag it has no named arm for" {
         // The named arm, the first tag past it, and a full u32.
         .{ .bytes = &.{0x00}, .value = 0, .named = true },
         .{ .bytes = &.{0x07}, .value = 7, .named = false },
-        .{ .bytes = &.{ 0xff, 0xff, 0xff, 0xff, 0x0f }, .value = std.math.maxInt(u32), .named = false },
+        .{
+            .bytes = &.{ 0xff, 0xff, 0xff, 0xff, 0x0f },
+            .value = std.math.maxInt(u32),
+            .named = false,
+        },
     };
     for (cases) |case| {
         var reader = Reader.init(case.bytes);

@@ -619,7 +619,10 @@ test "no egress room leaves the flight unsent, and the retry after it emits the 
 
     // Both refusals come before the core is asked for anything.
     try t.expectError(error.NoRoom, conn.drain(no_slot[0..], out[0..], start, client.random()));
-    try t.expectError(error.NoRoom, conn.drain(egress[0..], too_short[0..], start, client.random()));
+    try t.expectError(
+        error.NoRoom,
+        conn.drain(egress[0..], too_short[0..], start, client.random()),
+    );
 
     // And the flight is still there: the datagram both refusals declined to
     // produce is the one this call gets.
@@ -776,7 +779,11 @@ test "one egress slot at a time sends as much as the whole array sends" {
     var narrow_client: Client = undefined;
     try narrow_client.init(client_secret, server_secret.nodeId(), 32, start);
     defer narrow_client.deinit();
-    const narrow_len = try narrow_client.conn.sendAt(&narrow_client.buffer, start, narrow_client.random());
+    const narrow_len = try narrow_client.conn.sendAt(
+        &narrow_client.buffer,
+        start,
+        narrow_client.random(),
+    );
     const narrow_ingress = try narrow.recv(&narrow_map, .{
         .bytes = narrow_client.buffer[0..narrow_len],
         .from = client_addr,
@@ -802,7 +809,12 @@ test "one egress slot at a time sends as much as the whole array sends" {
     defer narrow_bytes.deinit(t.allocator);
     var passes: usize = 0;
     while (passes < max_rounds) : (passes += 1) {
-        const sends = try narrow_conn.drain(one[0..], narrow_out[0..], start, narrow_client.random());
+        const sends = try narrow_conn.drain(
+            one[0..],
+            narrow_out[0..],
+            start,
+            narrow_client.random(),
+        );
         if (sends.len == 0) break;
         for (sends) |send| try narrow_bytes.appendSlice(t.allocator, send.send.contents);
     }
