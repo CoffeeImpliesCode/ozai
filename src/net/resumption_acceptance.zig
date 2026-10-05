@@ -194,8 +194,8 @@ pub const Layer = enum {
 /// layer cannot miss one and cannot invent one.
 pub fn layerOf(refusal: Refusal) Layer {
     return switch (refusal) {
-        .WrongVersion, .WrongAlpn => .tls_core,
-        .Expired, .WrongPeer => .application,
+        error.WrongVersion, error.WrongAlpn => .tls_core,
+        error.Expired, error.WrongPeer => .application,
     };
 }
 
@@ -545,7 +545,9 @@ test "another peer's ticket is refused by name on the hand-held path only" {
 test "an expired resumption is refused, dropped and reported as this tree's own" {
     const peer = try testNodeId(1);
     var store: Store = .{};
-    try t.expect(store.capture(peer, ticketFor(alpn_main, quic_v1, 100, 1_000), 1_000).stored);
+    try t.expect(
+        store.capture(peer, ticketFor(alpn_main, quic_v1, 100, 1_000, 1_024), 1_000).stored,
+    );
 
     // Inside the lifetime the entry resumes.
     const live = fromStore(
@@ -583,8 +585,9 @@ test "an expired resumption is refused, dropped and reported as this tree's own"
 test "every refusal names its layer, and the mapping is total" {
     // The comptime sweep is the coverage: `Refusal` gains an arm and this stops
     // compiling rather than leaving the new one unclassified.
-    inline for (@typeInfo(Refusal).error_set.slice) |refusal| {
-        const layer = layerOf(@errorCast(refusal));
+    inline for (@typeInfo(Refusal).error_set.?) |member| {
+        const refusal: Refusal = @field(Refusal, member.name);
+        const layer = layerOf(refusal);
         try t.expect(layer == .tls_core or layer == .application);
     }
     // And the two byte-level refusals are the core's; the two that need a peer

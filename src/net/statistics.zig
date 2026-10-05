@@ -308,7 +308,10 @@ pub const Entry = struct {
     /// `SocketAddr.order`.
     subject: SocketAddr,
     /// How many measurements were started, answered or not.
-    attempted: Counter,
+    /// Zero by default, because filing is not a measurement: a subject `open`
+    /// has just filed carries nothing until `attempt` is called. See
+    /// `Opened.filed`.
+    attempted: Counter = .{},
     /// The round trips that came back. Never holds a failure.
     latency: Latencies = .{},
     /// When the last round trip came back. Null while nothing has.
@@ -388,7 +391,14 @@ const Where = union(enum) {
 pub const Table = struct {
     /// The subjects, first `len` of them ascending by `SocketAddr.order`.
     entries: [max_subjects]Entry = undefined,
+    /// How many entries of `entries` are live. Zero by default, and never
+    /// above `max_subjects`: `open` past it refuses rather than displaces.
+    len: usize = 0,
+
     /// How many subjects are being measured.
+    ///
+    /// `len` under the name a caller reads rather than the one the storage
+    /// bound has, so the count is stated once and read two ways.
     pub fn count(self: *const Table) usize {
         return self.len;
     }

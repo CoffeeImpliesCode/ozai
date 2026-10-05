@@ -437,8 +437,10 @@ fn converged(exchange: Exchange) bool {
     const count = collectRates(exchange, &scratch);
     if (count < min_rounds) return false;
     sortRates(scratch[0..count]);
-    const fastest = scratch[count - 1];
-    const slowest = scratch[0];
+    // The sort is descending, so the fastest is at index zero: the spread is
+    // only a subtraction in that order, and taking it the other way underflows.
+    const fastest = scratch[0];
+    const slowest = scratch[count - 1];
     return (fastest - slowest) * 100 <= fastest * converge_tolerance;
 }
 

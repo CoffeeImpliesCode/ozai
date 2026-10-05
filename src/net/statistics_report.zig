@@ -441,7 +441,10 @@ test "a report is a value of the table and of the instant, not a view" {
     entry.attempt(millis(90), test_now);
     entry.attempt(null, test_now);
     try t.expectEqual(@as(u64, 3), entry.attempted.value);
-    try t.expectEqual(@as(u64, 2), entry.failed());
+    // Three attempts, two of which came back: one failure. The refusal added
+    // a count and no sample, so it is in `attempted` and out of `recorded` —
+    // which is the same subtraction the report below is checked against.
+    try t.expectEqual(@as(u64, 1), entry.failed());
     try t.expectEqual(@as(u64, 1), before.slice()[0].attempted);
     try t.expectEqual(millis(10), before.slice()[0].slowest.?);
     try t.expect(testSubject(1).order(before.best.?) == .eq);

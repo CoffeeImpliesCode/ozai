@@ -71,17 +71,23 @@
 //! translate; this file produces the topic-level `OutEvent` a caller can hand
 //! straight to the same loop that drains `TopicState.handle`'s output.
 //!
+//! **`NodeId` comes from `base/key.zig` rather than from `gossip`,** because
+//! `hyparview.zig` does not re-export it and a `NodeId` is one type across the
+//! tree — the same spelling `topic_membership.zig` and `topic_policy.zig` use
+//! for the peers they answer about.
+//!
 //! **Nothing here has been checked against bytes from the reference, so no
 //! interoperability claim is made.** What is pinned is that a node refusing a
 //! frame names no action and answers nothing — a local property with no wire in
 //! it at all, which is the only kind this file can honestly assert.
 
 const std = @import("std");
+const base_key = @import("../base/key.zig");
 const gossip = @import("hyparview.zig");
 const plumtree = @import("plumtree.zig");
 const topic_policy = @import("topic_policy.zig");
 
-const NodeId = gossip.NodeId;
+const NodeId = base_key.NodeId;
 const TopicId = gossip.TopicId;
 const TopicPolicy = topic_policy.TopicPolicy;
 

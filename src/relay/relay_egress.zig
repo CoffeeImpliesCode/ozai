@@ -75,7 +75,6 @@ const std = @import("std");
 const node_route = @import("../node/node_relay_route.zig");
 const addr_map = @import("../transport/addr_map.zig");
 
-
 /// The node id a datagram is for. See `base/key.zig`.
 pub const NodeId = node_route.NodeId;
 

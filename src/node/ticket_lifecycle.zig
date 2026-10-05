@@ -20,7 +20,9 @@
 //! second on the caller's own clock and is only ever differenced inside the
 //! cache; the connection directory is borrowed read-only and never written
 //! through, because a connection belongs to the transport and not to a claim.
-
+//! The one allocator this file carries is the one `use` hands the cache to
+//! release a claim that has aged out, and it is the allocator `deinit` takes:
+//! releasing is not allocating, and there is no third owner here.
 const std = @import("std");
 const base_addr = @import("../base/addr.zig");
 const base_key = @import("../base/key.zig");
@@ -139,8 +141,9 @@ pub fn Lifecycle(comptime peers: usize) type {
         }
 
         /// Free every claim still held, and nothing else. See
-        /// `ticket_cache.deinit`: this is the one call that frees on the
-        /// cache's behalf, and it is safe to run twice.
+        /// `ticket_cache.deinit`: this is one of the two calls that free on the
+        /// cache's behalf, the other being the aged-out drop `use` asks for,
+        /// and it is safe to run twice.
         ///
         /// The borrowed connection directory is untouched, and this lifecycle
         /// must not be used afterward.
@@ -171,11 +174,15 @@ pub fn Lifecycle(comptime peers: usize) type {
         /// exists to repeat a round the stack refused, and a second round with
         /// no claim left is a round that has to start over.
         ///
+        /// `alloc` releases a claim the cache drops on the way through — an
+        /// aged-out one — and is reached on no other answer, so it is the same
+        /// allocator `deinit` takes rather than a third one.
+        ///
         /// An aged-out claim is dropped by the cache on the way through, so
         /// `.expired` frees a slot and a second ask is `.unknown`.
-        pub fn use(self: *Self, peer: NodeId, now_s: i64) Plan {
+        pub fn use(self: *Self, peer: NodeId, now_s: i64, alloc: Allocator) Plan {
             if (self.conns.connFor(peer)) |conn| return .{ .connected = conn };
-            return switch (self.cache.take(peer, now_s)) {
+            return switch (self.cache.take(peer, now_s, alloc)) {
                 .unknown => .unknown,
                 .expired => .expired,
                 .claim => |claim| .{ .claim = claim },
@@ -218,11 +225,16 @@ fn claimAddress(alloc: Allocator, seed: u8, url: []const u8) !NodeAddr {
     return NodeAddr.withRelay(alloc, node, try RelayUrl.parse(url));
 }
 
-/// The host of the one relay in `node`'s list.
+/// The host of the one relay in `node`'s list, borrowed from `node` itself.
+///
+/// Switched through a pointer and captured by pointer: a payload captured out
+/// of a value copy is a local, and the slice into it would be dead the moment
+/// this returned.
 fn relayHost(node: *const NodeAddr) ![]const u8 {
     try t.expectEqual(@as(usize, 1), node.addrs.len);
-    return switch (node.addrs[0]) {
-        .relay => |url| url.hostSlice(),
+    const one = &node.addrs[0];
+    return switch (one.*) {
+        .relay => |*url| url.hostSlice(),
         else => error.NotARelay,
     };
 }
@@ -245,7 +257,7 @@ test "a peer this node is speaking to is dialed and its claim is not touched" {
         0,
     ));
 
-    const conn = switch (life.use(peer, 10)) {
+    const conn = switch (life.use(peer, 10, t.allocator)) {
         .connected => |answer| answer,
         else => return error.NotConnected,
     };
@@ -256,7 +268,7 @@ test "a peer this node is speaking to is dialed and its claim is not touched" {
     // is the whole of what a connected peer costs the cache.
     try t.expectEqual(@as(usize, 1), life.cache.count());
     _ = index.remove(peer);
-    switch (life.use(peer, 11)) {
+    switch (life.use(peer, 11, t.allocator)) {
         .claim => |claim| try t.expectEqual(@as(u32, 1), claim.uses),
         else => return error.NotAClaim,
     }
@@ -272,14 +284,14 @@ test "a peer that was never filed and a peer whose claim aged out are two answer
     defer life.deinit(t.allocator);
 
     const peer = try node_test_ids.testNodeId(2);
-    try t.expectEqual(Plan.unknown, life.use(peer, 0));
+    try t.expectEqual(Plan.unknown, life.use(peer, 0, t.allocator));
     try t.expectEqual(Put.stored, try life.cache.put(
         try claimAddress(t.allocator, 2, relay_a),
         100,
     ));
 
     // Fresh inside the lifetime: the claim and the connection between them.
-    switch (life.use(peer, 100 + ticket_cache.ticket_lifetime_s)) {
+    switch (life.use(peer, 100 + ticket_cache.ticket_lifetime_s, t.allocator)) {
         .claim => |claim| try t.expectEqualStrings(host_a, try relayHost(claim.addr)),
         else => return error.NotAClaim,
     }
@@ -288,10 +300,13 @@ test "a peer that was never filed and a peer whose claim aged out are two answer
     // the next ask is a cold one rather than a second expiry of nothing.
     try t.expectEqual(
         Plan.expired,
-        life.use(peer, 101 + ticket_cache.ticket_lifetime_s),
+        life.use(peer, 101 + ticket_cache.ticket_lifetime_s, t.allocator),
     );
     try t.expectEqual(@as(usize, 0), life.cache.count());
-    try t.expectEqual(Plan.unknown, life.use(peer, 102 + ticket_cache.ticket_lifetime_s));
+    try t.expectEqual(
+        Plan.unknown,
+        life.use(peer, 102 + ticket_cache.ticket_lifetime_s, t.allocator),
+    );
 }
 
 test "two callers reaching for one peer both get it and the second use is counted" {
@@ -309,11 +324,11 @@ test "two callers reaching for one peer both get it and the second use is counte
         0,
     ));
 
-    const first = switch (life.use(peer, 10)) {
+    const first = switch (life.use(peer, 10, t.allocator)) {
         .claim => |claim| claim,
         else => return error.NotAClaim,
     };
-    const second = switch (life.use(peer, 11)) {
+    const second = switch (life.use(peer, 11, t.allocator)) {
         .claim => |claim| claim,
         else => return error.NotAClaim,
     };
@@ -360,12 +375,12 @@ test "a claim is dropped by discard and the claims around it are not" {
     // The peers on either side of the gap still answer with their own claims,
     // and the discarded one answers as a peer that was never filed.
     for ([_]u8{ 1, 3 }) |seed| {
-        switch (life.use(try node_test_ids.testNodeId(seed), 1)) {
+        switch (life.use(try node_test_ids.testNodeId(seed), 1, t.allocator)) {
             .claim => |claim| try t.expectEqualStrings(host_a, try relayHost(claim.addr)),
             else => return error.NotAClaim,
         }
     }
-    try t.expectEqual(Plan.unknown, life.use(try node_test_ids.testNodeId(2), 1));
+    try t.expectEqual(Plan.unknown, life.use(try node_test_ids.testNodeId(2), 1, t.allocator));
 
     // A second discard of the same peer costs nothing, which is what makes a
     // path that discards on a failed dial and again on the disconnect safe.
@@ -431,7 +446,7 @@ test "an offer for a connected peer is kept, because the connection ends first" 
     try t.expectEqual(@as(usize, 1), life.cache.count());
 
     _ = index.remove(peer);
-    switch (life.use(peer, 10)) {
+    switch (life.use(peer, 10, t.allocator)) {
         .claim => |claim| try t.expectEqualStrings(host_a, try relayHost(claim.addr)),
         else => return error.NotAClaim,
     }

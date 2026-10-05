@@ -68,15 +68,15 @@ const corpus = [_][]const u8{
     &.{ 0x82, 0x7e, 0x01, 0x00 }, // width_16_header: RFC 5.7, with no body behind it
     &.{ 0x82, 0x7f, 0, 0, 0, 0, 0, 0x01, 0, 0 }, // width_64_header: RFC 5.7, likewise
     &.{0x81}, // one_byte: half a header
-    &.{0x81, 0x85}, // masked_no_key: a mask bit with no key behind it
-    &.{0x81, 0x05}, // header_no_payload: a legal header and no body
+    &.{ 0x81, 0x85 }, // masked_no_key: a mask bit with no key behind it
+    &.{ 0x81, 0x05 }, // header_no_payload: a legal header and no body
     &.{ 0x81, 0x7e, 0x00, 0x7d }, // nonminimal_16: 125 in the sixteen-bit field
     &.{ 0x81, 0x7f, 0, 0, 0, 0, 0, 0, 0, 0x01 }, // reserved_length_bit: the top bit set
-    &.{0xc1, 0x00}, // rsv1_set: an extension nobody negotiated
-    &.{0x83, 0x00}, // reserved_opcode: 3 is one of the three RFC reserves
-    &.{0x8b, 0x00}, // undefined_opcode: 11 is above the six the RFC defines
-    &.{0x09, 0x00}, // fragmented_control: a ping with FIN clear
-    &.{0x89, 0x7e, 0x00, 0x00}, // control_too_long: 126 is over the 125 ceiling
+    &.{ 0xc1, 0x00 }, // rsv1_set: an extension nobody negotiated
+    &.{ 0x83, 0x00 }, // reserved_opcode: 3 is one of the three RFC reserves
+    &.{ 0x8b, 0x00 }, // undefined_opcode: 11 is above the six the RFC defines
+    &.{ 0x09, 0x00 }, // fragmented_control: a ping with FIN clear
+    &.{ 0x89, 0x7e, 0x00, 0x00 }, // control_too_long: 126 is over the 125 ceiling
 };
 
 /// Long enough for a seed and for a mutated input to still reach a check it was
@@ -113,10 +113,10 @@ const decode_cases = [_]DecodeCase{
     .{ .bytes = &.{ 0x83, 0x00 }, .role = .server, .expected = error.UnknownOpcode },
     .{ .bytes = &.{ 0x8b, 0x00 }, .role = .server, .expected = error.UnknownOpcode },
     .{ .bytes = &.{0xfb}, .role = .server, .expected = error.UnknownOpcode },
-    .{ .bytes = &.{0x89, 0x7e}, .role = .server, .expected = error.ControlFrameTooLong },
-    .{ .bytes = &.{0x8a, 0x7f}, .role = .server, .expected = error.ControlFrameTooLong },
-    .{ .bytes = &.{0x09, 0x00}, .role = .server, .expected = error.FragmentedControlFrame },
-    .{ .bytes = &.{0x01, 0x7e, 0x00, 0x7d}, .role = .client, .expected = error.NonMinimalLength },
+    .{ .bytes = &.{ 0x89, 0x7e }, .role = .server, .expected = error.ControlFrameTooLong },
+    .{ .bytes = &.{ 0x8a, 0x7f }, .role = .server, .expected = error.ControlFrameTooLong },
+    .{ .bytes = &.{ 0x09, 0x00 }, .role = .server, .expected = error.FragmentedControlFrame },
+    .{ .bytes = &.{ 0x01, 0x7e, 0x00, 0x7d }, .role = .client, .expected = error.NonMinimalLength },
     .{
         .bytes = &.{ 0x01, 0x7f, 0, 0, 0, 0, 0, 0, 0, 0x01 },
         .role = .client,
@@ -128,9 +128,9 @@ const decode_cases = [_]DecodeCase{
         .expected = error.ReservedLengthBit,
     },
     .{ .bytes = &.{0x81}, .role = .client, .expected = error.UnexpectedEnd },
-    .{ .bytes = &.{0x81, 0x85}, .role = .client, .expected = error.UnexpectedEnd },
-    .{ .bytes = &.{0x81, 0x05}, .role = .client, .expected = error.UnexpectedEnd },
-    .{ .bytes = &.{0x81, 0x05}, .role = .server, .expected = error.UnmaskedClientFrame },
+    .{ .bytes = &.{ 0x81, 0x85 }, .role = .client, .expected = error.UnexpectedEnd },
+    .{ .bytes = &.{ 0x81, 0x05 }, .role = .client, .expected = error.UnexpectedEnd },
+    .{ .bytes = &.{ 0x81, 0x05 }, .role = .server, .expected = error.UnmaskedClientFrame },
     .{
         .bytes = &.{ 0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d },
         .role = .server,
@@ -162,10 +162,10 @@ const header_cases = [_]HeaderCase{
     .{ .bytes = &.{0x81}, .expected = error.UnexpectedEnd },
     .{ .bytes = &.{ 0x81, 0x7e, 0x00, 0x00 }, .expected = error.UnexpectedEnd },
     .{ .bytes = &.{ 0x81, 0x7f, 0x00, 0x00 }, .expected = error.UnexpectedEnd },
-    .{ .bytes = &.{0xc1, 0x00}, .expected = error.ReservedBitSet },
-    .{ .bytes = &.{0x83, 0x00}, .expected = error.UnknownOpcode },
-    .{ .bytes = &.{0x89, 0x7e}, .expected = error.ControlFrameTooLong },
-    .{ .bytes = &.{0x09, 0x00}, .expected = error.FragmentedControlFrame },
+    .{ .bytes = &.{ 0xc1, 0x00 }, .expected = error.ReservedBitSet },
+    .{ .bytes = &.{ 0x83, 0x00 }, .expected = error.UnknownOpcode },
+    .{ .bytes = &.{ 0x89, 0x7e }, .expected = error.ControlFrameTooLong },
+    .{ .bytes = &.{ 0x09, 0x00 }, .expected = error.FragmentedControlFrame },
     .{ .bytes = &.{ 0x81, 0x7e, 0x00, 0x7d }, .expected = error.NonMinimalLength },
     .{ .bytes = &.{ 0x81, 0x7f, 0x80, 0, 0, 0, 0, 0, 0, 0 }, .expected = error.ReservedLengthBit },
     .{ .bytes = &.{ 0x82, 0x7f, 0, 0, 0, 0, 0x10, 0, 0, 0 }, .expected = error.FrameTooLarge },

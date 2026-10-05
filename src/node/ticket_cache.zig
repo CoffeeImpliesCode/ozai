@@ -26,9 +26,10 @@
 //! one place this file departs from `conn_index.zig`'s "allocates nothing": a
 //! `NodeAddr` owns one heap list (`base/addr.zig`), so a cache of claims
 //! cannot be a value with nothing behind it. The allocator is a parameter of
-//! the one call that frees and of no other — `put` and `take` allocate
-//! nothing at all, and `forget` hands the caller what it removed rather than
-//! freeing it.
+//! the two calls that release and of no other — `deinit`, and the aged-out
+//! drop inside `take`, which frees a claim there is no caller left to hand it
+//! to. `put` allocates nothing at all, and `forget` hands the caller what it
+//! removed rather than freeing it.
 
 const std = @import("std");
 const base_addr = @import("../base/addr.zig");
@@ -230,13 +231,13 @@ pub fn TicketCache(comptime capacity: usize) type {
 
         /// Free every claim still held, and nothing else.
         ///
-        /// **This is the only place in the file that frees.** `forget` and
-        /// `Put.replaced` hand the list back instead, so there is exactly one
-        /// call that releases an address on this cache's behalf and one place
-        /// a leak could be. It is `NodeAddr.deinit` per entry: the outer list
-        /// and nothing else, because a `.custom` payload inside it is a borrow
-        /// whoever parsed it and `base/addr.zig` is where that obligation is
-        /// stated.
+        /// **This is one of the two calls that free**, the other being the
+        /// aged-out drop inside `take`. `forget` and `Put.replaced` hand the
+        /// list back instead, so an address leaves on this cache's behalf only
+        /// when there is no caller left who might still want to read it. It is
+        /// `NodeAddr.deinit` per entry: the outer list and nothing else,
+        /// because a `.custom` payload inside it is a borrow whoever parsed it
+        /// and `base/addr.zig` is where that obligation is stated.
         ///
         /// `len` goes to zero, so a second call frees nothing rather than
         /// freeing twice. Everything borrowed from the cache — a `Claim`, and
@@ -252,6 +253,9 @@ pub fn TicketCache(comptime capacity: usize) type {
         }
 
         /// The claim for `peer`, whether it is fresh, and mark it used.
+        ///
+        /// `alloc` releases a claim this call drops — an aged-out one — and is
+        /// reached on no other answer.
         ///
         /// **Used is not consumed.** The claim stays in the cache and stays
         /// answerable however many times it is taken; this counts rather than
@@ -271,10 +275,13 @@ pub fn TicketCache(comptime capacity: usize) type {
         /// That is `transport/session_store.zig`'s rule for an expired session
         /// ticket, and the reason is the same: handing a stale claim back
         /// spends a dial on an address that was already known not to work.
-        pub fn take(self: *Self, peer: NodeId, now_s: i64) Taken {
+        /// Unlike `forget` there is no caller to hand it to instead — this
+        /// answer learned nothing and was asked for a claim, so the list goes
+        /// back to the allocator here rather than to the caller.
+        pub fn take(self: *Self, peer: NodeId, now_s: i64, alloc: Allocator) Taken {
             const index = self.indexOf(peer) orelse return .unknown;
             if (!isFresh(self.entries[index], now_s)) {
-                _ = self.dropAt(index);
+                self.dropAt(index).deinit(alloc);
                 return .expired;
             }
             self.entries[index].uses +|= 1;
@@ -388,11 +395,16 @@ fn claimAddress(alloc: Allocator, seed: u8, url: []const u8) !NodeAddr {
     return NodeAddr.withRelay(alloc, node, try RelayUrl.parse(url));
 }
 
-/// The host of the one relay in `node`'s list.
+/// The host of the one relay in `node`'s list, borrowed from `node` itself.
+///
+/// Switched through a pointer and captured by pointer: a payload captured out
+/// of a value copy is a local, and the slice into it would be dead the moment
+/// this returned.
 fn relayHost(node: *const NodeAddr) ![]const u8 {
     try t.expectEqual(@as(usize, 1), node.addrs.len);
-    return switch (node.addrs[0]) {
-        .relay => |url| url.hostSlice(),
+    const one = &node.addrs[0];
+    return switch (one.*) {
+        .relay => |*url| url.hostSlice(),
         else => error.NotARelay,
     };
 }
@@ -409,7 +421,7 @@ test "a filed claim is found by the peer it names and an unfiled peer has none" 
     // spends a slot.
     try t.expectEqual(@as(usize, 0), cache.count());
     const stranger = try node_test_ids.testNodeId(1);
-    try t.expectEqual(Taken.unknown, cache.take(stranger, 0));
+    try t.expectEqual(Taken.unknown, cache.take(stranger, 0, t.allocator));
 
     try t.expectEqual(Put.stored, try cache.put(
         try claimAddress(t.allocator, 1, relay_a),
@@ -419,14 +431,14 @@ test "a filed claim is found by the peer it names and an unfiled peer has none" 
 
     // The claim answers under the peer its own `node_id` names, and carries the
     // address that was offered rather than a neighbour's.
-    const taken = switch (cache.take(stranger, 10)) {
+    const taken = switch (cache.take(stranger, 10, t.allocator)) {
         .claim => |claim| claim,
         else => return error.NotAClaim,
     };
     try t.expectEqualStrings(host_a, try relayHost(taken.addr));
     // A claim is marked used, not consumed: the second take is the same claim.
     try t.expectEqual(@as(u32, 1), taken.uses);
-    const again = switch (cache.take(stranger, 11)) {
+    const again = switch (cache.take(stranger, 11, t.allocator)) {
         .claim => |claim| claim,
         else => return error.NotAClaim,
     };
@@ -459,7 +471,7 @@ test "a second offer for one peer replaces its claim and hands the old one back"
 
     // One entry, the new address, and a claim counted from the new offer.
     try t.expectEqual(@as(usize, 1), cache.count());
-    const taken = switch (cache.take(peer, 61)) {
+    const taken = switch (cache.take(peer, 61, t.allocator)) {
         .claim => |claim| claim,
         else => return error.NotAClaim,
     };
@@ -484,7 +496,7 @@ test "an offer naming no address is refused and the claim it would have replaced
     // that had a claim cannot trade it for one that says nothing.
     try t.expectError(error.NoPaths, cache.put(NodeAddr.init(peer), 10));
     // The caller still owns what it offered: the refusal allocated nothing.
-    const taken = switch (cache.take(peer, 11)) {
+    const taken = switch (cache.take(peer, 11, t.allocator)) {
         .claim => |claim| claim,
         else => return error.NotAClaim,
     };
@@ -506,7 +518,7 @@ test "a claim ages out from the moment it was filed and a use does not renew it"
 
     // Fresh just inside the lifetime, and the use does not move the filing
     // time: a claim this node just dialled and failed on is as old as it was.
-    const used = switch (cache.take(peer, 100 + ticket_lifetime_s)) {
+    const used = switch (cache.take(peer, 100 + ticket_lifetime_s, t.allocator)) {
         .claim => |claim| claim,
         else => return error.NotAClaim,
     };
@@ -514,9 +526,9 @@ test "a claim ages out from the moment it was filed and a use does not renew it"
 
     // One second later it is gone, and gone means gone: the slot is free, so
     // the next ask is a cold one rather than a second expiry.
-    try t.expectEqual(Taken.expired, cache.take(peer, 101 + ticket_lifetime_s));
+    try t.expectEqual(Taken.expired, cache.take(peer, 101 + ticket_lifetime_s, t.allocator));
     try t.expectEqual(@as(usize, 0), cache.count());
-    try t.expectEqual(Taken.unknown, cache.take(peer, 102 + ticket_lifetime_s));
+    try t.expectEqual(Taken.unknown, cache.take(peer, 102 + ticket_lifetime_s, t.allocator));
 
     // The slot the drop freed is one the next offer can take.
     try t.expectEqual(Put.stored, try cache.put(
@@ -541,7 +553,7 @@ test "a claim stamped in the future is not a fresh one" {
     // A clock that moved back leaves the age negative, and a negative age read
     // as fresh would make this the youngest claim in the cache. Fail closed
     // instead: the node cannot say how old it is, so it does not offer it.
-    try t.expectEqual(Taken.expired, cache.take(peer, 0));
+    try t.expectEqual(Taken.expired, cache.take(peer, 0, t.allocator));
     try t.expectEqual(@as(usize, 0), cache.count());
 }
 
@@ -567,17 +579,18 @@ test "a full cache refuses a peer it does not hold and keeps every claim it had"
     // One peer past the bound is refused, and the refusal is an error the
     // caller can count rather than an eviction it has to detect.
     const stranger = try node_test_ids.testNodeId(200);
-    try t.expectError(
-        error.NoFreeTicket,
-        cache.put(try claimAddress(t.allocator, 200, relay_b), 10),
-    );
+    // A refusal takes nothing and allocates nothing, so the offer is still the
+    // caller's: `put` takes the list over on a filing and on nothing else.
+    const refused = try claimAddress(t.allocator, 200, relay_b);
+    defer refused.deinit(t.allocator);
+    try t.expectError(error.NoFreeTicket, cache.put(refused, 10));
     try t.expectEqual(@as(usize, max_tickets), cache.count());
-    try t.expectEqual(Taken.unknown, cache.take(stranger, 10));
+    try t.expectEqual(Taken.unknown, cache.take(stranger, 10, t.allocator));
 
     // Every peer already held still answers with its own claim.
     for (0..max_tickets) |offset| {
         const seed: u8 = @intCast(offset + 1);
-        switch (cache.take(try node_test_ids.testNodeId(seed), 10)) {
+        switch (cache.take(try node_test_ids.testNodeId(seed), 10, t.allocator)) {
             .claim => |claim| {
                 try t.expectEqualStrings(host_a, try relayHost(claim.addr));
             },
@@ -646,7 +659,7 @@ test "a forgotten claim is gone and the claims around it are not" {
     // each of them sits in: `forget` closes the gap with the last entry and
     // drops nothing else.
     for ([_]u8{ 1, 3 }) |seed| {
-        switch (cache.take(try node_test_ids.testNodeId(seed), 1)) {
+        switch (cache.take(try node_test_ids.testNodeId(seed), 1, t.allocator)) {
             .claim => |claim| try t.expectEqualStrings(host_a, try relayHost(claim.addr)),
             else => return error.NotAClaim,
         }

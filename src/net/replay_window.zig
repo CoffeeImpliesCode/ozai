@@ -191,8 +191,8 @@ pub const Window = struct {
     /// answers the same thing twice — the record it finds is the record
     /// `admit` would refuse on.
     pub fn suppressing(self: *const Window, id: RequestId, now_s: i64) bool {
-        const entry = self.find(id) orelse return false;
-        return entry.live(now_s);
+        const index = self.find(id) orelse return false;
+        return self.entries[index].live(now_s);
     }
 
     /// Admit `id` as an early-data request, and say whether it is new.
@@ -272,7 +272,7 @@ const t = std.testing;
 
 /// Thirty-two: the width of every other content name in this tree, asserted
 /// at comptime so the field and the helper that fills it cannot drift.
-const request_id_len = RequestId.len;
+const request_id_len = @sizeOf(RequestId);
 comptime {
     std.debug.assert(request_id_len == 32);
 }

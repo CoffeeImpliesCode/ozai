@@ -295,7 +295,7 @@ pub const Sequence = struct {
 /// `198.51.100.7` as an IPv4-mapped IPv6 address: RFC 4291 §2.5.5.2's ten
 /// zeros, two `0xff`, and the four address octets.
 const mapped_v6: [16]u8 = .{
-    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0,    0,    0,   0,  0,   0,
     0, 0, 0xff, 0xff, 198, 51, 100, 7,
 };
 
@@ -303,8 +303,8 @@ const mapped_v6: [16]u8 = .{
 /// zeros and the four octets. One `0xff` pair is the whole difference between
 /// this and `mapped_v6`, and it is the difference between unmapping and not.
 const compatible_v6: [16]u8 = .{
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0,    0, 198, 51, 100, 7,
+    0, 0, 0, 0, 0,   0,  0,   0,
+    0, 0, 0, 0, 198, 51, 100, 7,
 };
 
 /// `2001:db8::7`, from the documentation prefix. A real v6 address, and the

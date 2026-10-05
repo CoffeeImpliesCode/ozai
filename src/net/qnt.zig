@@ -341,6 +341,12 @@ pub fn encode(frame: Frame, out: []u8) Error!usize {
     var offset: usize = 0;
     offset += try putVarint(out[offset..], frameTypeOf(frame.family));
     offset += try putVarint(out[offset..], frame.sequence);
+    // The one fixed-width field, guarded the way `qad.zig` guards its address:
+    // a buffer that ends inside the challenge is `NoRoom`, not a slice of a
+    // slice that has run out. Every varint field is checked by `putVarint`
+    // itself, so without this a buffer one byte short of this copy panicked
+    // where the rest of the frame answers.
+    if (out[offset..].len < challenge_length) return error.NoRoom;
     @memcpy(out[offset..][0..challenge_length], frame.challenge[0..]);
     offset += challenge_length;
     offset += try putVarint(out[offset..], frame.timestamp);
@@ -747,7 +753,7 @@ test "a range list past the ceiling is refused, never clipped" {
 
 test "an inverted range and a non-canonical list are three refusals" {
     var scratch: [max_frame_length]u8 = undefined;
-    const out = [_]u8{0} ** max_frame_length;
+    var out: [max_frame_length]u8 = [_]u8{0} ** max_frame_length;
 
     // 20 then 10: the range names no packet numbers at all.
     try t.expectError(

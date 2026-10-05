@@ -469,7 +469,7 @@ test "a fresh figure is owed nothing and a stale one is owed a challenge" {
     // The path challenged is the entry's own address, and the attempt is timed
     // on the caller's timeline rather than on either of `probe_live`'s.
     try t.expect(sameAddress(ask.path, at(1000)));
-    try t.expectEqual(Nanos, ask.at);
+    try t.expectEqual(@as(Nanos, now), ask.at);
     try t.expectEqual(now, ask.at);
     try t.expectEqual(now + probe_grace, ask.deadline);
 
@@ -560,7 +560,7 @@ test "an attempt out is nothing new owed, and it drains through silence" {
     const late = 1_000 + unverified_after + 1;
     try t.expectEqual(Verdict.unverified, silence(&outstanding, &entry, late).?);
     try t.expectEqual(@as(usize, 0), outstanding.count());
-    try t.expectEqual(Nanos, entry.rtt_at);
+    try t.expectEqual(@as(Nanos, 1_000), entry.rtt_at);
     try t.expectEqual(PathStatus.open, entry.status);
 
     // The next turn asks again, and a second discharge of nothing is refused
@@ -628,7 +628,7 @@ test "a figure is read against the record before the record is written" {
     // And nothing was written here: the entry the caller holds is a value and
     // still carries the record the figure was read against.
     try t.expectEqual(@as(?Nanos, 20 * millis), entry.rtt);
-    try t.expectEqual(Nanos, entry.rtt_at);
+    try t.expectEqual(@as(Nanos, 0), entry.rtt_at);
     try t.expectEqual(@as(?Nanos, 20 * millis), table.get(at(1000)).?.rtt);
 
     // Write the figure and the same figure reads as confirmed against itself,
@@ -636,7 +636,7 @@ test "a figure is read against the record before the record is written" {
     try t.expect(table.sample(at(1000), 40 * millis, now));
     const written = table.get(at(1000)).?;
     try t.expectEqual(@as(?Nanos, 40 * millis), written.rtt);
-    try t.expectEqual(Nanos, written.rtt_at);
+    try t.expectEqual(@as(Nanos, now), written.rtt_at);
     try t.expectEqual(Reading.confirmed, path_revalidate.classify(&written, 40 * millis));
     // The regression is recorded regardless — the record changes at once.
     try t.expectEqual(PathStatus.open, written.status);
@@ -763,11 +763,11 @@ test "the windows are the ones the module doc claims" {
     const entry = entryWith(20 * millis, 0);
 
     // Borrowed, not restated: this file holds no copy of any of them.
-    try t.expectEqual(Nanos, probe_grace);
-    try t.expectEqual(Nanos, path_revalidate.probe_grace);
-    try t.expectEqual(Nanos, unverified_after - revalidate_after);
-    try t.expectEqual(Nanos, path_revalidate.unverified_after);
-    try t.expectEqual(Nanos, path_revalidate.revalidate_after);
+    try t.expectEqual(@as(Nanos, 10 * std.time.ns_per_s), probe_grace);
+    try t.expectEqual(@as(Nanos, 10 * std.time.ns_per_s), path_revalidate.probe_grace);
+    try t.expectEqual(@as(Nanos, 10 * std.time.ns_per_s), unverified_after - revalidate_after);
+    try t.expectEqual(@as(Nanos, 20 * std.time.ns_per_s), path_revalidate.unverified_after);
+    try t.expectEqual(@as(Nanos, 10 * std.time.ns_per_s), path_revalidate.revalidate_after);
 
     // An attempt made at the first stale instant is given up one nanosecond
     // after the entry reads `.unverified`, so the attempt never holds the

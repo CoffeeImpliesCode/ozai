@@ -332,6 +332,27 @@ const Allowlist = struct {
     }
 };
 
+/// A policy that refuses in its own name but supplies no sentence of its own,
+/// which is `access_policy.Reason.text` being null.
+///
+/// **A second fixture rather than a flag on `Allowlist`, because the case under
+/// test is exactly the one `Allowlist` cannot produce.** An operator who wrote
+/// no words reads as the relay's default, and a policy that always writes some
+/// cannot demonstrate that; the alternative — a `quiet: bool` read inside
+/// `decide` — would put the assertion's subject in the code being asserted on.
+const Unspoken = struct {
+    asked: u32 = 0,
+
+    /// Refuses every peer by code and by nothing else, which is the whole of
+    /// the case: the code reaches the operator's counters and no sentence
+    /// reaches the peer from here.
+    fn decide(context: ?*anyopaque, _: Identity) Decision {
+        const self: *Unspoken = @ptrCast(@alignCast(context.?));
+        self.asked += 1;
+        return .{ .refuse = .{ .code = .unknown_peer, .text = null } };
+    }
+};
+
 /// An instant far enough from zero that nothing here underflows it.
 const start: relay_auth_wiring.Nanos = 1_000_000_000;
 
@@ -445,18 +466,32 @@ test "a governed relay asks its policy once, and the refusal keeps the operator'
     // The same refusal without a sentence of the operator's own reads as the
     // relay's default, which is upstream's arrangement (`handshake.rs:543`) and
     // is not the same as having chosen those words.
-    var quiet: Allowlist = .{ .allowed = allowed };
+    //
+    // **`Unspoken` and not `Allowlist`, because `Allowlist` cannot produce this
+    // case at all**: it writes a sentence on every refusal, so pointing this
+    // assertion at it would have been asserting the wrong thing — the branch
+    // under test is `Plan.admit`'s fallback for a null `text`, and a fixture
+    // that never produces a null `text` never reaches it.
+    var quiet: Unspoken = .{};
     const silent = try plan(.{
-        .admission = .{ .governed = .{ .context = &quiet, .decide = Allowlist.decide } },
+        .admission = .{ .governed = .{ .context = &quiet, .decide = Unspoken.decide } },
     });
-    try t.expectEqualStrings(
-        default_denial,
-        silent.admit(.{
-            .node_id = stranger,
-            .connection_id = 44,
-            .mechanism = .signed_challenge,
-        }).refuse.text,
+    const unspoken = silent.admit(.{
+        .node_id = stranger,
+        .connection_id = 44,
+        .mechanism = .signed_challenge,
+    });
+    try t.expectEqualStrings(default_denial, unspoken.refuse.text);
+    // The operator's own code survives the missing sentence: a relay that fell
+    // back to `default_denial` by dropping the code with it would leave the
+    // operator's counters saying something they never wrote.
+    try t.expectEqual(
+        Refusal{ .cause = .{ .policy_refused = .unknown_peer }, .text = default_denial },
+        unspoken.refuse,
     );
+    // Asked once, like every other peer: the sentence that is missing is the
+    // operator's, not the relay's asking.
+    try t.expectEqual(@as(u32, 1), quiet.asked);
 }
 
 test "a mechanism this relay cannot perform is refused before a peer arrives" {
@@ -476,7 +511,10 @@ test "a mechanism this relay cannot perform is refused before a peer arrives" {
     // The arm that does run is accepted, and the admission shape survives the
     // check unchanged: checking a configuration does not edit it.
     const open = try plan(.{ .admission = .open, .mechanism = .signed_challenge });
-    try t.expectEqual(std.meta.activeTag(@as(Admission, .open)), std.meta.activeTag(open.admission));
+    try t.expectEqual(
+        std.meta.activeTag(@as(Admission, .open)),
+        std.meta.activeTag(open.admission),
+    );
     try t.expectEqual(AvailableMechanism.signed_challenge, open.mechanism);
 }
 

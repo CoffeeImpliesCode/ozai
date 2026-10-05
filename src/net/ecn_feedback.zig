@@ -206,20 +206,35 @@ pub const Standing = enum {
 /// (`vendor/quic/src/quic/ecn.zig:132-140`). Deltas rather than totals because
 /// a total cannot be compared against a path's own send history without the
 /// in-flight set, which is the core's to hold.
+///
+/// **Zero is what each of them means when the peer accounted for none of those
+/// packets, so all three default to zero.** That report is one this module is
+/// named for — `observe` reads it as silence, and silence clears nothing — so
+/// it has to be spellable: `.{}` is "no report" and `.{ .acked = 9 }` is the
+/// shortfall. `ack_handler`'s three counters, which are the numbers these are,
+/// default the same way (`vendor/quic/src/quic/ack_handler.zig:823-830`).
+///
+/// A default here cannot state a claim. Zero `acked` is never above
+/// `accounted()`, so it cannot invent a shortfall, and zero `ect0` and `ce`
+/// leave `codepoint` null, so they cannot advance `clean_run`. What a default
+/// cannot recover is a real shortfall a caller left out, and `acked` is the
+/// core's own number rather than this module's — see the module doc under "A
+/// dropped mark" — so stating it is the caller's obligation whatever the
+/// default says.
 pub const Seen = struct {
     /// Marked packets this peer has newly acknowledged on this path.
     ///
     /// Marked means the codepoint went on the wire, so a packet whose control
     /// message the socket refused is not in here and cannot appear as a
     /// shortfall — see the module doc under "A dropped mark".
-    acked: u64,
+    acked: u64 = 0,
     /// Of those, how many arrived ECT(0): the mark survived the path.
-    ect0: u64,
+    ect0: u64 = 0,
     /// Of those, how many arrived CE: the path was congested and said so.
     ///
     /// Congestion is reported for a packet the path already accepted, so this
     /// is never evidence that the path is idle.
-    ce: u64,
+    ce: u64 = 0,
 
     /// How many of `acked` the peer accounted for with a codepoint at all.
     ///

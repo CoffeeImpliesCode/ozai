@@ -394,7 +394,7 @@ const doc_v6: [16]u8 = .{
 /// `198.51.100.7` in the IPv4-mapped IPv6 form, so a test can name the spelling
 /// a dual-stack relay produces.
 const mapped_v6: [16]u8 = .{
-    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0,    0,    0,   0,  0,   0,
     0, 0, 0xff, 0xff, 198, 51, 100, 7,
 };
 
@@ -640,7 +640,7 @@ test "a mapped address is claimed as the v4 address it names, and never as v6" {
     // exactly as `report_fold.fold` drops it (`report_fold.zig:276-283`).
     const mismatched = seen(b, public_v4, 12, .v6, .v6);
     try t.expect(!mismatched.isAddressBearing());
-    const dropped = fold(&.{ mismatched });
+    const dropped = fold(&.{mismatched});
     try t.expectEqual(@as(?Claim, null), dropped.v4);
     try t.expectEqual(@as(?Claim, null), dropped.v6);
 

@@ -75,17 +75,17 @@ const NodeId = ozai.NodeId;
 const corpus = [_][]const u8{
     &.{}, // empty: no prefix at all
     &.{0x02}, // length_without_body: a prefix and nothing behind it
-    &.{0x40, 0x00}, // length_past_end: 64 bytes named, none sent
-    &.{0x01, 0x00, 0x00, 0x05, 0x00}, // trailing_byte: a body and a byte behind it
+    &.{ 0x40, 0x00 }, // length_past_end: 64 bytes named, none sent
+    &.{ 0x01, 0x00, 0x00, 0x05, 0x00 }, // trailing_byte: a body and a byte behind it
     &.{0x02}, // unknown_layer: no arm names this layer
-    &.{0x80, 0x01}, // wide_layer_varint: the same layer, two groups long
-    &.{0x02, 0x00, 0x06}, // unknown_swarm_arm: one past the membership table
-    &.{0x02, 0x01, 0x04}, // unknown_tree_arm: one past the broadcast table
-    &.{0x04, 0x00, 0x04, 0x02, 0x00}, // unknown_priority: a `Neighbor`'s third value
-    &.{0x04, 0x00, 0x05, 0x02, 0x00}, // bad_bool: a `Disconnect` whose `alive` is 2
-    &.{0x01, 0x00, 0x00, 0x00, 0x00}, // arm_tag_truncated: a layer and no arm
-    &.{0x03, 0x01, 0x01}, // prune_frame: a whole `Prune`
-    &.{0x04, 0x00, 0x05, 0x01, 0x00}, // disconnect_frame: a whole `Disconnect`
+    &.{ 0x80, 0x01 }, // wide_layer_varint: the same layer, two groups long
+    &.{ 0x02, 0x00, 0x06 }, // unknown_swarm_arm: one past the membership table
+    &.{ 0x02, 0x01, 0x04 }, // unknown_tree_arm: one past the broadcast table
+    &.{ 0x04, 0x00, 0x04, 0x02, 0x00 }, // unknown_priority: a `Neighbor`'s third value
+    &.{ 0x04, 0x00, 0x05, 0x02, 0x00 }, // bad_bool: a `Disconnect` whose `alive` is 2
+    &.{ 0x01, 0x00, 0x00, 0x00, 0x00 }, // arm_tag_truncated: a layer and no arm
+    &.{ 0x03, 0x01, 0x01 }, // prune_frame: a whole `Prune`
+    &.{ 0x04, 0x00, 0x05, 0x01, 0x00 }, // disconnect_frame: a whole `Disconnect`
 };
 
 /// Long enough for a seed and for a mutated input to still reach a check it was
