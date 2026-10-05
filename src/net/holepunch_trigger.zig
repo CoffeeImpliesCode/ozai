@@ -68,35 +68,18 @@
 //! `Answer.superseded`, `Started.superseded` — is a number of descriptors the
 //! owner has to close, not a queue of them.
 //!
-//! # How an unreachable candidate is remembered, and how it expires
+//! # Where the unreachable-candidate memory lives
 //!
-//! One `Failure` per address: the address, and the instant the failure was
-//! recorded. `start` skips a candidate a live record covers, so a known-dead
-//! address costs nothing on the next pass — no socket, no deadline, no entry
-//! in the attempt list.
-//!
-//! **A permanently remembered failure is its own bug, and this one expires.**
-//! A record is live for `failure_hold` and no longer; nothing in this file can
-//! extend it, and `start` collects the expired ones before it looks at the
-//! candidates. Two reasons it cannot be permanent. First, a NAT rebinding is
-//! not a failure of the address — `docs/DECISIONS/0001` records one measured at
-//! 2.2 s, and an address whose mapping was rebuilt during a punch answers on
-//! the next round. A record that outlived that would blacklist a working
-//! address for the life of the connection. Second, this tree has no way to
-//! learn that a peer's mapping changed: `holepunch_run`'s gap table says the
-//! candidate sets are never aged, so expiry is the *only* mechanism that can
-//! bring a candidate back, and a permanent record would be a peer's direct path
-//! gone for good over one round that nobody answered.
-//!
-//! `failure_hold` is two `punch_interval`s. One interval is the gap between
-//! rounds, and a candidate that failed in the round just gone is retried in the
-//! next round under `holepunch.decide`'s own rule — that is what the gate's
-//! interval is for. Holding it for twice that means a record spans exactly one
-//! skipped round, which is long enough to stop a dead address being retried in
-//! a loop and short enough that a rebinding costs one round of silence.
-//!
-//! A `.connected` clears the record for that address outright: the address
-//! worked, so nothing about it is remembered.
+//! One `Failure` per address, held for `failure_hold` and no longer, and the
+//! expiry is what brings a candidate back at all. That bookkeeping is
+//! `holepunch_failure_memory.zig`'s, and its module doc is where the whole
+//! argument sits — why a permanent record is its own bug, why the hold is two
+//! intervals, and why a rebinding at 2.2 s outranks a round nobody answered.
+//! What this file keeps of it is the four questions it asks: `covered` per
+//! candidate in `start`, `remember` on a refusal, a timeout or a
+//! `holepunch_target` answer, `forget` on a `.connected`, and `forgetExpired`
+//! once per `start`. No count of any of them crosses this file's own surface
+//! except `Answer.unremembered` and `Started.skipped`.
 //!
 //! # At the bound
 //!
@@ -110,19 +93,17 @@
 //!   offered. The caller controls that order — `holepunch_run_candidate.Set`
 //!   already fixes it — so the cost is a documented caller decision rather than
 //!   a silent one here.
-//! - **`max_failures` is a refusal too, and it refuses the newest.** A record
-//!   being dropped is one the peer already earned, and the record that cannot
-//!   be written is a failure this round had not learned before. Trading an
-//!   earned memory for a fresh one is the worse of the two: the earned one
-//!   stops a wasted attempt and the fresh one only saves one. The refusal is
-//!   reported as `Answer.unremembered` rather than dropped in silence, because
-//!   a caller choosing between more peers and more memory per peer cannot
-//!   answer without being told which happened.
+//! - **`max_failures` is a refusal too, and it refuses the newest.** Its
+//!   bookkeeping is `holepunch_failure_memory`'s; what matters here is that the
+//!   refusal arrives as `Answer.unremembered` rather than being dropped in
+//!   silence, because a caller choosing between more peers and more memory per
+//!   peer cannot answer without being told which happened.
 
 const std = @import("std");
 const base_addr = @import("../base/addr.zig");
 const holepunch = @import("holepunch.zig");
 const target_mod = @import("holepunch_target.zig");
+const memory_mod = @import("holepunch_failure_memory.zig");
 
 const NodeId = base_addr.NodeId;
 const SocketAddr = base_addr.SocketAddr;
@@ -165,36 +146,21 @@ pub const attempt_timeout: Nanos = holepunch.punch_interval;
 
 /// How many unreachable candidates one peer may have on record.
 ///
-/// The same eight, and for the same reason without the substrate citation: a
-/// record is 24 bytes against an attempt's eighty, so eight is not this
-/// memory's constraint — consistency with `max_attempts` is, so a reader who
-/// has learned one bound has learned both.
-pub const max_failures: usize = 8;
+/// The same eight as `max_attempts`, and for the same reason without the
+/// substrate citation: a record is 24 bytes against an attempt's eighty, so
+/// eight is not this memory's constraint — consistency with `max_attempts` is,
+/// so a reader who has learned one bound has learned both. The bookkeeping
+/// itself is `holepunch_failure_memory`'s.
+pub const max_failures: usize = memory_mod.max_failures;
 
 /// How long one unreachable record suppresses its candidate.
-pub const failure_hold: Nanos = 2 * holepunch.punch_interval;
+pub const failure_hold: Nanos = memory_mod.failure_hold;
 
 /// One candidate this peer has already been told does not work.
-pub const Failure = struct {
-    /// The address that failed. Compared with `SocketAddr.order`, because two
-    /// spellings of one address are one candidate — the same rule
-    /// `holepunch_run_candidate.Set` appends under.
-    addr: SocketAddr,
-    /// When the failure was recorded. The record is live while this is younger
-    /// than `failure_hold`; nothing rewrites it and nothing extends it, so a
-    /// record's age is the one thing that decides whether it still suppresses
-    /// anything.
-    at: Nanos,
+pub const Failure = memory_mod.Failure;
 
-    /// Whether this record still suppresses its address at `now`.
-    ///
-    /// Saturating, so a caller whose timeline runs past the ceiling reads a
-    /// record as expired rather than as one whose age wrapped into the far
-    /// past and is therefore fresh.
-    pub fn live(self: Failure, now: Nanos) bool {
-        return now -| self.at < failure_hold;
-    }
-};
+/// The unreachable candidates one peer has on record, as a value.
+pub const Memory = memory_mod.Memory;
 
 /// What one round did.
 ///
@@ -250,7 +216,7 @@ pub const Answer = struct {
 /// nothing about whether the address works — only about what this planner still
 /// believes, which is a different and much weaker question.
 pub fn mayAttempt(planner: *const Planner, candidate: SocketAddr, now: Nanos) bool {
-    return !planner.covered(candidate, now);
+    return !planner.memory.covered(candidate, now);
 }
 
 /// One peer's attempts, in one value.
@@ -273,16 +239,14 @@ pub const Planner = struct {
     targets: [max_attempts]Target = undefined,
     /// How many entries of `targets` are live. Never above `targets.len`.
     live: usize,
-    /// The unreachable candidates, first `held` of them. Never above
-    /// `max_failures`, and never written past it either — a full memory
-    /// refuses.
-    failures: [max_failures]Failure = undefined,
-    /// How many entries of `failures` are live.
-    held: usize,
+    /// The unreachable candidates this peer has on record. The bookkeeping is
+    /// `holepunch_failure_memory.Memory`'s; this file holds one by value and
+    /// asks it four questions.
+    memory: Memory,
 
     /// A planner for one peer, with nothing in flight and nothing remembered.
     pub fn init(peer: NodeId) Planner {
-        return .{ .peer = peer, .live = 0, .held = 0 };
+        return .{ .peer = peer, .live = 0, .memory = memory_mod.Memory.init() };
     }
 
     /// The attempts, exactly `targets[0..live]`.
@@ -290,9 +254,9 @@ pub const Planner = struct {
         return self.targets[0..self.live];
     }
 
-    /// The unreachable candidates, exactly `failures[0..held]`.
+    /// The unreachable candidates, exactly `memory.failures[0..memory.held]`.
     pub fn remembered(self: *const Planner) []const Failure {
-        return self.failures[0..self.held];
+        return self.memory.remembered();
     }
 
     /// The instant the next attempt falls due, or null when nothing is in
@@ -341,12 +305,12 @@ pub const Planner = struct {
         // The count is not reported. `Started` counts what this round did, and
         // a record that ran out is one this planner no longer believes either
         // way — not an event the caller acted on.
-        _ = self.forgetExpired(now);
+        _ = self.memory.forgetExpired(now);
         switch (action) {
             .initiateNatTraversalRound => {
                 result.superseded = self.supersedeAll(now);
                 for (candidates) |candidate| {
-                    if (self.covered(candidate, now)) {
+                    if (self.memory.covered(candidate, now)) {
                         result.skipped += 1;
                         continue;
                     }
@@ -392,8 +356,7 @@ pub const Planner = struct {
             answer.released += @intFromBool(timed_out.released);
             // Every timed-out address is a candidate this planner now believes
             // is dead, and a full memory says so rather than losing one.
-            answer.unremembered = answer.unremembered or
-                !self.remember(target.addr, now);
+            answer.unremembered = answer.unremembered or !self.memory.remember(target.addr, now);
         }
         return answer;
     }
@@ -441,10 +404,10 @@ pub const Planner = struct {
         if (!settled.released) return answer;
         switch (outcome) {
             .connected => {
-                self.forget(addr);
+                self.memory.forget(addr);
                 answer.superseded = self.supersedeOthers(now, addr);
             },
-            .refused, .timed_out => answer.unremembered = !self.remember(addr, now),
+            .refused, .timed_out => answer.unremembered = !self.memory.remember(addr, now),
             .pending, .superseded => {},
         }
         answer.released += answer.superseded;
@@ -533,66 +496,6 @@ pub const Planner = struct {
             if (self.targets[index].addr.order(addr) == .eq) return index;
         }
         return null;
-    }
-
-    /// Whether a live record covers `addr` at `now`.
-    fn covered(self: *const Planner, addr: SocketAddr, now: Nanos) bool {
-        for (self.failures[0..self.held]) |failure| {
-            if (!failure.live(now)) continue;
-            if (failure.addr.order(addr) == .eq) return true;
-        }
-        return false;
-    }
-
-    /// Record `addr` as unreachable, or refuse to.
-    ///
-    /// An address already recorded has its record rewritten at `now` rather
-    /// than a second one written: a record is one fact about one address, and
-    /// two of them would let the older one expire and leave the newer behind to
-    /// suppress a candidate with nothing left to say. Rewriting restarts the
-    /// hold, which is the honest reading — the failure is current.
-    fn remember(self: *Planner, addr: SocketAddr, now: Nanos) bool {
-        for (self.failures[0..self.held]) |*failure| {
-            if (failure.addr.order(addr) == .eq) {
-                failure.at = now;
-                return true;
-            }
-        }
-        if (self.held == self.failures.len) return false;
-        self.failures[self.held] = .{ .addr = addr, .at = now };
-        self.held += 1;
-        return true;
-    }
-
-    /// Drop the record for `addr`, if there is one.
-    fn forget(self: *Planner, addr: SocketAddr) void {
-        var index: usize = 0;
-        while (index < self.held) : (index += 1) {
-            if (self.failures[index].addr.order(addr) != .eq) continue;
-            self.failures[index] = self.failures[self.held - 1];
-            self.held -= 1;
-            return;
-        }
-    }
-
-    /// Drop every record whose hold has run out, and answer how many went.
-    ///
-    /// Compaction rather than a tombstone, and a forward walk rather than an
-    /// index that steps back: the live records are copied down over the dead
-    /// ones and `held` shrinks, so the array stays dense and no state has to
-    /// say which slots are holes. A backwards index would need `held - 1` on
-    /// the last step, and one that underflows is a trap rather than a loop.
-    fn forgetExpired(self: *Planner, now: Nanos) usize {
-        var kept: usize = 0;
-        var index: usize = 0;
-        while (index < self.held) : (index += 1) {
-            if (!self.failures[index].live(now)) continue;
-            self.failures[kept] = self.failures[index];
-            kept += 1;
-        }
-        const dropped = self.held - kept;
-        self.held = kept;
-        return dropped;
     }
 };
 
