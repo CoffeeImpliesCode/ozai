@@ -12,9 +12,6 @@
 //! about a deadline.
 
 const std = @import("std");
-const ozai = @import("ozai");
-
-const t = std.testing;
 
 const posix = std.posix;
 

@@ -574,9 +574,16 @@ fn challengeOf(round: u8) Challenge {
 ///
 /// Round zero is the baseline: a reply with nothing to difference against, and
 /// no contribution to any statistic.
-fn runRounds(rates: []const u64) Exchange {
-    var exchange = arm(Exchange{}, challengeOf(0)) catch unreachable;
-    exchange = observe(exchange, 0, sample(challengeOf(0), 0)) catch unreachable;
+///
+/// The refusals are propagated rather than discarded. `arm` refuses a round
+/// that is already in flight and an exchange that has already answered, and
+/// `observe` refuses a frame that is not the armed round's answer; the loop
+/// below makes each of those unreachable, and a `rates` list long enough to
+/// break that is a fixture that should fail this test rather than a claim about
+/// a path no caller walks.
+fn runRounds(rates: []const u64) Error!Exchange {
+    var exchange = try arm(Exchange{}, challengeOf(0));
+    exchange = try observe(exchange, 0, sample(challengeOf(0), 0));
     var covered: u64 = 0;
     var index: usize = 0;
     // Stopping on the answer is what a real caller does, and it is what makes
@@ -585,12 +592,12 @@ fn runRounds(rates: []const u64) Exchange {
     while (index < rates.len and answer(exchange) == null) : (index += 1) {
         covered += rates[index];
         const round: u8 = @intCast(index + 1);
-        exchange = arm(exchange, challengeOf(round)) catch unreachable;
-        exchange = observe(
+        exchange = try arm(exchange, challengeOf(round));
+        exchange = try observe(
             exchange,
             @as(Nanos, index + 1) * second,
             sample(challengeOf(round), covered),
-        ) catch unreachable;
+        );
     }
     return exchange;
 }
@@ -743,7 +750,7 @@ test "the answer is the median of the measured rounds, not the fastest and not t
     // 265. The 1000 is a send buffer that drained inside one round, and it must
     // move the answer by nothing at all.
     const measured = [_]u64{ 1000, 10, 20, 30 };
-    const exchange = runRounds(&measured);
+    const exchange = try runRounds(&measured);
     const settled = answer(exchange).?;
     try t.expectEqual(Outcome.exhausted, settled.outcome);
     try t.expectEqual(@as(?Rate, 20), settled.rate);
@@ -761,7 +768,7 @@ test "the answer is the median of the measured rounds, not the fastest and not t
 test "a path that alternates idle and busy never settles and says so" {
     // A busy round, an idle one, busy, busy: the spread never closes, so the
     // bound decides, and the outcome is named rather than the loop running on.
-    const exchange = runRounds(&.{ 1000, 0, 1000, 1000 });
+    const exchange = try runRounds(&.{ 1000, 0, 1000, 1000 });
     const settled = answer(exchange).?;
     try t.expectEqual(Outcome.exhausted, settled.outcome);
     try t.expectEqual(@as(usize, 5), settled.rounds_run);
@@ -775,7 +782,7 @@ test "a stable slow path converges early, because the spread is about variation"
     // Four packets per second, the slowest rate in this file, and still a
     // convergence: every round agrees with every other, and what the spread
     // measures is variability rather than speed.
-    const exchange = runRounds(&.{ 4, 4, 4, 4 });
+    const exchange = try runRounds(&.{ 4, 4, 4, 4 });
     const settled = answer(exchange).?;
     try t.expectEqual(Outcome.converged, settled.outcome);
     try t.expectEqual(@as(?Rate, 4), settled.rate);
@@ -844,7 +851,7 @@ test "too few measured rounds end as undetermined, with no rate at all" {
 }
 
 test "the bound holds: five rounds, then the exchange refuses to start another" {
-    const exchange = runRounds(&.{ 1, 2, 3, 4 });
+    const exchange = try runRounds(&.{ 1, 2, 3, 4 });
     try t.expectEqual(max_rounds, exchange.round_count);
     try t.expectEqual(@as(?Probe, null), probe(exchange));
     try t.expectError(error.Finished, arm(exchange, challengeOf(9)));
@@ -860,8 +867,8 @@ test "two exchanges over the same frames and instants are equal" {
     // The purity claim, as a test. `==` on the state reaches every field, so
     // this fails if anything in the exchange reads a clock, an allocator or an
     // order the caller did not supply.
-    const first = runRounds(&.{ 1000, 10, 20, 30 });
-    const other = runRounds(&.{ 1000, 10, 20, 30 });
+    const first = try runRounds(&.{ 1000, 10, 20, 30 });
+    const other = try runRounds(&.{ 1000, 10, 20, 30 });
     try t.expectEqual(first, other);
     try t.expectEqual(answer(first), answer(other));
 }

@@ -163,7 +163,6 @@ test {
     const discovery_resolve_deadline = @import("discovery/resolve_deadline.zig");
     const gossip_topic_policy = @import("gossip/topic_policy.zig");
     const gossip_gossip_actions = @import("gossip/gossip_actions.zig");
-    const net_address_change = @import("net/address_change.zig");
     const net_ecn_feedback = @import("net/ecn_feedback.zig");
     const net_path_probe = @import("net/path_probe.zig");
     const net_qnt = @import("net/qnt.zig");
@@ -189,7 +188,6 @@ test {
     std.testing.refAllDecls(discovery_resolve_deadline);
     std.testing.refAllDecls(gossip_topic_policy);
     std.testing.refAllDecls(gossip_gossip_actions);
-    std.testing.refAllDecls(net_address_change);
     std.testing.refAllDecls(net_ecn_feedback);
     std.testing.refAllDecls(net_path_probe);
     std.testing.refAllDecls(net_qnt);

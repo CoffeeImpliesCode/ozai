@@ -92,7 +92,6 @@
 //! as data. Completion depends on observed state, not on a sleep.
 
 const std = @import("std");
-const ozai = @import("ozai");
 
 const t = std.testing;
 

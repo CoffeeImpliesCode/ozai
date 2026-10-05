@@ -263,7 +263,7 @@ pub const BaoTree = struct {
         const range = node.bytes(self);
         if (data.len != self.size) return error.SizeMismatch;
         var hasher = try subtree.Hasher.init(range.start);
-        hasher.update(data[range.start..range.end]);
+        hasher.update(data[@intCast(range.start)..@intCast(range.end)]);
         return hasher.finalChainingValue();
     }
 
@@ -273,7 +273,7 @@ pub const BaoTree = struct {
         const range = self.root().bytes(self);
         if (data.len != self.size) return error.SizeMismatch;
         var hasher = try subtree.Hasher.init(0);
-        hasher.update(data[range.start..range.end]);
+        hasher.update(data[@intCast(range.start)..@intCast(range.end)]);
         return hasher.final();
     }
 };

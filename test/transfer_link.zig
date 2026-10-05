@@ -19,7 +19,6 @@ const ranges_mod = @import("transfer_ranges.zig");
 const wire = @import("transfer_wire.zig");
 
 const Wire = wire.Wire;
-const Conn = wire.Conn;
 const SecretKey = ozai.SecretKey;
 
 /// The most jobs one link carries, and so the most decode storages.

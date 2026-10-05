@@ -62,16 +62,20 @@ what "next" means.
 
 ## Next
 
-Everything below is reachable on this node. The one thing that is not is at the
-bottom of this file.
+The gate work below is reachable on this node. The largest unwired body of work
+is not on this list; it is counted once in
+[`README.md`](README.md#what-is-built-and-tested-but-not-yet-reachable-from-a-node).
 
-- **The four gate inputs nothing supplies.** `src/net/holepunch_run.zig` takes
-  seven. Three have a producer there: the local set and the
+- **Three of the seven gate inputs, not four.** `src/net/holepunch_run.zig`
+  takes seven. Three have a producer there: the local set and the
   varies-by-destination verdict from `observeReport`, and the peer's candidate
-  addresses from `observePeer`. The four that do not are the connection to
-  punch on, what the QUIC stack said about a round, whether a path carried
-  traffic, and the socket's interface addresses. Each needs a producer or an
-  explicit admission that it is out of scope.
+  addresses from `observePeer`. `src/net/interface.zig` closed a fourth — "the
+  socket's interface addresses", which `holepunch_run.zig`'s own table used to
+  call a gap — by enumerating interfaces with `getifaddrs` and comparing two
+  reads. **Three remain open**: the connection to punch on, what the QUIC
+  stack said about a round (`qnt` is not in the vendored core), and whether a
+  path carried traffic (there is no multipath layer). Each needs a producer or
+  an explicit admission that it is out of scope.
 - **The retry token's hook lives in `vendor/quic/`.** A retry token has nowhere
   to go, so the action was removed rather than left unperformable:
   `Action.send_token` does not exist, and the router's `send_retry` verdict —
@@ -129,20 +133,26 @@ bottom of this file.
   a socket, a clock, a global entropy source or a libc call returns to the
   vendored tree.
 - Cross-validation separates the full Linux socket/process suite in
-  `cross-test.profile.sh` from 463 tests in 32 pure project modules across all
-  108 pinned compiler libc ABI targets in `cross-test.portable.profile.sh`.
-  The 32 are the previous 29 plus the QUIC bridge, the dial path and the
-  discovery driver, pure for the same reason as the rest; the three
-  socket-owning live roots stay out. 463/463 is what the expanded root measures
-  in isolation under Debug, not a cross-target result. The last 108-target
-  portable survey — 53 run, 37 build-only, 18 SDK failures — predates those
-  three modules and describes the older 29-module root, so it has to be rerun
-  before its counts describe this one. The vendored sans-IO core, 467 tests,
-  uses the same matrix with `--step quic-test`; its canonical row is likewise
-  still being measured, and the earlier one predates the pure-address and
-  fixture corrections. Core path addresses stay pure values; kernel conversion
-  stays in the socket seam. Emulation budgets do not replace payload, order or
-  virtual-time checks. Exact executed/build-only/failed counts, toolchain
+  `cross-test.profile.sh` from the pure project root in
+  `cross-test.portable.profile.sh`, across all 108 pinned compiler libc ABI
+  targets. **Counted 2026-10-06 from `src/portable_test.zig`: 100 pure project
+  modules, not 32.** The method is one `grep -o '@import("[^"]*")'` over that
+  file excluding `std`, deduplicated: 100 unique project imports and 100
+  matching `refAllDecls` calls, no duplicates. The root's own closure is
+  larger again — 236 files reachable by `@import` from it, carrying 1001
+  top-level `test` blocks by static count. The 32-module, 463-test figure in
+  this file was a snapshot of an earlier expansion and no longer describes
+  the tree. The **executed** test count for this root is not stated here: it
+  needs `zig build test-portable`, which this entry does not record, and a
+  static `test`-block count is not an executed count. The last 108-target
+  portable survey — 53 run, 37 build-only, 18 SDK failures — predates even the
+  32-module root and has to be rerun before its counts describe this one. The
+  vendored sans-IO core, 467 tests, uses the same matrix with `--step
+  quic-test`; its canonical row is likewise still being measured, and the
+  earlier one predates the pure-address and fixture corrections. Core path
+  addresses stay pure values; kernel conversion stays in the socket seam.
+  Emulation budgets do not replace payload, order or virtual-time checks.
+  Exact executed/build-only/failed counts, toolchain
   limits, native coverage and accepted cold regions are in
   [`README.md`](README.md); a build-only row is never a test pass. The portable
   entry point is explicit: update its imports and `refAllDecls` list when

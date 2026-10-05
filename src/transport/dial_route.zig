@@ -129,7 +129,6 @@ const t = std.testing;
 const pair_mod = @import("dial_pair.zig");
 const client_seed = pair_mod.client_seed;
 const server_seed = pair_mod.server_seed;
-const client_addr = pair_mod.client_addr;
 const direct_addr = pair_mod.direct_addr;
 const Prng = pair_mod.Prng;
 const CustomAddr = base_addr.CustomAddr;

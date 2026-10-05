@@ -253,9 +253,15 @@ pub fn writeBody(
 /// length octet at all.
 fn rdataLength(record: []const u8) usize {
     if (record.len == 0) return 1;
-    // `divCeil` on two positive `usize`s cannot fail: `max_string_length` is
-    // not zero and the quotient is bounded by `pkarr.max_dns_length`.
-    const strings = std.math.divCeil(usize, record.len, max_string_length) catch unreachable;
+    // The quotient is spelled out rather than taken from `divCeil`, because
+    // `divCeil` refuses a zero denominator and `max_string_length` is a
+    // `pub const` of 255 that no caller can change: the only error it can
+    // return is one this line cannot produce, and paying for the error union to
+    // discard it would be a claim about a constant instead of arithmetic about
+    // the bytes. `record.len / d` rounds down and the remainder is what decides
+    // whether there is a string past it, which is the ceiling exactly.
+    const strings = record.len / max_string_length +
+        @intFromBool(record.len % max_string_length != 0);
     return record.len + strings;
 }
 

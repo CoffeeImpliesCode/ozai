@@ -6,14 +6,12 @@
 //! `runDuration` are the three ways a caller advances the clock. The link table
 //! and the one latency drawn per link are here too, because a link only comes
 //! into being while a tick is moving a message along it.
-const std = @import("std");
 const plumtree = @import("../plumtree.zig");
 const topic = @import("topic.zig");
 const harness = @import("sim_harness.zig");
 const parking = @import("sim_park.zig");
 const swarm = @import("sim_swarm.zig");
 
-const Allocator = std.mem.Allocator;
 const Nanos = plumtree.Nanos;
 const Actions = plumtree.Actions;
 const Command = topic.Command;

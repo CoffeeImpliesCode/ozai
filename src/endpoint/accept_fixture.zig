@@ -16,7 +16,6 @@ const filter = @import("incoming_filter.zig");
 
 const Incoming = filter.Incoming;
 const IncomingFilter = filter.IncomingFilter;
-const Validation = filter.Validation;
 
 /// A handler that records what the router called it for, and can fail on
 /// demand. Every test owns one, so the context pointer is the observable

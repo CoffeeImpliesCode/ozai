@@ -57,17 +57,27 @@
 //! with its timers firing, and the shutdown in the order `router.Shutdown`
 //! enforces — handlers, then cancel the accepts, then close.
 //!
-//! Not wired: **the gossip wire format.** `gossip/hyparview.zig` says of
-//! itself that it has no codec, and the only encoder in this repository is
-//! `test/protocol_loopback_test.zig`'s, which is explicitly not the project's
-//! format. So every `send_message` membership asks for is counted, in
+//! Not wired: **the gossip wire codec is not connected to this node.**
+//! `gossip/codec.zig` and the six modules under `gossip/codec/` are a
+//! production wire codec — upstream declaration-order tags, postcard framing,
+//! byte-budgeted `IHave` chunking, its own fuzz target and tests. It exists,
+//! it is exported as `ozai.gossip_codec`, and nothing in `src/node/` imports
+//! it. `gossip/hyparview/message.zig` still says of itself that it has no
+//! wire codec and that the obsolete `Disconnect` byte waits for one; that
+//! second wait is over, because `gossip/codec/membership.zig` writes the
+//! byte, and the sentence is behind the layer rather than true of the tree.
+//!
+//! So every `send_message` membership asks for is counted, in
 //! `gossip_membership_asked` and `gossip_broadcast_asked`, and the peer it
 //! names is kept in `Node.named`, and nothing else happens to it. That is
-//! the whole of the gap and it is visible in the counters rather than
-//! inferred from silence: a node whose counters grow while nothing arrives at
-//! its peer is a finding, and the binary prints both halves. The codec belongs
-//! in `src/gossip/`, where a codec belongs, and lands with the protocol
-//! milestone rather than here.
+//! visible in the counters rather than inferred from silence: a node whose
+//! counters grow while nothing arrives at its peer is a finding, and the
+//! binary prints both halves. What closes the gap is calling
+//! `gossip_codec.encode` on the message a `send_message` carries and handing
+//! the frame to the connection table, which is also what a
+//! `disconnect_peer` needs before this node can tear a connection down by
+//! node id.
+//!
 //! # The relay, and where it sits in the loop
 //!
 //! `relay/server.zig` was a complete state machine that nothing drove: a
@@ -201,7 +211,6 @@ const node_config = @import("node_config.zig");
 const node_gossip = @import("node_gossip.zig");
 const node_loop = @import("node_loop.zig");
 const node_relay_client = @import("node_relay_client.zig");
-const node_relay_forward = @import("node_relay_forward.zig");
 const node_relay_frame = @import("node_relay_frame.zig");
 const node_relay_serve = @import("node_relay_serve.zig");
 const node_relay_table = @import("node_relay_table.zig");

@@ -18,8 +18,10 @@ from the certificate, moves bytes both ways, and carries ECN over a real socket.
 forwarding, payload delivery, and independent shutdown on loopback.
 
 External iroh interoperability and node-level 0-RTT remain open. The gossip
-state machines run, but the node does not yet encode their messages on the
-wire.
+state machines run, and the gossip wire codec is built and tested
+(`src/gossip/codec.zig` and the six modules under `src/gossip/codec/`, with a
+fuzz target), but the node does not yet call it: a `send_message` the layer
+asks for is counted and its peer named, and nothing is encoded onto the wire.
 
 ### Current native gate record
 
@@ -40,7 +42,7 @@ cross-platform, iroh-interoperability or performance result.
 | Syntax | `zig ast-check`: 74 Zig files, 3 rechecks, 5 final-comment rechecks; manifest parsed separately | 82 source checks + 1 manifest parse, all exit 0 |
 | Lint | `zlint -c zlint.json -f json -S` | exit 0; 0 errors; 24 vendored warnings |
 | Static analysis | `zwanzig --threads 2` over 42 non-vendored changed files, 21 rules | exit 0; No issues found |
-| Fuzz | `zig build fuzz --fuzz=10000` | exit 0; 15/15 steps; 7/7 targets, at least 10 000 new runs each, no crash |
+| Fuzz | `zig build fuzz --fuzz=10000` | exit 0; 21/21 steps; 10/10 targets, at least 10 000 new runs each, no crash |
 
 **1159/1159 tests over 22 build steps** is the current figure, the same in both
 modes. It is **599 package tests — 562 in the main test root plus 37 across
@@ -61,8 +63,11 @@ with one path from that list exits 0 and reports that file's own four
 findings. Those runs are trace history for a caller that sent the wrong shape,
 and they are lint evidence in neither direction.
 
-Each of the seven decoder fuzz targets advanced by at least 10 000 new runs;
-the largest advance is 10 213. The `Runs:` counters those reports print are
+Each of the ten decoder fuzz targets advanced by at least 10 000 new runs;
+the largest advance is 10 213. The targets are the ten rows of `build.zig`'s
+`fuzz_targets` table, one per decoder: `base32`, `range-spec`,
+`endpoint-ticket`, `blob-ticket`, `pkarr`, `relay-frame`, `postcard`, `bao`,
+`gossip-codec` and `ws-frame`. The `Runs:` counters those reports print are
 cumulative across the retained corpus and earlier runs, so a counter is not
 this invocation's work and the per-target advance is what the bound covers.
 
@@ -207,6 +212,33 @@ The cross-platform survey and its toolchain limits are reported by
 interoperability, no performance number and no node-level authenticated
 0-RTT is claimed.
 
+### What is built and tested but not yet reachable from a node
+
+This is the tree's largest gap and it is a wiring gap, not a correctness one.
+**165 of the 281 modules the build compiles are not reachable from
+`ozai-node`** — 153 production modules and 12 `_test.zig` files. They carry
+tests, several carry fuzz targets, and none of it can run in a live node
+because nothing in `src/node/` imports it.
+
+The count is taken by crossing the tree module by module from
+`src/node/main.zig` and the three `src/node/` files it imports at top level,
+treating `src/root.zig` as what it is — a facade of `pub const` re-exports that
+would otherwise make every module in the tree look reachable. Only the
+re-export names the binary actually references drag a module in. Liveness is
+per module rather than per call path, so a module reached by an untaken branch
+counts as reachable and the figure above is a **lower bound** on what is
+unwired.
+
+By directory, the 153 production modules are: `src/discovery/` 35,
+`src/net/` 37, `src/relay/` 23, `src/blobs/` 19, `src/node/` 9,
+`src/transport/` 7, `src/gossip/codec/` 6, `src/gossip/` 5, `src/crypto/` 4,
+`src/ticket/` 4, `src/gossip/plumtree/` 2, `src/root.zig` itself, and
+`src/router/qad_route.zig`. The largest groups are discovery, NAT traversal
+and hole punching, blobs, and the gossip codec. `TODO.md`'s *Next* list
+names parts of this — the gate inputs, the live lookup seam — but it is a
+list of what to do next, not a register of what is unwired, and it does not
+account for all 165.
+
 ### Earlier records, kept as dated history
 
 Before the matrix expansion the direct nine-section gate passed over the
@@ -246,10 +278,13 @@ After the portability fixes, `zig-gate --no-cross --cov` passed all nine local
 sections with zero lint/static findings. Native Debug and ReleaseSafe passed
 543/543 and the separate vendored core passed 467/467 in both modes. In that
 run the portable root was the 29-module, 438-test root and passed 438/438 in
-both modes; that run predates the expansion of that root to 32 modules and
-463 tests, whose coverage and ReleaseSafe figures are not recorded here. The
-instrumented full suite measured 49.0% of PC source lines (12896/26307) and
-41.5% of blocks (21237/51116); those are whole-run figures that include
+both modes. That run predates every later expansion of that root: it is
+**100 modules** as of 2026-10-06 (counted from `src/portable_test.zig`, method
+under *Cross-platform tests* above), and neither its coverage nor its
+ReleaseSafe figures are recorded here.
+
+The instrumented full suite measured 49.0% of PC source lines (12896/26307)
+and 41.5% of blocks (21237/51116); those are whole-run figures that include
 unchanged vendored code, not a per-root breakdown, and the QUIC root's own
 ratio below is a separate measurement that is not added to them. The accepted
 cold regions above are not claims that every changed branch is covered.
@@ -282,11 +317,30 @@ duplicate permanent tests were added to raise them.
 | `src/net/` | The net report fold, the NAT classifier, and the holepunch gate. |
 | `src/transport/` | The synthetic-ULA allocation, the GSO/GRO/ECN seam and its socket, the bridge to the QUIC core, and the dial path. |
 | `src/router/`, `src/endpoint/` | ALPN dispatch, the accept loop, and the incoming filter. |
-| `src/gossip/` | HyParView, PlumTree, and a deterministic in-process simulator. |
+| `src/gossip/` | HyParView, PlumTree, the gossip wire codec (`codec.zig` plus `codec/`), and a deterministic in-process simulator. The codec is built and tested but the node does not call it yet. |
 | `vendor/quic/` | The sans-IO QUIC core, 33 files, pinned by commit. No socket, no clock, no global entropy, no libc. |
 
-Every wire format is pinned to bytes captured from the Rust implementation at a
-named commit. A claim with no captured bytes attached does not go in.
+Pinned to bytes captured from the Rust implementation at a named commit:
+`src/wire/postcard.zig` (postcard at `872b9082`), `src/relay/frame_vectors.zig`
+(the two upstream snapshot tests at `187f59e8`, which pin
+`frame_decode`/`frame_encode`/`frame_types`/`frame_writer`/
+`frame_roundtrip`), `src/base/ula.zig` (`187f59e8`), `src/blobs/
+range_spec.zig` and `src/ticket/blob_ticket.zig` (`e82cbdcb`), and
+`src/ticket/endpoint_ticket.zig` (`cec7f1e1`). BLAKE3 is a real pin of a
+different kind — published upstream vectors rather than iroh's bytes, in
+`src/gossip/plumtree/blake3_vectors.zig` and
+`src/crypto/blake3_subtree_vectors.zig`.
+
+Five formats in this tree declare that **no** captured upstream bytes exist
+for them, and each says so in its own module doc rather than here: the gossip
+codec (`src/gossip/codec.zig`), QUIC address discovery (`src/net/qad.zig`),
+QUIC NAT traversal (`src/net/qnt.zig`), the WebSocket frame layer
+(`src/relay/ws_frame.zig`, whose vectors are RFC 6455's own worked examples),
+and the host-answer records (`src/discovery/host_answer.zig`, constructed
+rather than captured). Where such a module has a golden vector, the vector is
+derived from a written specification and is pinned as a *declared* table, not
+as evidence about a peer. The rule is unchanged: a claim with no captured
+bytes attached does not go in.
 
 Read [`docs/PLAN.md`](docs/PLAN.md) for the milestone order and the reasoning,
 and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the module tree, the
@@ -438,10 +492,11 @@ node artifact built for each target. Its default matrix is
 Foreign GNU runs require compatible guest runtimes and are separate from
 that self-contained gate. `cross-test.portable.profile.sh` surveys all 108
 libc ABI targets listed by the pinned Zig 0.16 compiler. It uses
-`src/portable_test.zig`: **32 pure modules**, including
-the socket-free endpoint and the socket-free `discovery/dial_source.zig`,
-`transport/quic_bridge.zig` and `transport/dial.zig`. It does **not** claim a
-non-Linux node backend.
+`src/portable_test.zig`: **100 pure modules** as of 2026-10-06, counted as the
+unique non-`std` `@import` specifiers in that file, each with a matching
+`refAllDecls` and no duplicates. It does **not** claim a non-Linux node
+backend. An earlier figure of 32 modules is history and no longer describes
+the file.
 
 The tree as it stood before the 2026-10-03 contract cutover executed
 **543/543 on all 26 live Linux ABI targets** in one
@@ -477,11 +532,12 @@ including 32-bit, big-endian, GNU/musl ABI variants and WASI. Another
 
 Those failing rows remain in the survey rather than being silently dropped.
 They are toolchain-side outcomes, and the 53/37/18 split above belongs to the
-29-module, 438-test root. It is not a survey of the 32-module, 463-test
-source: that expanded root has since been executed at **463/463 in Debug** in
-isolation on this host, 3/3 build steps and exit 0, and its execute,
-build-only and SDK-failure split across the 108 rows is not recorded here
-until the full survey is rerun against it.
+29-module, 438-test root. It is not a survey of the current source: that root
+has since grown to **100 modules** (2026-10-06), and this file records no
+execute, build-only or SDK-failure split across the 108 rows for it, because
+the full survey has not been rerun against it. A 463/463 Debug run for the
+intermediate 32-module expansion is recorded history and does not describe the
+root as it now stands.
 
 The live gate excludes n32 and x32 because the pinned standard library does
 not compile for them, and Hexagon because its full Debug build crashes the

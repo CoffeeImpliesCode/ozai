@@ -512,10 +512,16 @@ fn on_iface(interface: []const u8, ip: IpAddress, up: bool, loopback: bool) Entr
     return .{ .interface = iface_name(interface), .ip = ip, .up = up, .loopback = loopback };
 }
 
-fn filled(entries: []const Entry) Snapshot {
+/// A `Snapshot` carrying `entries` in the order they are written.
+///
+/// `add` refuses the sixty-fifth entry, and the refusal is propagated rather
+/// than discarded: a fixture that grew past `max_entries` is a broken fixture
+/// this file should be told about, and `Snapshot.add` already has a test that
+/// walks the ceiling itself.
+fn filled(entries: []const Entry) SnapshotError!Snapshot {
     var snapshot: Snapshot = undefined;
     snapshot.clear();
-    for (entries) |one| snapshot.add(one) catch unreachable;
+    for (entries) |one| try snapshot.add(one);
     return snapshot;
 }
 
@@ -524,7 +530,7 @@ fn carries(reach: *const Reach, ip: IpAddress) bool {
 }
 
 test "an interface address is reachable and the families stay apart" {
-    const snapshot = filled(&.{
+    const snapshot = try filled(&.{
         on_iface("eth0", v4(1), true, false),
         on_iface("eth0", v6(), true, false),
         on_iface("docker0", v4(2), true, false),
@@ -545,8 +551,8 @@ test "an interface address is reachable and the families stay apart" {
 }
 
 test "an interface that is down reaches nobody" {
-    const up = filled(&.{on_iface("eth0", v4(1), true, false)});
-    const down = filled(&.{on_iface("eth0", v4(1), false, false)});
+    const up = try filled(&.{on_iface("eth0", v4(1), true, false)});
+    const down = try filled(&.{on_iface("eth0", v4(1), false, false)});
 
     // The flags are recorded by `read` and applied here, so one bit the caller
     // never set is the whole difference between a published address and none.
@@ -570,7 +576,7 @@ test "an interface that is down reaches nobody" {
 }
 
 test "loopback is counted only when the caller says its peer is this host" {
-    const snapshot = filled(&.{
+    const snapshot = try filled(&.{
         on_iface("eth0", v4(1), true, false),
         on_iface("lo", v4(3), true, true),
     });
@@ -587,7 +593,7 @@ test "loopback is counted only when the caller says its peer is this host" {
 }
 
 test "one address on two interfaces is one address" {
-    const bonded = filled(&.{
+    const bonded = try filled(&.{
         on_iface("eth0", v4(1), true, false),
         on_iface("bond0", v4(1), true, false),
         on_iface("eth1", v4(1), true, false),
@@ -601,13 +607,13 @@ test "one address on two interfaces is one address" {
     // And a read in which the address moved to one of those interfaces is not
     // a change at all, which is what makes the dedup load-bearing rather than
     // a tidy-up.
-    const onto_bond = filled(&.{on_iface("bond0", v4(1), true, false)});
+    const onto_bond = try filled(&.{on_iface("bond0", v4(1), true, false)});
     const change: Change = .{ .previous = bonded, .current = onto_bond, .loopback = false };
     try t.expect(!change.moved().changed());
 }
 
 test "the synthetic address is the one ula builds and ula reads it back" {
-    const snapshot = filled(&.{});
+    const snapshot = try filled(&.{});
 
     const reach = reachableAt(&snapshot, test_host, test_port, false);
     // Built by `base/ula.zig` and not spelled here: the port is ula's and the
@@ -625,15 +631,15 @@ test "the synthetic address is the one ula builds and ula reads it back" {
 }
 
 test "two reads of an unchanged machine differ in nothing, in either order" {
-    const first = filled(&.{
+    const first = try filled(&.{
         on_iface("eth0", v4(1), true, false),
         on_iface("eth1", v4(2), true, false),
     });
-    const same = filled(&.{
+    const same = try filled(&.{
         on_iface("eth0", v4(1), true, false),
         on_iface("eth1", v4(2), true, false),
     });
-    const reversed = filled(&.{
+    const reversed = try filled(&.{
         on_iface("eth1", v4(2), true, false),
         on_iface("eth0", v4(1), true, false),
     });
@@ -648,11 +654,11 @@ test "two reads of an unchanged machine differ in nothing, in either order" {
 }
 
 test "the comparison follows the policy the change was stored with" {
-    const with_loopback = filled(&.{
+    const with_loopback = try filled(&.{
         on_iface("lo", v4(3), true, true),
         on_iface("eth0", v4(1), true, false),
     });
-    const without_loopback = filled(&.{on_iface("eth0", v4(1), true, false)});
+    const without_loopback = try filled(&.{on_iface("eth0", v4(1), true, false)});
 
     // The same two reads, one machine that lost nothing. Counted under a
     // policy that hides loopback — a peer on another host — the interface
@@ -681,11 +687,11 @@ test "the comparison follows the policy the change was stored with" {
 }
 
 test "a change reports what appeared and what retired" {
-    const before = filled(&.{
+    const before = try filled(&.{
         on_iface("eth0", v4(1), true, false),
         on_iface("eth1", v4(2), true, false),
     });
-    const after = filled(&.{
+    const after = try filled(&.{
         on_iface("eth1", v4(2), true, false),
         on_iface("eth2", v4(9), true, false),
     });

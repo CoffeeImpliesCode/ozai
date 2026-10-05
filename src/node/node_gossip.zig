@@ -3,8 +3,10 @@
 //! `gossip` fires the timers membership asked for, `feedGossip` hands the layer
 //! one event and does what it asks for, and `peerGone` is the only way this
 //! project tells membership that a peer went away. The gap the module doc of
-//! `node.zig` names is here and not elsewhere: the layer has no codec, so every
-//! message it asks to be sent is counted and named rather than sent.
+//! `node.zig` names is here and not elsewhere: the layer has a codec —
+//! `gossip/codec.zig`, a production wire codec with its own tests and fuzz
+//! target — and this file does not call it, so every message the layer asks
+//! to be sent is counted and named rather than sent.
 
 const std = @import("std");
 
@@ -67,11 +69,11 @@ pub fn feedGossip(self: *Node, event: hyparview.InEvent, now: hyparview.Nanos) E
     try self.topic.handle(event, now, &out);
     self.stats.gossip_events += 1;
     for (out.slice()) |produced| switch (produced) {
-        // **Not wired.** The gossip wire format does not exist in this
-        // project — `gossip/hyparview.zig` says of itself that it has no
-        // codec, and the only encoder here is a test's. So the request is
-        // counted, split by the layer that asked, and the peer is named;
-        // nothing is sent. See `node.zig`'s module doc.
+        // **Not wired.** The codec exists — `gossip/codec.zig` is a
+        // production wire codec with its own tests and fuzz target — and
+        // nothing here calls it. So the request is counted, split by the
+        // layer that asked, and the peer is named; the frame is never
+        // encoded and nothing is sent. See `node.zig`'s module doc.
         .send_message => |send| {
             noteNamed(self, send.to);
             switch (send.message) {
@@ -86,12 +88,12 @@ pub fn feedGossip(self: *Node, event: hyparview.InEvent, now: hyparview.Nanos) E
                 .timer = schedule.timer,
             });
         },
-        // Also not wired, for the same reason: a `disconnect_peer` names a
-        // node, and this node finds a connection by an address the map or
-        // the dialer holds, never by an id. Counting it is the honest
-        // report; tearing a connection down by node id belongs with the
-        // codec, which is what would have carried the message the state
-        // machine is asking to be believed about.
+        // Also not wired, and for the second reason rather than the first: a
+        // `disconnect_peer` names a node, and this node finds a connection by
+        // an address the map or the dialer holds, never by an id. The codec
+        // exists and would carry the message; what is missing is a lookup by
+        // node id over the connection table. Counting it is the honest
+        // report.
         .disconnect_peer => |peer| {
             self.stats.gossip_disconnects_asked += 1;
             noteNamed(self, peer);
@@ -106,8 +108,9 @@ pub fn feedGossip(self: *Node, event: hyparview.InEvent, now: hyparview.Nanos) E
 }
 
 /// Tell the gossip layer a peer went away, which is how membership is told
-/// anything at all in this project: there is no `Disconnect` message on the
-/// wire, because there is no wire.
+/// anything at all in this project. No `Disconnect` message reaches a peer,
+/// because this file never encodes the one `gossip/codec.zig` can already
+/// write; the event is local in both directions.
 pub fn peerGone(self: *Node, peer: NodeId, at: Instant) Error!void {
     try feedGossip(self, .{ .peer_disconnected = peer }, try gossipNow(at));
 }

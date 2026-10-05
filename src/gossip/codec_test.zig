@@ -477,7 +477,7 @@ test "varintLen is the length postcard writes for the same value" {
     var buf: [limits.max_prefix_size]u8 = undefined;
     for (values) |value| {
         var writer = postcard.Writer.init(&buf);
-        try writer.writeLen(value);
+        try writer.writeLen(@intCast(value));
         try t.expectEqual(writer.finish().len, limits.varintLen(value));
     }
 }

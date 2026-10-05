@@ -631,5 +631,3 @@ test "the descriptor is this resolver's own, and a stop reaches it" {
         seam.send(seam.ctx, t.io, support.nameserver, &.{}),
     );
 }
-
-const item_Provenance_dns = item.Provenance.dns;

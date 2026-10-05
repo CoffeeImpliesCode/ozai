@@ -18,7 +18,6 @@ const Actions = actions.Actions;
 const Claim = claim_table.Claim;
 const max_claims = limits.max_claims;
 const Gossip = wire.Gossip;
-const IHave = wire.IHave;
 const IHaves = wire.IHaves;
 const InEvent = wire.InEvent;
 const OutEvent = wire.OutEvent;

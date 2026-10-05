@@ -286,7 +286,7 @@ test "the clip is the range layer's own reading of the request" {
     const sizes = [_]u64{ 1, 1024, 1025, 16384, 16385, 49152, 49153 };
     for (sizes) |size| {
         const tree = BaoTree.init(size);
-        for (0..tree.chunks() + 3) |start| {
+        for (0..@as(usize, @intCast(tree.chunks() + 3))) |start| {
             for ([_]u64{ 0, 1, 5, 16, 17, 1000 }) |length| {
                 const request = ranges.ChunkRange{ .start = start, .end = start + length };
                 const got = clip(tree, request);
@@ -298,7 +298,7 @@ test "the clip is the range layer's own reading of the request" {
                 } else if (length == 0) {
                     try t.expectEqual(@as(u64, 0), got.len());
                 } else {
-                    try t.expectEqual(start, got.start);
+                    try t.expectEqual(@as(u64, start), got.start);
                     try t.expectEqual(@min(start + length, tree.chunks()), got.end);
                 }
             }
@@ -375,7 +375,7 @@ test "a plan stays inside its bound and inside the blob" {
     const sizes = [_]u64{ 16385, 32769, 47000, 49153, 65537 };
     for (sizes) |size| {
         const tree = BaoTree.init(size);
-        for (0..tree.chunks() + 1) |start| {
+        for (0..@as(usize, @intCast(tree.chunks() + 1))) |start| {
             for ([_]u64{ 0, 1, 3, 16, 17, 33, 47 }) |length| {
                 const plan = planOf(tree, .{ .start = start, .end = start + length });
                 try t.expect(plan.len <= max_items);

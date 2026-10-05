@@ -49,13 +49,11 @@
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
-const report = @import("report.zig");
 
 const gate = @import("holepunch_gate.zig");
 const path_mod = @import("holepunch_path.zig");
 
 const SocketAddr = addr.SocketAddr;
-const TransportAddr = addr.TransportAddr;
 
 // The punch gate.
 pub const Nanos = gate.Nanos;

@@ -367,8 +367,6 @@ fn budgetOf(state: State) Budget {
 
 // --- tests
 
-const ms = std.time.ns_per_ms;
-
 /// The numbers the policy tests run on, named so the instants in them are
 /// readable: a one second first wait doubling to eight, ten seconds of budget
 /// for a relay that said nothing, and two seconds for one attempt.

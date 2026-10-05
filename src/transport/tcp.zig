@@ -644,6 +644,13 @@ test "a stop ends a wait in progress, and a stopped stream stays stopped" {
 /// ends in `error.Canceled` still stops the stream — returning without the stop
 /// would leave that read to sit out its deadline instead of being woken.
 fn stopAfter(io: std.Io, stream: *Tcp, delay_ms: i64) void {
-    io.sleep(.fromMilliseconds(delay_ms), .awake) catch {};
+    // The arm is named rather than swallowed by a bare `catch`, which is the
+    // only thing that changes here: `Cancelable` is `error{Canceled}` and the
+    // doc above is about exactly that refusal, so it is handled and not
+    // discarded. Spelling it out is what makes a second arm in `Cancelable` a
+    // build error here instead of a refusal this line stops noticing.
+    io.sleep(.fromMilliseconds(delay_ms), .awake) catch |err| switch (err) {
+        error.Canceled => {},
+    };
     stream.stop();
 }

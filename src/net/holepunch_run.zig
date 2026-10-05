@@ -12,10 +12,10 @@
 //! # The seven inputs, and where each one comes from
 //!
 //! A probe round measures **this node**, from the inside, over QUIC. The gate
-//! asks about **one connection**, from the outside. Three of its seven inputs
-//! have a producer here and four do not, and each of the four is named below
-//! with what would close it. A reader without this section reads a gap as a
-//! rule, and then wonders why the gap is never closed.
+//! asks about **one connection**, from the outside. Four of its seven inputs
+//! have a producer and three do not, and each of the three is named below with
+//! what would close it. A reader without this section reads a gap as a rule,
+//! and then wonders why the gap is never closed.
 //!
 //! ```text
 //! gate input                          | where it comes from
@@ -23,11 +23,19 @@
 //! local: where this node is reachable | `observeReport`
 //! the mapping verdict                  | `observeReport`
 //! remote: where the peer is reachable | `observePeer`
+//! the socket's interface addresses    | `net/interface.zig`
 //! the connection to punch on          | gap: the transport's table
 //! what the stack said about a round   | gap: no QNT in the vendored core
 //! whether a path carried traffic      | gap: no multipath layer
-//! the socket's interface addresses    | gap: no interface enumeration
 //! ```
+//!
+//! **The socket's interface addresses.** This one used to be the fourth gap,
+//! and it is closed: `net/interface.zig` enumerates interfaces with
+//! `getifaddrs` and hands the caller a `Snapshot`, and `net/address_change.zig`
+//! compares two reads under a policy. Its own module doc says which three
+//! gaps it does *not* close, and those are the three rows above still marked
+//! `gap`. The half of the local set no round measures is the half it now
+//! supplies.
 //!
 //! **The connection.** `holepunch.selectPunchConnection` turns a table into
 //! the one connection a round runs on, and `Join.selectConnection` is its
@@ -64,14 +72,19 @@
 //! about which status follows which is written here.
 //!
 //! **The socket's interface addresses.** The half of the local set no round
-//! measures, and the one argument of `observeReport` a caller has to find.
-//! The socket knows a single address and it is not one of these:
-//! `transport/socket.zig:885` reads it back with `getsockname`, which on a
-//! wildcard bind is `0.0.0.0` or `::` with the ephemeral port — where this
-//! node is *bound*, not where a peer may reach it, and advertising it would
-//! be worse than advertising nothing. The addresses behind it need
-//! `getifaddrs` or a netlink route dump, and neither appears anywhere under
-//! `src/`: there is no netwatcher here to call one.
+//! measures, and the one argument of `observeReport` a caller used to have to
+//! find for itself. The socket knows a single address and it is not one of
+//! these: `transport/socket.zig:885` reads it back with `getsockname`, which
+//! on a wildcard bind is `0.0.0.0` or `::` with the ephemeral port — where
+//! this node is *bound*, not where a peer may reach it, and advertising it
+//! would be worse than advertising nothing. `net/interface.zig` is what reads
+//! the addresses behind it, with one `getifaddrs` call and no netlink
+//! subscription; `net/address_change.zig` compares two reads and reports
+//! whether anything moved. What is still missing is the caller: nothing in
+//! `src/node/` reaches either module, so a live node does not yet hand this
+//! gate the local set from either source. That is a wiring gap rather than a
+//! missing input, and [`README.md`](README.md)'s reachability section counts
+//! it.
 //!
 //! # The two mappings
 //!
@@ -199,7 +212,6 @@ const candidate = @import("holepunch_run_candidate.zig");
 const peer_mod = @import("holepunch_run_peer.zig");
 
 const Nanos = report.Nanos;
-const Path = holepunch.Path;
 const SocketAddr = addr.SocketAddr;
 
 // The candidate storage and its tallies.

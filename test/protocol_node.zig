@@ -29,7 +29,6 @@ const wire = @import("protocol_wire.zig");
 const Wire = wire.Wire;
 const Counters = wire.Counters;
 const Conn = wire.Conn;
-const NodeId = ozai.NodeId;
 const SecretKey = ozai.SecretKey;
 
 /// Nodes in the gossip mesh. More than two, and small enough that every node

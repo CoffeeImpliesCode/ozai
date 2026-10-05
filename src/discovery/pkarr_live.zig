@@ -91,11 +91,9 @@ const resolve_mod = @import("resolve.zig");
 const addr = @import("../base/addr.zig");
 const key = @import("../base/key.zig");
 
-const lookup_io = @import("lookup_io.zig");
 const pkarr = @import("pkarr.zig");
 const pkarr_body = @import("pkarr_body.zig");
 const preset = @import("preset.zig");
-const tcp = @import("../transport/tcp.zig");
 const tls_client = @import("tls_client.zig");
 
 /// Everything one pkarr exchange can fail with.

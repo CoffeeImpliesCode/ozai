@@ -157,8 +157,17 @@ pub fn carried(message: Message) ?DatagramFrame {
 const relay_test_ids = @import("relay_test_ids.zig");
 
 /// The frame type a payload of this shape goes out under, for both directions.
-fn frameTypeOf(peer: NodeId, datagrams: Datagrams, direction: Direction) frame.FrameType {
-    const message = carry(peer, datagrams, direction) catch unreachable;
+///
+/// The error is propagated rather than discarded: `carry` refuses a payload
+/// over `max_payload` and a batch whose segment size is zero, and a fixture
+/// that grew into either is a broken fixture this test should be told about
+/// rather than a case to assert is unreachable.
+fn frameTypeOf(
+    peer: NodeId,
+    datagrams: Datagrams,
+    direction: Direction,
+) Error!frame.FrameType {
+    const message = try carry(peer, datagrams, direction);
     return std.meta.activeTag(message);
 }
 
@@ -169,11 +178,11 @@ test "one datagram is a datagram frame and a batch is a batch frame" {
     const peer = try relay_test_ids.testNodeId(30);
     try std_testing.expectEqual(
         frame.FrameType.client_to_relay_datagram,
-        frameTypeOf(peer, single, .client_to_relay),
+        try frameTypeOf(peer, single, .client_to_relay),
     );
     try std_testing.expectEqual(
         frame.FrameType.relay_to_client_datagram,
-        frameTypeOf(peer, single, .relay_to_client),
+        try frameTypeOf(peer, single, .relay_to_client),
     );
 
     // Three equal datagrams, which is what a GSO send looks like on the core's
@@ -181,11 +190,11 @@ test "one datagram is a datagram frame and a batch is a batch frame" {
     const batch: Datagrams = .{ .ecn = .ce, .segment_size = 4, .contents = "abcdefghijkl" };
     try std_testing.expectEqual(
         frame.FrameType.client_to_relay_datagram_batch,
-        frameTypeOf(peer, batch, .client_to_relay),
+        try frameTypeOf(peer, batch, .client_to_relay),
     );
     try std_testing.expectEqual(
         frame.FrameType.relay_to_client_datagram_batch,
-        frameTypeOf(peer, batch, .relay_to_client),
+        try frameTypeOf(peer, batch, .relay_to_client),
     );
 }
 
@@ -231,7 +240,7 @@ test "a batch keeps its segmentation and its codepoint across the codec" {
     try std_testing.expectEqual(@as(?u16, null), draining.segment_size);
     try std_testing.expectEqual(
         frame.FrameType.relay_to_client_datagram,
-        frameTypeOf(src, draining, .relay_to_client),
+        try frameTypeOf(src, draining, .relay_to_client),
     );
 }
 

@@ -399,12 +399,15 @@ fn at(port: u16) TransportAddr {
 
 /// A relay-addressed path, because the arm decision has to hold for every
 /// address a `TransportAddr` can spell and not only for the direct one.
-fn relayPath() TransportAddr {
-    var text: [64]u8 = undefined;
-    const url = addr.RelayUrl.parse(
-        std.fmt.bufPrint(&text, "https://relay.example./", .{}) catch unreachable,
-    ) catch unreachable;
-    return .{ .relay = url };
+///
+/// The URL is spelled as the literal it is, not printed into a buffer first:
+/// `bufPrint` over a format string with no arguments is a copy with an error
+/// union bolted to it, and the buffer only added a second thing that could
+/// fail. `parse` still refuses it, and the refusal is propagated — a fixture
+/// whose URL stopped parsing is a broken fixture this file should be told
+/// about, and `base/relay.zig` has its own tests for what `parse` refuses.
+fn relayPath() addr.RelayUrlParseError!TransportAddr {
+    return .{ .relay = try addr.RelayUrl.parse("https://relay.example./") };
 }
 
 /// A registered non-IP transport's path, the third spelling of the same
@@ -486,7 +489,7 @@ test "the challenge travels the path the evidence is about, however it is spelle
     // relay-keyed probe cannot do — there is no relay to key on for an `.ip`
     // path at all, and a `.custom` payload is opaque bytes no `RelayUrl.parse`
     // will accept.
-    const cases = [_]TransportAddr{ at(1000), relayPath(), customPath() };
+    const cases = [_]TransportAddr{ at(1000), try relayPath(), customPath() };
     var none: InFlight = .{};
     for (cases) |address| {
         var entry = entryWith(20 * millis, 0);

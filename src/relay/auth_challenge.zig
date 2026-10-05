@@ -214,8 +214,6 @@ pub fn messageToSign(issued: Issued) [32]u8 {
 
 const t = std.testing;
 
-const relay_test_ids = @import("relay_test_ids.zig");
-
 /// A challenge from a fixed pattern, which is what `server_handshake.zig` does
 /// for the same reason: a module that draws randomness is not one a test can
 /// drive, and the draw is not what is under test.

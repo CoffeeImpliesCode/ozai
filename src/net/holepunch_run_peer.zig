@@ -142,8 +142,9 @@ pub const Join = struct {
     /// local set no round can measure. An empty slice is a host that has
     /// published none, not a host with none: the gate is handed what was
     /// known and answers about it, and the stack's `not_enough_addresses` is
-    /// the answer to a set it cannot use. The module doc says why nothing in
-    /// this tree produces them.
+    /// the answer to a set it cannot use. `net/interface.zig` is what
+    /// enumerates them; what is missing is the caller, because nothing in
+    /// `src/node/` reaches that module.
     pub fn observeReport(
         self: *Join,
         folded: *const report.Report,

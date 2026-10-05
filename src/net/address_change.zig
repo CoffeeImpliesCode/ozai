@@ -109,9 +109,11 @@ const HostBits = ula.HostBits;
 
 // `interface.zig` owns all three. Bound here rather than re-declared so that
 // `Change` and `Snapshot` cannot stop being the types this module was written
-// against.
+// against. `SnapshotError` is bound for the same reason: `Snapshot.add` refuses
+// past `max_entries` and a test fixture built here has to be able to say so.
 const Change = interface.Change;
 const Snapshot = interface.Snapshot;
+const SnapshotError = interface.SnapshotError;
 const Reach = interface.Reach;
 
 /// This node's own binding: the identity the transport seam allocated and the
@@ -339,12 +341,16 @@ fn on(ip: IpAddress) interface.Entry {
 }
 
 /// A `Snapshot` carrying `entries` in the order they are written, and nothing
-/// else. Whole or nothing: every entry written here fits under the ceiling, and
-/// a test that wanted one that does not would be testing `Snapshot.add`.
-fn snapshot(entries: []const interface.Entry) Snapshot {
+/// else.
+///
+/// Whole or nothing, and the refusal is propagated rather than discarded: the
+/// ceiling belongs to `Snapshot.add`, which this file does not test, so a
+/// fixture that grew past it is a broken fixture this file should be told
+/// about rather than a case to assert is unreachable.
+fn snapshot(entries: []const interface.Entry) SnapshotError!Snapshot {
     var read: Snapshot = undefined;
     read.clear();
-    for (entries) |entry| read.add(entry) catch unreachable;
+    for (entries) |entry| try read.add(entry);
     return read;
 }
 
@@ -362,7 +368,7 @@ fn relayed(local: ?IpAddress) !Held {
 }
 
 test "an unchanged machine holds every path it held" {
-    const read = snapshot(&.{ on(v4(1)), on(v4(2)) });
+    const read = try snapshot(&.{ on(v4(1)), on(v4(2)) });
     const change: Change = .{ .previous = read, .current = read, .loopback = false };
 
     const one = direct(10, v4(1));
@@ -382,8 +388,8 @@ test "an unchanged machine holds every path it held" {
 
 test "a retired local address costs one pairing while the node holds another" {
     const change: Change = .{
-        .previous = snapshot(&.{ on(v4(1)), on(v4(2)) }),
-        .current = snapshot(&.{on(v4(2))}),
+        .previous = try snapshot(&.{ on(v4(1)), on(v4(2)) }),
+        .current = try snapshot(&.{on(v4(2))}),
         .loopback = false,
     };
 
@@ -403,8 +409,8 @@ test "a retired local address costs one pairing while the node holds another" {
 
 test "a node that keeps none of its addresses strands the paths it was reached at" {
     const change: Change = .{
-        .previous = snapshot(&.{on(v4(1))}),
-        .current = snapshot(&.{on(v4(9))}),
+        .previous = try snapshot(&.{on(v4(1))}),
+        .current = try snapshot(&.{on(v4(9))}),
         .loopback = false,
     };
 
@@ -421,8 +427,8 @@ test "a node that keeps none of its addresses strands the paths it was reached a
 
 test "the verdict reads the local half of a path and never the peer's" {
     const change: Change = .{
-        .previous = snapshot(&.{on(v4(1))}),
-        .current = snapshot(&.{on(v4(9))}),
+        .previous = try snapshot(&.{on(v4(1))}),
+        .current = try snapshot(&.{on(v4(9))}),
         .loopback = false,
     };
     const gone = v4(1);
@@ -453,8 +459,8 @@ test "the verdict reads the local half of a path and never the peer's" {
 
 test "a path reached at no interface address is unbound under any change" {
     const change: Change = .{
-        .previous = snapshot(&.{on(v4(1))}),
-        .current = snapshot(&.{}),
+        .previous = try snapshot(&.{on(v4(1))}),
+        .current = try snapshot(&.{}),
         .loopback = false,
     };
 
@@ -478,8 +484,8 @@ test "a path reached at no interface address is unbound under any change" {
 
 test "an address no read ever reported is unbound, not stranded" {
     const change: Change = .{
-        .previous = snapshot(&.{on(v4(1))}),
-        .current = snapshot(&.{on(v4(9))}),
+        .previous = try snapshot(&.{on(v4(1))}),
+        .current = try snapshot(&.{on(v4(9))}),
         .loopback = false,
     };
 
@@ -494,11 +500,11 @@ test "an address no read ever reported is unbound, not stranded" {
 
 test "the loopback policy the change was stored with decides what was held" {
     const change: Change = .{
-        .previous = snapshot(&.{
+        .previous = try snapshot(&.{
             on(v4(1)),
             .{ .interface = lo, .ip = v4(3), .up = true, .loopback = true },
         }),
-        .current = snapshot(&.{on(v4(1))}),
+        .current = try snapshot(&.{on(v4(1))}),
         .loopback = false,
     };
     const wide: Change = .{
@@ -534,10 +540,10 @@ test "the loopback policy the change was stored with decides what was held" {
 
 test "an address on an interface that is down was never held" {
     const change: Change = .{
-        .previous = snapshot(&.{
+        .previous = try snapshot(&.{
             .{ .interface = eth0, .ip = v4(1), .up = false, .loopback = false },
         }),
-        .current = snapshot(&.{}),
+        .current = try snapshot(&.{}),
         .loopback = false,
     };
 
@@ -551,8 +557,8 @@ test "an address on an interface that is down was never held" {
 
 test "the host bits and the port cannot reach the verdict" {
     const change: Change = .{
-        .previous = snapshot(&.{on(v4(1))}),
-        .current = snapshot(&.{ on(v4(9)), on(v6()) }),
+        .previous = try snapshot(&.{on(v4(1))}),
+        .current = try snapshot(&.{ on(v4(9)), on(v6()) }),
         .loopback = false,
     };
     const lost = direct(10, v4(1));
@@ -592,13 +598,13 @@ test "the host bits and the port cannot reach the verdict" {
 
 test "every verdict arm is reachable and the tally counts each path once" {
     const rebound_change: Change = .{
-        .previous = snapshot(&.{ on(v4(1)), on(v4(2)) }),
-        .current = snapshot(&.{on(v4(2))}),
+        .previous = try snapshot(&.{ on(v4(1)), on(v4(2)) }),
+        .current = try snapshot(&.{on(v4(2))}),
         .loopback = false,
     };
     const stranded_change: Change = .{
-        .previous = snapshot(&.{ on(v4(1)), on(v4(2)) }),
-        .current = snapshot(&.{}),
+        .previous = try snapshot(&.{ on(v4(1)), on(v4(2)) }),
+        .current = try snapshot(&.{}),
         .loopback = false,
     };
 
@@ -632,8 +638,8 @@ test "every verdict arm is reachable and the tally counts each path once" {
 
 test "the tally is the per-path verdict, counted" {
     const change: Change = .{
-        .previous = snapshot(&.{ on(v4(1)), on(v4(2)) }),
-        .current = snapshot(&.{on(v4(2))}),
+        .previous = try snapshot(&.{ on(v4(1)), on(v4(2)) }),
+        .current = try snapshot(&.{on(v4(2))}),
         .loopback = false,
     };
     const paths = [_]Held{

@@ -7,7 +7,6 @@
 
 const std = @import("std");
 const actions = @import("actions.zig");
-const settings = @import("config.zig");
 const wire = @import("message.zig");
 const message_id = @import("message_id.zig");
 const node_id = @import("node_id.zig");
@@ -18,7 +17,6 @@ const vectors = @import("blake3_vectors.zig");
 const t = std.testing;
 
 const Actions = actions.Actions;
-const Config = settings.Config;
 const IHaves = wire.IHaves;
 const OutEvent = wire.OutEvent;
 const MessageId = message_id.MessageId;

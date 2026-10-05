@@ -53,6 +53,18 @@ pub const Node = tree_mod.Node;
 pub const Plan = plan_mod.Plan;
 pub const pair_length = tree_mod.pair_length;
 
+comptime {
+    // The one place this file's `catch unreachable` on `Hasher.init` rests on.
+    // `Node.bytes` starts a node at `start_chunk * ranges.chunk_size`, and
+    // `Hasher.init` refuses any offset that is not a multiple of
+    // `core.chunk_length` — so while the two constants are the same number, no
+    // node this file can be handed names an offset the hasher will take. Both
+    // are declared in other modules and either could be edited alone; this is
+    // where that edit stops at the build instead of turning into a `catch
+    // unreachable` in Debug and a misaligned hash in ReleaseFast.
+    std.debug.assert(ranges.chunk_size == core.chunk_length);
+}
+
 /// Every way a proof can be refused. Each is a decision and not a crash: a
 /// peer that sends any of these is refused with the one that says why.
 pub const Error = error{
@@ -163,9 +175,11 @@ pub const Verifier = struct {
     /// compress, ROOT clear.
     fn hash(self: *const Verifier, node: Node, bytes: []const u8) core.CvBytes {
         const range = node.bytes(self.tree);
-        // Chunk-aligned by construction: a node's first byte is
-        // `start_chunk * 1024`, and `init` has already bounded `start_chunk`
-        // by the tree's chunk count.
+        // Chunk-aligned by construction, and `chunk_identity` below is what
+        // makes that a fact about the two constants rather than about this
+        // line: `Node.bytes` starts a node at `start_chunk * ranges.chunk_size`
+        // and `Hasher.init` refuses an offset that is not a multiple of
+        // `core.chunk_length`, so the two agreeing is the whole proof.
         var hasher = subtree.Hasher.init(range.start) catch unreachable;
         hasher.update(bytes[0..@intCast(range.end - range.start)]);
         return if (self.depth == 0) hasher.final() else hasher.finalChainingValue();

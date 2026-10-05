@@ -5,6 +5,12 @@
 //! replays the corpus, and `zig build fuzz --fuzz=<N>` hands the same corpus
 //! to Zig's coverage-guided fuzzer and lets it mutate for N iterations.
 //!
+//! The named refusals are a table of their own in `ws_frame_refusals.zig`, which
+//! this entry point imports and whose every row the second test below walks.
+//! The split is by responsibility: this file drives the fuzz and holds the
+//! oracles a mutation is walked through, and that file holds the fixed byte
+//! strings and the names they must be refused with.
+//!
 //! **The decoder is the production one, reached through the `ozai` module and
 //! not re-derived here.** A fuzz target carrying its own header reader would
 //! prove something about the copy, and the copy is what a mutation would be
@@ -42,6 +48,7 @@ const std = @import("std");
 const ozai = @import("ozai");
 const ws = ozai.relay_ws_frame;
 const t = std.testing;
+const cases = @import("ws_frame_refusals.zig");
 
 /// Seeds are the bytes off a peer's socket, one frame at a time.
 ///
@@ -93,84 +100,6 @@ const input_buffer_len = 128;
 /// bytes of header rule.
 const max_payload = 256;
 
-/// One refusal: the bytes, the end reading them, and the one name they may be
-/// refused with.
-///
-/// Each of these is a rule RFC 6455 states, so each is a name rather than a
-/// limit this module chose, and each is reached from a byte string short enough
-/// to write out.
-const DecodeCase = struct {
-    bytes: []const u8,
-    role: ws.Role,
-    expected: ws.Error,
-};
-
-const decode_cases = [_]DecodeCase{
-    .{ .bytes = &.{ 0xc1, 0x00 }, .role = .server, .expected = error.ReservedBitSet },
-    .{ .bytes = &.{ 0xf1, 0x00 }, .role = .client, .expected = error.ReservedBitSet },
-    .{ .bytes = &.{ 0xa1, 0x00 }, .role = .server, .expected = error.ReservedBitSet },
-    .{ .bytes = &.{ 0x91, 0x00 }, .role = .server, .expected = error.ReservedBitSet },
-    .{ .bytes = &.{ 0x83, 0x00 }, .role = .server, .expected = error.UnknownOpcode },
-    .{ .bytes = &.{ 0x8b, 0x00 }, .role = .server, .expected = error.UnknownOpcode },
-    .{ .bytes = &.{0xfb}, .role = .server, .expected = error.UnknownOpcode },
-    .{ .bytes = &.{ 0x89, 0x7e }, .role = .server, .expected = error.ControlFrameTooLong },
-    .{ .bytes = &.{ 0x8a, 0x7f }, .role = .server, .expected = error.ControlFrameTooLong },
-    .{ .bytes = &.{ 0x09, 0x00 }, .role = .server, .expected = error.FragmentedControlFrame },
-    .{ .bytes = &.{ 0x01, 0x7e, 0x00, 0x7d }, .role = .client, .expected = error.NonMinimalLength },
-    .{
-        .bytes = &.{ 0x01, 0x7f, 0, 0, 0, 0, 0, 0, 0, 0x01 },
-        .role = .client,
-        .expected = error.NonMinimalLength,
-    },
-    .{
-        .bytes = &.{ 0x81, 0x7f, 0x80, 0, 0, 0, 0, 0, 0, 0 },
-        .role = .server,
-        .expected = error.ReservedLengthBit,
-    },
-    .{ .bytes = &.{0x81}, .role = .client, .expected = error.UnexpectedEnd },
-    .{ .bytes = &.{ 0x81, 0x85 }, .role = .client, .expected = error.UnexpectedEnd },
-    .{ .bytes = &.{ 0x81, 0x05 }, .role = .client, .expected = error.UnexpectedEnd },
-    .{ .bytes = &.{ 0x81, 0x05 }, .role = .server, .expected = error.UnmaskedClientFrame },
-    .{
-        .bytes = &.{ 0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d },
-        .role = .server,
-        .expected = error.UnmaskedClientFrame,
-    },
-    .{
-        .bytes = &.{ 0x81, 0x05, 0x48 },
-        .role = .server,
-        .expected = error.MaskedServerFrame,
-    },
-    .{
-        .bytes = &.{ 0x82, 0x7f, 0, 0, 0, 0, 0x10, 0, 0, 0 },
-        .role = .client,
-        .expected = error.FrameTooLarge,
-    },
-};
-
-/// One header refusal: the bytes and the one name the header codec may answer
-/// them with. `readHeader` has no role and so cannot reach either of the two
-/// refusals about the end that sent the frame, which is what makes these a
-/// different list from the one above.
-const HeaderCase = struct {
-    bytes: []const u8,
-    expected: ws.Error,
-};
-
-const header_cases = [_]HeaderCase{
-    .{ .bytes = &.{}, .expected = error.UnexpectedEnd },
-    .{ .bytes = &.{0x81}, .expected = error.UnexpectedEnd },
-    .{ .bytes = &.{ 0x81, 0x7e, 0x00, 0x00 }, .expected = error.UnexpectedEnd },
-    .{ .bytes = &.{ 0x81, 0x7f, 0x00, 0x00 }, .expected = error.UnexpectedEnd },
-    .{ .bytes = &.{ 0xc1, 0x00 }, .expected = error.ReservedBitSet },
-    .{ .bytes = &.{ 0x83, 0x00 }, .expected = error.UnknownOpcode },
-    .{ .bytes = &.{ 0x89, 0x7e }, .expected = error.ControlFrameTooLong },
-    .{ .bytes = &.{ 0x09, 0x00 }, .expected = error.FragmentedControlFrame },
-    .{ .bytes = &.{ 0x81, 0x7e, 0x00, 0x7d }, .expected = error.NonMinimalLength },
-    .{ .bytes = &.{ 0x81, 0x7f, 0x80, 0, 0, 0, 0, 0, 0, 0 }, .expected = error.ReservedLengthBit },
-    .{ .bytes = &.{ 0x82, 0x7f, 0, 0, 0, 0, 0x10, 0, 0, 0 }, .expected = error.FrameTooLarge },
-};
-
 /// The lengths at and either side of each boundary between RFC 6455's three
 /// length widths, plus the two the rules are stated in terms of.
 const width_lengths = [_]u64{ 0, 1, 124, 125, 126, 127, 128, 255, 256, 65_535, 65_536 };
@@ -184,6 +113,27 @@ test "ws frame decode" {
     // walks the corpus instead of handing it to the fuzzer, which is what makes
     // a bare `zig build fuzz` a bounded gate rather than an empty step.
     try t.fuzz(Context{}, testOne, .{ .corpus = &corpus });
+}
+
+// The tables are read here rather than left as prose. They pin *which* name
+// each refusal gets, and the fuzz oracle in `checkRefusal` below pins only
+// which *set* a name belongs to — a header rule that started answering
+// `UnknownOpcode` where RFC 6455 says `ReservedBitSet` would pass every
+// mutation and fail nothing.
+//
+// It is a plain test and not part of the fuzz body because the rows are fixed
+// byte strings rather than inputs to mutate: a fuzzer would rewrite the very
+// bytes that make the expectation, and the expectation is the point. **Every
+// row of both tables is walked on every run** — a table that compiles and is
+// never read is a list of claims with nothing behind them, which is the one
+// thing a fuzz target may not be.
+test "each refusal is the name the RFC gives it, not another in its set" {
+    for (cases.decode_cases) |case| {
+        try t.expectError(case.expected, ws.decode(case.bytes, case.role));
+    }
+    for (cases.header_cases) |case| {
+        try t.expectError(case.expected, ws.readHeader(case.bytes));
+    }
 }
 
 fn testOne(_: Context, smith: *t.Smith) anyerror!void {
@@ -213,13 +163,26 @@ fn checkRefusal(bytes: []const u8) !void {
             // really is there.
             try checkDecoded(decoded, role);
         } else |err| {
-            // Oracle: ownership. `ws_frame_types.Error` has eleven names and
-            // three of them are not the header's: `UnmaskedClientFrame` and
-            // `MaskedServerFrame` belong to `decode` alone, and `BufferFull`
-            // belongs to the writer and is about the caller's storage rather than
-            // about a frame. A header rule answered through any of the three
-            // would mean the checks had moved.
-            try t.expect(isHeaderRefusal(err));
+            // Oracle: ownership, and it is role-aware because the two role
+            // refusals *belong to `decode`*: `ws_frame_types.Error` has eleven
+            // names, the eight header rules are eight of them, and the ninth
+            // `decode` can reach is the one this role is entitled to be
+            // refused with. RFC 6455 section 5.1 puts the mask obligation on
+            // the sender, so a reader is told about the frame the peer sent:
+            // `UnmaskedClientFrame` from a `.server` reader and
+            // `MaskedServerFrame` from a `.client` one, and `Role` names the
+            // end that is *reading*. `BufferFull` is the eleventh and `decode`
+            // can never answer with it — it belongs to the writer and is about
+            // the caller's storage rather than about a frame.
+            //
+            // So a header rule answered with a role name, the *other* role's
+            // name, or `BufferFull` all fail here, and a role name answered
+            // through `readHeader` below fails there.
+            try t.expect(switch (err) {
+                error.UnmaskedClientFrame => role == .server,
+                error.MaskedServerFrame => role == .client,
+                else => isHeaderRefusal(err),
+            });
         }
     }
     if (ws.readHeader(bytes)) |header| {
@@ -242,8 +205,15 @@ fn checkDecoded(decoded: ws.Decoded, role: ws.Role) !void {
     try t.expectEqual(@as(u64, decoded.payload.len), decoded.frame.payload_length);
     try t.expect(decoded.frame.header_length <= decoded.payload.len + ws.max_header_length);
     // The mask bit is what a role is checked against, so the two must be the
-    // same fact read twice.
-    try t.expectEqual(role == .client, decoded.frame.masked);
+    // same fact read twice. **The polarity is the other way round from the
+    // name**, and this is where it goes wrong: RFC 6455 section 5.1 makes it a
+    // client's frame that is masked and a server's that is not, and `Role`
+    // names the end that is *reading* — `.server` is a relay reading a
+    // client's frames — so a frame read as `.server` is masked and one read as
+    // `.client` is not. `ws_frame_types.zig` says "the value names this end,
+    // not the peer" in so many words, and this is the assertion that follows
+    // from it.
+    try t.expectEqual(role == .server, decoded.frame.masked);
     // A frame with the mask bit clear carries no key, so its four key bytes are
     // zero: a header that read them anyway would be reading bytes of its own
     // making, and a caller that trusted them would be trusting that.

@@ -31,8 +31,6 @@
 //! nothing allocates: a request borrows the buffer it was parsed from and a
 //! response is written into one the caller owns.
 
-const std = @import("std");
-
 /// Every way a relay upgrade request is refused.
 ///
 /// **Each arm names the first rule the request breaks, in the order RFC 6455

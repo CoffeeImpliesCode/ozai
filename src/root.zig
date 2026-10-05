@@ -49,6 +49,14 @@ pub const range_spec = @import("blobs/range_spec.zig");
 pub const blobs_protocol = @import("blobs/protocol.zig");
 pub const endpoint_ticket = @import("ticket/endpoint_ticket.zig");
 pub const blob_ticket = @import("ticket/blob_ticket.zig");
+pub const bao_tree = @import("blobs/bao_tree.zig");
+pub const bao_plan = @import("blobs/bao_plan.zig");
+pub const bao_proof_encode = @import("blobs/bao_proof_encode.zig");
+pub const bao_proof_verify = @import("blobs/bao_proof_verify.zig");
+
+pub const gossip_codec = @import("gossip/codec.zig");
+
+pub const relay_ws_frame = @import("relay/ws_frame.zig");
 
 pub const gossip_hyparview = @import("gossip/hyparview.zig");
 pub const gossip_plumtree = @import("gossip/plumtree.zig");
@@ -152,7 +160,6 @@ test {
     const node_topic_table = @import("node/topic_table.zig");
     const relay_http_upgrade = @import("relay/http_upgrade.zig");
     const relay_version_translate = @import("relay/version_translate.zig");
-    const relay_ws_frame = @import("relay/ws_frame.zig");
     const relay_ws_frame_mask = @import("relay/ws_frame_mask.zig");
     const transport_tcp = @import("transport/tcp.zig");
     const transport_tcp_error = @import("transport/tcp_error.zig");
@@ -169,7 +176,6 @@ test {
     std.testing.refAllDecls(node_topic_table);
     std.testing.refAllDecls(relay_http_upgrade);
     std.testing.refAllDecls(relay_version_translate);
-    std.testing.refAllDecls(relay_ws_frame);
     std.testing.refAllDecls(relay_ws_frame_mask);
     std.testing.refAllDecls(transport_tcp);
     std.testing.refAllDecls(transport_tcp_error);

@@ -63,19 +63,34 @@ const pair_length = bao_plan.pair_length;
 /// so a mutation starts from something that reaches the comparison half of the
 /// walk rather than only its length checks.
 ///
-/// They are held inline rather than as `@embedFile`s under `test/corpus/bao/`,
-/// because this slice was given exactly three files and a corpus directory
-/// would be a fourth. The names in the comments on each line are the file names
-/// a `test/corpus/bao/` carries for them.
+/// **Every seed is a named constant and not a value built where the table is.**
+/// A global may not point into a `comptime var` — that storage does not outlive
+/// comptime evaluation — so a run of one byte is written as its own constant
+/// and the table below takes that constant's address. A `const` at container
+/// scope is what gives these static storage duration, which is the one property
+/// this needs from them; a pointer cast or the address of a temporary would not
+/// have it.
+///
+/// The constants are named after the files a `test/corpus/bao/` carries for
+/// these seeds, so moving them out of line is a rename and nothing else.
+const empty_seed = [_]u8{};
+const one_byte = [_]u8{0x00};
+const one_byte_high = [_]u8{0xff};
+const bare_pair = [_]u8{0x00} ** pair_length;
+const short_pair = [_]u8{0x00} ** (pair_length - 1);
+const data_run = [_]u8{0x5a} ** 32;
+const pair_trailing_byte = [_]u8{0x00} ** (pair_length + 1);
+const data_run_nonzero = [_]u8{0x11} ** 16;
+
 const corpus = [_][]const u8{
-    repeated(0x00, 0), // empty: no response at all
-    &.{0x00}, // one_byte: a length no item of any plan has
-    &.{0xff}, // one_byte_high: the other end of the same range
-    repeated(0x00, pair_length), // bare_pair: a parent pair and nothing under it
-    repeated(0x00, pair_length - 1), // short_pair: the same pair, one byte short
-    repeated(0x5a, 32), // data_run: what a data node's own bytes look like
-    repeated(0x00, pair_length + 1), // pair_trailing_byte: a pair and one byte after
-    repeated(0x11, 16), // data_run_nonzero: a run no all-zero fill would produce
+    &empty_seed, // empty: no response at all
+    &one_byte, // one_byte: a length no item of any plan has
+    &one_byte_high, // one_byte_high: the other end of the same range
+    &bare_pair, // bare_pair: a parent pair and nothing under it
+    &short_pair, // short_pair: the same pair, one byte short
+    &data_run, // data_run: what a data node's own bytes look like
+    &pair_trailing_byte, // pair_trailing_byte: a pair and one byte after
+    &data_run_nonzero, // data_run_nonzero: a run no all-zero fill would produce
 };
 
 /// Long enough for a seed and for a mutated input to still reach a check it was
@@ -132,7 +147,10 @@ comptime {
     // refusal added there without a line here is a name a peer can be given that
     // this file has no record of, so it stops the build instead; a rename or a
     // reorder stops it too, which is the point of holding both.
-    const fields = @typeInfo(VerifyError).error_set.fields;
+    // `.error_set` is optional because `Type` is a union; the branch is the one
+    // an error set is in, and a null there means `VerifyError` stopped being an
+    // error set, which is as much of a stop as a rename is.
+    const fields = @typeInfo(VerifyError).error_set.?;
     if (fields.len != refusal_names.len) {
         @compileError("the proof verifier gained or lost a refusal");
     }
@@ -399,14 +417,6 @@ fn expectNamed(err: VerifyError) !void {
         @errorName(err),
     });
     return error.UnnamedRefusal;
-}
-
-/// `count` copies of `byte`. A run longer than a line or two is a run, and
-/// writing it out as a list would say nothing the name does not.
-fn repeated(comptime byte: u8, comptime count: usize) []const u8 {
-    comptime var out: [count]u8 = undefined;
-    for (&out) |*slot| slot.* = byte;
-    return &out;
 }
 
 /// An offset into a buffer of `len` bytes, chosen by a seed byte. The
