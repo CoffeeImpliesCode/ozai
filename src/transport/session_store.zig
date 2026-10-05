@@ -324,8 +324,17 @@ pub const Store = struct {
         ticket: SessionTicket,
         now_s: i64,
     ) Stored {
-        const key = Key.of(peer, ticket) orelse
-            return .{ .stored = false, .refused = .{ .peer = peer } };
+        const key = Key.of(peer, ticket) orelse {
+            // The refused key names the peer and the version the ticket claims,
+            // and leaves the name empty: a name this store cannot hold has no
+            // key, and a key naming an empty protocol is not the key that did
+            // not fit. The version still travels, because a caller logging the
+            // refusal is otherwise left saying a peer dropped its v1 ticket.
+            return .{
+                .stored = false,
+                .refused = .{ .peer = peer, .quic_version = ticket.quic_version },
+            };
+        };
         // An already-expired ticket is not filed. The core documents a zero
         // `lifetime` as expired one second after creation, so a ticket with no
         // recorded lifetime would otherwise occupy a slot until somebody looked.
@@ -480,7 +489,7 @@ test "a ticket is filed and offered under the key it names" {
     // negotiated and the version it ended on — read off the ticket, not off
     // the config the next connection will use.
     const entry = store.slice()[0];
-    try t.expectEqual(alpn_main, entry.key.alpnSlice());
+    try t.expectEqualStrings(alpn_main, entry.key.alpnSlice());
     try t.expectEqual(quic_v1, entry.key.quic_version);
     try t.expect(std.mem.eql(u8, &peer.toBytes(), &entry.key.peer.toBytes()));
 
@@ -577,18 +586,22 @@ test "an expired ticket is dropped rather than offered" {
     try t.expectEqual(@as(usize, 1), store.slice().len);
 }
 
-test "a ticket with no recorded lifetime is never filed" {
+test "a ticket with no recorded lifetime is refused one second past its creation" {
     const peer = otherPeer(0);
     var store: Store = .{};
     // A zero `lifetime` is the core's default for a ticket nobody recorded one
-    // on, and `isExpired` reads it as expired one second past `creation_time`.
-    // Filing it would fill the table with tickets that can only ever miss.
+    // on, and `isExpired` reads it as expired one second past `creation_time`:
+    // it asks whether `now - creation` is *past* the lifetime, so the one
+    // second this ticket is live in closes at its own creation stamp. Filing it
+    // would fill the table with tickets that can only ever miss.
     const recorded = ticketFor(alpn_main, quic_v1, 0, 1_000);
-    const refused = store.capture(peer, recorded, 1_000);
+    const refused = store.capture(peer, recorded, 1_001);
     try t.expect(!refused.stored);
     try t.expect(refused.refused != null);
     try t.expectEqual(@as(usize, 0), store.slice().len);
-    try t.expect(store.capture(peer, recorded, 1_001).stored == false);
+    // Still refused as the clock runs on, and the table is still empty.
+    try t.expect(store.capture(peer, recorded, 1_100).stored == false);
+    try t.expectEqual(@as(usize, 0), store.slice().len);
 }
 
 test "a second capture for the same key replaces the ticket in place" {
@@ -651,13 +664,16 @@ test "forget removes one entry and leaves the rest" {
     for (0..4) |offset| {
         _ = store.capture(otherPeer(offset), ticketFor(alpn_main, quic_v1, 3_600, 100), 100);
     }
-    const gone = otherPeer(3);
+    // The middle entry goes, because forgetting the last one would move it into
+    // its own gap and prove nothing about the move.
+    const gone = otherPeer(1);
     try t.expect(store.forget(Key.of(gone, ticketFor(alpn_main, quic_v1, 3_600, 100)).?));
     try t.expectEqual(@as(usize, 3), store.slice().len);
     try t.expect(store.take(gone, alpn_main, quic_v1, 100) == null);
     // The last entry moved into the gap rather than everything shifting down,
-    // so the other three are all still here.
-    for ([_]usize{ 0, 1, 3 }) |kept| {
+    // so the other three are all still here, in an order `slice` does not
+    // report as the order they were filed.
+    for ([_]usize{ 0, 2, 3 }) |kept| {
         try t.expect(store.take(otherPeer(kept), alpn_main, quic_v1, 100) != null);
     }
     // And a key the table never held is not found, twice or otherwise.
@@ -668,7 +684,7 @@ test "a copied store is an independent snapshot" {
     const peer = otherPeer(0);
     var original: Store = .{};
     try t.expect(original.capture(peer, ticketFor(alpn_main, quic_v1, 3_600, 100), 100).stored);
-    const copy = original;
+    var copy = original;
     try t.expectEqual(original.len, copy.len);
     try t.expectEqual(@as(?u8, 0xa5), pskOf(copy.take(peer, alpn_main, quic_v1, 100)));
 
@@ -728,7 +744,22 @@ test "a key compares over the protocol it names and not over its padding" {
         .alpn_len = @intCast(alpn_main.len - 1),
     };
     try t.expect(!clean.matches(shorter));
-    // And a name this store cannot hold has no key at all, so there is nothing
-    // for a lookup to match.
-    try t.expect(Key.of(peer, ticketFor("z" ** (alpn_len_max + 1), quic_v1, 3_600, 100)) == null);
+    // And a ticket claiming more name than the core's own field can hold has no
+    // key at all, so there is nothing for a lookup to match. The length is set
+    // past the array rather than written into it: `Key.of` answers from
+    // `alpn_len` alone and refuses before it reads a byte.
+    var over_long = ticketFor(alpn_main, quic_v1, 3_600, 100);
+    over_long.alpn_len = @intCast(alpn_len_max + 1);
+    try t.expect(Key.of(peer, over_long) == null);
+
+    // A `capture` handed one refuses and names it, carrying both fields it
+    // knows: the key that did not fit is the peer's and the version's, or a
+    // caller logging the refusal is left saying a peer dropped an unnamed
+    // ticket.
+    var store: Store = .{};
+    const refused = store.capture(peer, over_long, 100);
+    try t.expect(!refused.stored);
+    try t.expectEqual(quic_v1, refused.refused.?.quic_version);
+    try t.expect(std.mem.eql(u8, &peer.toBytes(), &refused.refused.?.peer.toBytes()));
+    try t.expectEqual(@as(usize, 0), store.slice().len);
 }

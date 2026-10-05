@@ -136,4 +136,12 @@ test {
     std.testing.refAllDecls(net_path_select);
     std.testing.refAllDecls(net_holepunch_target);
     std.testing.refAllDecls(net_holepunch_trigger);
+    const net_observed_address = @import("net/observed_address.zig");
+    const net_observed_reporter = @import("net/observed_reporter.zig");
+    const relay_auth_challenge = @import("relay/auth_challenge.zig");
+    const relay_auth_credential = @import("relay/auth_credential.zig");
+    std.testing.refAllDecls(net_observed_address);
+    std.testing.refAllDecls(net_observed_reporter);
+    std.testing.refAllDecls(relay_auth_challenge);
+    std.testing.refAllDecls(relay_auth_credential);
 }

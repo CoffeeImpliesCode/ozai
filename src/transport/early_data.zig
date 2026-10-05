@@ -179,7 +179,7 @@ pub fn settle(bytes: []const u8, zero_rtt_accepted: bool) Settlement {
 
 // --- tests
 
-const std_testing = @import("std").testing;
+const t = @import("std").testing;
 const base_key = @import("../base/key.zig");
 
 const NodeId = resumption.NodeId;
@@ -233,16 +233,16 @@ test "a live allowed ticket mints a permit bounded by the server's allowance" {
     // Minted, with exactly the budget the issuing server granted — no more,
     // because the budget is what the server agreed to bound.
     var pass = try permit(&allowed, peer, intent, 100);
-    try std_testing.expectEqual(@as(u32, 1_024), pass.remaining());
+    try t.expectEqual(@as(u32, 1_024), pass.remaining());
 
     // Every byte sent is charged, and the permit refuses past exhaustion
     // rather than emitting a prefix the peer never bounded.
     try pass.takeBytes(1_000);
-    try std_testing.expectEqual(@as(u32, 24), pass.remaining());
+    try t.expectEqual(@as(u32, 24), pass.remaining());
     try pass.takeBytes(24);
-    try std_testing.expectEqual(@as(u32, 0), pass.remaining());
-    try std_testing.expectError(error.BudgetExhausted, pass.takeBytes(1));
-    try std_testing.expectEqual(@as(u32, 0), pass.remaining());
+    try t.expectEqual(@as(u32, 0), pass.remaining());
+    try t.expectError(error.BudgetExhausted, pass.takeBytes(1));
+    try t.expectEqual(@as(u32, 0), pass.remaining());
 }
 
 test "a ticket without an early-data allowance resumes but mints no permit" {
@@ -255,7 +255,7 @@ test "a ticket without an early-data allowance resumes but mints no permit" {
     // But the issuing server advertised no allowance, so there is no 0-RTT
     // to send: the NewSessionTicket carried no early_data extension, and a
     // client sending against a zero here sends it unpermitted.
-    try std_testing.expectError(error.NoEarlyData, permit(&bare, peer, intent, 100));
+    try t.expectError(error.NoEarlyData, permit(&bare, peer, intent, 100));
 }
 
 test "a dead or foreign ticket mints no permit, naming its own reason" {
@@ -265,22 +265,22 @@ test "a dead or foreign ticket mints no permit, naming its own reason" {
 
     // Past its lifetime: dead everywhere, not just for early data.
     const dead = ticketFor(alpn_main, quic_v1, 100, 1_000, 1_024);
-    try std_testing.expectError(error.Expired, permit(&dead, peer, intent, 1_101));
+    try t.expectError(error.Expired, permit(&dead, peer, intent, 1_101));
 
     // Captured for another peer: not ours to send under.
     const live = ticketFor(alpn_main, quic_v1, 3_600, 100, 1_024);
-    try std_testing.expectError(error.WrongPeer, permit(&live, stranger, intent, 100));
+    try t.expectError(error.WrongPeer, permit(&live, stranger, intent, 100));
 
     // Issued for another protocol: early data is the issuing connection's
     // own data under its own protocol, and this connection named another.
-    try std_testing.expectError(
+    try t.expectError(
         error.WrongAlpn,
         permit(&live, peer, intentFor(peer, alpn_other, quic_v1), 100),
     );
 
     // Issued on another QUIC version: RFC 9369 §5 forbids it outright.
     const future = ticketFor(alpn_main, quic_v2, 3_600, 100, 1_024);
-    try std_testing.expectError(error.WrongVersion, permit(&future, peer, intent, 100));
+    try t.expectError(error.WrongVersion, permit(&future, peer, intent, 100));
 }
 
 test "settlement processes accepted bytes and resends refused ones as 1-RTT" {
@@ -289,7 +289,7 @@ test "settlement processes accepted bytes and resends refused ones as 1-RTT" {
     // Accepted: the core verified the binder and the sealed protocol, so
     // these are early data under the resumption's keys and may be processed.
     const ok = settle(bytes, true);
-    try std_testing.expectEqualStrings(bytes, ok.accepted);
+    try t.expectEqualStrings(bytes, ok.accepted);
 
     // Refused: the bytes were never early data. They return for re-emission
     // as 1-RTT — the fallback this file decided — rather than failing the
@@ -297,5 +297,5 @@ test "settlement processes accepted bytes and resends refused ones as 1-RTT" {
     // policy, ALPN drift), so failing here would turn the fast path into a
     // failure path.
     const retry = settle(bytes, false);
-    try std_testing.expectEqualStrings(bytes, retry.refused_resend);
+    try t.expectEqualStrings(bytes, retry.refused_resend);
 }

@@ -169,7 +169,11 @@ pub fn offer(store: *Store, intent: Intent, now_s: i64) OfferError!*const Sessio
         if (version_ok and alpn_ok) {
             if (entry.ticket.isExpired(now_s)) {
                 const key = entry.key;
-                std.debug.assert(store.forget(key));
+                // The call first, the claim second: an assert holding the
+                // only call would vanish where safety is off and keep the
+                // dead entry.
+                const dropped = store.forget(key);
+                std.debug.assert(dropped);
                 return error.Expired;
             }
             return &entry.ticket;
@@ -203,7 +207,7 @@ pub fn accept(
     if (!std.mem.eql(u8, &captured_for.toBytes(), &intent.peer.toBytes())) return error.WrongPeer;
     if (ticket.isExpired(now_s)) return error.Expired;
     if (ticket.quic_version != intent.quic_version) return error.WrongVersion;
-    if (ticket.alpn_len > ticket.alpn.len) return error.WrongAlpn;
+    if (@as(usize, ticket.alpn_len) > ticket.alpn.len) return error.WrongAlpn;
     if (!std.mem.eql(u8, ticket.getAlpn(), intent.alpn)) return error.WrongAlpn;
 }
 
@@ -287,7 +291,8 @@ test "another peer's ticket is never offered, and presenting it names the peer" 
 
     // The explicit-value path, where the caller assembles the pair by hand,
     // refuses it and names the dimension that failed.
-    try t.expectError(error.WrongPeer, accept(&filed, first, intentFor(second, alpn_main, quic_v1), 100));
+    const pair_refusal = accept(&filed, first, intentFor(second, alpn_main, quic_v1), 100);
+    try t.expectError(error.WrongPeer, pair_refusal);
     // And the right peer still passes: the refusal was about the pair, not
     // the ticket.
     try accept(&filed, first, intentFor(first, alpn_main, quic_v1), 100);
@@ -311,6 +316,14 @@ test "a ticket offered for another protocol is refused with its own error" {
     const longer = ticketFor("ozai-blobs-2", quic_v1, 3_600, 100);
     const prefix_refusal = accept(&longer, peer, intentFor(peer, "ozai", quic_v1), 100);
     try t.expectError(error.WrongAlpn, prefix_refusal);
+
+    // A length past the selection width matches nothing rather than reading
+    // past the name: fail closed on the corrupt value instead of panicking
+    // in `getAlpn`.
+    var corrupt = ticketFor(alpn_main, quic_v1, 3_600, 100);
+    corrupt.alpn_len = corrupt.alpn.len + 1;
+    const corrupt_refusal = accept(&corrupt, peer, intentFor(peer, alpn_main, quic_v1), 100);
+    try t.expectError(error.WrongAlpn, corrupt_refusal);
 }
 test "a ticket from another QUIC version is refused with its own error" {
     const peer = try testNodeId(1);
@@ -319,10 +332,12 @@ test "a ticket from another QUIC version is refused with its own error" {
 
     // RFC 9369 §5 in both directions, and the entry survives: it is still
     // the right ticket for a connection starting on version 2.
-    try t.expectError(error.WrongVersion, offer(&store, intentFor(peer, alpn_main, quic_v1), 100));
+    const v1 = intentFor(peer, alpn_main, quic_v1);
+    try t.expectError(error.WrongVersion, offer(&store, v1, 100));
     try t.expectEqual(@as(usize, 1), store.slice().len);
     const filed = ticketFor(alpn_main, quic_v2, 3_600, 100);
-    try t.expectError(error.WrongVersion, accept(&filed, peer, intentFor(peer, alpn_main, quic_v1), 100));
+    const stale_refusal = accept(&filed, peer, v1, 100);
+    try t.expectError(error.WrongVersion, stale_refusal);
 
     // The version the entry was issued for still offers and accepts.
     _ = try offer(&store, intentFor(peer, alpn_main, quic_v2), 100);
@@ -342,10 +357,12 @@ test "an expired ticket is refused and its slot freed" {
     // not "nothing filed" and not a wrong-dimension error. Offering a PSK
     // the peer has stopped accepting would cost a flight and a binder log
     // to arrive where a full handshake arrives directly.
-    try t.expectError(error.Expired, offer(&store, intentFor(peer, alpn_main, quic_v1), 1_101));
+    const late = intentFor(peer, alpn_main, quic_v1);
+    try t.expectError(error.Expired, offer(&store, late, 1_101));
     try t.expectEqual(@as(usize, 0), store.slice().len);
     const dead = ticketFor(alpn_main, quic_v1, 100, 1_000);
-    try t.expectError(error.Expired, accept(&dead, peer, intentFor(peer, alpn_main, quic_v1), 1_101));
+    const dead_refusal = accept(&dead, peer, late, 1_101);
+    try t.expectError(error.Expired, dead_refusal);
 
     // The freed slot files again immediately.
     try t.expect(store.capture(peer, ticketFor(alpn_main, quic_v1, 100, 1_101), 1_101).stored);
@@ -374,7 +391,9 @@ test "an empty store and an unholdable protocol are an ordinary full handshake" 
     // the cold start rather than any of the three refusals above.
     try t.expectError(error.NoTicket, offer(&store, intentFor(peer, alpn_main, quic_v1), 100));
     const filed = ticketFor(alpn_main, quic_v1, 3_600, 100);
-    try t.expectError(error.WrongPeer, accept(&filed, try testNodeId(9), intentFor(peer, alpn_main, quic_v1), 100));
+    const foreign = try testNodeId(9);
+    const foreign_refusal = accept(&filed, foreign, intentFor(peer, alpn_main, quic_v1), 100);
+    try t.expectError(error.WrongPeer, foreign_refusal);
 
     // A protocol longer than the store can key on can never be filed, so it
     // can never match: same cold start, without probing.

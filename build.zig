@@ -423,6 +423,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "pkarr", .file = "test/pkarr_fuzz.zig" },
         .{ .name = "relay-frame", .file = "test/relay_frame_fuzz.zig" },
         .{ .name = "postcard", .file = "test/postcard_fuzz.zig" },
+        .{ .name = "bao", .file = "test/bao_fuzz.zig" },
+        .{ .name = "gossip-codec", .file = "test/gossip_codec_fuzz.zig" },
+        .{ .name = "ws-frame", .file = "test/ws_frame_fuzz.zig" },
     };
     const fuzz_step = b.step("fuzz", "Run the decoder fuzz targets, `--fuzz=N` to mutate");
     for (fuzz_targets) |fuzz_target| {
