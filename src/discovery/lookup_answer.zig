@@ -115,7 +115,12 @@ pub fn readAnswer(
 }
 
 /// What one header says, once the fields this file acts on have been checked.
-const Counts = struct {
+///
+/// Public because a second reader — `discovery/host_io.zig` — parses the same
+/// header for the host record types. One header, one parser: `AGENTS.md` §1
+/// does not allow a second copy of this rule to exist because a second caller
+/// needed it.
+pub const Counts = struct {
     questions: u16,
     answers: u16,
     authorities: u16,
@@ -127,7 +132,7 @@ const Counts = struct {
 /// The order is the order the checks can be made in: the length, then the `ID`
 /// — a foreign transaction is not a malformed message and must not be reported
 /// as one — then `QR`, then `TC`, then the counts.
-fn readHeader(message: []const u8, id: u16) wire.WireError!Counts {
+pub fn readHeader(message: []const u8, id: u16) wire.WireError!Counts {
     if (message.len < wire.header_length) return error.ShortMessage;
     if (wire.be16(message, 0) != id) return error.ForeignTransaction;
     const flags = wire.be16(message, 2);
@@ -187,7 +192,7 @@ fn walkRecord(
 
 /// Walk one record without reading what it holds, for the sections that cannot
 /// carry this question's answer.
-fn skipRecord(message: []const u8, at: usize) wire.WireError!usize {
+pub fn skipRecord(message: []const u8, at: usize) wire.WireError!usize {
     const decoded = try names.readName(message, at, &.{});
     const fixed = try recordBody(message, decoded.end);
     return fixed + wire.be16(message, decoded.end + 8);
@@ -196,7 +201,7 @@ fn skipRecord(message: []const u8, at: usize) wire.WireError!usize {
 /// `TYPE`, `CLASS`, `TTL` and `RDLENGTH` end here: the offset the `RDATA`
 /// starts at, checked against the message so a `RDLENGTH` past the end is a
 /// short message and not a read out of bounds.
-fn recordBody(message: []const u8, at: usize) wire.WireError!usize {
+pub fn recordBody(message: []const u8, at: usize) wire.WireError!usize {
     const fixed = at + 2 + 2 + 4 + 2;
     if (fixed > message.len) return error.ShortMessage;
     const rdlength = wire.be16(message, at + 8);

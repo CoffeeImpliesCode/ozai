@@ -35,6 +35,20 @@ const endpoint_ticket = @import("ticket/endpoint_ticket.zig");
 const blob_ticket = @import("ticket/blob_ticket.zig");
 const gossip_hyparview = @import("gossip/hyparview.zig");
 const gossip_plumtree = @import("gossip/plumtree.zig");
+const crypto_blake3_core = @import("crypto/blake3_core.zig");
+const crypto_blake3_nodes = @import("crypto/blake3_nodes.zig");
+const crypto_blake3_subtree = @import("crypto/blake3_subtree.zig");
+const discovery_host_answer = @import("discovery/host_answer.zig");
+const discovery_host_io = @import("discovery/host_io.zig");
+const discovery_host_wire = @import("discovery/host_wire.zig");
+const gossip_codec_test = @import("gossip/codec_test.zig");
+const gossip_codec_chunk_test = @import("gossip/codec/chunk_test.zig");
+const node_conn_index = @import("node/conn_index.zig");
+const node_topic_table = @import("node/topic_table.zig");
+const relay_http_upgrade = @import("relay/http_upgrade.zig");
+const relay_version_translate = @import("relay/version_translate.zig");
+const relay_ws_frame = @import("relay/ws_frame.zig");
+const relay_ws_frame_mask = @import("relay/ws_frame_mask.zig");
 
 test {
     std.testing.refAllDecls(@This());
@@ -70,4 +84,18 @@ test {
     std.testing.refAllDecls(blob_ticket);
     std.testing.refAllDecls(gossip_hyparview);
     std.testing.refAllDecls(gossip_plumtree);
+    std.testing.refAllDecls(crypto_blake3_core);
+    std.testing.refAllDecls(crypto_blake3_nodes);
+    std.testing.refAllDecls(crypto_blake3_subtree);
+    std.testing.refAllDecls(discovery_host_answer);
+    std.testing.refAllDecls(discovery_host_io);
+    std.testing.refAllDecls(discovery_host_wire);
+    std.testing.refAllDecls(gossip_codec_test);
+    std.testing.refAllDecls(gossip_codec_chunk_test);
+    std.testing.refAllDecls(node_conn_index);
+    std.testing.refAllDecls(node_topic_table);
+    std.testing.refAllDecls(relay_http_upgrade);
+    std.testing.refAllDecls(relay_version_translate);
+    std.testing.refAllDecls(relay_ws_frame);
+    std.testing.refAllDecls(relay_ws_frame_mask);
 }
