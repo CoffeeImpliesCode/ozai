@@ -244,6 +244,18 @@ test {
     std.testing.refAllDecls(transport_resumption);
     std.testing.refAllDecls(transport_early_data);
     std.testing.refAllDecls(transport_session_store);
+    const blobs_blob_set = @import("blobs/blob_set.zig");
+    const net_blobs_route = @import("net/blobs_route.zig");
+    const net_path_revalidate = @import("net/path_revalidate.zig");
+    const relay_relay_egress = @import("relay/relay_egress.zig");
+    const relay_relay_ingress = @import("relay/relay_ingress.zig");
+    const transport_multipath = @import("transport/multipath.zig");
+    std.testing.refAllDecls(blobs_blob_set);
+    std.testing.refAllDecls(net_blobs_route);
+    std.testing.refAllDecls(net_path_revalidate);
+    std.testing.refAllDecls(relay_relay_egress);
+    std.testing.refAllDecls(relay_relay_ingress);
+    std.testing.refAllDecls(transport_multipath);
     std.testing.refAllDecls(base32);
     std.testing.refAllDecls(key);
     std.testing.refAllDecls(addr);
