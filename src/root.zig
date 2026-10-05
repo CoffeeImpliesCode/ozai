@@ -74,6 +74,72 @@ test {
     // Reference every declaration so an unused module still type-checks. Zig
     // 0.16 dropped `refAllDeclsRecursive`; the roots are named explicitly.
     std.testing.refAllDecls(@This());
+    // A split leaves the facade naming the layer, but a facade re-export does
+    // not pull in the tests of the module behind it: Zig collects a file's test
+    // blocks only when that file is itself referenced. Without these lines the
+    // build stays green and the tests silently stop running.
+    const dial_source_harness = @import("discovery/dial_source_harness.zig");
+    const item_merge = @import("discovery/item_merge.zig");
+    const item_record = @import("discovery/item_record.zig");
+    const item_resolution = @import("discovery/item_resolution.zig");
+    const lookup_answer = @import("discovery/lookup_answer.zig");
+    const lookup_query = @import("discovery/lookup_query.zig");
+    const lookup_retrieval = @import("discovery/lookup_retrieval.zig");
+    const preset = @import("discovery/preset.zig");
+    const accept_machine = @import("endpoint/accept_machine.zig");
+    const hyparview_config_test = @import("gossip/hyparview/config_test.zig");
+    const hyparview_peer_data_test = @import("gossip/hyparview/peer_data_test.zig");
+    const hyparview_sim_test = @import("gossip/hyparview/sim_test.zig");
+    const hyparview_state_test = @import("gossip/hyparview/state_test.zig");
+    const hyparview_topic_id_test = @import("gossip/hyparview/topic_id_test.zig");
+    const plumtree_blake3_test = @import("gossip/plumtree/blake3_test.zig");
+    const plumtree_cache_test = @import("gossip/plumtree/cache_test.zig");
+    const plumtree_recovery_test = @import("gossip/plumtree/recovery_test.zig");
+    const plumtree_state_test = @import("gossip/plumtree/state_test.zig");
+    const relay_frame_decode = @import("relay/frame_decode.zig");
+    const relay_frame_encode = @import("relay/frame_encode.zig");
+    const relay_frame_roundtrip = @import("relay/frame_roundtrip.zig");
+    const relay_frame_types = @import("relay/frame_types.zig");
+    const relay_frame_writer = @import("relay/frame_writer.zig");
+    const relay_server_handshake = @import("relay/server_handshake.zig");
+    const relay_server_queue = @import("relay/server_queue.zig");
+    const relay_server_registry = @import("relay/server_registry.zig");
+    const transport_bridge_config = @import("transport/bridge_config.zig");
+    const transport_bridge_conn = @import("transport/bridge_conn.zig");
+    const transport_bridge_manager = @import("transport/bridge_manager.zig");
+    const transport_dial_client = @import("transport/dial_client.zig");
+    const transport_dial_route = @import("transport/dial_route.zig");
+    std.testing.refAllDecls(dial_source_harness);
+    std.testing.refAllDecls(item_merge);
+    std.testing.refAllDecls(item_record);
+    std.testing.refAllDecls(item_resolution);
+    std.testing.refAllDecls(lookup_answer);
+    std.testing.refAllDecls(lookup_query);
+    std.testing.refAllDecls(lookup_retrieval);
+    std.testing.refAllDecls(preset);
+    std.testing.refAllDecls(accept_machine);
+    std.testing.refAllDecls(hyparview_config_test);
+    std.testing.refAllDecls(hyparview_peer_data_test);
+    std.testing.refAllDecls(hyparview_sim_test);
+    std.testing.refAllDecls(hyparview_state_test);
+    std.testing.refAllDecls(hyparview_topic_id_test);
+    std.testing.refAllDecls(plumtree_blake3_test);
+    std.testing.refAllDecls(plumtree_cache_test);
+    std.testing.refAllDecls(plumtree_recovery_test);
+    std.testing.refAllDecls(plumtree_state_test);
+    std.testing.refAllDecls(relay_frame_decode);
+    std.testing.refAllDecls(relay_frame_encode);
+    std.testing.refAllDecls(relay_frame_roundtrip);
+    std.testing.refAllDecls(relay_frame_types);
+    std.testing.refAllDecls(relay_frame_writer);
+    std.testing.refAllDecls(relay_server_handshake);
+    std.testing.refAllDecls(relay_server_queue);
+    std.testing.refAllDecls(relay_server_registry);
+    std.testing.refAllDecls(transport_bridge_config);
+    std.testing.refAllDecls(transport_bridge_conn);
+    std.testing.refAllDecls(transport_bridge_manager);
+    std.testing.refAllDecls(transport_dial_client);
+    std.testing.refAllDecls(transport_dial_route);
     std.testing.refAllDecls(base32);
     std.testing.refAllDecls(key);
     std.testing.refAllDecls(addr);
