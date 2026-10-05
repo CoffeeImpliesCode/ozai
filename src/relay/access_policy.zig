@@ -271,7 +271,7 @@ test "a policy refuses with a named reason and the handshake carries it" {
         policy.event(.{
             .node_id = stranger,
             .connection_id = 8,
-        .mechanism = .signed_key_material,
+            .mechanism = .signed_key_material,
         }),
     );
     try std_testing.expectEqualStrings("this relay serves nobody else", denial.state.denied.reason);
@@ -356,7 +356,7 @@ test "accept_all is a policy and not an absent decision" {
         accept_all.event(.{
             .node_id = peer,
             .connection_id = 12,
-        .mechanism = .signed_key_material,
+            .mechanism = .signed_key_material,
         }),
     );
     try std_testing.expectEqual(

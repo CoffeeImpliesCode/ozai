@@ -234,16 +234,18 @@ test "pending is not an outcome, and expiry asks for it" {
 
     // Expiry is the deadline and nothing else: one nanosecond before, nothing
     // has happened; at it, the attempt is past due and still in flight.
-    try t.expect(!attempt.expired(attempt.deadline - 1));
-    try t.expect(attempt.expired(attempt.deadline));
-    try t.expect(!attempt.settled());
-    try t.expect(live(start, 4000).expired(attempt.deadline + std.time.ns_per_s));
+    try t.expect(!expired(attempt, attempt.deadline - 1));
+    try t.expect(expired(attempt, attempt.deadline));
+    try t.expect(!settled(attempt));
+    try t.expect(expired(live(start, 4000), attempt.deadline + std.time.ns_per_s));
 
     // A settled attempt is never expired again, so a poller cannot time out a
-    // connection that already answered.
-    try t.expect(!same.target.expired(attempt.deadline + std.time.ns_per_s));
-    try t.expect(settle(attempt, start, .connected).target.settled());
-    try t.expect(!settle(attempt, start, .connected).target.expired(attempt.deadline + 1));
+    // connection that already answered. `same.target` is not one: a refused
+    // `.pending` leaves the attempt in flight, so past the deadline it is
+    // expired like any other pending attempt.
+    try t.expect(expired(same.target, attempt.deadline + std.time.ns_per_s));
+    try t.expect(settled(settle(attempt, start, .connected).target));
+    try t.expect(!expired(settle(attempt, start, .connected).target, attempt.deadline + 1));
 }
 
 test "a copy of an attempt reads its own bytes" {

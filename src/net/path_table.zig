@@ -537,7 +537,7 @@ test "at the bound the table refuses a file and moves nothing" {
     }
 
     // And the refusal is counted rather than silent.
-    const burst = table.absorb(&.{ at(2000) }, 0);
+    const burst = table.absorb(&.{at(2000)}, 0);
     try t.expectEqual(Absorbed{ .added = 0, .refused = 1, .evicted = 0 }, burst);
 }
 
@@ -566,7 +566,7 @@ test "a refused file takes the slot of a failed path and names it" {
 
     // The slot the failure gave up is the one the new path has, and it is
     // counted rather than spent in silence.
-    const burst = table.absorb(&.{ at(2001) }, 0);
+    const burst = table.absorb(&.{at(2001)}, 0);
     try t.expectEqual(Absorbed{ .added = 0, .refused = 1, .evicted = 0 }, burst);
 }
 
@@ -574,10 +574,11 @@ test "marking is idempotent and reports what it changed" {
     var table: Table = .{};
     _ = table.observe(at(1000), .open, 0);
     _ = table.observe(at(1001), .open, 0);
-    try t.expect(table.account(at(1000), 1, 1, 0));
-    // `at(1001)` has never had a byte on it, so it is idle from when it was
-    // filed: after the timeout it is marked, and the path that carried at `now`
-    // is not.
+    try t.expect(table.account(at(1000), 1, 1, idle_timeout));
+    // `at(1000)` carried at the instant `mark` runs and `at(1001)` never had a
+    // byte on it, so it is idle from when it was filed: at `idle_timeout` both
+    // are still inside the timeout, and a nanosecond later only the second is
+    // outside it.
     try t.expectEqual(@as(usize, 0), table.mark(idle_timeout));
     try t.expectEqual(@as(usize, 1), table.mark(idle_timeout + 1));
 

@@ -73,7 +73,7 @@ pub const BaoTree = tree_mod.BaoTree;
 const pair_length = tree_mod.pair_length;
 
 /// Everything that can stop an answer being written.
-pub const Error = std.Io.Dir.OpenError ||
+pub const Error = std.Io.File.OpenError ||
     std.Io.File.LengthError ||
     std.Io.File.ReadPositionalError ||
     std.Io.Writer.Error ||
@@ -145,7 +145,7 @@ pub const Provider = struct {
         };
         defer handles.close(io);
 
-        const tree = BaoTree.init(try handles.data.length(io));
+        const tree = BaoTree.init(try handles.data.length(t.io));
         const selected = selectedRange(request, tree.chunks()) orelse return .absent;
         const plan = plan_mod.planOf(tree, selected);
         if (plan.isEmpty()) return .absent;
@@ -177,6 +177,10 @@ pub fn selectedRange(request: GetRequest, total_chunks: u64) ?ranges.ChunkRange 
         .start = first.offset,
         .end = first.offset + first.size,
     };
+    // Two spans that do not touch are two selected runs with a deselected gap
+    // between them, and closing that gap up would answer for chunks the spec
+    // refused. A third span is refused for the same reason.
+    if (second.offset != first.offset + first.size) return null;
     if (walk.next() != null) return null;
     return .{ .start = first.offset, .end = second.offset + second.size };
 }
@@ -203,7 +207,7 @@ fn writePlan(
         ),
         .pair => |node| {
             if (node.isOutboardParent()) {
-                try handles.outboard.readPositionalAll(
+                _ = try handles.outboard.readPositionalAll(
                     io,
                     &pair,
                     outboard_index * pair_length,
@@ -290,6 +294,18 @@ const published = @import("../gossip/plumtree/blake3_vectors.zig");
 /// and five below a group it does not.
 const off_group = ranges.ChunkRange{ .start = 20, .end = 21 };
 
+/// `off_group` as a request's ranges, over storage that outlives the call.
+///
+/// `GetRequest` borrows its items and the items borrow their widths, so a
+/// helper that built either would hand back a pointer to a frame that is gone
+/// before the caller reads it. These two arrays are comptime, so they are in
+/// the binary and a request built over them is a request anyone may hold.
+const off_group_widths = [_]u64{ off_group.start, off_group.len() };
+const off_group_items = [_]range_spec.Item{
+    .{ .delta = 0, .spec = .{ .widths = &off_group_widths } },
+    .{ .delta = 1, .spec = range_spec.RangeSpec.empty },
+};
+
 // A whole-blob answer is the blob. Nothing is prepended, because the plan of
 // every chunk is the root and the root's own bytes are the answer; and a blob
 // the store does not have is answered with nothing, which is the one refusal a
@@ -308,16 +324,17 @@ test "a whole blob is answered with its own bytes, and a miss with none" {
     var scratch: [1024]u8 = undefined;
     const provider = try Provider.init(tmp.dir, &name_storage, hash, &scratch);
 
-    var answer: [data.len]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&answer);
-    try t.expectEqual(.answered, try provider.answer(t.io, &writer, .blob(hash)));
+    const answer = try t.allocator.alloc(u8, data.len);
+    defer t.allocator.free(answer);
+    var writer = std.Io.Writer.fixed(answer);
+    try t.expectEqual(.answered, try provider.answer(t.io, &writer, GetRequest.blob(hash)));
     try t.expectEqualSlices(u8, data, writer.buffered());
 
     // A hash nobody stored: the writer is untouched, which is what "closes
     // just that stream with nothing written" means at this layer.
     var missed: [64]u8 = undefined;
     var miss_writer = std.Io.Writer.fixed(&missed);
-    const absent = try provider.answer(t.io, &miss_writer, .blob(@splat(0x99)));
+    const absent = try provider.answer(t.io, &miss_writer, GetRequest.blob(@splat(0x99)));
     try t.expectEqual(.absent, absent);
     try t.expectEqual(@as(usize, 0), miss_writer.buffered().len);
 }
@@ -337,16 +354,18 @@ test "a partial range is the plan's own encoding, pairs in preorder" {
     try putBlob(tmp.dir, hash, data);
 
     const plan = plan_mod.planOf(tree, off_group);
-    var expected: [plan.bytes]u8 = undefined;
-    const expected_len = try encode_mod.encode(plan, tree, data, &expected);
+    const expected = try t.allocator.alloc(u8, plan.bytes);
+    defer t.allocator.free(expected);
+    const expected_len = try encode_mod.encode(plan, tree, data, expected);
 
     var name_storage: store.NameStorage = undefined;
     var scratch: [1024]u8 = undefined;
     const provider = try Provider.init(tmp.dir, &name_storage, hash, &scratch);
 
-    var answer: [expected.len]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&answer);
-    const request = requestFor(hash, off_group);
+    const answer = try t.allocator.alloc(u8, expected.len);
+    defer t.allocator.free(answer);
+    var writer = std.Io.Writer.fixed(answer);
+    const request = off_groupFor(hash);
     try t.expectEqual(.answered, try provider.answer(t.io, &writer, request));
     try t.expectEqualSlices(u8, expected[0..expected_len], writer.buffered());
 }
@@ -370,6 +389,7 @@ test "an outboard parent is read from the file, not recomputed" {
     var name_storage: store.NameStorage = undefined;
     const paths = store.names(&name_storage, hash);
     var damaged = try readAll(t.io, tmp.dir, paths.outboard);
+    defer t.allocator.free(damaged);
     damaged[0] ^= 0x01;
     var outboard = try tmp.dir.createFile(t.io, paths.outboard, .{ .truncate = true });
     try outboard.writeStreamingAll(t.io, damaged);
@@ -379,7 +399,7 @@ test "an outboard parent is read from the file, not recomputed" {
     const provider = try Provider.init(tmp.dir, &name_storage, hash, &scratch);
     var answer: [1024 * 3]u8 = undefined;
     var writer = std.Io.Writer.fixed(&answer);
-    try t.expectEqual(.answered, try provider.answer(t.io, &writer, requestFor(hash, off_group)));
+    try t.expectEqual(.answered, try provider.answer(t.io, &writer, off_groupFor(hash)));
     try t.expectEqualSlices(u8, damaged[0..pair_length], writer.buffered()[0..pair_length]);
 }
 
@@ -402,12 +422,13 @@ test "a walk this store cannot take is refused, not half-answered" {
     const provider = try Provider.init(tmp.dir, &name_storage, hash, &scratch);
 
     // `GetRequest.all`: one spec and no terminator, so the walk never ends.
-    try t.expectEqual(.absent, try expectNothingWritten(provider, .all(hash)));
+    try t.expectEqual(.absent, try expectNothingWritten(provider, GetRequest.all(hash)));
 
-    // Two selected runs with a gap between them. The spans resolve to two
-    // disjoint ranges and one `ChunkRange` cannot name both.
+    // Two selected runs with a gap between them: skip two, take four, skip
+    // three, take one. The spans resolve to `[2, 6)` and `[9, 10)`, and one
+    // `ChunkRange` cannot name both without also naming the gap.
     const gapped = [_]range_spec.Item{
-        .{ .delta = 0, .spec = .{ .widths = &.{ 2, 4 } } },
+        .{ .delta = 0, .spec = .{ .widths = &.{ 2, 4, 3, 1 } } },
         .{ .delta = 1, .spec = range_spec.RangeSpec.empty },
     };
     try t.expectEqual(.absent, try expectNothingWritten(provider, .{
@@ -427,14 +448,9 @@ fn expectNothingWritten(provider: Provider, request: GetRequest) !Outcome {
     return outcome;
 }
 
-fn requestFor(hash: store.Hash, selected: ranges.ChunkRange) GetRequest {
-    return .{
-        .hash = hash,
-        .ranges = .{ .items = &.{
-            .{ .delta = 0, .spec = .{ .widths = &.{ selected.start, selected.len() } } },
-            .{ .delta = 1, .spec = range_spec.RangeSpec.empty },
-        } },
-    };
+/// The request that names `off_group` and nothing else, for the blob `hash`.
+fn off_groupFor(hash: store.Hash) GetRequest {
+    return .{ .hash = hash, .ranges = .{ .items = &off_group_items } };
 }
 
 /// A blob written the way a store is written: into the partials, then promoted.
@@ -442,8 +458,9 @@ fn putBlob(dir: std.Io.Dir, hash: store.Hash, data: []const u8) !void {
     var name_storage: store.NameStorage = undefined;
     const paths = store.names(&name_storage, hash);
     const tree = BaoTree.init(data.len);
-    var outboard: [outboard_length(tree)]u8 = undefined;
-    const outboard_len = try outboard_mod.encode(tree, data, &outboard);
+    const outboard = try t.allocator.alloc(u8, outboard_length(tree));
+    defer t.allocator.free(outboard);
+    const outboard_len = try outboard_mod.encode(tree, data, outboard);
     const partial = try store.createPartial(t.io, dir, paths);
     try partial.data.writeStreamingAll(t.io, data);
     try partial.outboard.writeStreamingAll(t.io, outboard[0..outboard_len]);
@@ -463,6 +480,6 @@ fn readAll(io: std.Io, dir: std.Io.Dir, path: []const u8) ![]u8 {
     const length: usize = @intCast(try file.length(io));
     const bytes = try t.allocator.alloc(u8, length);
     errdefer t.allocator.free(bytes);
-    try file.readPositionalAll(io, bytes, 0);
+    _ = try file.readPositionalAll(io, bytes, 0);
     return bytes;
 }

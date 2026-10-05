@@ -124,4 +124,16 @@ test {
     std.testing.refAllDecls(relay_conn_version);
     std.testing.refAllDecls(relay_liveness);
     std.testing.refAllDecls(relay_reconnect);
+    const net_qad = @import("net/qad.zig");
+    const router_qad_route = @import("router/qad_route.zig");
+    const net_path_table = @import("net/path_table.zig");
+    const net_path_select = @import("net/path_select.zig");
+    const net_holepunch_target = @import("net/holepunch_target.zig");
+    const net_holepunch_trigger = @import("net/holepunch_trigger.zig");
+    std.testing.refAllDecls(net_qad);
+    std.testing.refAllDecls(router_qad_route);
+    std.testing.refAllDecls(net_path_table);
+    std.testing.refAllDecls(net_path_select);
+    std.testing.refAllDecls(net_holepunch_target);
+    std.testing.refAllDecls(net_holepunch_trigger);
 }

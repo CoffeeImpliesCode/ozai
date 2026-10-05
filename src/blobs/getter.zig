@@ -45,8 +45,10 @@ const std = @import("std");
 
 const core = @import("../crypto/blake3_core.zig");
 const ranges = @import("ranges.zig");
+const range_spec = @import("range_spec.zig");
 const plan_mod = @import("bao_plan.zig");
 const verify_mod = @import("bao_proof_verify.zig");
+const encode_mod = @import("bao_proof_encode.zig");
 const provider_mod = @import("provider.zig");
 const requests = @import("requests.zig");
 
@@ -58,6 +60,15 @@ pub const BaoTree = verify_mod.BaoTree;
 
 /// A refusal, which is every way an answer can fail to be a blob.
 pub const Refused = verify_mod.Error;
+
+/// Everything `expectedAnswer` can fail with: the encoder's own failures, plus
+/// the one refusal this module names for a request that selects nothing.
+pub const EncodeError = encode_mod.Error || error{
+    /// The request names no single contiguous range, so there is no answer to
+    /// encode. `check` reports the same refusal under `.refused`, and it is
+    /// `Refused`'s arm of the same name.
+    NoRangeRequested,
+};
 
 /// What one answer turned out to be.
 pub const Outcome = struct {
@@ -110,15 +121,14 @@ pub fn expectedAnswer(
     tree: BaoTree,
     data: []const u8,
     out: []u8,
-) plan_mod.BuilderError!usize {
+) EncodeError!usize {
     const selected = provider_mod.selectedRange(request, tree.chunks()) orelse
         return error.NoRangeRequested;
     const plan = plan_mod.planOf(tree, selected);
-    return @import("bao_proof_encode.zig").encode(plan, tree, data, out);
+    return encode_mod.encode(plan, tree, data, out);
 }
 
 const t = std.testing;
-const encode_mod = @import("bao_proof_encode.zig");
 const published = @import("../gossip/plumtree/blake3_vectors.zig");
 
 const whole_blob = 49153;
@@ -130,9 +140,9 @@ test "a whole-blob answer is the blob, and the walk accepts it" {
     const data = try published.blake3Input(whole_blob);
     defer t.allocator.free(data);
     const tree = BaoTree.init(data.len);
-    const hash: store_mod_placeholder = try tree.rootHash(data);
+    const hash: core.CvBytes = try tree.rootHash(data);
     var scratch: [whole_blob]u8 = undefined;
-    const request = .blob(hash);
+    const request = GetRequest.blob(hash);
     const written = try encode_mod.encode(
         plan_mod.planOf(tree, .{ .start = 0, .end = tree.chunks() }),
         tree,
@@ -154,7 +164,7 @@ test "an empty answer is refused for every request that selects chunks" {
     const data = try published.blake3Input(whole_blob);
     defer t.allocator.free(data);
     const tree = BaoTree.init(data.len);
-    const hash: store_mod_placeholder = try tree.rootHash(data);
+    const hash: core.CvBytes = try tree.rootHash(data);
 
     const cases = [_]ranges.ChunkRange{
         .{ .start = 0, .end = tree.chunks() },
@@ -166,7 +176,14 @@ test "an empty answer is refused for every request that selects chunks" {
         .{ .start = 48, .end = 60 },
     };
     for (cases) |selected| {
-        const request = requestFor(hash, selected);
+        // A request borrows its items and the items borrow their widths, so the
+        // two arrays are the caller's and outlive the request.
+        const widths = [_]u64{ selected.start, selected.len() };
+        const items = [_]range_spec.Item{
+            .{ .delta = 0, .spec = .{ .widths = &widths } },
+            .{ .delta = 1, .spec = range_spec.RangeSpec.empty },
+        };
+        const request: GetRequest = .{ .hash = hash, .ranges = .{ .items = &items } };
         const outcome = check(request, tree, hash, &.{});
         try t.expect(outcome.empty);
         try t.expect(!outcome.isComplete());
@@ -186,12 +203,15 @@ test "an empty answer is refused for every request that selects chunks" {
 test "a zero-length blob is refused by name, and refused as incomplete" {
     const data = try published.blake3Input(whole_blob);
     defer t.allocator.free(data);
-    const hash: store_mod_placeholder = try tree_zero().rootHash(data);
-
-    // A tree over no bytes has no chunks, so no plan selects anything.
+    // A tree over no bytes has no chunks, so no plan selects anything, and its
+    // root is the published digest of the empty input. That hash comes from the
+    // tree, not from a range request, which is why it is taken over no bytes.
+    const empty_data = try published.blake3Input(0);
+    defer t.allocator.free(empty_data);
     const empty_tree = BaoTree.init(0);
+    const hash: core.CvBytes = try empty_tree.rootHash(empty_data);
     try t.expectEqual(@as(u64, 0), empty_tree.chunks());
-    const outcome = check(.blob(hash), empty_tree, hash, &.{});
+    const outcome = check(GetRequest.blob(hash), empty_tree, hash, &.{});
     try t.expect(outcome.empty);
     try t.expectEqual(error.NoRangeRequested, outcome.refused.?);
 
@@ -200,7 +220,7 @@ test "a zero-length blob is refused by name, and refused as incomplete" {
     const tree = BaoTree.init(data.len);
     try t.expectEqual(
         error.ProofIncomplete,
-        check(.blob(hash), tree, hash, &.{}).refused.?,
+        check(GetRequest.blob(hash), tree, hash, &.{}).refused.?,
     );
 }
 
@@ -211,27 +231,30 @@ test "a flipped byte and a truncated answer are the verifier's refusals" {
     const data = try published.blake3Input(whole_blob);
     defer t.allocator.free(data);
     const tree = BaoTree.init(data.len);
-    const hash: store_mod_placeholder = try tree.rootHash(data);
+    const hash: core.CvBytes = try tree.rootHash(data);
     const selected = ranges.ChunkRange{ .start = 20, .end = 21 };
 
-    var scratch: [plan_mod.planOf(tree, selected).bytes]u8 = undefined;
-    const written = try encode_mod.encode(
-        plan_mod.planOf(tree, selected),
-        tree,
-        data,
-        &scratch,
-    );
+    const plan = plan_mod.planOf(tree, selected);
+    const scratch = try t.allocator.alloc(u8, plan.bytes);
+    defer t.allocator.free(scratch);
+    const written = try encode_mod.encode(plan, tree, data, scratch);
     const answer = scratch[0..written];
 
     var damaged = try t.allocator.dupe(u8, answer);
     defer t.allocator.free(damaged);
     damaged[damaged.len - 1] ^= 0x01;
-    const flipped = check(requestFor(hash, selected), tree, hash, damaged);
+    const widths = [_]u64{ selected.start, selected.len() };
+    const items = [_]range_spec.Item{
+        .{ .delta = 0, .spec = .{ .widths = &widths } },
+        .{ .delta = 1, .spec = range_spec.RangeSpec.empty },
+    };
+    const request: GetRequest = .{ .hash = hash, .ranges = .{ .items = &items } };
+    const flipped = check(request, tree, hash, damaged);
     try t.expect(!flipped.empty);
     try t.expectEqual(error.ChildMismatch, flipped.refused.?);
 
     // Cut in the middle of the answer: bytes arrived, and not enough of them.
-    const truncated = check(requestFor(hash, selected), tree, hash, answer[0 .. answer.len / 2]);
+    const truncated = check(request, tree, hash, answer[0 .. answer.len / 2]);
     try t.expect(!truncated.empty);
     try t.expect(truncated.refused.? == error.ResponseTruncated or
         truncated.refused.? == error.ProofIncomplete);
@@ -244,7 +267,7 @@ test "a request naming no single range is refused by the verifier's name" {
     const data = try published.blake3Input(whole_blob);
     defer t.allocator.free(data);
     const tree = BaoTree.init(data.len);
-    const hash: store_mod_placeholder = try tree.rootHash(data);
+    const hash: core.CvBytes = try tree.rootHash(data);
 
     var scratch: [whole_blob]u8 = undefined;
     const written = try encode_mod.encode(
@@ -253,24 +276,22 @@ test "a request naming no single range is refused by the verifier's name" {
         data,
         &scratch,
     );
-    for ([_]GetRequest{ .all(hash), .blob(hash).* }) |request| {
-        if (std.meta.activeTag(request) == .ranges and request.ranges.isEmpty()) continue;
+    // An unbounded sequence, a sequence with no ranges at all, and a spec with
+    // two selected runs and a gap between them. `GetRequest.blob` is not one of
+    // them: it names the whole blob, which is one range, and the complete
+    // answer above is exactly the answer to it.
+    const gapped = [_]range_spec.Item{
+        .{ .delta = 0, .spec = .{ .widths = &.{ 2, 4, 3, 1 } } },
+        .{ .delta = 1, .spec = range_spec.RangeSpec.empty },
+    };
+    const cases = [_]GetRequest{
+        GetRequest.all(hash),
+        .{ .hash = hash, .ranges = .empty },
+        .{ .hash = hash, .ranges = .{ .items = &gapped } },
+    };
+    for (cases) |request| {
         const outcome = check(request, tree, hash, scratch[0..written]);
         try t.expectEqual(error.NoRangeRequested, outcome.refused.?);
         try t.expect(!outcome.empty);
     }
-}
-
-fn requestFor(hash: core.CvBytes, selected: ranges.ChunkRange) GetRequest {
-    return .{
-        .hash = hash,
-        .ranges = .{ .items = &.{
-            .{ .delta = 0, .spec = .{ .widths = &.{ selected.start, selected.len() } } },
-            .{ .delta = 1, .spec = @import("range_spec.zig").RangeSpec.empty },
-        } },
-    };
-}
-
-fn tree_zero() BaoTree {
-    return BaoTree.init(1);
 }

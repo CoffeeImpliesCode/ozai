@@ -493,10 +493,17 @@ fn v6() IpAddress {
 }
 
 /// A kernel name, NUL-terminated, handed to the one function that copies one.
-fn iface_name(comptime text: []const u8) Name {
-    var buffer: [text.len + 1]u8 = undefined;
-    @memcpy(buffer[0..text.len], text);
-    buffer[text.len] = 0;
+///
+/// The buffer is `name_length` wide and not `text.len` wide, because `text` is
+/// a runtime slice and an array's width is part of its type: a buffer sized
+/// from it is only a type when `text` is comptime. That width is the bound
+/// `nameFrom` already enforces — the same `IFNAMSIZ - 1` the read is handed —
+/// so the two agree by construction, and a longer argument is cut at the one
+/// length the kernel cannot produce rather than at a length chosen here.
+fn iface_name(text: []const u8) Name {
+    const kept = @min(text.len, name_length);
+    var buffer: [name_length + 1]u8 = @splat(0);
+    @memcpy(buffer[0..kept], text[0..kept]);
     const sentinel: [*:0]const u8 = @ptrCast(&buffer);
     return nameFrom(sentinel);
 }
@@ -564,8 +571,8 @@ test "an interface that is down reaches nobody" {
 
 test "loopback is counted only when the caller says its peer is this host" {
     const snapshot = filled(&.{
-        on_iface("lo", v4(3), true, true),
         on_iface("eth0", v4(1), true, false),
+        on_iface("lo", v4(3), true, true),
     });
 
     const off = reachableAt(&snapshot, test_host, test_port, false);
@@ -647,10 +654,11 @@ test "the comparison follows the policy the change was stored with" {
     });
     const without_loopback = filled(&.{on_iface("eth0", v4(1), true, false)});
 
-    // The same two reads, one machine that lost nothing. Counted without
-    // loopback the `127.0.0.1`-shaped address went away, which is the truth
-    // about what a peer on another host may be sent to; counted with it, both
-    // reads hold the address and nothing moved.
+    // The same two reads, one machine that lost nothing. Counted under a
+    // policy that hides loopback — a peer on another host — the interface
+    // that went is invisible in both reads, and nothing moved. Counted under
+    // the policy that admits it — a peer on this host — that interface's
+    // address was in the first read and not the second, and it retired.
     const narrow: Change = .{
         .previous = with_loopback,
         .current = without_loopback,
@@ -661,11 +669,15 @@ test "the comparison follows the policy the change was stored with" {
         .current = without_loopback,
         .loopback = true,
     };
-    const drop = narrow.moved();
+    const quiet = narrow.moved();
+    try t.expect(!quiet.changed());
+    try t.expectEqual(@as(usize, 0), quiet.retired);
+    try t.expectEqual(@as(usize, 0), quiet.appeared);
+
+    const drop = wide.moved();
     try t.expect(drop.changed());
     try t.expectEqual(@as(usize, 1), drop.retired);
     try t.expectEqual(@as(usize, 0), drop.appeared);
-    try t.expect(!wide.moved().changed());
 }
 
 test "a change reports what appeared and what retired" {

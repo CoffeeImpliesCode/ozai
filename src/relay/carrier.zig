@@ -143,8 +143,10 @@ pub fn carry(peer: NodeId, datagrams: Datagrams, direction: Direction) Error!Mes
 /// datagram.
 pub fn carried(message: Message) ?DatagramFrame {
     return switch (message) {
-        .client_to_relay_datagram, .client_to_relay_datagram_batch,
-        .relay_to_client_datagram, .relay_to_client_datagram_batch,
+        .client_to_relay_datagram,
+        .client_to_relay_datagram_batch,
+        .relay_to_client_datagram,
+        .relay_to_client_datagram_batch,
         => |datagram| datagram,
         else => null,
     };

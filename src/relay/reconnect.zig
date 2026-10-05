@@ -257,14 +257,19 @@ fn announced(notice: Restarting, attempt: u8, now: Nanos, policy: Config) Step {
     const asked: Nanos = @as(Nanos, notice.reconnect_in_ms) * std.time.ns_per_ms;
     const asked_for: Nanos = @as(Nanos, notice.try_for_ms) * std.time.ns_per_ms;
     const wait = @max(asked, backoff(policy, attempt));
-    return .{ .state = .{ .waiting = .{
-        .until = now +| wait,
-        .attempt = attempt,
-        // Zero is "no budget" in upstream's own wording, and then this client's
-        // budget runs from the same instant.
-        .give_up_at = now +| if (asked_for == 0) policy.gone_budget else asked_for,
-        .source = .relay_announced,
-    } }, .action = .{ .wait = wait } };
+    return .{
+        .state = .{
+            .waiting = .{
+                .until = now +| wait,
+                .attempt = attempt,
+                // Zero is "no budget" in upstream's own wording, and then this client's
+                // budget runs from the same instant.
+                .give_up_at = now +| if (asked_for == 0) policy.gone_budget else asked_for,
+                .source = .relay_announced,
+            },
+        },
+        .action = .{ .wait = wait },
+    };
 }
 
 /// The wait and budget for a relay that went away, keeping the attempt count.

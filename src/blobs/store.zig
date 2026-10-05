@@ -92,10 +92,10 @@ pub const Names = struct {
 pub fn names(storage: *NameStorage, hash: Hash) Names {
     const digits = std.fmt.bytesToHex(&hash, .lower);
     return .{
-        .data = fill(storage[0], &digits, data_suffix),
-        .outboard = fill(storage[1], &digits, outboard_suffix),
-        .data_partial = fill(storage[2], &digits, data_partial_suffix),
-        .outboard_partial = fill(storage[3], &digits, outboard_partial_suffix),
+        .data = fill(storage[0][0..], &digits, data_suffix),
+        .outboard = fill(storage[1][0..], &digits, outboard_suffix),
+        .data_partial = fill(storage[2][0..], &digits, data_partial_suffix),
+        .outboard_partial = fill(storage[3][0..], &digits, outboard_partial_suffix),
     };
 }
 
@@ -133,10 +133,16 @@ pub fn openComplete(
     io: std.Io,
     dir: std.Io.Dir,
     paths: Names,
-) std.Io.Dir.OpenError!Handles {
-    const data = try dir.openFile(io, paths.data, .{});
+) std.Io.File.OpenError!Handles {
+    // `allow_directory = false` on both opens: a directory standing where a
+    // half of a pair belongs is not a half of a pair, and on Linux a read-only
+    // open of a directory succeeds. Refusing it here costs one syscall and
+    // keeps `Handles` a promise of two readable files, which is the same thing
+    // the write-mode open in `createPartial` already does on its own.
+    const options: std.Io.Dir.OpenFileOptions = .{ .allow_directory = false };
+    const data = try dir.openFile(io, paths.data, options);
     errdefer data.close(io);
-    const outboard = try dir.openFile(io, paths.outboard, .{});
+    const outboard = try dir.openFile(io, paths.outboard, options);
     return .{ .data = data, .outboard = outboard };
 }
 
@@ -149,7 +155,7 @@ pub fn createPartial(
     io: std.Io,
     dir: std.Io.Dir,
     paths: Names,
-) std.Io.Dir.OpenError!Handles {
+) std.Io.File.OpenError!Handles {
     const flags: std.Io.Dir.CreateFileOptions = .{ .read = true, .truncate = true };
     const data = try dir.createFile(io, paths.data_partial, flags);
     errdefer data.close(io);
@@ -210,9 +216,17 @@ test "the four names are the hash's digits and four different suffixes" {
     for (all, 0..) |left, left_index| {
         for (all, 0..) |right, right_index| {
             if (left_index == right_index) continue;
-            // No name is a prefix of another, so a rename onto one of the four
-            // can never land on another of the four.
-            try t.expect(!std.mem.startsWith(u8, right, left));
+            // The four are four different whole names, which is what every
+            // syscall in this file matches on: a rename takes `.data.partial`
+            // and lands on `.data`, and no two of the four strings are equal,
+            // so it can never land on another of them.
+            //
+            // A committed name *is* a prefix of its own partial — `.data` of
+            // `.data.partial`, and `.outboard` of `.outboard.partial`. That is
+            // not a hazard here and the test above it says why: nothing in this
+            // module matches a name by prefix, so the two spellings of one half
+            // cannot be confused for one another.
+            try t.expect(!std.mem.eql(u8, right, left));
         }
     }
 }
@@ -237,7 +251,7 @@ test "a commit is two renames, and the result opens as a pair" {
     const handles = try openComplete(t.io, tmp.dir, built);
     defer handles.close(t.io);
     var read_back: [data.len]u8 = undefined;
-    try handles.data.readPositionalAll(t.io, &read_back, 0);
+    _ = try handles.data.readPositionalAll(t.io, &read_back, 0);
     try t.expectEqualSlices(u8, &data, &read_back);
     // The partial names are gone: a rename does not leave the old name behind,
     // which is what makes a second `commit` fail rather than re-promote.
@@ -263,10 +277,12 @@ test "a failed second open releases the first, and a missing data is one miss" {
     try t.expectEqual(before, try openDescriptors());
 
     // Now the other way round: the data absent, the outboard present. Same
-    // answer, and one open rather than two.
+    // answer, and one open rather than two. The data goes first, because a
+    // half-open pair is the torn window the module comment is about.
     try tmp.dir.deleteDir(t.io, built.outboard);
     const outboard = try createFileAt(t.io, tmp.dir, built.outboard);
     outboard.close(t.io);
+    try tmp.dir.deleteFile(t.io, built.data);
     try t.expectError(error.FileNotFound, openComplete(t.io, tmp.dir, built));
 }
 
@@ -301,7 +317,7 @@ fn openFileAt(io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
 /// fails the test rather than skipping when `/proc` is not there, because a
 /// descriptor count of zero would make the assertion vacuous.
 fn openDescriptors() !usize {
-    const proc = try std.Io.Dir.openDirAbsolute(t.io, "/proc/self/fd", .{});
+    const proc = try std.Io.Dir.openDirAbsolute(t.io, "/proc/self/fd", .{ .iterate = true });
     defer proc.close(t.io);
     var count: usize = 0;
     var iterator = proc.iterate();
