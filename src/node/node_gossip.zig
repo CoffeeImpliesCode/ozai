@@ -2,16 +2,23 @@
 //!
 //! `gossip` fires the timers membership asked for, `feedGossip` hands the layer
 //! one event and does what it asks for, and `peerGone` is the only way this
-//! project tells membership that a peer went away. The gap the module doc of
-//! `node.zig` names is here and not elsewhere: the layer has a codec —
-//! `gossip/codec.zig`, a production wire codec with its own tests and fuzz
-//! target — and this file does not call it, so every message the layer asks
-//! to be sent is counted and named rather than sent.
+//! project tells membership that a peer went away.
+//!
+//! **What a `send_message` gets is a frame on a stream, not a name.** The
+//! codec the module doc of `node.zig` names as unwired is wired here:
+//! `feedGossip` encodes the message the layer produced with
+//! `gossip_codec.encode` and hands the frame to the connection table
+//! (`node_gossip_wire.zig`), which is the only place in this tree that
+//! encodes a gossip message. The peer is still named, because a send that
+//! could not happen is a send a reader still has to be able to find — and a
+//! refusal is counted under its own name rather than raised, since one peer
+//! this node cannot write to is a fact about that peer.
 
 const std = @import("std");
 
 const node_mod = @import("node.zig");
 const node_config = @import("node_config.zig");
+const node_gossip_wire = @import("node_gossip_wire.zig");
 
 const bridge_mod = @import("../transport/quic_bridge.zig");
 const hyparview = @import("../gossip/hyparview.zig");
@@ -67,19 +74,27 @@ pub fn feedGossip(self: *Node, event: hyparview.InEvent, now: hyparview.Nanos) E
     var out: hyparview.Actions(hyparview.OutEvent) = .init(self.gpa);
     defer out.deinit();
     try self.topic.handle(event, now, &out);
+    // The directory is refreshed here rather than in `gossip` alone, because
+    // `feedGossip` is every entry point into the layer: a timer from the pass,
+    // the join `start` feeds, and the `peerGone` `expire` feeds. A connection
+    // that handshook between two passes is routable on the very next event.
+    node_gossip_wire.learn(self);
     self.stats.gossip_events += 1;
     for (out.slice()) |produced| switch (produced) {
-        // **Not wired.** The codec exists — `gossip/codec.zig` is a
-        // production wire codec with its own tests and fuzz target — and
-        // nothing here calls it. So the request is counted, split by the
-        // layer that asked, and the peer is named; the frame is never
-        // encoded and nothing is sent. See `node.zig`'s module doc.
         .send_message => |send| {
+            // The name comes first and comes whatever the send does, so a
+            // refused peer is a named peer and `Node.namedPeers` still answers
+            // "who is being talked about" for every action of the last pass.
             noteNamed(self, send.to);
             switch (send.message) {
                 .swarm => self.stats.gossip_membership_asked += 1,
                 .gossip => self.stats.gossip_broadcast_asked += 1,
             }
+            // The counter above counts what the layer asked for, which is what
+            // it has always counted; what became of the ask is the wire's own
+            // answer, and the two halves are read together. See
+            // `node_gossip_wire.Wire`'s note on `refused`.
+            _ = node_gossip_wire.send(self, send.to, send.message);
         },
         .schedule_timer => |schedule| {
             self.stats.gossip_timers_scheduled += 1;
@@ -88,12 +103,14 @@ pub fn feedGossip(self: *Node, event: hyparview.InEvent, now: hyparview.Nanos) E
                 .timer = schedule.timer,
             });
         },
-        // Also not wired, and for the second reason rather than the first: a
-        // `disconnect_peer` names a node, and this node finds a connection by
-        // an address the map or the dialer holds, never by an id. The codec
-        // exists and would carry the message; what is missing is a lookup by
-        // node id over the connection table. Counting it is the honest
-        // report.
+        // **Not wired, and for the second reason rather than the first.** The
+        // lookup this needed is here now — `node_gossip_wire` answers "which
+        // connection is this peer on", which is what the connection table was
+        // for — but closing that connection is a core operation, and
+        // `bridge_conn.Conn` names no door to it: `Conn` reads state, drains
+        // egress and hands over a stream, and that is all. So the action is
+        // counted and the peer is named, which is what this arm did before the
+        // codec was wired and is still the whole of what it can say.
         .disconnect_peer => |peer| {
             self.stats.gossip_disconnects_asked += 1;
             noteNamed(self, peer);
@@ -108,10 +125,19 @@ pub fn feedGossip(self: *Node, event: hyparview.InEvent, now: hyparview.Nanos) E
 }
 
 /// Tell the gossip layer a peer went away, which is how membership is told
-/// anything at all in this project. No `Disconnect` message reaches a peer,
-/// because this file never encodes the one `gossip/codec.zig` can already
-/// write; the event is local in both directions.
+/// anything at all in this project.
+///
+/// **The peer leaves the connection table here, before the layer is told**, so
+/// a `send_message` naming it in this same event is refused by name instead
+/// of being written to a connection the core has finished with. Only
+/// `node_transport.expire` calls this, and it calls it after the core has
+/// taken the connection out of its own table, so the directory does not fill
+/// it straight back in. No `Disconnect` message reaches a peer from here
+/// either: the codec that writes that byte is wired (`node_gossip_wire.send`
+/// sends it like any other message), but this event is local in both
+/// directions, because the peer it names has nowhere to carry one.
 pub fn peerGone(self: *Node, peer: NodeId, at: Instant) Error!void {
+    node_gossip_wire.forget(self, peer);
     try feedGossip(self, .{ .peer_disconnected = peer }, try gossipNow(at));
 }
 

@@ -483,7 +483,11 @@ fn pump(io: std.Io, peer: *Process, zig: *Zig) !void {
 /// the same bytes.
 fn take(io: std.Io, zig: *Zig) !void {
     while (true) {
-        const got = zig.side.socket.tryReceive(io, zig.side.buf, &zig.side.control) catch |err| switch (err) {
+        const got = zig.side.socket.tryReceive(
+            io,
+            zig.side.buf,
+            &zig.side.control,
+        ) catch |err| switch (err) {
             // The socket is non-blocking from the moment it was created, and an
             // empty queue is a fact the loop acts on rather than a failure.
             error.WouldBlock => break,
@@ -522,7 +526,13 @@ fn take(io: std.Io, zig: *Zig) !void {
 /// nothing here reads a clock, so a stall is a finding about the stack rather
 /// than about how loaded this machine is. A gate that never held prints the
 /// peer, because the question is about a process this file cannot see into.
-fn driveUntil(io: std.Io, peer: *Process, zig: *Zig, comptime gate: anytype, comptime what: []const u8) !void {
+fn driveUntil(
+    io: std.Io,
+    peer: *Process,
+    zig: *Zig,
+    comptime gate: anytype,
+    comptime what: []const u8,
+) !void {
     if (try rounds(io, peer, zig, gate)) return;
     printPeer(io, peer);
     std.debug.print("rust_interop: the run never reached {s} in {d} rounds\n", .{

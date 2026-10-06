@@ -125,7 +125,10 @@ const Writer = struct {
                 const range = covered.bytes(self.tree);
                 const count: usize = @intCast(range.end - range.start);
                 const at = try self.reserve(count);
-                @memcpy(self.out[at..][0..count], self.data[@intCast(range.start)..@intCast(range.end)]);
+                @memcpy(
+                    self.out[at..][0..count],
+                    self.data[@intCast(range.start)..@intCast(range.end)],
+                );
                 return cv;
             },
         }

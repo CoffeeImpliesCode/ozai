@@ -176,6 +176,13 @@ files. It reports **20 142 / 36 814 attributed source lines (54.71 %)** and
 figure is 20 130 / 36 789 (54.72 %). Function counters are absent.
 These are not branch or path measurements.
 
+**The 2026-10-06 gate-7 measurement and its per-path dispositions are in
+[`docs/COVERAGE-LEDGER.md`](docs/COVERAGE-LEDGER.md).** It re-ran the
+instrumented suite in Debug and ReleaseSafe over the current tree, reports
+19/19 steps and 1171/1171 tests in both, and dispositions every production line
+that is cold in both modes as test, refactor, or accepted-with-a-reason. The
+block above is the earlier record and describes an earlier tree.
+
 For added or replaced nonblank, non-comment lines in 74 changed Zig files,
 1 946 have positive attribution, 2 338 have zero attribution, and 1 827 have
 no report row. An absent row does not prove that the compiler emitted no code.
@@ -238,6 +245,12 @@ and hole punching, blobs, and the gossip codec. `TODO.md`'s *Next* list
 names parts of this — the gate inputs, the live lookup seam — but it is a
 list of what to do next, not a register of what is unwired, and it does not
 account for all 165.
+
+That figure was re-measured independently for the 2026-10-06 coverage gate:
+168 of the 285 modules under `src/` are unreachable from `ozai-node`, and the
+gate's per-path dispositions — including the treatment of the unwired modules,
+which are **not** counted as covered — are in
+[`docs/COVERAGE-LEDGER.md`](docs/COVERAGE-LEDGER.md).
 
 ### Earlier records, kept as dated history
 

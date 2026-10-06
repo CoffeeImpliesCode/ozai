@@ -57,26 +57,40 @@
 //! with its timers firing, and the shutdown in the order `router.Shutdown`
 //! enforces — handlers, then cancel the accepts, then close.
 //!
-//! Not wired: **the gossip wire codec is not connected to this node.**
+//! **The gossip wire codec is connected to this node.**
 //! `gossip/codec.zig` and the six modules under `gossip/codec/` are a
 //! production wire codec — upstream declaration-order tags, postcard framing,
-//! byte-budgeted `IHave` chunking, its own fuzz target and tests. It exists,
-//! it is exported as `ozai.gossip_codec`, and nothing in `src/node/` imports
-//! it. `gossip/hyparview/message.zig` still says of itself that it has no
-//! wire codec and that the obsolete `Disconnect` byte waits for one; that
-//! second wait is over, because `gossip/codec/membership.zig` writes the
-//! byte, and the sentence is behind the layer rather than true of the tree.
+//! byte-budgeted `IHave` chunking, its own fuzz target and tests — and every
+//! `send_message` the layer produces is now encoded by it and written on that
+//! peer's stream, through a directory from peer to connection this node holds
+//! and asks once per send (`node_gossip_wire.zig`). So the sentence
+//! `gossip/hyparview/message.zig` carries of itself — "this module has no wire
+//! codec", and the obsolete `Disconnect` byte that waits for one — is behind
+//! the layer rather than true of the tree: `gossip/codec/membership.zig`
+//! writes that byte, and it is the byte a `disconnect_peer` would carry.
 //!
-//! So every `send_message` membership asks for is counted, in
-//! `gossip_membership_asked` and `gossip_broadcast_asked`, and the peer it
-//! names is kept in `Node.named`, and nothing else happens to it. That is
-//! visible in the counters rather than inferred from silence: a node whose
-//! counters grow while nothing arrives at its peer is a finding, and the
-//! binary prints both halves. What closes the gap is calling
-//! `gossip_codec.encode` on the message a `send_message` carries and handing
-//! the frame to the connection table, which is also what a
-//! `disconnect_peer` needs before this node can tear a connection down by
-//! node id.
+//! **What became of the count-and-name half.** The counters stay what they
+//! have always been — what the layer asked for — and the peer is still named
+//! whatever the send does, so `Node.namedPeers` still answers "who is being
+//! talked about". What is new is what became of each ask: every way a frame
+//! fails to reach a stream has a name in `node_gossip_wire.Outcome` and a
+//! counter in `Wire.refused`. `gossip_membership_asked` plus the wire's
+//! `sent` plus its refusals is every `send_message` the layer produced, and
+//! a node whose asks grow while nothing leaves is a finding rather than an
+//! absence — which is what the counters were for before the codec was wired.
+//!
+//! Not wired, and named rather than solved:
+//!
+//! * **The receive side.** Nothing reads a gossip stream, so a frame this
+//!   node writes is on the wire and nowhere else: mapping a frame's topic
+//!   onto the state that should take it is `gossip_actions.zig`'s own
+//!   missing half. No stream header is written either, because `Config`
+//!   carries no `TopicId` to write one from; `node_gossip_wire.zig` says so
+//!   where the frames are written.
+//! * **`disconnect_peer` still stops at a counter.** The directory answers
+//!   "which connection is this peer on" now, and closing that connection is
+//!   a core operation `bridge_conn.Conn` names no door to — so the action is
+//!   counted and the peer is named, which is what it was doing.
 //!
 //! # The relay, and where it sits in the loop
 //!
@@ -201,6 +215,10 @@ const socket_mod = @import("../transport/socket.zig");
 const router = @import("../router/router.zig");
 const endpoint = @import("../endpoint/endpoint.zig");
 const hyparview = @import("../gossip/hyparview.zig");
+/// The project codec, which the tests below decode with rather than with a
+/// second encoding. Nothing in this file's production path names it: the one
+/// encode is `node_gossip_wire`'s.
+const gossip_codec = @import("../gossip/codec.zig");
 const relay_frame = @import("../relay/frame.zig");
 const relay_server = @import("../relay/server.zig");
 
@@ -209,6 +227,7 @@ const node_build = @import("node_build.zig");
 const node_close = @import("node_close.zig");
 const node_config = @import("node_config.zig");
 const node_gossip = @import("node_gossip.zig");
+const node_gossip_wire = @import("node_gossip_wire.zig");
 const node_loop = @import("node_loop.zig");
 const node_relay_client = @import("node_relay_client.zig");
 const node_relay_frame = @import("node_relay_frame.zig");
@@ -376,6 +395,17 @@ pub const Node = struct {
     timers: std.ArrayList(Pending),
     named: [named_ring]NodeId,
     named_len: usize,
+
+    /// The gossip send path: the peers this node can reach, the stream each
+    /// one's frames go out on, the room a frame is encoded in, and what the
+    /// path did with every message the layer asked to be sent.
+    ///
+    /// **A value and not an allocation, so `create` writes nothing and
+    /// `deinit` has nothing to give back.** Every field is fixed storage —
+    /// the directory, the stream table, the frame room and the counters —
+    /// which is why its default is a complete wire: `node_build.create` is
+    /// not given one, and this node can send from its first pass.
+    gossip: node_gossip_wire.Wire = .{},
 
     /// The generator, and the buffers the socket and the drain seams need.
     /// They are on the heap because the receive buffer is
@@ -2277,4 +2307,218 @@ test "a join the gossip layer could not take leaves the node not joined" {
     // with.
     try t.expect(!node.joined);
     try t.expectEqual(@as(u64, 0), node.stats.gossip_events);
+}
+
+/// Everything the peers of this node's connections have written on the streams
+/// they opened, appended to `sink`.
+///
+/// A peer that has opened nothing answers with nothing, which is a peer that
+/// has not spoken and not a fault. `sink` is drained under the node's own
+/// allocator because that is the one its streams were built with
+/// (`bridge_conn.Stream.drain`'s own contract).
+fn drainPeerStreams(node: *Node, sink: *std.ArrayList(u8)) Error!void {
+    var index: usize = 0;
+    while (node.bridge.connectionAt(index)) |conn| : (index += 1) {
+        var stream = conn.peerStream() orelse continue;
+        _ = try stream.drain(node.gpa, sink);
+    }
+}
+
+/// What building a `Pair` can fail with: everything a `Node` can, plus the
+/// seed errors `SecretKey.fromSeed` names — this file's other tests call
+/// `identityOf` straight out of a `test` block, whose error set is inferred,
+/// and a helper that cannot name its own would be the one function here that
+/// does not.
+const PairError = Error || base_key.KeyError;
+
+/// A listener and a dialer that has dialled it, driven until the link is up.
+///
+/// One socket, two identities, one completed handshake — the shape every test
+/// below needs and none of them should re-derive. `at` is the pair's own
+/// clock: `pass` moves it by one quantum and steps both nodes, which is
+/// `Node.run` with a clock this file supplies instead of an `Io`.
+const Pair = struct {
+    listener: *Node,
+    dialer: *Node,
+    at: Instant,
+
+    /// Two nodes, the second dialling the first, and the passes that finish
+    /// their handshake. The caller asserts the link came up: a handshake that
+    /// did not finish is a transport finding rather than a gossip one, and a
+    /// helper that swallowed it would hand back a pair whose every later
+    /// failure then means the same wrong thing.
+    fn open(listener_tag: u8, dialer_tag: u8, listener_seed: u64, dialer_seed: u64) PairError!Pair {
+        const listener = try Node.create(t.allocator, t.io, .{
+            .secret = try identityOf(listener_tag),
+            .listen = loopback,
+            .topic = patientTopic(),
+        }, listener_seed);
+        errdefer listener.deinit();
+        const peers = [_]Peer{.{
+            .id = listener.nodeId(),
+            .addr = .{ .ip = listener.address() },
+        }};
+        const dialer = try Node.create(t.allocator, t.io, .{
+            .secret = try identityOf(dialer_tag),
+            .listen = loopback,
+            .peers = &peers,
+            .topic = patientTopic(),
+        }, dialer_seed);
+        errdefer dialer.deinit();
+        var pair: Pair = .{ .listener = listener, .dialer = dialer, .at = start_ns };
+        try pair.dialer.start(pair.at, pair.dialer.generator());
+        var passes: usize = 0;
+        while (passes < max_passes and pair.dialer.establishedCount() == 0) : (passes += 1) {
+            try pair.pass();
+        }
+        return pair;
+    }
+
+    /// One pass over both nodes, at the next instant.
+    fn pass(self: *Pair) Error!void {
+        self.at += time_quantum;
+        _ = try self.dialer.step(t.io, self.at, self.dialer.generator());
+        _ = try self.listener.step(t.io, self.at, self.listener.generator());
+    }
+};
+
+/// The topic the wire tests run on: the paper's defaults with every timer
+/// moved past this file's clock.
+///
+/// `briskTopic` is right for a test about the loop converging and wrong here.
+/// A `pending_neighbor_request` two milliseconds out fires between two passes
+/// and puts a second frame on the same stream, which is a fact about the
+/// timers rather than about the wire under test.
+fn patientTopic() hyparview.TopicConfig {
+    return .{ .membership = .{
+        .shuffle_interval = 1000 * hyparview.nanos_per_milli,
+        .neighbor_request_timeout = 1000 * hyparview.nanos_per_milli,
+    } };
+}
+
+/// A `Neighbor` from `from`, which is what a peer that wants to be in this
+/// node's active view sends. Membership answers one it did not ask for with a
+/// `Neighbor` of its own, so feeding this is a `send_message` the layer
+/// produces on its own — through the node's own pass, and with nothing about
+/// the frame written by the test.
+fn neighborFrom(from: NodeId) hyparview.InEvent {
+    return .{ .recv_message = .{
+        .from = from,
+        .message = .{ .swarm = .{ .neighbor = .{ .priority = .high, .data = null } } },
+    } };
+}
+
+test "a message membership asks to be sent leaves as the frame the codec wrote" {
+    var pair = try Pair.open(0x81, 0x82, 0x8181, 0x8282);
+    defer pair.listener.deinit();
+    defer pair.dialer.deinit();
+    try t.expectEqual(@as(usize, 1), pair.dialer.establishedCount());
+
+    // The join `start` feeds asks for a frame before there is a connection to
+    // put it on, and that ask is refused by name rather than dropped: the
+    // first half of what a send path owes a caller, on a node that is not
+    // refusing anything.
+    try t.expectEqual(@as(u64, 1), pair.dialer.stats.gossip_membership_asked);
+    try t.expectEqual(@as(u64, 1), pair.dialer.gossip.refused.no_route);
+    try t.expectEqual(@as(u64, 0), pair.dialer.gossip.sent);
+
+    // Now the link is up and the layer asks for something again. This is the
+    // node's own gossip pass: the same `feedGossip` the timers, `start` and
+    // `peerGone` all go through, called the way the transport will call it
+    // once a stream is read.
+    try node_gossip.feedGossip(
+        pair.dialer,
+        neighborFrom(pair.listener.nodeId()),
+        try node_gossip.gossipNow(pair.at),
+    );
+
+    // One ask became one frame, the counter moved with it, and the peer is
+    // named — the count-and-name behaviour, still intact, on a send that
+    // happened rather than one that stopped at a counter.
+    try t.expectEqual(@as(u64, 2), pair.dialer.stats.gossip_membership_asked);
+    try t.expectEqual(@as(u64, 1), pair.dialer.gossip.sent);
+    try t.expect(pair.dialer.gossip.bytes > 0);
+    try t.expect(pair.dialer.namedPeers().len > 0);
+    try t.expectEqual(
+        pair.listener.nodeId(),
+        pair.dialer.namedPeers()[pair.dialer.namedPeers().len - 1],
+    );
+
+    // And the peer has it. The listener runs passes until the core holds what
+    // the dialer wrote, and the test reads it off the stream the dialer
+    // opened — the bytes are read at the far end of a kernel socket, not
+    // inspected where they were made.
+    var inbox: std.ArrayList(u8) = .empty;
+    defer inbox.deinit(t.allocator);
+    var passes: usize = 0;
+    while (passes < max_passes) : (passes += 1) {
+        try pair.pass();
+        try drainPeerStreams(pair.listener, &inbox);
+        if (inbox.items.len > 0) break;
+    }
+    try t.expect(inbox.items.len > 0);
+
+    // The peer reads what the codec wrote, and it is the message the layer
+    // asked to be sent: a membership `Neighbor`. No counter says this, and a
+    // frame built by the test would.
+    switch (try gossip_codec.decode(inbox.items)) {
+        .swarm => |message| switch (message) {
+            .neighbor => {},
+            else => return error.NotAMembershipNeighbor,
+        },
+        .gossip => return error.NotAMembershipMessage,
+    }
+
+    try pair.dialer.close(t.io, pair.at, pair.dialer.generator());
+    try pair.listener.close(t.io, pair.at, pair.listener.generator());
+}
+
+test "a message this node's frame room cannot hold is refused by name and not truncated" {
+    var pair = try Pair.open(0x83, 0x84, 0x8383, 0x8484);
+    defer pair.listener.deinit();
+    defer pair.dialer.deinit();
+    try t.expectEqual(@as(usize, 1), pair.dialer.establishedCount());
+    try t.expectEqual(@as(u64, 1), pair.dialer.gossip.refused.no_route);
+
+    // Four bytes cannot hold a `Neighbor`: the codec refuses the message
+    // before it writes one, so the refusal carries the codec's own name
+    // rather than this file's opinion of it. A room is the one thing a caller
+    // may narrow (`node_gossip_wire.Wire`'s note on it), and the state
+    // machines' bounds keep every message they produce under the codec's
+    // budget — which is what makes this the way to reach the refusal at all.
+    pair.dialer.gossip.room = 4;
+    try node_gossip.feedGossip(
+        pair.dialer,
+        neighborFrom(pair.listener.nodeId()),
+        try node_gossip.gossipNow(pair.at),
+    );
+
+    // The ask is counted, the frame is not, the refusal is counted under its
+    // own name, and the peer is still named — a refused send that left no
+    // trace would be the drop this project refuses to make.
+    try t.expectEqual(@as(u64, 2), pair.dialer.stats.gossip_membership_asked);
+    try t.expectEqual(@as(u64, 0), pair.dialer.gossip.sent);
+    try t.expectEqual(@as(u64, 0), pair.dialer.gossip.bytes);
+    try t.expectEqual(@as(u64, 1), pair.dialer.gossip.refused.no_room);
+    try t.expect(pair.dialer.namedPeers().len > 0);
+    try t.expectEqual(
+        pair.listener.nodeId(),
+        pair.dialer.namedPeers()[pair.dialer.namedPeers().len - 1],
+    );
+
+    // And nothing reached the peer: several passes later the stream the frame
+    // would have been written on is still empty. A truncated frame is a frame
+    // the peer decodes as a different message, so this is the assertion that
+    // tells a refusal from a short write.
+    var inbox: std.ArrayList(u8) = .empty;
+    defer inbox.deinit(t.allocator);
+    var passes: usize = 0;
+    while (passes < 4) : (passes += 1) {
+        try pair.pass();
+        try drainPeerStreams(pair.listener, &inbox);
+    }
+    try t.expectEqual(@as(usize, 0), inbox.items.len);
+
+    try pair.dialer.close(t.io, pair.at, pair.dialer.generator());
+    try pair.listener.close(t.io, pair.at, pair.listener.generator());
 }
