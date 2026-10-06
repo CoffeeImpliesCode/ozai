@@ -48,8 +48,26 @@ pub const Stats = struct {
     neighbor_down: u64 = 0,
     broadcasts_received: u64 = 0,
     peer_data_seen: u64 = 0,
+    /// What discovery did, counted on the side that succeeded. The refusals
+    /// are `Node.discovery`'s own `Refused`, one field per non-success name,
+    /// because they are not the same question: `discovery_lookups` counts
+    /// questions asked and `Refused` says what became of each, and a node
+    /// whose asks grow while nothing leaves is a finding rather than an
+    /// absence — which is what the gossip counters above were for before the
+    /// codec was wired.
+    discovery_lookups: u64 = 0,
+    /// Answers that carried records, and the items the resolution path made of
+    /// them. `discovery_answers - discovery_lookups` is every question that did
+    /// not come back with records, counted apart per name in `Refused`.
+    discovery_answers: u64 = 0,
+    /// Items the node's own resolution path produced, and the addresses they
+    /// carried.
+    discovery_items: u64 = 0,
+    discovery_addresses: u64 = 0,
+    /// Signed packets a pkarr relay stored. The only publish counter: what an
+    /// attempt became is `discovery.Refused`.
+    discovery_publishes: u64 = 0,
     /// What the relay did, counted.
-    ///
     /// Split by what was asked of it rather than folded together, because a
     /// relay that forwards nothing and a relay that forwards nothing *useful*
     /// produce the same counter and need not produce the same log.

@@ -26,6 +26,10 @@ const node_relay_table = @import("node_relay_table.zig");
 const NodeId = base_key.NodeId;
 const SecretKey = base_key.SecretKey;
 const SocketAddr = base_addr.SocketAddr;
+const lookup_io = @import("../discovery/lookup_io.zig");
+const pkarr_live = @import("../discovery/pkarr_live.zig");
+const tls_client = @import("../discovery/tls_client.zig");
+const node_discovery = @import("node_discovery.zig");
 
 /// The bounds a `Relay` is sized by; they live with the storage they size.
 const max_relay_clients = node_relay_table.max_relay_clients;
@@ -164,6 +168,72 @@ pub const Config = struct {
     /// What this node is toward relays. Off unless it says otherwise, and see
     /// `node.zig`'s module doc for what a relay node gives up by being one.
     relay: Relay = .{},
+    /// What this node does about being found, and about finding one peer.
+    ///
+    /// **`Discovery{}` — the default — publishes nothing and looks nobody
+    /// up.** `discovery/preset.zig`'s `Publication.relay_only` is this
+    /// project's default and it is kept: the node is reachable through the
+    /// relays it already dials and hands no address to a third party. A
+    /// caller that wants a pkarr packet names `discovery.relay`; a caller that
+    /// wants its peers resolved names `discovery.lookup`.
+    ///
+    /// **Borrowed, and the same rule as `peers` above**: every slice and every
+    /// pointer below must outlive the node, not merely the call. `relay`'s
+    /// three buffers and its trust bundle are the caller's storage by
+    /// `pkarr_live.Options`' own doc ("the two `[]u8` fields are the caller's
+    /// storage and are not copied"), and `lookup.datagram` borrows whatever
+    /// `dns_live.Resolver` it came from.
+    discovery: node_discovery.Config = .{},
+};
+
+/// What one node publishes about itself and where, in this project's vocabulary.
+///
+/// A group of its own rather than six more fields on `Config`, because every
+/// one of them is an I/O dependency the caller owns and a node without any of
+/// them is a node that publishes nothing and looks nobody up — the default, and
+/// `discovery/preset.zig`'s own answer for a node holding only a relay map.
+pub const Discovery = node_discovery.Config;
+
+/// A pkarr relay this node publishes to and resolves from, and the trust that
+/// goes with it. See `node_discovery.Config.relay`.
+///
+/// **Every field is the caller's storage and outlives the node.** The two TLS
+/// scratch buffers are `tls_client.buffer_length` bytes each
+/// (`pkarr_live.Options`' own rule: "must each be `tls_client.buffer_length`
+/// bytes or more"), `response` is `pkarr_live.max_header_length +
+/// pkarr_live.max_body_length` bytes or more because the response borrows it,
+/// and `bundle` is a `std.crypto.Certificate.Bundle` the caller rescanned
+/// (`tls_client.rescanTrust` is the only call in the tree that reads the disk
+/// for one). A node that trusts nothing leaves this null and publishes nothing,
+/// which is `Publication.relay_only` reached a second way.
+pub const DiscoveryRelay = struct {
+    /// The relay's base URL, as `discovery/preset.zig` spells it:
+    /// `https://dns.iroh.link/pkarr`. Borrowed text.
+    base_url: []const u8,
+    /// The address the relay was resolved to, by value. A `SocketAddr` and not
+    /// a name, because `base/relay.zig`'s `RelayUrl.socketAddr` refuses a name
+    /// and this tree does not resolve hostnames inside a relay client.
+    server: SocketAddr,
+    /// The name the relay's certificate must carry. `pkarr_live.exchange`
+    /// reads the host out of `base_url` itself and never looks here; the field
+    /// exists because `tls_client.Options.host` has no default and no
+    /// `no_verification` alternative, so something has to be named.
+    certificate_host: []const u8,
+    /// The trust anchors, and the lock they are read under. Both borrowed, and
+    /// both must outlive every publish this node makes.
+    bundle: *std.crypto.Certificate.Bundle,
+    bundle_lock: *std.Io.RwLock,
+    /// The relay's read scratch, `tls_client.buffer_length` bytes or more.
+    read_buffer: []u8,
+    /// The relay's write scratch, same bound.
+    write_buffer: []u8,
+    /// Where a whole response is read, `pkarr_live.max_header_length +
+    /// pkarr_live.max_body_length` bytes or more. The response borrows this, so
+    /// it must be storage that outlives the call rather than a temporary.
+    response: []u8,
+    /// How long a connect and each read and write wait. Null is
+    /// `pkarr_live.default_timeout_ms`, and it is that module's decision.
+    timeout_ms: ?i32 = null,
 };
 
 /// What this module refuses.

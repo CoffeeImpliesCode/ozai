@@ -24,6 +24,8 @@ const node_gossip = @import("node_gossip.zig");
 const base_key = @import("../base/key.zig");
 const base_addr = @import("../base/addr.zig");
 const addr_map = @import("../transport/addr_map.zig");
+const node_discovery = @import("node_discovery.zig");
+const node_discovery_record = @import("node_discovery_record.zig");
 const bridge_mod = @import("../transport/quic_bridge.zig");
 const dial_mod = @import("../transport/dial.zig");
 const socket_mod = @import("../transport/socket.zig");
@@ -144,6 +146,7 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
         .relay_out = &.{},
         .relay_scratch = &.{},
         .stats = .{},
+        .discovery = .{},
     };
     errdefer self.map.deinit(gpa);
     errdefer self.offered.deinit(gpa);
@@ -230,6 +233,12 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
     self.table = builder.build();
     self.accept = endpoint.Loop.init(&self.table, null, &self.tasks);
     self.lease = self.accept.acquire();
+    // The node's own record, armed once and republished by the discovery pass
+    // on its timer. Not a failure: a node configured with no relay has nothing
+    // to publish, and that is `discovery/preset.zig`'s own default rather than
+    // a refusal of the node — `arm` counts it by name and leaves the timer
+    // unarmed, so the pass never comes due.
+    node_discovery_record.arm(self);
     return self;
 }
 
@@ -395,6 +404,7 @@ pub fn deinit(self: *Node) void {
     self.offered.deinit(self.gpa);
     self.dialled.deinit(self.gpa);
     self.timers.deinit(self.gpa);
+    self.discovery.release();
     node_transport.shutdownSocket(self);
     self.config.secret.deinit();
     self.gpa.destroy(self);

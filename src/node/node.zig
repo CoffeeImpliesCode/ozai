@@ -230,6 +230,8 @@ const node_gossip = @import("node_gossip.zig");
 const node_gossip_wire = @import("node_gossip_wire.zig");
 const node_loop = @import("node_loop.zig");
 const node_relay_client = @import("node_relay_client.zig");
+const node_discovery_wire = @import("node_discovery_wire.zig");
+const node_discovery = @import("node_discovery.zig");
 const node_relay_frame = @import("node_relay_frame.zig");
 const node_relay_serve = @import("node_relay_serve.zig");
 const node_relay_table = @import("node_relay_table.zig");
@@ -289,6 +291,13 @@ pub const max_close_steps = node_close.max_close_steps;
 pub const max_relay_clients = node_relay_table.max_relay_clients;
 pub const default_relay_queue_depth = node_relay_table.default_relay_queue_depth;
 pub const relay_frame_room = node_relay_frame.relay_frame_room;
+pub const discovery_default_lookup_interval_ms = node_discovery.default_lookup_interval_ms;
+pub const discovery_record_room = node_discovery.record_room;
+pub const discovery_max_relays = node_discovery.max_relays;
+pub const Discovery = node_config.Discovery;
+pub const DiscoveryRelay = node_config.DiscoveryRelay;
+pub const DiscoveryRefused = node_discovery_wire.Refused;
+pub const DiscoveryOutcome = node_discovery_wire.Outcome;
 
 // ---------------------------------------------------------------------------
 // The node
@@ -406,6 +415,16 @@ pub const Node = struct {
     /// which is why its default is a complete wire: `node_build.create` is
     /// not given one, and this node can send from its first pass.
     gossip: node_gossip_wire.Wire = .{},
+
+    /// The node's own discovery: the republish timer and the record it
+    /// republishes, the two DNS buffers, the TLS entropy, the lookup schedule,
+    /// and what every refusal was counted under.
+    ///
+    /// **A value and not an allocation, so `create` writes nothing and
+    /// `deinit` has one answer to give.** `node_discovery.zig`'s module doc is
+    /// what the pass does; what matters here is that `step` runs it and
+    /// `Stats` reads it, exactly as `gossip` above.
+    discovery: node_discovery.State = .{},
 
     /// The generator, and the buffers the socket and the drain seams need.
     /// They are on the heap because the receive buffer is
@@ -593,6 +612,12 @@ pub const Node = struct {
         moved = try node_transport.drain(self, io, at, random) or moved;
         moved = try node_transport.expire(self, io, at, random) or moved;
         moved = try node_gossip.gossip(self, at) or moved;
+        // The discovery pass sits last, and it is the only pass that can
+        // block: a question waits on a nameserver and a publish waits on a
+        // relay. Everything above it has already moved what it moved this
+        // pass, so a relay that is slow costs this pass its own tick and not
+        // the loop's. See `node_discovery.zig`'s module doc.
+        moved = node_discovery.pass(self, io, at, random) or moved;
         return moved;
     }
 
