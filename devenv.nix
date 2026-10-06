@@ -85,6 +85,9 @@ in
   # section reads whatever the file list hands it, and a build leaves
   # `.zig-cache/` and `zig-out/` in the tree; reporting build output as a
   # defect is a measurement of build state, not of this repository.
+  # AGENTS.md §4 gates 2-3 require Debug AND ReleaseSafe. zig-gate sections 2-3
+  # run the default mode only, so the ReleaseSafe passes run here, after the
+  # default gate is green (issue #15).
   scripts.gate.exec = ''
     set -eu
     ${pinnedToolPath}
@@ -95,6 +98,8 @@ in
       exit 1
     }
     GATE_EXCLUDE='^[.]/vendor/ /[.]zig-cache/ /zig-out/ /zig-cache/ /zig-global-cache/' zig-gate
+    zig build -Doptimize=ReleaseSafe
+    zig build test -Doptimize=ReleaseSafe --summary all
   '';
 
   # The same gate with two changes, and only two. `--no-zbc` drops section 7
@@ -114,6 +119,8 @@ in
     }
     GATE_EXCLUDE='^[.]/vendor/ /[.]zig-cache/ /zig-out/ /zig-cache/ /zig-global-cache/' \
       zig-gate --no-zbc --cov
+    zig build -Doptimize=ReleaseSafe
+    zig build test -Doptimize=ReleaseSafe --summary all
   '';
 
   # See full reference at https://devenv.sh/reference/options/
