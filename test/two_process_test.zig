@@ -28,6 +28,13 @@
 //! A timeout names the missing counters and prints every child's stdout and stderr.
 //! No finite deadline guarantees success under arbitrary scheduler starvation.
 //!
+//! **That deadline bounds this file, not the program under test.** Every gate
+//! below is a counter a node published after it reached the state that counter
+//! names, and none of them is a statement about how long anything took. The
+//! deadline is therefore per target (`budget_ms` in `two_process_roster.zig`,
+//! ten times larger on every row this project does not gate on) and generous
+//! there, so a slow emulator cannot fail a run that was correct.
+//!
 //! # Why there is a control
 //!
 //! `connections finished` is how a node says a connection ended. If a node's own

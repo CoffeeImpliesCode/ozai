@@ -9,10 +9,14 @@
 //!
 //! The module doc `probe.zig` carries is the argument for all three halves and
 //! is not repeated here.
+//!
+//! The tests of this half live here rather than in the facade, beside the code
+//! they exercise; the facade keeps the ones that drive `probe_turn.zig`.
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
 const report = @import("report.zig");
+const t = std.testing;
 
 const RelayUrl = addr.RelayUrl;
 const SocketAddr = addr.SocketAddr;
@@ -518,4 +522,184 @@ pub fn plan(input: Input) Plan {
 fn isEmpty(latencies: *const report.RelayLatencies) bool {
     var iterator = latencies.iter();
     return iterator.next() == null;
+}
+
+/// A minute in, on the timeline the tests hand to the runner. Five minutes is
+/// `full_report_interval`, so a round stamped with it is incremental and one
+/// left at zero is a full round for being stale.
+pub const test_start: Nanos = 600 * std.time.ns_per_s;
+
+pub fn millis(n: u64) Nanos {
+    return n * std.time.ns_per_ms;
+}
+
+/// A relay URL rendered into `scratch`. The host is `<n>.example.`, so the
+/// URLs sort by index and the fold's relay ordering is predictable.
+pub fn namedRelay(scratch: []u8, index: usize) !RelayUrl {
+    return RelayUrl.parse(try std.fmt.bufPrint(scratch, "https://{d}.example./", .{index}));
+}
+
+/// Three relays, in relay-map order.
+pub fn relaySet(scratch: []u8) ![3]RelayUrl {
+    return .{
+        try namedRelay(scratch[0..64], 0),
+        try namedRelay(scratch[64..128], 1),
+        try namedRelay(scratch[128..192], 2),
+    };
+}
+
+/// A round that is not full: nothing asks for one and the age rule does not
+/// force it. Every test of an incremental rule needs one of these first,
+/// because `isFull` is what upstream's incremental rules are defined against.
+pub fn freshRound() Round {
+    return .{ .next_full = false, .last_full = test_start };
+}
+
+pub const public_v4: SocketAddr = .{ .ip = .{ .v4 = .{ 198, 51, 100, 7 } }, .port = 41234 };
+pub const other_v4: SocketAddr = .{ .ip = .{ .v4 = .{ 198, 51, 100, 9 } }, .port = 51234 };
+pub const public_v6: SocketAddr = .{
+    .ip = .{ .v6 = .{
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+        0,    0,    0,    0,    0, 0, 0, 0x07,
+    } },
+    .port = 41234,
+};
+
+test "a QAD result is tagged with the probe its family names" {
+    var scratch: [64]u8 = undefined;
+    const relay = try namedRelay(&scratch, 0);
+    // The attribution rule in one line: the tag comes from the family the
+    // probe *ran* with, and `report.fold` checks the reported address against
+    // that tag. If the two enums ever stopped agreeing, every latency would be
+    // filed against a family that never ran and no address would be checked.
+    for ([_]QadFamily{ .v4, .v6 }) |family| {
+        const tagged = qadResult(family, relay, test_start, millis(9), public_v4);
+        try t.expectEqual(probeFor(family), tagged.kind());
+    }
+}
+
+test "a full round probes every relay over QUIC and ladders every relay over HTTPS" {
+    var scratch: [192]u8 = undefined;
+    const relays = try relaySet(&scratch);
+    const planned = plan(.{
+        .relays = &relays,
+        .if_state = .{ .have_v4 = true, .have_v6 = true },
+        .protocols = .{ .https = true, .qad_ipv4 = true, .qad_ipv6 = true },
+        .now = test_start,
+    });
+    try t.expect(planned.full);
+    try t.expectEqual(@as(usize, enough_endpoints), planned.enough_relays);
+    try t.expectEqual(@as(u8, 3 * 5), try planned.taskCount());
+
+    const want = [_]Task{
+        .{ .proto = .qad_ipv4, .relay = 0, .attempt = 0 },
+        .{ .proto = .qad_ipv6, .relay = 0, .attempt = 0 },
+        .{ .proto = .https, .relay = 0, .attempt = 0 },
+        .{ .proto = .https, .relay = 0, .attempt = 1 },
+        .{ .proto = .https, .relay = 0, .attempt = 2 },
+        .{ .proto = .qad_ipv4, .relay = 1, .attempt = 0 },
+        .{ .proto = .qad_ipv6, .relay = 1, .attempt = 0 },
+        .{ .proto = .https, .relay = 1, .attempt = 0 },
+        .{ .proto = .https, .relay = 1, .attempt = 1 },
+        .{ .proto = .https, .relay = 1, .attempt = 2 },
+        .{ .proto = .qad_ipv4, .relay = 2, .attempt = 0 },
+        .{ .proto = .qad_ipv6, .relay = 2, .attempt = 0 },
+        .{ .proto = .https, .relay = 2, .attempt = 0 },
+        .{ .proto = .https, .relay = 2, .attempt = 1 },
+        .{ .proto = .https, .relay = 2, .attempt = 2 },
+    };
+    for (want, 0..) |task, index| {
+        try t.expectEqualDeep(task, (try planned.taskAt(@intCast(index))).?);
+    }
+    try t.expect((try planned.taskAt(@intCast(want.len))) == null);
+}
+
+test "a v6 probe is planned only when the host's capability and its answer disagree" {
+    var scratch: [192]u8 = undefined;
+    const relays = try relaySet(&scratch);
+    const carried: QadProbe = .{
+        .relay = relays[0],
+        .instant = test_start - millis(1),
+        .latency = millis(10),
+        .addr = public_v6,
+    };
+    const base: Input = .{
+        .relays = &relays,
+        .if_state = .{ .have_v4 = false, .have_v6 = true },
+        .protocols = .{ .https = false, .qad_ipv4 = false, .qad_ipv6 = true },
+        .now = test_start,
+    };
+
+    // A v6 host with no v6 answer needs one.
+    try t.expect(plan(base).run[@intFromEnum(Probe.qad_ipv6)]);
+    // A v6 host whose live connection already has one does not: this is the
+    // whole point of the connection carrying it.
+    var incremental = base;
+    incremental.round = freshRound();
+    incremental.round.carried_v6 = carried;
+    try t.expect(!plan(incremental).run[@intFromEnum(Probe.qad_ipv6)]);
+    // A host that has just lost IPv6 with an answer still in hand is the case
+    // the two families' rules differ on: v6's rule says "probe", and the
+    // capability gate upstream applies to both families (`net_report.rs:523`)
+    // says it cannot. Nothing is sent, and the answer stays in the report.
+    var lost = base;
+    lost.if_state.have_v6 = false;
+    lost.round = freshRound();
+    lost.round.carried_v6 = carried;
+    try t.expect(!plan(lost).run[@intFromEnum(Probe.qad_ipv6)]);
+    // v4 has no such clause: it is asked only whether it has an answer.
+    var v4: Input = .{
+        .relays = &relays,
+        .if_state = .{ .have_v4 = true, .have_v6 = false },
+        .protocols = .{ .https = false, .qad_ipv4 = true, .qad_ipv6 = false },
+        .now = test_start,
+    };
+    try t.expect(plan(v4).run[@intFromEnum(Probe.qad_ipv4)]);
+    v4.round = freshRound();
+    v4.round.carried_v4 = .{
+        .relay = relays[1],
+        .instant = test_start - millis(1),
+        .latency = millis(10),
+        .addr = public_v4,
+    };
+    try t.expect(!plan(v4).run[@intFromEnum(Probe.qad_ipv4)]);
+}
+
+test "a round is full on the first one, on request, every five minutes, and after a portal" {
+    var last: report.Report = .{};
+    try t.expect(isFull(.{}, test_start));
+    try t.expect(isFull(.{ .next_full = false, .is_major = true }, test_start));
+    try t.expect(!isFull(.{
+        .next_full = false,
+        .last_full = test_start - full_report_interval,
+    }, test_start));
+    try t.expect(!isFull(.{
+        .next_full = false,
+        .last_full = test_start - full_report_interval + 1,
+    }, test_start));
+    // A clock that went backwards is not a stale round.
+    try t.expect(!isFull(.{ .next_full = false, .last_full = test_start + 1 }, test_start));
+
+    last.udp_v4 = true;
+    try t.expect(!isFull(.{
+        .next_full = false,
+        .last_full = test_start,
+        .last = &last,
+    }, test_start));
+    // No UDP and a portal: the same probes will be refused the same way, so
+    // the round goes back to probing everything.
+    last.udp_v4 = false;
+    last.captive_portal = true;
+    try t.expect(isFull(.{
+        .next_full = false,
+        .last_full = test_start,
+        .last = &last,
+    }, test_start));
+    // A portal with no UDP is not a reason; a report that has neither is.
+    last.captive_portal = false;
+    try t.expect(!isFull(.{
+        .next_full = false,
+        .last_full = test_start,
+        .last = &last,
+    }, test_start));
 }

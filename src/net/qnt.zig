@@ -22,13 +22,13 @@
 //!   address family, so `Family`, `familyOf` and `frameTypeOf` are the same
 //!   three declarations with two constants changed. `Family` is not redeclared
 //!   here: it is `qad.Family`, so a path's family has one type in this tree.
-//! - **The varint.** One QUIC variable-length integer, RFC 9000 §16, written
-//!   and read by the same two private functions with the same four widths.
-//!   They are written out rather than borrowed because `qad.zig` keeps its
-//!   copies private for a stated reason — a net codec must not reach into a
-//!   layer whose types it has no business naming — and that reason holds here.
-//!   `node/node_relay_frame.zig` spells the same encoding a third time, and
-//!   the three are held to the same boundary sweep by the tests below.
+//! - **The varint.** One QUIC variable-length integer, RFC 9000 §16. The rule
+//!   and the boundary table live in `wire/quic_varint.zig` and this file calls
+//!   `put` and `get` there: the encoding is a transport specification's, it
+//!   names no discovery or gossip concept, and `src/wire/` is the layer below
+//!   every codec that spells bytes — so `qad.zig` and
+//!   `node/node_relay_frame.zig` call the same three functions and the sweep
+//!   that holds them to §16 exists once, in that module.
 //! - **The refusals and their shape.** `NoRoom` before the bytes that did fit
 //!   mean anything, `Truncated` for every prefix that ends inside a field, a
 //!   closed `Error` with no arm a peer cannot provoke, a derived `Decoded`
@@ -145,6 +145,7 @@
 
 const std = @import("std");
 const qad = @import("qad.zig");
+const quic_varint = @import("../wire/quic_varint.zig");
 
 /// The address family a frame's path belongs to.
 ///
@@ -167,15 +168,15 @@ pub const frame_type_ipv6: u64 = 0x9f81a9;
 
 /// The widest a QUIC variable-length integer is (RFC 9000 §16), so the widest
 /// each of this frame's four varint fields can be.
-pub const max_varint_length: usize = qad.max_varint_length;
+pub const max_varint_length: usize = quic_varint.max_length;
 
 /// The largest value a variable-length integer can carry, and so the largest a
 /// sequence number, a timestamp or a range endpoint can be.
 ///
-/// `qad.max_sequence` under the name this file needs: QNT has three kinds of
-/// varint value, and a name naming the first of them would be wrong for the
+/// `quic_varint.max_value` under the name this file needs: QNT has three kinds
+/// of varint value, and a name naming the first of them would be wrong for the
 /// other two.
-pub const max_value: u64 = qad.max_sequence;
+pub const max_value: u64 = quic_varint.max_value;
 
 /// How many packet-number ranges one frame may carry.
 ///
@@ -339,23 +340,23 @@ pub fn frameTypeOf(family: Family) u64 {
 pub fn encode(frame: Frame, out: []u8) Error!usize {
     try checkShape(frame);
     var offset: usize = 0;
-    offset += try putVarint(out[offset..], frameTypeOf(frame.family));
-    offset += try putVarint(out[offset..], frame.sequence);
+    offset += try quic_varint.put(out[offset..], frameTypeOf(frame.family));
+    offset += try quic_varint.put(out[offset..], frame.sequence);
     // The one fixed-width field, guarded the way `qad.zig` guards its address:
     // a buffer that ends inside the challenge is `NoRoom`, not a slice of a
-    // slice that has run out. Every varint field is checked by `putVarint`
-    // itself, so without this a buffer one byte short of this copy panicked
-    // where the rest of the frame answers.
+    // slice that has run out. Every varint field is checked by
+    // `quic_varint.put` itself, so without this a buffer one byte short of
+    // this copy panicked where the rest of the frame answers.
     if (out[offset..].len < challenge_length) return error.NoRoom;
     @memcpy(out[offset..][0..challenge_length], frame.challenge[0..]);
     offset += challenge_length;
-    offset += try putVarint(out[offset..], frame.timestamp);
-    offset += try putVarint(out[offset..], frame.range_count);
+    offset += try quic_varint.put(out[offset..], frame.timestamp);
+    offset += try quic_varint.put(out[offset..], frame.range_count);
     var index: usize = 0;
     while (index < frame.range_count) : (index += 1) {
         const range = frame.ranges[index];
-        offset += try putVarint(out[offset..], range.first);
-        offset += try putVarint(out[offset..], range.last);
+        offset += try quic_varint.put(out[offset..], range.first);
+        offset += try quic_varint.put(out[offset..], range.last);
     }
     return offset;
 }
@@ -368,14 +369,14 @@ pub fn encode(frame: Frame, out: []u8) Error!usize {
 /// have been silently dropped.
 pub fn decode(bytes: []const u8) Error!Decoded {
     var offset: usize = 0;
-    const family = try familyOf(try getVarint(bytes, &offset));
-    const sequence = try getVarint(bytes, &offset);
+    const family = try familyOf(try quic_varint.get(bytes, &offset));
+    const sequence = try quic_varint.get(bytes, &offset);
     if (bytes[offset..].len < challenge_length) return error.Truncated;
     var challenge: Challenge = undefined;
     @memcpy(challenge[0..], bytes[offset..][0..challenge_length]);
     offset += challenge_length;
-    const timestamp = try getVarint(bytes, &offset);
-    const count = try getVarint(bytes, &offset);
+    const timestamp = try quic_varint.get(bytes, &offset);
+    const count = try quic_varint.get(bytes, &offset);
     if (count > max_packet_ranges) return error.TooManyRanges;
     const range_count: usize = @intCast(count);
     // Zeroed rather than undefined, so `Frame`'s equality is total: a decoded
@@ -383,8 +384,8 @@ pub fn decode(bytes: []const u8) Error!Decoded {
     var ranges = [_]PacketRange{.{ .first = 0, .last = 0 }} ** max_packet_ranges;
     var index: usize = 0;
     while (index < range_count) : (index += 1) {
-        const first = try getVarint(bytes, &offset);
-        const last = try getVarint(bytes, &offset);
+        const first = try quic_varint.get(bytes, &offset);
+        const last = try quic_varint.get(bytes, &offset);
         try checkRange(first, last, if (index == 0) null else ranges[index - 1]);
         ranges[index] = .{ .first = first, .last = last };
     }
@@ -429,87 +430,12 @@ fn checkRange(first: u64, last: u64, previous: ?PacketRange) Error!void {
     if (first - before.last == 1) return error.UnorderedRanges;
 }
 
-/// How many bytes the variable-length integer for `value` takes, RFC 9000
-/// §16: two prefix bits in the first byte say the width, and the value is
-/// what is left of it.
-fn varintLength(value: u64) usize {
-    if (value < 1 << 6) return 1;
-    if (value < 1 << 14) return 2;
-    if (value < 1 << 30) return 4;
-    return max_varint_length;
-}
-
-/// Write `value` as a variable-length integer at the front of `out`, and say
-/// how wide it was.
-///
-/// `noq_proto::VarInt::encode`, and `noq_proto::VarInt::size` for the width.
-/// Both type constants and every value past 16383 are four and eight bytes
-/// wide; nothing here writes one byte for a value that needs more, and nothing
-/// here reads a width it did not write.
-fn putVarint(out: []u8, value: u64) Error!usize {
-    const length = varintLength(value);
-    if (out.len < length) return error.NoRoom;
-    const prefix: u64 = switch (length) {
-        1 => 0b00,
-        2 => 0b01,
-        4 => 0b10,
-        else => 0b11,
-    };
-    const shift: u6 = @intCast(8 * length - 2);
-    const wide = value | (prefix << shift);
-    switch (length) {
-        1 => out[0] = @intCast(wide),
-        2 => {
-            var bytes: [2]u8 = undefined;
-            std.mem.writeInt(u16, &bytes, @intCast(wide), .big);
-            @memcpy(out[0..2], bytes[0..]);
-        },
-        4 => {
-            var bytes: [4]u8 = undefined;
-            std.mem.writeInt(u32, &bytes, @intCast(wide), .big);
-            @memcpy(out[0..4], bytes[0..]);
-        },
-        else => {
-            var bytes: [max_varint_length]u8 = undefined;
-            std.mem.writeInt(u64, &bytes, wide, .big);
-            @memcpy(out[0..max_varint_length], bytes[0..]);
-        },
-    }
-    return length;
-}
-
-/// Why a variable-length integer cannot be read. Its own set rather than
-/// `Error`, because a read has exactly one failure and the frame's refusals
-/// widen it on the way out — the same split `qad.zig` makes.
-const VarintError = error{
-    /// The slice ended before the width the first byte named was behind it.
-    Truncated,
-};
-
-/// Read the variable-length integer at `bytes[offset..]`, leaving `offset`
-/// after it.
-///
-/// `noq_proto::VarInt::decode`, loop for loop. One rejection: a first byte
-/// naming a two-, four- or eight-byte integer with fewer bytes behind it.
-/// There is no second, because a QUIC variable-length integer is
-/// self-describing and every value below 2^62 has exactly one spelling.
-fn getVarint(bytes: []const u8, offset: *usize) VarintError!u64 {
-    const rest = bytes[offset.*..];
-    if (rest.len == 0) return error.Truncated;
-    const length: usize = @as(usize, 1) << @intCast(rest[0] >> 6);
-    if (rest.len < length) return error.Truncated;
-    var value: u64 = rest[0] & 0b0011_1111;
-    for (rest[1..length]) |byte| value = (value << 8) | byte;
-    offset.* += length;
-    return value;
-}
-
 comptime {
     // The bound above is a bound because of these facts, and a reader who
     // changes a constant should be told here rather than by a test that stops
     // holding.
-    std.debug.assert(varintLength(frame_type_ipv4) == 4);
-    std.debug.assert(varintLength(frame_type_ipv6) == 4);
+    std.debug.assert(quic_varint.length(frame_type_ipv4) == 4);
+    std.debug.assert(quic_varint.length(frame_type_ipv6) == 4);
     std.debug.assert(max_frame_length >= 4 + max_varint_length + challenge_length +
         1 + 2 * max_packet_ranges * max_varint_length);
 }
@@ -549,13 +475,14 @@ fn expectHex(text: []const u8, actual: []const u8) !void {
 /// The variable-length integer `value` spells, compared against `text`.
 fn expectVarint(text: []const u8, value: u64) !void {
     var scratch: [max_varint_length]u8 = undefined;
-    const length = try putVarint(&scratch, value);
+    const length = try quic_varint.put(&scratch, value);
     try expectHex(text, scratch[0..length]);
 }
 
-/// The varint boundaries RFC 9000 §16 draws. A comptime array so a field added
-/// later is swept without a test being edited.
-const widths = [_]u64{ 0, 1, 42, 63, 64, 16_383, 16_384, 1 << 30, max_value };
+/// The varint boundaries RFC 9000 §16 draws, from the module that owns the
+/// rule rather than restated here. A comptime array so a field added later is
+/// swept without a test being edited.
+const widths = quic_varint.boundaries;
 
 /// The largest packet number the one canonical frame the tests build covers, so
 /// two ranges can be placed without either being adjacent to its predecessor.
@@ -708,7 +635,7 @@ test "a frame type this build does not carry is refused by name" {
         0x00,
     }) |frame_type| {
         var scratch: [max_varint_length]u8 = undefined;
-        const length = try putVarint(&scratch, frame_type);
+        const length = try quic_varint.put(&scratch, frame_type);
         try t.expectError(error.UnknownAddressFamily, decode(scratch[0..length]));
     }
 

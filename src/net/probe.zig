@@ -106,11 +106,12 @@
 //!
 //! # What lives where
 //!
-//! This file is the facade and holds the module's test suite. Two modules hold
-//! the bodies:
+//! This file is the facade and holds the tests that drive both halves. The two
+//! bodies live elsewhere, and the plan half keeps its own tests:
 //!
 //! - `probe_plan.zig` — what a round will run: the constants, `Protocols`,
-//!   `IfState`, `Round`, `Input`, `Task` and `Plan`, and `plan` itself.
+//!   `IfState`, `Round`, `Input`, `Task` and `Plan`, and `plan` itself, plus
+//!   the tests of that half.
 //! - `probe_turn.zig` — the turn machine: `Results`, `Runner`, `Step`, and
 //!   `new`, `step`, `observe` and the `fold` that hands the round to the report.
 //!
@@ -125,11 +126,8 @@ const plan_mod = @import("probe_plan.zig");
 const turn_mod = @import("probe_turn.zig");
 
 const RelayUrl = addr.RelayUrl;
-const SocketAddr = addr.SocketAddr;
 const Probe = report.Probe;
-const Nanos = report.Nanos;
 const ProbeResult = report.ProbeResult;
-const QadProbe = report.QadProbe;
 
 // The plan half.
 pub const initial_retransmit = plan_mod.initial_retransmit;
@@ -178,29 +176,16 @@ const bit = turn_mod.bit;
 
 const t = std.testing;
 
-/// A minute in, on the timeline the tests hand to the runner. Five minutes is
-/// `full_report_interval`, so a round stamped with it is incremental and one
-/// left at zero is a full round for being stale.
-const test_start: Nanos = 600 * std.time.ns_per_s;
-
-fn millis(n: u64) Nanos {
-    return n * std.time.ns_per_ms;
-}
-
-/// A relay URL rendered into `scratch`. The host is `<n>.example.`, so the
-/// URLs sort by index and the fold's relay ordering is predictable.
-fn namedRelay(scratch: []u8, index: usize) !RelayUrl {
-    return RelayUrl.parse(try std.fmt.bufPrint(scratch, "https://{d}.example./", .{index}));
-}
-
-/// Three relays, in relay-map order.
-fn relaySet(scratch: []u8) ![3]RelayUrl {
-    return .{
-        try namedRelay(scratch[0..64], 0),
-        try namedRelay(scratch[64..128], 1),
-        try namedRelay(scratch[128..192], 2),
-    };
-}
+// File-scope aliases of the fixtures in `probe_plan.zig`, which owns them and
+// the tests that use them; the tests left in this facade keep their own text.
+const test_start = plan_mod.test_start;
+const millis = plan_mod.millis;
+const namedRelay = plan_mod.namedRelay;
+const relaySet = plan_mod.relaySet;
+const freshRound = plan_mod.freshRound;
+const public_v4 = plan_mod.public_v4;
+const other_v4 = plan_mod.other_v4;
+const public_v6 = plan_mod.public_v6;
 
 /// `out.len` relay URLs, one 64-byte host each, so a relay list longer than
 /// `max_relays` can be built at all.
@@ -210,72 +195,7 @@ fn fillRelays(out: []RelayUrl, scratch: []u8) !void {
     }
 }
 
-/// A round that is not full: nothing asks for one and the age rule does not
-/// force it. Every test of an incremental rule needs one of these first,
-/// because `isFull` is what upstream's incremental rules are defined against.
-fn freshRound() Round {
-    return .{ .next_full = false, .last_full = test_start };
-}
-
-const public_v4: SocketAddr = .{ .ip = .{ .v4 = .{ 198, 51, 100, 7 } }, .port = 41234 };
-const other_v4: SocketAddr = .{ .ip = .{ .v4 = .{ 198, 51, 100, 9 } }, .port = 51234 };
-const public_v6: SocketAddr = .{
-    .ip = .{ .v6 = .{
-        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
-        0,    0,    0,    0,    0, 0, 0, 0x07,
-    } },
-    .port = 41234,
-};
-
-test "a QAD result is tagged with the probe its family names" {
-    var scratch: [64]u8 = undefined;
-    const relay = try namedRelay(&scratch, 0);
-    // The attribution rule in one line: the tag comes from the family the
-    // probe *ran* with, and `report.fold` checks the reported address against
-    // that tag. If the two enums ever stopped agreeing, every latency would be
-    // filed against a family that never ran and no address would be checked.
-    for ([_]QadFamily{ .v4, .v6 }) |family| {
-        const tagged = qadResult(family, relay, test_start, millis(9), public_v4);
-        try t.expectEqual(probeFor(family), tagged.kind());
-    }
-}
-
-test "a full round probes every relay over QUIC and ladders every relay over HTTPS" {
-    var scratch: [192]u8 = undefined;
-    const relays = try relaySet(&scratch);
-    const planned = plan(.{
-        .relays = &relays,
-        .if_state = .{ .have_v4 = true, .have_v6 = true },
-        .protocols = .{ .https = true, .qad_ipv4 = true, .qad_ipv6 = true },
-        .now = test_start,
-    });
-    try t.expect(planned.full);
-    try t.expectEqual(@as(usize, enough_endpoints), planned.enough_relays);
-    try t.expectEqual(@as(u8, 3 * 5), try planned.taskCount());
-
-    const want = [_]Task{
-        .{ .proto = .qad_ipv4, .relay = 0, .attempt = 0 },
-        .{ .proto = .qad_ipv6, .relay = 0, .attempt = 0 },
-        .{ .proto = .https, .relay = 0, .attempt = 0 },
-        .{ .proto = .https, .relay = 0, .attempt = 1 },
-        .{ .proto = .https, .relay = 0, .attempt = 2 },
-        .{ .proto = .qad_ipv4, .relay = 1, .attempt = 0 },
-        .{ .proto = .qad_ipv6, .relay = 1, .attempt = 0 },
-        .{ .proto = .https, .relay = 1, .attempt = 0 },
-        .{ .proto = .https, .relay = 1, .attempt = 1 },
-        .{ .proto = .https, .relay = 1, .attempt = 2 },
-        .{ .proto = .qad_ipv4, .relay = 2, .attempt = 0 },
-        .{ .proto = .qad_ipv6, .relay = 2, .attempt = 0 },
-        .{ .proto = .https, .relay = 2, .attempt = 0 },
-        .{ .proto = .https, .relay = 2, .attempt = 1 },
-        .{ .proto = .https, .relay = 2, .attempt = 2 },
-    };
-    for (want, 0..) |task, index| {
-        try t.expectEqualDeep(task, (try planned.taskAt(@intCast(index))).?);
-    }
-    try t.expect((try planned.taskAt(@intCast(want.len))) == null);
-}
-
+// The plan half's own tests live in `probe_plan.zig`; the ones below drive `probe_turn.zig`.
 test "the ladder is 200, 300 and 400 milliseconds, and QUIC has no ladder" {
     var scratch: [192]u8 = undefined;
     const relays = try relaySet(&scratch);
@@ -323,57 +243,6 @@ test "the ladder is 200, 300 and 400 milliseconds, and QUIC has no ladder" {
     try t.expectEqual(@as(u8, 0), spent.sends_len);
     try t.expectEqual(test_start + probe_timeout, spent.wake_at);
     try t.expect(spent.outcome == null);
-}
-
-test "a v6 probe is planned only when the host's capability and its answer disagree" {
-    var scratch: [192]u8 = undefined;
-    const relays = try relaySet(&scratch);
-    const carried: QadProbe = .{
-        .relay = relays[0],
-        .instant = test_start - millis(1),
-        .latency = millis(10),
-        .addr = public_v6,
-    };
-    const base: Input = .{
-        .relays = &relays,
-        .if_state = .{ .have_v4 = false, .have_v6 = true },
-        .protocols = .{ .https = false, .qad_ipv4 = false, .qad_ipv6 = true },
-        .now = test_start,
-    };
-
-    // A v6 host with no v6 answer needs one.
-    try t.expect(plan(base).run[@intFromEnum(Probe.qad_ipv6)]);
-    // A v6 host whose live connection already has one does not: this is the
-    // whole point of the connection carrying it.
-    var incremental = base;
-    incremental.round = freshRound();
-    incremental.round.carried_v6 = carried;
-    try t.expect(!plan(incremental).run[@intFromEnum(Probe.qad_ipv6)]);
-    // A host that has just lost IPv6 with an answer still in hand is the case
-    // the two families' rules differ on: v6's rule says "probe", and the
-    // capability gate upstream applies to both families (`net_report.rs:523`)
-    // says it cannot. Nothing is sent, and the answer stays in the report.
-    var lost = base;
-    lost.if_state.have_v6 = false;
-    lost.round = freshRound();
-    lost.round.carried_v6 = carried;
-    try t.expect(!plan(lost).run[@intFromEnum(Probe.qad_ipv6)]);
-    // v4 has no such clause: it is asked only whether it has an answer.
-    var v4: Input = .{
-        .relays = &relays,
-        .if_state = .{ .have_v4 = true, .have_v6 = false },
-        .protocols = .{ .https = false, .qad_ipv4 = true, .qad_ipv6 = false },
-        .now = test_start,
-    };
-    try t.expect(plan(v4).run[@intFromEnum(Probe.qad_ipv4)]);
-    v4.round = freshRound();
-    v4.round.carried_v4 = .{
-        .relay = relays[1],
-        .instant = test_start - millis(1),
-        .latency = millis(10),
-        .addr = public_v4,
-    };
-    try t.expect(!plan(v4).run[@intFromEnum(Probe.qad_ipv4)]);
 }
 
 test "an incremental round with one live connection on a v4-only host sends nothing" {
@@ -711,45 +580,7 @@ test "the captive-portal check waits, and a round that is already good enough sk
     try t.expectEqual(@as(?bool, true), fold(idle, .{}, test_start).captive_portal);
 }
 
-test "a round is full on the first one, on request, every five minutes, and after a portal" {
-    var last: report.Report = .{};
-    try t.expect(isFull(.{}, test_start));
-    try t.expect(isFull(.{ .next_full = false, .is_major = true }, test_start));
-    try t.expect(!isFull(.{
-        .next_full = false,
-        .last_full = test_start - full_report_interval,
-    }, test_start));
-    try t.expect(!isFull(.{
-        .next_full = false,
-        .last_full = test_start - full_report_interval + 1,
-    }, test_start));
-    // A clock that went backwards is not a stale round.
-    try t.expect(!isFull(.{ .next_full = false, .last_full = test_start + 1 }, test_start));
-
-    last.udp_v4 = true;
-    try t.expect(!isFull(.{
-        .next_full = false,
-        .last_full = test_start,
-        .last = &last,
-    }, test_start));
-    // No UDP and a portal: the same probes will be refused the same way, so
-    // the round goes back to probing everything.
-    last.udp_v4 = false;
-    last.captive_portal = true;
-    try t.expect(isFull(.{
-        .next_full = false,
-        .last_full = test_start,
-        .last = &last,
-    }, test_start));
-    // A portal with no UDP is not a reason; a report that has neither is.
-    last.captive_portal = false;
-    try t.expect(!isFull(.{
-        .next_full = false,
-        .last_full = test_start,
-        .last = &last,
-    }, test_start));
-}
-
+// `probe_turn.zig` is the only half they drive, which is why they stay here.
 test "an answer for a probe that was never sent is dropped" {
     var scratch: [192]u8 = undefined;
     const relays = try relaySet(&scratch);
@@ -906,6 +737,7 @@ test "the widest relay list a plan admits serves every index it has" {
     try t.expect(answered.outcome == null);
 }
 
+// `probe_turn.zig` is the only half they drive, which is why they stay here.
 test "a plan wider than the arrays that hold it is refused, not wrapped" {
     // A `Plan` is a public struct with public fields, so a caller can build one
     // by literal and nothing in the type stops the list from outrunning

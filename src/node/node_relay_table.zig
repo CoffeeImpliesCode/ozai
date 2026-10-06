@@ -18,13 +18,14 @@ const node_transport = @import("node_transport.zig");
 const base_key = @import("../base/key.zig");
 const bridge_mod = @import("../transport/quic_bridge.zig");
 const relay_server = @import("../relay/server.zig");
+const quic_varint = @import("../wire/quic_varint.zig");
 
 const Node = node_mod.Node;
 const Error = node_config.Error;
 const NodeId = base_key.NodeId;
 const max_datagram = node_transport.max_datagram;
 const relay_frame_room = node_relay_frame.relay_frame_room;
-const varint_max = node_relay_frame.varint_max;
+const varint_max = quic_varint.max_length;
 
 /// How many clients a relay admits.
 ///

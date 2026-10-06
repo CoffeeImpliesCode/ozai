@@ -1,11 +1,14 @@
-//! The route that makes the reserved QAD ALPN reachable, and nothing else.
+//! The route that would make the reserved QAD ALPN reachable, and nothing else.
 //!
 //! `router/alpn_table.zig` reserves `/iroh-qad/0` for iroh's own address
 //! discovery and refuses it through the public registration path. This file is
 //! the one place allowed past that refusal: `registerLast` is the only caller
 //! of `Builder.acceptInternal` under `src/`, and it is what turns the
 //! reservation into a served route — a peer that negotiates `/iroh-qad/0`
-//! now reaches a handler instead of being dropped by `negotiatingStep`.
+//! reaches a handler instead of being dropped by `negotiatingStep`.
+//!
+//! **Nothing calls it, on purpose.** Read "Nothing calls this, and that is the
+//! decision" below before concluding the tree forgot a line; it did not.
 //!
 //! # The reservation and the refusal both survive this file
 //!
@@ -29,18 +32,15 @@
 //!
 //! # Why it registers last, and how a reader can tell
 //!
-//! Registration order is the offer list (`Router.alpns` is the entries in
-//! order), and the endpoint's ALPN preference runs over that list: the first
-//! ALPN a peer offers that the server also offers is the one negotiated
-//! (`alpn_table.zig`'s `Builder.accept` doc, upstream
-//! `iroh/src/endpoint.rs:973-977`). So order does *not* decide which handler
-//! answers a given ALPN — `Router.lookup` is an exact match and takes the
-//! newest entry for it — and order does decide what the peer is offered and in
-//! what order the server prefers. An entry for the internal protocol ahead of
-//! an application's would therefore win a negotiation from a peer that offers
-//! both, and a peer that offers `/iroh-qad/0` alone would be served either
-//! way. Last is the only position from which the internal protocol is chosen
-//! *only* when no application ALPN matched.
+//! **Last is a property of the offer list, not of negotiation.** Registration
+//! order is what `Router.alpns` yields and what the endpoint hands the TLS
+//! stack, and in this core the *peer's* list decides which name is chosen: the
+//! server walks the client's entries and takes the first one it also offers
+//! (`vendor/quic/src/quic/tls13.zig:2862-2883`). An internal entry ahead of an
+//! application's would therefore win nothing here. Last is still the right
+//! position — it is the one that reads as "the protocol the caller configured,
+//! then the internal one" — and `Router.lookup` is an exact match either way,
+//! so an entry's position never decides which handler answers it.
 //!
 //! A reader does not have to take that on trust:
 //!
@@ -50,16 +50,40 @@
 //!   a registration made after this one turns it false, and a test here is
 //!   exactly that.
 //!
-//! # What is not wired yet
+//! # Nothing calls this, and that is the decision
 //!
-//! Nothing under `src/` calls `registerLast`. The route exists and is the one
-//! way past the reservation, but the call site is the registration block in
-//! `node/node_build.zig` (`:224-230`), and `max_alpns` is 1
-//! (`node/node_accept.zig:45`), so a node's entry storage has no slot for the
-//! internal protocol yet. Until that call lands a table built in this tree
-//! still never offers `/iroh-qad/0` and a peer that negotiates it is still
-//! dropped by `negotiatingStep` — which is what `alpn_table.qad_alpn` says
-//! today, and what it will have to stop saying the moment the call is made.
+//! **The route exists, is tested, and is deliberately not registered.** The
+//! reason is not `max_alpns`. That bound is one this tree chose: `TlsConfig.alpn`
+//! is `[]const []const u8` and the server matcher walks every entry
+//! (`vendor/quic/src/quic/tls13.zig:1280`, `:2867`), so `alpn_list` in
+//! `transport/bridge_manager.zig:82` and `transport/dial_client.zig:82` could
+//! each be `[2][]const u8` and the core would carry both names. The reason is
+//! that the vendored core has nowhere to put the protocol's two halves:
+//!
+//! - **No OBSERVED_ADDRESS frame.** `FrameType` names no type in
+//!   `0x9f81a6..0x9f81a7` (`vendor/quic/src/quic/frame.zig:45-75`), and
+//!   `Frame.parseSized` answers `error.FrameEncodingError` for a type it has no
+//!   arm for (`frame.zig:670`). There is no arm to build an outbound frame
+//!   from, and an inbound one fails the connection.
+//! - **No `address_discovery` transport parameter.** `ParamId` carries no
+//!   `0x9f81a176` (`vendor/quic/src/quic/transport_params.zig:24-46`), and
+//!   `decode` skips an unknown id by its declared length
+//!   (`transport_params.zig:609-612`), so a peer that sent the parameter reads
+//!   as one that never asked for QAD.
+//!
+//! `vendor/quic/` is read-only here, so neither is this tree's to add. A node
+//! that registered this route would offer `/iroh-qad/0`, negotiate it, and be
+//! unable to report one observed address — the whole service — with
+//! `net/qad.zig`'s `Role.shouldReport` gate answerable by nothing. A peer that
+//! negotiated QAD and received silence would be worse served than by today's
+//! drop, which names itself (`conn_dispatch.zig:303-304`). **So the reservation
+//! is the honest state: the ALPN is refused at `Builder.accept`, a table in
+//! this tree never offers it, and a peer that negotiates it is dropped.**
+//!
+//! What closes it, and only then: both vendored-core additions named above; a
+//! transport seam on the connection handle, which is an opaque `*anyopaque`
+//! the router never dereferences, so a body can neither read a peer's role nor
+//! write a frame; and `max_alpns` at 2 with the two `alpn_list` widenings.
 //!
 //! # What the handler can and cannot do here
 //!
@@ -73,10 +97,9 @@
 //!   layer minted. The router never dereferences it, so a body can neither
 //!   wait for a close nor read a close code off it.
 //! - The vendored core has no OBSERVED_ADDRESS frame and no
-//!   `address_discovery` transport parameter. `vendor/quic/src/quic/frame.rs`
-//!   answers `error.FrameEncodingError` for a type it has no arm for, so the
-//!   frames `net/qad.zig` encodes cannot reach a socket through this core
-//!   yet, and `transport_params.zig` skips the parameter as an unknown id.
+//!   `address_discovery` transport parameter — the two gaps named with their
+//!   line numbers in "Nothing calls this, and that is the decision" above,
+//!   which is also why they are the reason nothing is registered.
 //!
 //! So `acceptConnection` records that a QAD connection reached the handler
 //! and returns, which is the whole of what the handler shape can observe. It

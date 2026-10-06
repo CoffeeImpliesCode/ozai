@@ -23,11 +23,14 @@
 
 const std = @import("std");
 const http_upgrade_types = @import("http_upgrade_types.zig");
+const vectors = @import("ws_frame_vectors.zig");
 
 const Error = http_upgrade_types.Error;
-const ProtocolVersion = http_upgrade_types.Version;
+const Version = http_upgrade_types.Version;
 const accept_length = http_upgrade_types.accept_length;
+const websocket_guid = http_upgrade_types.websocket_guid;
 const crlf = "\r\n";
+const std_testing = std.testing;
 
 /// What `build` can fail with.
 ///
@@ -75,7 +78,7 @@ const protocol_field = "Sec-WebSocket-Protocol: ";
 pub fn accept(key_text: []const u8) [accept_length]u8 {
     var hasher = Sha1.init(.{});
     hasher.update(key_text);
-    hasher.update(http_upgrade_types.websocket_guid);
+    hasher.update(websocket_guid);
     var digest: [Sha1.digest_length]u8 = undefined;
     hasher.final(&digest);
     var out: [accept_length]u8 = undefined;
@@ -93,7 +96,7 @@ pub fn accept(key_text: []const u8) [accept_length]u8 {
 /// upstream version names are the same length, so `v1` and `v2` size alike and
 /// a caller comparing them learns that from the return value rather than from a
 /// table.
-pub fn responseLen(version: ?ProtocolVersion) usize {
+pub fn responseLen(version: ?Version) usize {
     // The sub-protocol field, its name and its own `crlf` are counted only when
     // the request named one: `build` leaves the field out for a null version,
     // and a size that counted an absent header would send a caller one buffer
@@ -124,7 +127,7 @@ pub fn responseLen(version: ?ProtocolVersion) usize {
 /// so it aliases `out` and is invalidated by whatever the caller writes next.
 pub fn build(
     out: []u8,
-    version: ?ProtocolVersion,
+    version: ?Version,
     key_text: []const u8,
 ) BuildError![]const u8 {
     if (out.len < responseLen(version)) return error.BufferFull;
@@ -151,4 +154,62 @@ pub fn build(
 fn put(out: []u8, at: usize, text: []const u8) usize {
     @memcpy(out[at..][0..text.len], text);
     return text.len;
+}
+
+// --- tests
+
+test "RFC 6455 section 1.3: the accept value, directly" {
+    // The one pair of strings in the RFC that is quoted rather than derived. A
+    // relay that concatenates the sixteen decoded bytes instead of the field
+    // value produces a different digest and fails here first, which is why this
+    // assertion sits above the whole-message one rather than inside it.
+    const accept_value = accept(vectors.handshake_key);
+    try std_testing.expectEqualSlices(u8, vectors.handshake_accept, &accept_value);
+    try std_testing.expectEqual(@as(usize, 28), accept_value.len);
+    try std_testing.expectEqual(@as(usize, 28), accept_length);
+
+    // The GUID is the RFC's own, and it is the only part of the computation that
+    // is not derived from the key, so a wrong constant shows here.
+    try std_testing.expectEqualStrings("258EAFA5-E914-47DA-95CA-C5AB0DC85B11", websocket_guid);
+
+    // A different key gives a different accept, which is what makes the value a
+    // check on the handshake rather than a constant to copy.
+    try std_testing.expect(
+        !std.mem.eql(u8, vectors.handshake_accept, &accept("dGhlIHNhbXBsZSBub25jZR==")),
+    );
+    // And an empty key is hashed rather than refused: `accept` answers a value
+    // and decides nothing, so the length rule stays where it is — in the parse.
+    try std_testing.expectEqual(@as(usize, 28), accept("").len);
+}
+
+test "the response is a fixed size and refuses a short buffer" {
+    // Every field of the response is fixed width except the version's own name,
+    // so one size answers for either version and a caller may size a buffer
+    // before it has read the request.
+    var out: [256]u8 = undefined;
+    for ([_]?Version{ null, .v1, .v2 }) |version| {
+        const response = try build(&out, version, vectors.handshake_key);
+        try std_testing.expectEqual(responseLen(version), response.len);
+        try std_testing.expect(
+            std.mem.indexOf(u8, response, "101 Switching Protocols\r\n") != null,
+        );
+    }
+
+    // One byte short is refused and writes nothing, the same rule
+    // `relay/ws_frame.zig` follows for a frame and for the same reason: one
+    // scratch buffer serves a whole connection and it is never grown.
+    var short: [64]u8 = undefined;
+    @memset(&short, 0xee);
+    try std_testing.expectError(error.BufferFull, build(&short, .v2, vectors.handshake_key));
+    for (short) |byte| try std_testing.expectEqual(@as(u8, 0xee), byte);
+    try std_testing.expectError(error.BufferFull, build(&.{}, .v1, vectors.handshake_key));
+
+    // The buffer that is exactly big enough is not short, which is the other half
+    // of the claim.
+    const exact = try std_testing.allocator.alloc(u8, responseLen(.v2));
+    defer std_testing.allocator.free(exact);
+    try std_testing.expectEqual(
+        responseLen(.v2),
+        (try build(exact, .v2, vectors.handshake_key)).len,
+    );
 }

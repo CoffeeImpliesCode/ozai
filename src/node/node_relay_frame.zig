@@ -9,6 +9,12 @@
 //! decodes: a frame's length says where it ends, and `decode` says what it
 //! means, and the two answers are kept apart so a frame `decode` refuses has
 //! still arrived whole.
+//!
+//! The varint itself is not spelled here. RFC 9000 §16 names the four widths
+//! and their bytes, and `wire/quic_varint.zig` is that rule written once for
+//! this tree — this file, `net/qad.zig` and `net/qnt.zig` all call `put` and
+//! `get` there, and the sweep holding them to the specification is that
+//! module's test rather than three copies of one.
 
 const std = @import("std");
 
@@ -16,6 +22,7 @@ const node_config = @import("node_config.zig");
 const node_transport = @import("node_transport.zig");
 const bridge_mod = @import("../transport/quic_bridge.zig");
 const relay_frame = @import("../relay/frame.zig");
+const quic_varint = @import("../wire/quic_varint.zig");
 const relay_server = @import("../relay/server.zig");
 
 const Error = node_config.Error;
@@ -28,12 +35,13 @@ const max_datagram = node_transport.max_datagram;
 /// **This is a write bound, and `encode` refuses rather than truncates**, so a
 /// frame that does not fit is `error.BufferFull` rather than a lie on the wire.
 ///
-/// Eight is the widest a QUIC varint can be, and `DatagramFrame.header_length`
-/// is the node id and the codepoint. That makes a datagram the widest frame
-/// this node sends, and every other frame narrower — a serving relay writes a
-/// challenge, a confirmation, a datagram, an `endpoint_gone`, a `status` and a
-/// `pong`; a relay client writes a `client_auth`, a datagram and a `pong`. All
-/// but one are bounded by a node id, by eight fixed bytes, or by the datagram.
+/// `quic_varint.max_length` is the widest a QUIC varint can be, and
+/// `DatagramFrame.header_length` is the node id and the codepoint. That makes a
+/// datagram the widest frame this node sends, and every other frame narrower
+/// — a serving relay writes a challenge, a confirmation, a datagram, an
+/// `endpoint_gone`, a `status` and a `pong`; a relay client writes a
+/// `client_auth`, a datagram and a `pong`. All but one are bounded by a node
+/// id, by eight fixed bytes, or by the datagram.
 ///
 /// **The eighth — `server_denies_auth`, whose payload is a reason string — was
 /// the hole, and it is closed in the codec rather than here.** Its length is
@@ -48,7 +56,8 @@ const max_datagram = node_transport.max_datagram;
 /// the wrong answer:** it is unbounded, so "worst case" is not a number, and
 /// sizing a buffer for an unbounded string is the same mistake with a bigger
 /// constant.
-pub const relay_frame_room = relay_frame.DatagramFrame.header_length + max_datagram + 8;
+pub const relay_frame_room =
+    relay_frame.DatagramFrame.header_length + max_datagram + quic_varint.max_length;
 
 comptime {
     // The reason a relay sends is bounded by the codec, so this is arithmetic
@@ -74,12 +83,13 @@ pub fn writeRelay(
     out: []u8,
     message: relay_frame.Message,
 ) Error!void {
-    const written = try relay_frame.encode(message, .v2, out[varint_max..]);
-    const prefix = try writeVarint(out[0..varint_max], written.len);
-    // The frame was written at `varint_max` because the length had to go in
-    // front of it and its own width is not known until it has been written.
-    // It is moved down over the gap the length did not use, so what goes on the
-    // wire is the length and then the frame and nothing between them.
+    const written = try relay_frame.encode(message, .v2, out[quic_varint.max_length..]);
+    const prefix = try quic_varint.put(out[0..quic_varint.max_length], written.len);
+    // The frame was written at `quic_varint.max_length` because the length had
+    // to go in front of it and its own width is not known until it has been
+    // written. It is moved down over the gap the length did not use, so what
+    // goes on the wire is the length and then the frame and nothing between
+    // them.
     @memmove(out[prefix..][0..written.len], written);
     try stream.write(out[0 .. prefix + written.len]);
 }
@@ -122,12 +132,13 @@ pub fn peekFrame(
     from: usize,
     scratch: []u8,
 ) Error!?struct { frame: []const u8, end: usize } {
-    const head = readVarint(bytes[from..]) orelse return null;
-    const whole = std.math.cast(usize, head.value) orelse return error.FrameTooLarge;
-    const end = from +| head.len +| whole;
+    var head_length: usize = 0;
+    const head = quic_varint.get(bytes[from..], &head_length) catch return null;
+    const whole = std.math.cast(usize, head) orelse return error.FrameTooLarge;
+    const end = from +| head_length +| whole;
     if (bytes.len < end) return null;
     if (whole > scratch.len) return error.FrameTooLarge;
-    @memcpy(scratch[0..whole], bytes[from + head.len ..][0..whole]);
+    @memcpy(scratch[0..whole], bytes[from + head_length ..][0..whole]);
     return .{ .frame = scratch[0..whole], .end = end };
 }
 
@@ -165,63 +176,4 @@ pub fn controlFrame(control: relay_server.Control) relay_frame.Message {
         .peer_gone => |node_id| .{ .endpoint_gone = node_id },
         .status => |status| .{ .status = status },
     };
-}
-
-/// The widest a QUIC variable-length integer is, which is also the headroom a
-/// message leaves in front of its frame. The same encoding `relay/frame.zig`
-/// writes a frame type with, because that is what a peer will read it as.
-pub const varint_max = 8;
-
-/// A QUIC variable-length integer: two prefix bits say the width, and the
-/// value is what is left of it.
-pub const Varint = struct {
-    value: u64,
-    len: usize,
-};
-
-pub fn writeVarint(out: []u8, value: u64) Error!usize {
-    if (value < 64) {
-        if (out.len < 1) return error.NoRoom;
-        out[0] = @intCast(value);
-        return 1;
-    }
-    if (value < 16384) {
-        if (out.len < 2) return error.NoRoom;
-        putInt(u16, out[0..2], @intCast(value | (0b01 << 14)));
-        return 2;
-    }
-    if (value < 1 << 30) {
-        if (out.len < 4) return error.NoRoom;
-        putInt(u32, out[0..4], @intCast(value | (0b10 << 30)));
-        return 4;
-    }
-    if (out.len < varint_max) return error.NoRoom;
-    putInt(u64, out[0..varint_max], value | (0b11 << 62));
-    return varint_max;
-}
-
-pub fn readVarint(bytes: []const u8) ?Varint {
-    if (bytes.len == 0) return null;
-    const len = @as(usize, 1) << @as(u2, @truncate(bytes[0] >> 6));
-    if (bytes.len < len) return null;
-    const wide: u64 = switch (len) {
-        1 => bytes[0],
-        2 => getInt(u16, bytes[0..2]),
-        4 => getInt(u32, bytes[0..4]),
-        else => getInt(u64, bytes[0..varint_max]),
-    };
-    const bits: u6 = @intCast(@as(u32, @intCast(len)) * 8 - 2);
-    return .{ .value = wide & ((@as(u64, 1) << bits) - 1), .len = len };
-}
-
-/// Write `value` big-endian into the front of `out`, which the caller has
-/// already sized for `T`'s width.
-fn putInt(comptime T: type, out: []u8, value: T) void {
-    std.mem.writeInt(T, @ptrCast(out.ptr), value, .big);
-}
-
-/// Read a big-endian `T` off the front of `bytes`, which the caller has
-/// already checked is long enough.
-fn getInt(comptime T: type, bytes: []const u8) T {
-    return std.mem.readInt(T, @ptrCast(bytes.ptr), .big);
 }

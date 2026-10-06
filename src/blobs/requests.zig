@@ -15,6 +15,8 @@ const postcard = @import("../wire/postcard.zig");
 const range_spec = @import("range_spec.zig");
 const ranges_mod = @import("ranges.zig");
 
+const testing = std.testing;
+
 // `ObserveItem`'s range set is a boundary list rather than a spec sequence, and
 // the type that says so is the one that owns it.
 const ChunkRangeSet = ranges_mod.ChunkRangeSet;
@@ -370,3 +372,54 @@ pub const ObserveItem = struct {
         };
     }
 };
+
+test "GetManyRequest.allRanges is upstream's FromIterator" {
+    // Upstream's `FromIterator` (`src/protocol.rs:590`) sorts and dedups the
+    // hashes and then writes one selected spec at the first hash and an empty
+    // spec `count` hashes on to end the run. Three cases, including the empty
+    // one: a `get_many` for no hashes is a legal frame.
+    // One buffer per case, because every one of these writes the same two slots
+    // and a walk over a sequence whose storage has since been overwritten is a
+    // walk over the wrong sequence.
+    var none_items: [2]range_spec.Item = undefined;
+    var one_items: [2]range_spec.Item = undefined;
+    var three_items: [2]range_spec.Item = undefined;
+
+    const none = GetManyRequest.allRanges(&none_items, 0);
+    try testing.expectEqual(@as(usize, 2), none.items.len);
+    try testing.expectEqual(@as(u64, 0), none.items[0].delta);
+    try testing.expect(none.items[0].spec.isAll());
+    try testing.expectEqual(@as(u64, 0), none.items[1].delta);
+    try testing.expect(none.items[1].spec.isEmpty());
+
+    // One hash: the selected spec is at it and the terminator is at the one
+    // after, so the walk covers the hash and then stops.
+    const one = GetManyRequest.allRanges(&one_items, 1);
+    try testing.expectEqual(@as(u64, 1), one.items[1].delta);
+    try testing.expect(!one.isInfinite());
+    {
+        var walk = one.iter();
+        try testing.expect(walk.next().?.isAll());
+        try testing.expect(walk.next().?.isEmpty());
+        try testing.expect(walk.next() == null);
+    }
+    // With no hashes both pairs start at the same place, and the walk is one
+    // blob past the pair before it, so the run covers two blobs and selects
+    // nothing on the second. Upstream's builder drops a hash whose ranges are
+    // empty, so a real `get_many` never sends this frame.
+    {
+        var walk = none.iter();
+        try testing.expect(walk.next().?.isAll());
+        try testing.expect(walk.next().?.isEmpty());
+        try testing.expect(walk.next() == null);
+    }
+
+    const three = GetManyRequest.allRanges(&three_items, 3);
+    try testing.expectEqual(@as(u64, 3), three.items[1].delta);
+    try testing.expect(!three.isInfinite());
+    // Room for fewer than the two pairs the form needs is the empty sequence
+    // rather than a write past the caller's buffer.
+    var tight: [1]range_spec.Item = undefined;
+    try testing.expect(GetManyRequest.allRanges(&tight, 4).isEmpty());
+    try testing.expect(GetManyRequest.allRanges(&.{}, 4).isEmpty());
+}

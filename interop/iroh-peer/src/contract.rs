@@ -29,9 +29,13 @@
 //! reserves it for iroh's own QUIC address discovery and `Builder.accept`
 //! refuses it with `error.reserved_alpn` (`:208`); `src/node/node_accept.zig:45`
 //! caps a node at one ALPN and `src/node/node_build.zig:224-230` registers the
-//! application one alone, so a table built in this tree never offers it. A peer
-//! that offered it would be offering something the Zig side refuses to
-//! register.
+//! application one alone, so a table built in this tree never offers it. That
+//! is a decision rather than an oversight: `src/router/qad_route.zig` holds the
+//! route that would serve it and records why nothing calls it — the vendored
+//! QUIC core carries neither the OBSERVED_ADDRESS frame nor the
+//! `address_discovery` transport parameter, so a node here could negotiate
+//! QAD and report nothing. A peer that offered it would be offering something
+//! no node here can answer.
 //!
 //! Order matters and is the preference order: `src/router/alpn_table.zig:228-231`
 //! records that the offer list goes out in registration order and the first

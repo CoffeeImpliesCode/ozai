@@ -16,6 +16,7 @@ pub const key = @import("base/key.zig");
 pub const addr = @import("base/addr.zig");
 pub const ula = @import("base/ula.zig");
 pub const postcard = @import("wire/postcard.zig");
+pub const quic_varint = @import("wire/quic_varint.zig");
 pub const net_report = @import("net/report.zig");
 pub const holepunch = @import("net/holepunch.zig");
 pub const net_probe = @import("net/probe.zig");
@@ -47,6 +48,9 @@ pub const router = @import("router/router.zig");
 
 pub const range_spec = @import("blobs/range_spec.zig");
 pub const blobs_protocol = @import("blobs/protocol.zig");
+pub const blobs_framing = @import("blobs/framing.zig");
+pub const blobs_requests = @import("blobs/requests.zig");
+pub const blobs_responses = @import("blobs/responses.zig");
 pub const endpoint_ticket = @import("ticket/endpoint_ticket.zig");
 pub const blob_ticket = @import("ticket/blob_ticket.zig");
 pub const bao_tree = @import("blobs/bao_tree.zig");

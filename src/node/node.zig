@@ -415,8 +415,8 @@ pub const Node = struct {
     /// node's.** `initRelay` allocates `relay_out` and `relay_scratch` before
     /// it looks at the role at all, and `freeRelay` frees both whatever the
     /// role was, so a `.off` node holds and returns two relay allocations it
-    /// never writes a byte into — `relay_frame_room + varint_max` and
-    /// `relay_frame_room`. An ownership audit that reads this group as "no
+    /// never writes a byte into — `relay_frame_room + quic_varint.max_length`
+    /// and `relay_frame_room`. An ownership audit that reads this group as "no
     /// relay storage off a relay node" misses both, on every gossip node in the
     /// tree.
     slots: [relay_table_slots]relay_server.Registry(relay_displaced).Slot,
@@ -2136,31 +2136,6 @@ test "a payload the relay handed over is retained once and given back once" {
     // endpoint abandoned in `serving` at error level, and an error-level log
     // fails the artifact for a reason that has nothing to do with the payload.
     try node.close(t.io, start_ns, node.generator());
-}
-
-test "a message length round-trips at every varint width" {
-    // The widths a relay never reaches: a frame here is one datagram and a
-    // datagram is `max_datagram` bytes, so nothing this node sends needs the
-    // four- or eight-byte form. A length that crosses a width boundary and is
-    // read back wrong is a frame decoded as a *different* frame, so the
-    // widths are checked here rather than left to a datagram large enough to
-    // need them.
-    const widths = [_]u64{
-        0,     63,            64,      16383,
-        16384, (1 << 30) - 1, 1 << 30, (1 << 62) - 1,
-    };
-    var out: [node_relay_frame.varint_max]u8 = undefined;
-    for (widths) |value| {
-        const len = try node_relay_frame.writeVarint(&out, value);
-        const read = node_relay_frame.readVarint(out[0..len]) orelse return error.NoVarint;
-        try t.expectEqual(value, read.value);
-        try t.expectEqual(len, read.len);
-    }
-    // A buffer with no room is refused rather than truncated, and half a
-    // length is not a length.
-    try t.expectError(error.NoRoom, node_relay_frame.writeVarint(out[0..1], 64));
-    try t.expect(node_relay_frame.readVarint(&.{}) == null);
-    try t.expect(node_relay_frame.readVarint(&.{0x40}) == null);
 }
 
 test "every relay role answers a client count, and only a serving relay holds one" {

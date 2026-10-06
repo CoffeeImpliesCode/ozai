@@ -95,6 +95,35 @@ same path answer with the same address again lives here.
 **The router owns ALPN dispatch and nothing else.** It turns a negotiated ALPN
 into a handler call. It does not know what any protocol does.
 
+**`/iroh-qad/0` is reserved and not offered, by decision.** The router holds
+one ALPN reserved for iroh's own QUIC address discovery. `Builder.accept`
+refuses it with `error.reserved_alpn`, and nothing registers it, so a table
+built in this tree never offers it and a peer that negotiates it is dropped.
+Both halves are deliberate, and the codec over the protocol's bytes
+(`src/net/qad.zig`) is tested and deliberately unwired rather than forgotten.
+
+The route that would serve it exists and is uncalled:
+`src/router/qad_route.zig`'s `registerLast` is the only caller of
+`Builder.acceptInternal`, and its module doc records why nothing calls it.
+The blocker is the vendored core, not this tree's own ALPN width.
+`TlsConfig.alpn` is `[]const []const u8` and the server matcher walks every
+entry, so `max_alpns` could go to 2 with a two-element `alpn_list` in
+`src/transport/bridge_manager.zig` and `src/transport/dial_client.zig` and no
+vendor patch at all. What is missing is that `vendor/quic/` carries no
+OBSERVED_ADDRESS frame (`frame.zig`'s `FrameType` has no `0x9f81a6`/`0x9f81a7`
+arm, and `parseSized` answers `error.FrameEncodingError` for a type it cannot
+name) and no `address_discovery` transport parameter (`transport_params.zig`'s
+`ParamId` has no `0x9f81a176`, and `decode` skips unknown ids). `vendor/quic/`
+is read-only here.
+
+So the route is not wired, and wiring it would be worse than dropping: a node
+offering `/iroh-qad/0` would negotiate it and then be unable to report a
+single observed address, which is the whole service. That is the fail-closed
+rule (`AGENTS.md` §2) deciding this, not the one-element list. Three things
+close it, and they are listed in `src/router/qad_route.zig`'s module doc: the
+two vendored-core features, a transport seam on the connection handle the
+handler is given, and `max_alpns` at 2 last.
+
 ## Invariants
 
 These are the things that break silently. Each is stated with the failure it

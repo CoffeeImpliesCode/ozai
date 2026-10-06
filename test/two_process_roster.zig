@@ -9,6 +9,7 @@
 //! node has reached is answered by the node.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ozai = @import("ozai");
 
 const posix = std.posix;
@@ -32,12 +33,44 @@ pub fn windowMs(passes: i64) i64 {
     return passes * pass_ms * pass_slack;
 }
 
-/// Each observation and reap remains bounded to sixty seconds.
-const wait_passes = 120;
-pub const budget_ms: i64 = windowMs(wait_passes);
+/// The passes one parent wait allows, per target.
+///
+/// **This bounds the harness, and nothing else.** No wait in
+/// `two_process_test.zig` claims anything about a duration: every one of them
+/// is gated on a counter the node published after it reached the state that
+/// counter names. A deadline that a slow emulator can trip must not be where a
+/// correctness claim hides, and what the wall clock decides here is how many of
+/// a node's passes fit inside the budget — a fact about the target rather than
+/// about the program under test.
+///
+/// Sixty seconds is the row this project gates on, and the only row where the
+/// waits it bounds have been measured in seconds. Every other row of the cross
+/// matrices reaches this file through an emulator, where the same waits run an
+/// order of magnitude longer and where the harness runs rows beside each other,
+/// so those rows get ten times the bound: enough that a wait given up on here is
+/// a finding about a node rather than about the machine it ran on.
+fn waitPasses() i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => gate_passes,
+        else => emulated_passes,
+    };
+}
+
+/// The gated row's allowance: 120 passes, twice over for contention.
+const gate_passes = 120;
+
+/// Ten times that, for a target this project only ever emulates.
+const emulated_passes = 10 * gate_passes;
+
+pub const budget_ms: i64 = windowMs(waitPasses());
 
 /// A child must remain alive while its parent observes and signals it.
 /// Auto-expiry is a last-resort guard, not the event a lifecycle test awaits.
+///
+/// It is a function of `budget_ms` for the reason `budget_ms` is a function of
+/// the target: `--for` is wall clock, so a slow target gets *fewer* passes
+/// before it expires rather than more, and a child that expired mid-run would
+/// report `exited before reporting ...` for a run that was only slow.
 pub const watchdog_ms: i64 = 4 * budget_ms;
 
 /// How long a single `poll` blocks, so a line one of the nodes writes is noticed

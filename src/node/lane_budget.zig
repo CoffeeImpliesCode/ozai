@@ -65,17 +65,19 @@
 //! **`qad_alpn` is `acceptInternal`'s, and `accept` refuses it**
 //! (`router/alpn_table.zig:237`). Nothing under `src/` calls `acceptInternal`,
 //! so a table built in this tree never offers `/iroh-qad/0`
-//! (`router/qad_route.zig:56-60`). Two consequences, and both are enforced
-//! rather than described:
+//! (`router/qad_route.zig`, "Nothing calls this, and that is the decision").
+//! Two consequences, and both are enforced rather than described:
 //!
 //! - `plan` refuses the reserved ALPN by name. A node's own configuration cannot
 //!   claim it, and the refusal is a different name from a full table because the
 //!   two answer different questions: one is "you may not have this", the other
 //!   is "there is no room".
 //! - There is no way to plan an internal lane. Not a parameter, not a method.
-//!   The internal route is the router's business, it is not wired, and at
-//!   `max_alpns` of one the wire has no room for it anyway — a second bridge
-//!   field is what brings it, exactly as `node/node_accept.zig:41-44` says.
+//!   The internal route is the router's business and it is deliberately not
+//!   registered: `router/qad_route.zig` records the decision and the two
+//!   vendored-core features it waits on. A second bridge field is what brings
+//!   the lane, exactly as `node/node_accept.zig:41-44` says — and it is the
+//!   last of the three, not the first.
 //!
 //! **A repeated ALPN is not refused here.** `Builder.push` reproduces upstream
 //! and pushes a second entry, offering the name twice and dispatching to the

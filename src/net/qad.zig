@@ -40,6 +40,9 @@
 //! spells them; the field order and the width of every field; all three role
 //! values and the refusal of every other one; the truncation bound; the
 //! buffer bound; and the round trip for both families at every varint width.
+//! The encoding itself — the four widths, their bytes, and both refusals — is
+//! pinned once in `wire/quic_varint.zig`, which this file calls rather than
+//! restating.
 //!
 //! **Not pinned:** no upstream bytes were captured on this node. The golden
 //! frame in the test below is *derived* — §4.1's field order composed with
@@ -51,8 +54,34 @@
 //! `/iroh-qad/0` connection; this node has no such capture and cannot make
 //! one, so that test does not exist yet.
 //!
-//! **Not implemented here, and said here rather than left to be assumed:**
-//! the sequence number's monotonicity rule — ignore an OBSERVED_ADDRESS frame
+//! # Deliberately unwired, and not waiting on a forgotten call
+//!
+//! Nothing in `src/` sends or receives these bytes, and the reserved ALPN
+//! `router/alpn_table.zig` names for them is refused at `Builder.accept`
+//! rather than registered. `router/qad_route.zig` holds the one way past that
+//! refusal and is likewise uncalled; its module doc records why, which is the
+//! same answer given here: the vendored core has no frame type for an
+//! OBSERVED_ADDRESS (`vendor/quic/src/quic/frame.zig:45-75`, `:670`) and no
+//! `address_discovery` transport parameter
+//! (`vendor/quic/src/quic/transport_params.zig:24-46`, `:609-612`), and
+//! `vendor/quic/` is read-only in this tree. Until both exist there is nowhere
+//! for an encoded frame to go, so a live route would negotiate QAD and report
+//! silence — which is why the reservation is the honest state rather than a
+//! route that is merely unwired.
+//!
+//! **What closes it, in order:** those two vendored-core features; a transport
+//! seam on `router.Connection`, which is an opaque `*anyopaque` the router
+//! never dereferences, so a handler can neither read the peer's role nor write
+//! a frame; and `node/node_accept.zig`'s `max_alpns` raised to 2 with the two
+//! `alpn_list` widenings in `transport/bridge_manager.zig` and
+//! `transport/dial_client.zig`. The third is the cheap one and is the only one
+//! reachable without a vendor patch — it is also the one that would be wrong to
+//! do alone, since a node offering a protocol it cannot serve is the failure
+//! `AGENTS.md` §2's fail-closed rule exists to prevent.
+//!
+//! # What is not implemented here, and said here rather than left to be assumed
+//!
+//! The sequence number's monotonicity rule — ignore an OBSERVED_ADDRESS frame
 //! for a path whose sequence number is not greater than the last accepted one
 //! for that path (§4.1; noq's `PathData::update_observed_addr_report`). That
 //! rule is per-path state, so it belongs to whoever holds the paths and not to
@@ -67,6 +96,7 @@
 //! rule `relay/frame_writer.zig` follows and for the same reason.
 
 const std = @import("std");
+const quic_varint = @import("../wire/quic_varint.zig");
 const addr = @import("../base/addr.zig");
 
 const IpAddress = addr.IpAddress;
@@ -94,13 +124,13 @@ pub const frame_type_ipv6: u64 = 0x9f81a7;
 
 /// The widest a QUIC variable-length integer is (RFC 9000 §16), and so the
 /// widest this frame's type and sequence number can each be.
-pub const max_varint_length: usize = 8;
+pub const max_varint_length: usize = quic_varint.max_length;
 
 /// The largest sequence number a variable-length integer can carry, and so
 /// the largest this frame can name. A *decoded* frame cannot exceed it — the
 /// encoding has nowhere to put a 62nd bit — which is why the check is on the
 /// way in only.
-pub const max_sequence: u64 = (@as(u64, 1) << 62) - 1;
+pub const max_sequence: u64 = quic_varint.max_value;
 
 /// The longest frame `encode` can write: a type, a sequence number, a
 /// sixteen-byte address and a two-byte port. Both type constants are
@@ -187,7 +217,7 @@ pub const Role = enum(u64) {
 /// role — which is what makes the parameter's declared length 1 for all
 /// three, and the test below is what holds that.
 pub fn encodeRole(role: Role, out: []u8) Error!usize {
-    return putVarint(out, @intFromEnum(role));
+    return quic_varint.put(out, @intFromEnum(role));
 }
 
 /// The role a parameter's value spells, and how many bytes it occupied.
@@ -199,7 +229,7 @@ pub fn encodeRole(role: Role, out: []u8) Error!usize {
 /// one integer is not a value this parameter can carry.
 pub fn decodeRole(value: []const u8) RoleError!DecodedRole {
     var offset: usize = 0;
-    const raw = try getVarint(value, &offset);
+    const raw = try quic_varint.get(value, &offset);
     if (offset != value.len) return error.TrailingBytes;
     const role: Role = switch (raw) {
         0 => .send_only,
@@ -304,8 +334,8 @@ pub fn encode(observed: ObservedAddress, out: []u8) Error!usize {
         .v6 => .v6,
     };
     var offset: usize = 0;
-    offset += try putVarint(out[offset..], frameTypeOf(family));
-    offset += try putVarint(out[offset..], observed.sequence);
+    offset += try quic_varint.put(out[offset..], frameTypeOf(family));
+    offset += try quic_varint.put(out[offset..], observed.sequence);
     switch (observed.addr.ip) {
         .v4 => |octets| {
             if (out[offset..].len < 4 + 2) return error.NoRoom;
@@ -334,9 +364,9 @@ pub fn encode(observed: ObservedAddress, out: []u8) Error!usize {
 /// a skip.
 pub fn decode(bytes: []const u8) Error!Decoded {
     var offset: usize = 0;
-    const family = try familyOf(try getVarint(bytes, &offset));
+    const family = try familyOf(try quic_varint.get(bytes, &offset));
     const octets = family.addressLength();
-    const sequence = try getVarint(bytes, &offset);
+    const sequence = try quic_varint.get(bytes, &offset);
     if (bytes[offset..].len < octets + 2) return error.Truncated;
     var ip: IpAddress = undefined;
     switch (family) {
@@ -363,90 +393,13 @@ pub fn decode(bytes: []const u8) Error!Decoded {
     };
 }
 
-/// How many bytes the variable-length integer for `value` takes, RFC 9000
-/// §16: two prefix bits in the first byte say the width, and the value is
-/// what is left of it.
-fn varintLength(value: u64) usize {
-    if (value < 1 << 6) return 1;
-    if (value < 1 << 14) return 2;
-    if (value < 1 << 30) return 4;
-    return max_varint_length;
-}
-
-/// Write `value` as a variable-length integer at the front of `out`, and say
-/// how wide it was.
-///
-/// `noq_proto::VarInt::encode`, and `noq_proto::VarInt::size` for the width.
-/// Both type constants and the parameter id are past the two-byte range, so
-/// they are four and eight bytes wide; nothing here writes one byte for a
-/// value that needs more, and nothing here reads a width it did not write.
-fn putVarint(out: []u8, value: u64) Error!usize {
-    const length = varintLength(value);
-    if (out.len < length) return error.NoRoom;
-    const prefix: u64 = switch (length) {
-        1 => 0b00,
-        2 => 0b01,
-        4 => 0b10,
-        else => 0b11,
-    };
-    const shift: u6 = @intCast(8 * length - 2);
-    const wide = value | (prefix << shift);
-    switch (length) {
-        1 => out[0] = @intCast(wide),
-        2 => {
-            var bytes: [2]u8 = undefined;
-            std.mem.writeInt(u16, &bytes, @intCast(wide), .big);
-            @memcpy(out[0..2], bytes[0..]);
-        },
-        4 => {
-            var bytes: [4]u8 = undefined;
-            std.mem.writeInt(u32, &bytes, @intCast(wide), .big);
-            @memcpy(out[0..4], bytes[0..]);
-        },
-        else => {
-            var bytes: [max_varint_length]u8 = undefined;
-            std.mem.writeInt(u64, &bytes, wide, .big);
-            @memcpy(out[0..max_varint_length], bytes[0..]);
-        },
-    }
-    return length;
-}
-
-/// Why a variable-length integer cannot be read. Its own set rather than
-/// `Error`, because a read has exactly one failure and this module has two
-/// readers with two different wider sets: a frame body widens it with the
-/// frame's refusals, and a transport parameter's value with the role's.
-const VarintError = error{
-    /// The slice ended before the width the first byte named was behind it.
-    Truncated,
-};
-
-/// Read the variable-length integer at `bytes[offset..]`, leaving `offset`
-/// after it.
-///
-/// `noq_proto::VarInt::decode`, loop for loop. One rejection: a first byte
-/// naming a two-, four- or eight-byte integer with fewer bytes behind it.
-/// There is no second, because a QUIC variable-length integer is
-/// self-describing and every value below 2^62 has exactly one spelling — the
-/// over-long encodings a postcard varint admits cannot be written here.
-fn getVarint(bytes: []const u8, offset: *usize) VarintError!u64 {
-    const rest = bytes[offset.*..];
-    if (rest.len == 0) return error.Truncated;
-    const length: usize = @as(usize, 1) << @intCast(rest[0] >> 6);
-    if (rest.len < length) return error.Truncated;
-    var value: u64 = rest[0] & 0b0011_1111;
-    for (rest[1..length]) |byte| value = (value << 8) | byte;
-    offset.* += length;
-    return value;
-}
-
 comptime {
     // The bound above is a bound because of these two facts, and a reader
     // who changes a constant should be told here rather than by a test that
     // stops holding.
-    std.debug.assert(varintLength(frame_type_ipv4) == 4);
-    std.debug.assert(varintLength(frame_type_ipv6) == 4);
-    std.debug.assert(varintLength(transport_parameter_id) == max_varint_length);
+    std.debug.assert(quic_varint.length(frame_type_ipv4) == 4);
+    std.debug.assert(quic_varint.length(frame_type_ipv6) == 4);
+    std.debug.assert(quic_varint.length(transport_parameter_id) == max_varint_length);
 }
 
 // --- tests
@@ -484,16 +437,17 @@ fn expectHex(text: []const u8, actual: []const u8) !void {
 /// The variable-length integer `value` spells, compared against `text`.
 fn expectVarint(text: []const u8, value: u64) !void {
     var scratch: [max_varint_length]u8 = undefined;
-    const length = try putVarint(&scratch, value);
+    const length = try quic_varint.put(&scratch, value);
     try expectHex(text, scratch[0..length]);
 }
 
 /// Every family, every sequence width, and the two ports a `u16` can hold.
 ///
-/// The widths are the boundaries RFC 9000 §16 draws, and the sweep is a
-/// comptime one so a family added later is swept without a test being
-/// edited.
-const sequences = [_]u64{ 0, 1, 42, 63, 64, 16_383, 16_384, 1 << 30, max_sequence };
+/// The widths are `quic_varint.boundaries`, the boundaries RFC 9000 §16 draws,
+/// read from the module that owns the rule rather than restated here. The
+/// sweep is a comptime one so a family added later is swept without a test
+/// being edited.
+const sequences = quic_varint.boundaries;
 
 /// `2001:db8::1` out of the documentation prefix, as the sixteen bytes the
 /// frame carries. One constant rather than a literal per test, so the golden
@@ -620,7 +574,7 @@ test "a frame type this build does not carry is refused by name" {
     // not this frame cannot be anything but a refusal.
     for ([_]u64{ frame_type_ipv4 - 1, frame_type_ipv6 + 1, 0x1f, 0x00 }) |frame_type| {
         var scratch: [max_varint_length]u8 = undefined;
-        const length = try putVarint(&scratch, frame_type);
+        const length = try quic_varint.put(&scratch, frame_type);
         try t.expectError(error.UnknownAddressFamily, decode(scratch[0..length]));
     }
 

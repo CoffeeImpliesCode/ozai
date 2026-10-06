@@ -56,10 +56,27 @@
 //! That is why `BaoResponse.isEof` and `ObserveResponse.next` returning `null`
 //! are the two places EOF is a value at all. Both are tested against bytes
 //! that stop early, and neither is tested against an error.
+//!
+//! # Where these are tested
+//!
+//! The framings, the discriminant and the close codes are tested in this file,
+//! against the golden vectors below it. A test in the facade would still catch
+//! a broken reader, but it would name the facade in the failure, and the next
+//! edit to `framing.zig` would be the one that has to go looking for it.
+//! `protocol.zig` keeps the tests that are about more than one of these modules
+//! at once, and `responses.zig` keeps the ones about what a provider answers
+//! with.
 
 const std = @import("std");
 const postcard = @import("../wire/postcard.zig");
+const close_codes = @import("close_codes.zig");
 const requests = @import("requests.zig");
+const range_spec = @import("range_spec.zig");
+const test_support = @import("wire_test_support.zig");
+
+// The close codes are QUIC's and belong beside the stream rather than in the
+// bytes; `close_codes.zig` is their owner and this is the same type.
+pub const Closed = close_codes.Closed;
 
 // The bodies this module frames, re-bound so the framing code below reads as
 // framing code. `requests` is the owner; these are the same types, not copies.
@@ -68,6 +85,21 @@ const GetRequest = requests.GetRequest;
 const GetManyRequest = requests.GetManyRequest;
 const ObserveRequest = requests.ObserveRequest;
 const PushRequest = requests.PushRequest;
+
+// The bodies the golden vectors below are spelled from: the hash upstream's
+// own cases use, and the two range sequences it hands a blob, a collection and
+// a push.
+const Hash = requests.Hash;
+const blob_ranges = requests.blob_ranges;
+const push_ranges = requests.push_ranges;
+
+const testing = std.testing;
+
+// The arena a decode fills and the hex comparison, from the one module that
+// holds them for all three of this protocol's test suites.
+const Room = test_support.Room;
+const parseHex = test_support.parseHex;
+const expectHex = test_support.expectHex;
 
 /// The most bytes a request body may occupy.
 ///
@@ -146,53 +178,6 @@ comptime {
         }
     }
 }
-
-/// The reasons a stream is closed or stopped, as one namespace of error codes.
-///
-/// Upstream's `Closed` at `src/protocol.rs:667`, `#[repr(u16)]`, and the reason
-/// strings are its own at `src/protocol.rs:690`. These are QUIC codes, sent
-/// next to the stream and never inside it — which is the whole reason a
-/// provider that cannot answer a `get` has nothing to put in the payload. All
-/// three are below 64, and a QUIC varint of that size is a single byte holding
-/// the value (`toVarInt`).
-pub const Closed = enum(u16) {
-    /// The receive stream was dropped. Upstream keeps this as documentation of
-    /// what happened to `0` and says it is not used explicitly.
-    stream_dropped = 0,
-    /// The provider is terminating, and every stream with it.
-    provider_terminating = 1,
-    /// The provider has the request. Only one request is allowed per stream, so
-    /// more data after it is what this code is for.
-    request_received = 2,
-
-    /// The close reason as bytes, which upstream requires to be valid UTF-8.
-    pub fn reason(self: Closed) []const u8 {
-        return switch (self) {
-            .stream_dropped => "stream dropped",
-            .provider_terminating => "provider terminating",
-            .request_received => "request received",
-        };
-    }
-
-    /// The QUIC varint a STOP_STREAM carries for this reason.
-    ///
-    /// Upstream's `impl From<Closed> for VarInt` is `VarInt::from(self as
-    /// u16)`, and every arm is below 64, so each is one byte. The
-    /// compression is a QUIC varint's length prefix in its first two bits
-    /// (`RFC 9000` section 16), where `00` means one byte and the low six bits
-    /// are the value — which is why the value comes back unchanged.
-    pub fn toVarInt(self: Closed) u64 {
-        return @intFromEnum(self);
-    }
-
-    /// The reason a code names, or `error.UnknownClose` for a code this build
-    /// has no arm for. A decoder that invented a default arm would report a
-    /// close nobody sent.
-    pub fn fromVarInt(code: u64) Error!Closed {
-        if (code > std.math.maxInt(u16)) return error.UnknownClose;
-        return std.enums.fromInt(Closed, @as(u16, @intCast(code))) orelse error.UnknownClose;
-    }
-};
 
 /// A request whose bytes run to the end of the stream: `Get`, `GetMany` or
 /// `Observe`.
@@ -497,4 +482,363 @@ pub fn appendBytes(writer: *postcard.Writer, bytes: []const u8) Error!void {
     if (room.len < bytes.len) return error.BufferFull;
     @memcpy(room[0..bytes.len], bytes);
     writer.length += bytes.len;
+}
+
+// -- The tests ---------------------------------------------------------------
+//
+// Golden vectors below: n0-computer/iroh-blobs, `src/protocol.rs`, commit
+// e82cbdcbdac9a78033174aad55e3199b2cf4c0dc, fetched 2026-09-30. The two
+// hexdumps are the ones upstream's `request_wire_format` test holds, byte for
+// byte, and upstream's own comments name the fields. Everything else in this
+// block is either derived from those and cited where it is derived, or a
+// round trip — which asserts a property of the codec rather than a claim about
+// what a peer sent.
+
+/// The hash both upstream cases use: `let hash: Hash = [0xda; 32].into()`.
+const da_hash: Hash = @splat(0xda);
+
+const zero_hash: Hash = @splat(0);
+
+const two_hashes = [_]Hash{ @splat(0), @splat(1) };
+
+test "golden: Request wire format, iroh-blobs protocol.rs request_wire_format" {
+    // 00                      # enum variant for GetRequest
+    // dadadada…dadada (32)    # the hash
+    // 020001000100            # the ChunkRangesSeq
+    try expectRequestBytes(
+        .{ .to_eof = .{ .get = GetRequest.blob(da_hash) } },
+        "00" ++ "da" ** 32 ++ "020001000100",
+    );
+    try expectRequestFrom(
+        "00" ++ "da" ** 32 ++ "020001000100",
+        .{ .to_eof = .{ .get = GetRequest.blob(da_hash) } },
+    );
+
+    // 00                      # enum variant for GetRequest
+    // dadadada…dadada (32)    # the hash
+    // 01000100                # the ChunkRangesSeq
+    try expectRequestBytes(
+        .{ .to_eof = .{ .get = GetRequest.all(da_hash) } },
+        "00" ++ "da" ** 32 ++ "01000100",
+    );
+    try expectRequestFrom(
+        "00" ++ "da" ** 32 ++ "01000100",
+        .{ .to_eof = .{ .get = GetRequest.all(da_hash) } },
+    );
+
+    // The second sequence is one pair and no terminator, so the walk repeats
+    // it forever: that is what makes it a hash-sequence request rather than a
+    // blob one, and it is a property of the sequence rather than of the frame.
+    try testing.expect(GetRequest.all(da_hash).ranges.isInfinite());
+    try testing.expect(!GetRequest.blob(da_hash).ranges.isInfinite());
+}
+
+test "golden: the push frame, derived from the captured get vector" {
+    // Derived rather than captured, and derived from the two hexdumps above by
+    // exactly the two differences `Request::read_async` (`src/protocol.rs:479`)
+    // and `read_length_prefixed` (`src/util/stream.rs:381`) are: the
+    // discriminant changes from `00` to `08`, and a `varint(u64)` length of
+    // the body goes between the discriminant and the body. The body is
+    // identical because `PushRequest` is a newtype over `GetRequest`
+    // (`src/protocol.rs:567`) — the same hash and the same sequence, so the
+    // same 38 bytes, and 38 is `0x26`.
+    //
+    // The length is the *body's* length and not the frame's, which is why it
+    // covers the hash and the sequence and neither the discriminant in front
+    // nor the payload behind: a `PushRequest` is decoded from exactly those
+    // bytes, and the payload is outside the prefix by construction.
+    const push: Request = .{
+        .length_prefixed = .{ .request = .{ .get = GetRequest.blob(da_hash) } },
+    };
+    try expectRequestBytes(push, "08" ++ "26" ++ "da" ** 32 ++ "020001000100");
+    try expectRequestFrom(
+        "08" ++ "26" ++ "da" ** 32 ++ "020001000100",
+        push,
+    );
+}
+
+test "every request type round trips as a fixed point" {
+    const frames = [_]Request{
+        // A blob, and a collection, which is the same frame with a different
+        // sequence.
+        .{ .to_eof = .{ .get = GetRequest.blob(da_hash) } },
+        .{ .to_eof = .{ .get = GetRequest.all(da_hash) } },
+        // A `get` with an empty sequence: no ranges at all, which is a legal
+        // frame and not a missing one.
+        .{ .to_eof = .{ .get = .{ .hash = zero_hash, .ranges = .empty } } },
+        // A `get_many` over two hashes, with the sequence a blob request uses.
+        .{ .to_eof = .{ .get_many = .{
+            .hashes = &two_hashes,
+            .ranges = .{ .items = &blob_ranges },
+        } } },
+        // An observe, whose ranges are a spec and not a sequence.
+        .{ .to_eof = .{ .observe = .{
+            .hash = da_hash,
+            .ranges = range_spec.RangeSpec.all,
+        } } },
+        // And a push, which is the same body under the other framing: once with
+        // the sequence a whole-blob request sends, and once with a sequence of
+        // its own, because a push is not restricted to a whole blob.
+        .{ .length_prefixed = .{ .request = .{ .get = GetRequest.blob(da_hash) } } },
+        .{ .length_prefixed = .{ .request = PushRequest.new(
+            da_hash,
+            .{ .items = &push_ranges },
+        ) } },
+    };
+    for (frames) |request| try expectRequestFixedPoint(request);
+}
+
+test "framing: a push frame leaves the payload where it said it would" {
+    const bao = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x11 };
+    var frame: [64]u8 = undefined;
+    var body: [2048]u8 = undefined;
+    var writer = postcard.Writer.init(&frame);
+    try (Request{ .length_prefixed = .{ .request = .{ .get = GetRequest.blob(da_hash) } } })
+        .write(&writer, &body);
+
+    // The request ends 40 bytes in: a discriminant, a one-byte length, 32 hash
+    // bytes and a six-byte sequence. The payload starts there and is not
+    // covered by the length.
+    try testing.expectEqual(@as(usize, 40), writer.finish().len);
+    @memcpy(frame[40 .. 40 + bao.len], &bao);
+
+    var room: Room = .{};
+    var storage = room.storage();
+    var reader = postcard.Reader.init(frame[0 .. 40 + bao.len]);
+    const decoded = try Request.read(&reader, &storage);
+    const framed = switch (decoded) {
+        .to_eof => return error.NotAPushFrame,
+        .length_prefixed => |value| value,
+    };
+    try testing.expectEqual(@as(usize, 40), framed.payload_offset);
+    try testing.expectEqualSlices(u8, &bao, decoded.payload(&reader));
+    // The reader is left on the payload, not past it: the request is over and
+    // the data has not started being consumed.
+    try testing.expectEqual(@as(usize, 40), reader.offset);
+
+    // And a request that ran to the end of the stream has no payload at all,
+    // which the type says rather than leaving the caller to know which framing
+    // it was handed.
+    const get: Request = .{ .to_eof = .{ .get = GetRequest.blob(da_hash) } };
+    try testing.expectEqualSlices(u8, "", get.payload(&reader));
+}
+
+test "framing: the two shapes are not interchangeable" {
+    var get_frame: [64]u8 = undefined;
+    var body: [2048]u8 = undefined;
+    var writer = postcard.Writer.init(&get_frame);
+    try (Request{ .to_eof = .{ .get = GetRequest.blob(da_hash) } }).write(&writer, &body);
+    const get_bytes = writer.finish();
+
+    // A `get` body read as a length prefix — the step a decoder that assumed
+    // the other shape takes. The hash's first byte is the "length", and
+    // thirty-two bytes of 0xda is a varint with the continuation bit set for
+    // every byte a `u64` has room for. A named error, never a request.
+    {
+        var reader = postcard.Reader.init(get_bytes[1..]);
+        try testing.expectError(error.BadVarint, readLengthPrefaced(&reader));
+    }
+
+    // A `push` body read as a `get` body is the dangerous one. The length byte
+    // shifts the hash by one, and the sequence that follows is read from what
+    // is left of the frame — so the result is not the request that was sent,
+    // and it is either a named error or a *different* request depending on the
+    // bytes. That is the whole reason the framing is a property of the type:
+    // `Request.read` picks the framing from the discriminant, so no path in
+    // this module can reach this, and a caller that reaches for the wrong
+    // framing is told so instead. Here it is `BadLength`, because the shifted
+    // hash leaves a 0xda where the sequence's element count is.
+    {
+        const push_body = "26" ++ "da" ** 32 ++ "020001000100";
+        var reader = postcard.Reader.init(push_body);
+        var room: Room = .{};
+        var storage = room.storage();
+        try testing.expectError(error.BadLength, GetRequest.parse(&reader, &storage));
+    }
+
+    // And each framing refuses a type it does not carry, before it reads a
+    // byte of the body.
+    {
+        const push_frame = "08" ++ "26" ++ "da" ** 32 ++ "020001000100";
+        var reader = postcard.Reader.init(push_frame[1..]);
+        var room: Room = .{};
+        var storage = room.storage();
+        try testing.expectError(
+            error.WrongFraming,
+            EofFraming.read(.push, &reader, &storage),
+        );
+    }
+    {
+        var reader = postcard.Reader.init(get_bytes[1..]);
+        var room: Room = .{};
+        var storage = room.storage();
+        try testing.expectError(
+            error.WrongFraming,
+            LengthPrefixedFraming.read(.get, &reader, &storage),
+        );
+    }
+    // Every reserved arm is refused by the framing that would otherwise carry
+    // it, and refused by name rather than read as a body.
+    for (2..8) |slot| {
+        const tag: RequestType = @enumFromInt(@as(u8, @intCast(slot)));
+        var reader = postcard.Reader.init("");
+        var room: Room = .{};
+        var storage = room.storage();
+        try testing.expectError(
+            error.ReservedSlot,
+            EofFraming.read(tag, &reader, &storage),
+        );
+    }
+}
+
+test "codec: malformed request encodings are named errors" {
+    // A stream with no discriminant at all.
+    try expectRequestErrorHex("", error.UnexpectedEnd);
+    // 0x0a is one past the last arm, and 0x80 has the top bit set. Upstream
+    // reads a discriminant as a raw byte, so neither is a truncated varint: both
+    // are values this build does not have.
+    try expectRequestErrorHex("0a", error.UnknownVariant);
+    try expectRequestErrorHex("80", error.UnknownVariant);
+    try expectRequestErrorHex("ff", error.UnknownVariant);
+    // Every reserved arm, one through six, is refused.
+    for (2..8) |slot| {
+        const hex = [_]u8{ '0', '0' + @as(u8, @intCast(slot)) };
+        try expectRequestErrorHex(&hex, error.ReservedSlot);
+    }
+
+    // A `get` whose sequence is a whole frame plus one byte. postcard 1.1.3's
+    // `from_bytes` does not finalize its deserializer and would ignore that
+    // byte; `finish` is what makes the two different frames.
+    try expectRequestErrorHex(
+        "00" ++ "da" ** 32 ++ "01000100" ++ "00",
+        error.TrailingBytes,
+    );
+    // A `get` whose sequence declares a varint no `u64` can hold, and one
+    // whose last byte carries more value bits than a `u64` has.
+    try expectRequestErrorHex(
+        "00" ++ "da" ** 32 ++ "01" ++ "00" ++ "80" ** 10,
+        error.BadVarint,
+    );
+    try expectRequestErrorHex(
+        "00" ++ "da" ** 32 ++ "01" ++ "00" ++ "80" ** 9 ++ "02",
+        error.ValueOutOfRange,
+    );
+    // A `get` whose hash is cut short.
+    try expectRequestErrorHex("00" ++ "da" ** 8, error.UnexpectedEnd);
+
+    // A `push` whose declared length is past `max_message_size`, and one whose
+    // length is inside the cap and not inside the stream.
+    try expectRequestErrorHex("08" ++ "ffffffff01", error.MessageTooLarge);
+    try expectRequestErrorHex("08" ++ "27" ++ "da" ** 8, error.UnexpectedEnd);
+    // A `push` whose body decodes and then carries a byte the body did not
+    // claim. The length is 39 and the body is 39: the 32 hash bytes, the
+    // six-byte sequence, and one byte the `PushRequest` never asked for. The
+    // payload sits outside the prefix, so this byte is not it either.
+    try expectRequestErrorHex(
+        "08" ++ "27" ++ "da" ** 32 ++ "020001000100" ++ "ff",
+        error.TrailingBytes,
+    );
+    // A `push` with no length at all: the stream ends where the length is.
+    try expectRequestErrorHex("08", error.UnexpectedEnd);
+
+    // A `get_many` whose hash count is one the frame could carry and the
+    // caller's storage could not. Every hash is 32 bytes, so a count of five
+    // fits in the bytes that follow and not in `Room`'s four slots.
+    try expectRequestErrorHex("09" ++ "05" ++ "da" ** 32 ++ "0000", error.BufferFull);
+
+    // A `get` whose body is past `max_message_size`. This is the same cap the
+    // `push` arm checks against a declared length, and it is the one rule in
+    // the pair that a small frame cannot reach.
+    {
+        const big = try testing.allocator.alloc(u8, max_message_size + 2);
+        defer testing.allocator.free(big);
+        @memset(big, 0);
+        var reader = postcard.Reader.init(big);
+        var empty: Storage = .{};
+        try testing.expectError(error.MessageTooLarge, Request.read(&reader, &empty));
+    }
+}
+
+test "every request discriminant is one byte on the wire" {
+    // Upstream reads the discriminant as a raw `u8` (`src/protocol.rs:449`) and
+    // its `request_type_size` test pins the encoded size at one
+    // (`RequestType::POSTCARD_MAX_SIZE == 1`, `src/protocol.rs:1068`). Every
+    // arm is below 128, so postcard's `varint(u32)` for a discriminant and one
+    // raw byte are the same bytes — which is what lets the reader be a byte.
+    try testing.expectEqual(@as(usize, 10), std.enums.values(RequestType).len);
+    for (std.enums.values(RequestType)) |arm| {
+        var buffer: [1]u8 = undefined;
+        var writer = postcard.Writer.init(&buffer);
+        try writeRequestType(&writer, arm);
+        try testing.expectEqualSlices(u8, &.{@intFromEnum(arm)}, writer.finish());
+    }
+    // The four arms that carry a request are the four upstream dispatches on,
+    // and the order is the one `RequestType`'s own comment demands: it "must
+    // contain the request types in the same order as the full requests".
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(RequestType.get));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(RequestType.observe));
+    try testing.expectEqual(@as(u8, 8), @intFromEnum(RequestType.push));
+    try testing.expectEqual(@as(u8, 9), @intFromEnum(RequestType.get_many));
+}
+
+// -- The test helpers this module's own tests use ----------------------------
+//
+// The arena a decode fills and the two hex helpers live in
+// `wire_test_support.zig`: `responses.zig` and `protocol.zig` run their tests
+// through the same readers and want the same three, and this file is over its
+// pure-line budget with a copy of each. The four below are framing's own — a
+// request frame and the hexdump it is written as.
+
+/// Write `request` and expect exactly `hex`.
+fn expectRequestBytes(request: Request, hex: []const u8) !void {
+    var scratch: [256]u8 = undefined;
+    const expected = try parseHex(&scratch, hex);
+    var body: [2048]u8 = undefined;
+    var buffer: [2048]u8 = undefined;
+    var writer = postcard.Writer.init(&buffer);
+    try request.write(&writer, &body);
+    try expectHex(expected, writer.finish());
+}
+
+/// Read `hex` as a whole request and expect `expected`.
+fn expectRequestFrom(hex: []const u8, expected: Request) !void {
+    var scratch: [256]u8 = undefined;
+    const bytes = try parseHex(&scratch, hex);
+    var room: Room = .{};
+    var storage = room.storage();
+    var reader = postcard.Reader.init(bytes);
+    const decoded = try Request.read(&reader, &storage);
+    try reader.finish();
+    try testing.expect(expected.eql(decoded));
+}
+
+/// Read `hex` as a whole request and expect a named error.
+fn expectRequestErrorHex(hex: []const u8, expected: Error) !void {
+    var scratch: [256]u8 = undefined;
+    const bytes = try parseHex(&scratch, hex);
+    var room: Room = .{};
+    var storage = room.storage();
+    var reader = postcard.Reader.init(bytes);
+    try testing.expectError(expected, Request.read(&reader, &storage));
+}
+
+/// Encode `request`, read it back, and re-encode: a fixed point, both ways.
+fn expectRequestFixedPoint(request: Request) !void {
+    var body: [2048]u8 = undefined;
+    var buffer: [2048]u8 = undefined;
+    var writer = postcard.Writer.init(&buffer);
+    try request.write(&writer, &body);
+    const frame = writer.finish();
+
+    var room: Room = .{};
+    var storage = room.storage();
+    var reader = postcard.Reader.init(frame);
+    const decoded = try Request.read(&reader, &storage);
+    try reader.finish();
+    try testing.expect(request.eql(decoded));
+
+    var again: [2048]u8 = undefined;
+    var rewriter = postcard.Writer.init(&again);
+    try decoded.write(&rewriter, &body);
+    try testing.expectEqualSlices(u8, frame, rewriter.finish());
 }

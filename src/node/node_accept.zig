@@ -42,6 +42,16 @@ pub const max_accepts = 64;
 /// router dispatched one would have a table and a wire that disagree, so the
 /// second protocol arrives with a second bridge field rather than as a list
 /// `node.zig` fills.
+///
+/// **Raising this is the cheap half of wiring `/iroh-qad/0` and it is not
+/// enough on its own.** The core's `TlsConfig.alpn` is `[]const []const u8`
+/// and its matcher walks every entry, so `[2]` in
+/// `transport/bridge_manager.zig:82` and `transport/dial_client.zig:82` would
+/// carry two names with no vendor patch. What does not follow is a working
+/// QAD route: `vendor/quic/` has no OBSERVED_ADDRESS frame and no
+/// `address_discovery` transport parameter, and it is read-only here. A node
+/// that raised this alone would offer a protocol it cannot serve.
+/// `router/qad_route.zig` records that decision and what closes it.
 pub const max_alpns = 1;
 
 /// The deepest chain of endpoint events one `feed` can enqueue.

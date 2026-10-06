@@ -165,11 +165,15 @@ pub const AcceptError = error{
 /// with `error.reserved_alpn`. `Builder.acceptInternal` is the only way in, and
 /// it takes no ALPN at all so there is no string to pass wrongly.
 ///
-/// **Nothing under `src/` calls `acceptInternal` today**, so this is a
-/// reservation and not a wired route: a table built in this tree never offers
-/// `/iroh-qad/0`, and a peer that negotiates it is dropped rather than served
-/// (`negotiatingStep`, `router.zig:616-617`). Registering the handler that
-/// would answer it is the endpoint layer's job and it has not been done.
+/// **Nothing under `src/` calls `acceptInternal`, and that is a decision
+/// rather than a gap.** This is a reservation: a table built in this tree
+/// never offers `/iroh-qad/0`, and a peer that negotiates it is dropped rather
+/// than served (`conn_dispatch.zig:303-304`). `router/qad_route.zig` holds the
+/// one way past this refusal and explains, with line numbers, why it is not
+/// called: the vendored core carries neither the OBSERVED_ADDRESS frame nor
+/// the `address_discovery` transport parameter, so a registered route could
+/// negotiate this ALPN and then report nothing. The codec over those two
+/// halves is `net/qad.zig`, tested and unwired.
 pub const qad_alpn: []const u8 = "/iroh-qad/0";
 
 /// One registration: an ALPN and the handler that claims it.
