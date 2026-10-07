@@ -17,6 +17,7 @@ const batch = @import("batch.zig");
 const bridge_address = @import("bridge_address.zig");
 const bridge_config = @import("bridge_config.zig");
 const incoming_filter = @import("../endpoint/incoming_filter.zig");
+const qad = @import("../net/qad.zig");
 
 const SocketAddr = base_addr.SocketAddr;
 
@@ -26,6 +27,32 @@ const quic_stream = quic.stream;
 const Error = bridge_config.Error;
 const Instant = bridge_config.Instant;
 const fromCoreAddress = bridge_address.fromCoreAddress;
+const toCoreAddress = bridge_address.toCoreAddress;
+
+pub const PathError = quic.connection.Connection.PathError;
+pub const TraversalError = quic.connection.Connection.NatTraversalError;
+pub const RoundState = quic.connection.Connection.RoundState;
+pub const PathSnapshot = struct {
+    id: u8,
+    local: ?SocketAddr,
+    peer: ?SocketAddr,
+    validated: bool,
+    selected: bool,
+    status: quic.connection.Connection.PathStatus,
+    state: quic.connection.PathValidationState,
+    sent: u64,
+    received: u64,
+};
+pub const ObservedRoles = struct { local: ?qad.Role, peer: ?qad.Role };
+
+fn reportRole(role: quic.observed_address.Role) ?qad.Role {
+    return switch (role) {
+        .disabled => null,
+        .send_only => .send_only,
+        .receive_only => .receive_only,
+        .both => .both,
+    };
+}
 
 /// The room one datagram of egress needs, in bytes: RFC 9000 §14.1's padded
 /// Initial, taken from the core that pads to it rather than written down
@@ -64,6 +91,92 @@ pub const Conn = struct {
     }
 
 
+    /// The negotiated protocol, borrowed until this connection is destroyed.
+    pub fn alpn(self: Conn) ?[]const u8 {
+        if (!self.established()) return null;
+        const negotiated = self.entry.conn.negotiatedAlpn();
+        return if (negotiated.len == 0) null else negotiated;
+    }
+
+    pub fn pathSnapshot(self: Conn, path_id: u8) ?PathSnapshot {
+        const snapshot = self.entry.conn.pathSnapshot(path_id) orelse return null;
+        return .{
+            .id = snapshot.id,
+            .local = fromCoreAddress(&snapshot.local),
+            .peer = fromCoreAddress(&snapshot.peer),
+            .validated = snapshot.validated,
+            .selected = snapshot.selected,
+            .status = snapshot.status,
+            .state = snapshot.state,
+            .sent = snapshot.sent,
+            .received = snapshot.received,
+        };
+    }
+
+    pub fn openPath(
+        self: Conn,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        at: Instant,
+        random: std.Random,
+    ) PathError!u8 {
+        return self.entry.conn.openPath(
+            toCoreAddress(local_addr), toCoreAddress(peer_addr), at, random,
+        );
+    }
+
+    pub fn selectPath(self: Conn, path_id: u8) PathError!void {
+        try self.entry.conn.selectPath(path_id);
+    }
+
+    pub fn probePath(self: Conn, path_id: u8, at: Instant, random: std.Random) PathError!void {
+        try self.entry.conn.probePath(path_id, at, random);
+    }
+
+    pub fn addTraversalAddress(self: Conn, value: SocketAddr) TraversalError!void {
+        try self.entry.conn.addNatTraversalAddress(toCoreAddress(value));
+    }
+
+    pub fn removeTraversalAddress(self: Conn, value: SocketAddr) TraversalError!void {
+        try self.entry.conn.removeNatTraversalAddress(toCoreAddress(value));
+    }
+
+    pub fn initiateTraversal(self: Conn, at: Instant, random: std.Random) TraversalError!void {
+        try self.entry.conn.initiateNatTraversalRound(at, random);
+    }
+
+    pub fn traversalState(self: Conn) RoundState {
+        return self.entry.conn.roundState();
+    }
+
+    /// A copied snapshot in caller storage, not a borrow of changing candidate state.
+    pub fn traversalCandidates(self: Conn, out: []SocketAddr) []const SocketAddr {
+        var addresses: [32]quic.address.Address = undefined;
+        const candidates = self.entry.conn.remoteTraversalCandidates(
+            addresses[0..@min(addresses.len, out.len)],
+        );
+        var count: usize = 0;
+        for (candidates) |candidate| {
+            const value = fromCoreAddress(&candidate) orelse continue;
+            out[count] = value;
+            count += 1;
+        }
+        return out[0..count];
+    }
+
+    pub fn observedAddress(self: Conn, path_id: u8) ?qad.ObservedAddress {
+        const report = self.entry.conn.observedAddress(path_id) orelse return null;
+        return .{
+            .sequence = report.sequence,
+            .addr = fromCoreAddress(&report.address) orelse return null,
+        };
+    }
+
+    pub fn observedRoles(self: Conn) ObservedRoles {
+        const roles = self.entry.conn.observedRoles();
+        return .{ .local = reportRole(roles.local), .peer = reportRole(roles.peer) };
+    }
+
     /// The peer's address on the active path, in this project's address.
     ///
     /// Null when the path has no peer address yet; see
@@ -96,8 +209,8 @@ pub const Conn = struct {
     /// good until the next `drain` on this connection overwrites it.
     ///
     /// The bytes are exactly what `Connection.sendAt` wrote, in order, cut
-    /// into runs at every change of datagram size. A run of more than one
-    /// datagram of equal size is a `batch.Send` carrying a segment size and
+    /// into runs at every change of datagram size, destination or ECN mark.
+    /// A run of equal-sized datagrams is a `batch.Send` carrying a segment size and
     /// is what a socket with `UDP_SEGMENT` turns into one `sendmsg`; a run of
     /// one is `batch.Send.single`, which is what rule 7 of
     /// `docs/ARCHITECTURE.md` says a single datagram is. How many datagrams
@@ -140,21 +253,10 @@ pub const Conn = struct {
         random: std.Random,
     ) Error![]Egress {
         const conn = self.entry.conn;
-        // The codepoint belongs on the send, and the core already answers
-        // that question: `getEcnMark` is its own view of whether this path
-        // has validated ECN, and `batch.Recv.ecnFromBits` is the same two
-        // bits on this side of the seam. Reading its answer rather than its
-        // validator's internals is the difference between a seam and a
-        // second opinion — and `.ect0` is what the validator counts against
-        // the peer's ACK_ECN counts, so any other value would fail the path.
-        const ecn: ?batch.Ecn = batch.Recv.ecnFromBits(conn.getEcnMark());
-        // The peer address, read once and before anything is built: it is the
-        // same address for every send on this connection until the core
-        // migrates it, and a path with no address is refused here rather than
-        // halfway through a run that has to be handed back whole.
+        // The selected path must exist before packet assembly can consume frames.
         const core_peer = conn.peerAddress().*;
         if (core_peer == .unset) return error.NoPathAddress;
-        const to = fromCoreAddress(&core_peer) orelse return error.NoPathAddress;
+        const selected_peer = fromCoreAddress(&core_peer) orelse return error.NoPathAddress;
         if (out.len == 0 or buffer.len < min_datagram) return error.NoRoom;
 
         var filled: usize = 0;
@@ -162,6 +264,8 @@ pub const Conn = struct {
         // The run being accumulated: `run_size` is 0 when no run is open.
         var run_start: usize = 0;
         var run_size: usize = 0;
+        var run_to = selected_peer;
+        var run_ecn: ?batch.Ecn = null;
         while (true) {
             // A free slot for this datagram, before it is built. Two while a
             // run is open: one for the close this datagram may trigger, and
@@ -178,23 +282,28 @@ pub const Conn = struct {
                 return error.CoreRefused;
             };
             if (len == 0) break;
+            const to = fromCoreAddress(conn.lastSendPeer()) orelse return error.NoPathAddress;
+            const ecn = batch.Recv.ecnFromBits(conn.lastSendEcn());
             if (run_size == 0) {
                 run_size = len;
-            } else if (len != run_size) {
-                // A `UDP_SEGMENT` send names one size for every datagram but
-                // the last, so a change of size ends the run. Continuing
-                // anyway would hand the socket a `UDP_SEGMENT` value that
-                // does not describe the payload.
-                used = try closeRun(out, used, buffer, run_start, filled, run_size, ecn, to);
+                run_to = to;
+                run_ecn = ecn;
+            } else if (len != run_size or !std.meta.eql(to, run_to) or ecn != run_ecn) {
+                // Segmented datagrams share size, destination and ECN treatment.
+                used = try closeRun(
+                    out, used, buffer, run_start, filled, run_size, run_ecn, run_to,
+                );
                 run_start = filled;
                 run_size = len;
+                run_to = to;
+                run_ecn = ecn;
             }
             filled += len;
         }
         if (run_size != 0) {
             // Safe by the loop's own arithmetic rather than by hope: the slot
             // was reserved before the datagram that opened this run.
-            used = try closeRun(out, used, buffer, run_start, filled, run_size, ecn, to);
+            used = try closeRun(out, used, buffer, run_start, filled, run_size, run_ecn, run_to);
         }
         return out[0..used];
     }
@@ -218,9 +327,32 @@ pub const Conn = struct {
         var it = self.entry.conn.streams.streams.iterator();
         while (it.next()) |entry| {
             if (quic_stream.isLocal(entry.key_ptr.*, self.entry.conn.is_server)) continue;
-            return .{ .entry = entry.value_ptr.* };
+            return .{ .entry = entry.value_ptr.*, .owner = &self.entry.conn.streams };
         }
         return null;
+    }
+
+    /// Peer-initiated bidirectional streams in the current map iteration order.
+    /// Indices can change when streams are reclaimed; consumers retain stream IDs.
+    pub fn incomingStream(self: Conn, index: usize) ?Stream {
+        var incoming: usize = 0;
+        var iterator = self.entry.conn.streams.streams.iterator();
+        while (iterator.next()) |entry| {
+            const stream_id = entry.key_ptr.*;
+            if (!quic_stream.isBidi(stream_id)) continue;
+            if (quic_stream.isLocal(stream_id, self.entry.conn.is_server)) continue;
+            if (incoming == index) {
+                return .{ .entry = entry.value_ptr.*, .owner = &self.entry.conn.streams };
+            }
+            incoming += 1;
+        }
+        return null;
+    }
+
+    /// Borrow a live bidirectional stream by ID; reacquire after driving the connection.
+    pub fn stream(self: Conn, stream_id: u64) ?Stream {
+        const live = self.entry.conn.streams.streams.get(stream_id) orelse return null;
+        return .{ .entry = live, .owner = &self.entry.conn.streams };
     }
 };
 
@@ -238,14 +370,16 @@ pub const Conn = struct {
 /// protocol over QUIC asks of a transport.
 ///
 /// It is not relay-specific and nothing in this file knows what rides on it.
-/// A borrowed handle, so every guarantee `Conn` states about its own entry
-/// holds for this: good until the connection is swept.
+/// A borrowed handle, valid until stream reclamation or connection destruction.
+/// Pin it across connection processing, or reacquire it by ID afterward.
 ///
 /// Copies share the same stream and cursor. Serialize access with the owning
 /// bridge. `close` ends sending, but does not release the stream.
 pub const Stream = struct {
     /// The core's own stream.
     entry: *quic_stream.Stream,
+    /// Borrowed owner; it must outlive this handle and owns deferred reclamation.
+    owner: *quic_stream.StreamsMap,
 
     /// Open a new bidirectional stream on `conn`.
     ///
@@ -265,7 +399,7 @@ pub const Stream = struct {
                 return error.CoreRefused;
             },
         };
-        return .{ .entry = opened };
+        return .{ .entry = opened, .owner = &conn.entry.conn.streams };
     }
 
     /// The core's own id for this stream.
@@ -354,7 +488,7 @@ pub const Stream = struct {
         while (runs < max_drain_runs) : (runs += 1) {
             const len = self.entry.recv.peekLen() orelse break;
             try sink.ensureUnusedCapacity(gpa, len);
-            const chunk = self.entry.recv.read() orelse break;
+            const chunk = self.entry.recv.read() orelse return error.OutOfMemory;
             sink.appendSliceAssumeCapacity(chunk);
             gpa.free(chunk);
             moved = true;
@@ -366,13 +500,31 @@ pub const Stream = struct {
     pub fn finished(self: Stream) bool {
         return self.entry.recv.allReceived();
     }
+
+    /// The peer has acknowledged every byte and the FIN this side sent.
+    pub fn sentFinished(self: Stream) bool {
+        return self.entry.send.fin_acked and
+            self.entry.send.ack_offset >= self.entry.send.write_offset;
+    }
+
+    /// Keep this stream alive across connection processing until `unpin`.
+    /// One consumer owns the pin; it does not extend the connection's lifetime.
+    pub fn pin(self: Stream) error{AlreadyPinned}!void {
+        if (self.entry.send.pinned) return error.AlreadyPinned;
+        self.entry.send.pinned = true;
+    }
+
+    /// Release the borrow and offer a settled stream for next-cycle reclamation.
+    pub fn unpin(self: Stream) void {
+        std.debug.assert(self.entry.send.pinned);
+        self.entry.send.pinned = false;
+        self.owner.disposeIfSettled(self.entry);
+    }
 };
 
 /// One socket write: where it goes and what the batcher is to be asked for.
 pub const Egress = struct {
-    /// The peer address on the core's active path, in this project's
-    /// address. It is the same address for every send on this connection
-    /// until the core migrates it.
+    /// The actual destination of these datagrams, including off-path NAT probes.
     to: SocketAddr,
     /// The payload. Feed it to `batch.Runs.init` with the socket's
     /// `Capability` and hand each run to `batch.cmsg`.
@@ -393,13 +545,10 @@ pub fn group(contents: []const u8, size: usize, ecn: ?batch.Ecn) batch.Error!bat
 
 /// Close the run that ended at `end` and start nothing.
 ///
-/// `to` is the address `Conn.drain` resolved before it asked the core for
-/// anything, so this cannot discover a path with no address after the run it
-/// is closing has already been built. The `out.len` check is the slot the
-/// caller counted for this close; a run of equal-size datagrams always
-/// divides by its size, so `group` is not what refuses here. The check is a
-/// backstop against a bug in that arithmetic rather than a room answer:
-/// `Conn.drain` reserves the slot before it builds the run that needs it.
+/// `to` belongs to the emitted packet's route, not necessarily the selected path.
+/// The `out.len` check is the slot the caller counted for this close; a run of
+/// equal-size datagrams always divides by its size, so `group` cannot refuse it.
+/// The capacity check protects that invariant; the caller reserves the close slot.
 fn closeRun(
     out: []Egress,
     used: usize,
@@ -468,6 +617,40 @@ test "egress is the batcher's value, and a burst of one size is one send" {
 
     const conn = bridge.connectionAt(0) orelse return error.TestUnexpectedResult;
     try t.expect(conn.established());
+    try t.expectEqualStrings(alpn, conn.alpn() orelse return error.TestUnexpectedResult);
+    const before = conn.peer() orelse return error.TestUnexpectedResult;
+    try t.expectError(
+        error.MultipathNotNegotiated,
+        conn.openPath(peer_mod.server_addr, client_addr, start, engine.random()),
+    );
+    try t.expectError(error.InvalidPathId, conn.selectPath(2));
+    try t.expectError(error.NatTraversalNotNegotiated, conn.addTraversalAddress(client_addr));
+    try t.expectEqual(before, conn.peer().?);
+    try t.expect(conn.pathSnapshot(2) == null);
+    try t.expect(conn.observedAddress(0) == null);
+    try t.expect(conn.incomingStream(0) == null);
+    const first_incoming = try client.conn.openStream();
+    const second_incoming = try client.conn.openStream();
+    try first_incoming.send.writeData("first");
+    try second_incoming.send.writeData("second");
+    try exchange(&client, bridge, &map, start);
+    const first = conn.incomingStream(0) orelse return error.TestUnexpectedResult;
+    const second = conn.incomingStream(1) orelse return error.TestUnexpectedResult;
+    try t.expect(first.id() != second.id());
+    try t.expect(
+        first.id() == first_incoming.stream_id or first.id() == second_incoming.stream_id,
+    );
+    try t.expect(
+        second.id() == first_incoming.stream_id or second.id() == second_incoming.stream_id,
+    );
+    try t.expect(conn.incomingStream(2) == null);
+    try t.expectEqual(first.id(), (conn.stream(first.id()) orelse
+        return error.TestUnexpectedResult).id());
+    try t.expect(conn.stream(std.math.maxInt(u64)) == null);
+    try t.expect(!first.sentFinished());
+    try first.pin();
+    try t.expectError(error.AlreadyPinned, first.pin());
+    first.unpin();
 
     // Enough payload for several datagrams, which is what makes the batching
     // observable at all: one datagram is one send whatever the code does.
@@ -516,10 +699,11 @@ test "an allocator that refuses the sink leaves every byte pending for the next 
     // peer: the core hands out a receive half, and a STREAM frame is all it
     // takes to fill it.
     const message = "the relay frame this pass must not lose";
-    var core = quic_stream.Stream.init(t.allocator, 0);
-    defer core.deinit();
+    var owner = quic_stream.StreamsMap.init(t.allocator, true);
+    defer owner.deinit();
+    const core = try owner.getOrCreateStream(0);
     try core.recv.handleStreamFrame(0, message, false);
-    var stream: Stream = .{ .entry = &core };
+    var stream: Stream = .{ .entry = core, .owner = &owner };
 
     var sink: std.ArrayList(u8) = .empty;
     defer sink.deinit(t.allocator);
@@ -535,4 +719,126 @@ test "an allocator that refuses the sink leaves every byte pending for the next 
     try t.expect(try stream.drain(t.allocator, &sink));
     try t.expectEqualStrings(message, sink.items);
     try t.expect(!try stream.drain(t.allocator, &sink));
+}
+
+test "receive copy-out OOM is not mistaken for a finished stream" {
+    var refusing = std.testing.FailingAllocator.init(t.allocator, .{});
+    const gpa = refusing.allocator();
+    var owner = quic_stream.StreamsMap.init(gpa, true);
+    defer owner.deinit();
+    const core = try owner.getOrCreateStream(0);
+    try core.recv.handleStreamFrame(5, "world", true);
+    try core.recv.handleStreamFrame(0, "hello", false);
+    var sink: std.ArrayList(u8) = .empty;
+    defer sink.deinit(gpa);
+    try sink.ensureTotalCapacity(gpa, 10);
+    const ready = core.recv.peekLen().?;
+    var stream: Stream = .{ .entry = core, .owner = &owner };
+    refusing.fail_index = refusing.alloc_index;
+    try t.expectError(error.OutOfMemory, stream.drain(gpa, &sink));
+    try t.expectEqual(@as(usize, 0), sink.items.len);
+    try t.expectEqual(ready, core.recv.peekLen().?);
+    refusing.fail_index = std.math.maxInt(usize);
+    try t.expect(try stream.drain(gpa, &sink));
+    try t.expectEqualStrings("helloworld", sink.items);
+}
+
+test "unpin queues a stream that settled while pinned after guarded GC stood down" {
+    // FIN and ACK callbacks cannot reclaim a borrowed stream until its owner releases it.
+    var owner = quic_stream.StreamsMap.init(t.allocator, false);
+    defer owner.deinit();
+    owner.setMaxStreams(1, 0);
+    const core = try owner.openBidiStream();
+    var stream: Stream = .{ .entry = core, .owner = &owner };
+    const stream_id = stream.id();
+    try stream.pin();
+    try stream.write("done");
+    stream.close();
+    core.send.send_window = 4;
+    const sent = core.send.popStreamFrame(4).?.stream;
+    try t.expect(sent.fin);
+    try t.expectEqual(@as(u64, 4), sent.length);
+    try core.recv.handleStreamFrame(0, "", true);
+    owner.closeIfDone(core);
+    try core.send.onAck(sent.offset, sent.length, sent.fin);
+    owner.disposeIfSettled(core);
+    owner.needs_gc_scan = true;
+    owner.collectClosedStreams();
+    try t.expect(stream.finished());
+    try t.expect(stream.sentFinished());
+    try t.expect(core.closed_for_gc);
+    try t.expect(!core.disposal_queued);
+    try t.expect(!owner.needs_gc_scan);
+    try t.expectEqual(@as(usize, 0), owner.disposal_count);
+    owner.drainDisposalQueue();
+    try t.expect(owner.streams.get(stream_id) == core);
+
+    stream.unpin();
+    try t.expect(!core.send.pinned);
+    try t.expect(core.disposal_queued);
+    try t.expectEqual(@as(usize, 1), owner.disposal_count);
+    try t.expect(owner.streams.get(stream_id) == core);
+    owner.drainDisposalQueue();
+    try t.expect(owner.streams.get(stream_id) == null);
+}
+
+test "unpin retains a closed stream until its FIN is acknowledged" {
+    // Release must not discard a FIN that PTO still needs to retransmit.
+    var owner = quic_stream.StreamsMap.init(t.allocator, false);
+    defer owner.deinit();
+    owner.setMaxStreams(1, 0);
+    const core = try owner.openBidiStream();
+    var stream: Stream = .{ .entry = core, .owner = &owner };
+    const stream_id = stream.id();
+    try stream.pin();
+    stream.close();
+    const sent = core.send.popStreamFrame(0).?.stream;
+    try t.expect(sent.fin);
+    try core.recv.handleStreamFrame(0, "", true);
+    owner.closeIfDone(core);
+    stream.unpin();
+    try t.expect(!core.send.pinned);
+    try t.expect(core.closed_for_gc);
+    try t.expect(!core.disposal_queued);
+    try t.expectEqual(@as(usize, 0), owner.disposal_count);
+    owner.drainDisposalQueue();
+    try t.expect(owner.streams.get(stream_id) == core);
+
+    try core.send.onAck(sent.offset, sent.length, sent.fin);
+    owner.disposeIfSettled(core);
+    owner.drainDisposalQueue();
+    try t.expect(owner.streams.get(stream_id) == null);
+}
+
+test "unpin uses the disposal queue overflow backstop" {
+    // A full queue delays release through the existing manager, not a scan in unpin.
+    var owner = quic_stream.StreamsMap.init(t.allocator, false);
+    defer owner.deinit();
+    owner.setMaxStreams(owner.disposal_queue.len + 1, 0);
+    for (0..owner.disposal_queue.len) |_| {
+        const queued = try owner.openBidiStream();
+        owner.closeStream(queued.stream_id);
+    }
+    const core = try owner.openBidiStream();
+    var stream: Stream = .{ .entry = core, .owner = &owner };
+    const stream_id = stream.id();
+    try stream.pin();
+    stream.close();
+    const sent = core.send.popStreamFrame(0).?.stream;
+    try core.recv.handleStreamFrame(0, "", true);
+    owner.closeIfDone(core);
+    try core.send.onAck(sent.offset, sent.length, sent.fin);
+    owner.disposeIfSettled(core);
+    try t.expect(!owner.disposal_overflow);
+
+    stream.unpin();
+    try t.expect(!core.disposal_queued);
+    try t.expect(owner.disposal_overflow);
+    owner.drainDisposalQueue();
+    try t.expect(owner.streams.get(stream_id) == core);
+    try t.expect(owner.needs_gc_scan);
+    owner.collectClosedStreams();
+    try t.expect(core.disposal_queued);
+    owner.drainDisposalQueue();
+    try t.expect(owner.streams.get(stream_id) == null);
 }

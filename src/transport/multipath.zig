@@ -1,201 +1,68 @@
-//! One connection's paths, as the vendored core holds them: the pair of
-//! addresses each path runs between, the state of its validation, the round
-//! trip observed on it, and the bytes the core has moved on it.
-//!
-//! `net/path_table.zig` owns the paths a node *believes* it has to one peer —
-//! candidates from a peer's record and from probes, keyed on a
-//! `TransportAddr`. This file owns the paths one *connection* has, keyed on the
-//! two addresses the core is actually running between. The two tables answer
-//! different questions and neither reads the other: a candidate this file has
-//! never heard of is not a path, and a path the core has abandoned is not a
-//! candidate.
-//!
-//! Nothing here opens a socket, reads a clock or allocates. `at` is an argument
-//! to every call that stamps anything, the table is inline storage, and a whole
-//! `Table` is a value a test holds on the stack.
-//!
-//! # What the read-only vendored core means for this file
-//!
-//! `vendor/quic/src/quic/` is third-party code and is not edited. That single
-//! fact decides the whole design, and it decides it by subtraction.
-//!
-//! `docs/DECISIONS/0001` measured the gap and did not enjoy it. What the core
-//! has, quoted: "**Native multipath.** quic-zig has `paths: [2]NetworkPath`
-//! (`src/quic/connection.zig:608`) with a single `active_path_idx` (`:609`) and
-//! RFC 9000 migration; it does not implement `draft-ietf-quic-multipath`, and
-//! iroh wants up to 8 concurrent paths per connection" — and, of the remedy it
-//! names, "**Congestion, RTT and ECN state would have to become per-path.**
-//! Today a migration *discards* them (`connection.zig:3461-3468`) precisely
-//! because there was only one live path to move them to. With N live paths they
-//! must be retained per path; if they are not, every path change still costs a
-//! fresh Cubic and the 6% is the ceiling rather than the current state."
-//!
-//! So, precisely:
-//!
-//! - **This file delivers the observation.** Which address pairs the core
-//!   currently holds for a connection, what each one's validation state is, what
-//!   the core's own ledger says it has moved on it, and a per-path round trip
-//!   measured by the caller. All of that is readable out of a core that is not
-//!   modified, and `Table.mirror` is where it is read.
-//! - **This file cannot deliver a third path.** `DECISIONS/0001` names the
-//!   change that would, and none of it is in `src/transport/`: "**Widening the
-//!   array is the mechanical half.** Making those per-path instead of
-//!   per-active-path is the other half." Every one of those sites is in the
-//!   vendored tree.
-//! - **This file cannot deliver a path id.** `DECISIONS/0001` records the
-//!   dependency that wants one — "iroh 1.3.0 depends on `noq` / `noq-proto` /
-//!   `noq-udp`, n0's own fork of QUIC carrying multipath `PathId` and QNT" — and
-//!   the maintainer's own statement that this core has none: "**Multipath**:
-//!   not implemented, by the maintainer's own statement in `SPEC/STATUS.md`
-//!   ("Multipath QUIC (draft-ietf-quic-multipath) — **Status: Not
-//!   implemented**")." See the decision below.
-//! - **This file cannot deliver per-path congestion.** The core holds one `cc`,
-//!   one `rtt_stats` and one ECN validator per *connection*
-//!   (`connection.zig:4265-4270` is where a migration throws them away), so
-//!   there is nothing per-path to mirror. What this file records per path is the
-//!   round trip *this project* measures on that address pair, which the core
-//!   does not keep.
-//!
-//! Everything below is written so that a future patch to the core makes it wrong
-//! loudly: the fold over the core's two validation fields is one named function,
-//! the slot count is one named constant, and the one fact this file reads the core
-//! for — that `acceptInto` leaves the second slot `undefined` (`:1537`) and every
-//! later write promotes the slot it wrote — is stated at the read, with the four
-//! write sites it rests on.
-//!
-//! # Decision: a path is its two addresses, and the core names nothing else
-//!
-//! `Key` is the ordered pair `(local, peer)` — the same two values
-//! `NetworkPath.init` copies into `local_addr` and `peer_addr`
-//! (`connection.zig:217`). Three reasons, read out of the core rather than
-//! assumed:
-//!
-//! 1. **The core has no path identifier to reuse.** `NetworkPath` (`:188`)
-//!    carries two addresses, three counters, a flag and a validator. There is
-//!    no id field, `draft-ietf-quic-multipath`'s `PathId` is not implemented,
-//!    and a number minted in this file would be a second name for something the
-//!    core never produces — one that would have to be reconciled against the
-//!    core on every datagram and would name the wrong path the first time the
-//!    core rewrote a slot.
-//! 2. **The core's own equality is this pair.** A migration is triggered by
-//!    comparing a datagram's source against the active path with
-//!    `info.from.eql(active_path.peer_addr)` (`:2259`), and `Address.eql`
-//!    compares family, octets, port and scope. Two paths are the same path to
-//!    the core exactly when both addresses match, so the pair is the identity
-//!    and not a convenient proxy for one.
-//! 3. **A slot index is not an identity.** `handleMigration` overwrites the
-//!    candidate slot outright (`:4246`) and promotes it (`:4255`), so index 1
-//!    is one path before a migration and a different one after. An index that
-//!    changes what it names is provenance. `Entry.slot` records it, and the doc
-//!    on that field says why it is not the key.
-//!
-//! The connection itself is named by the core's own id: `mirror` copies
-//! `Conn.id()` (`bridge_conn.zig`, which is `ConnEntry.id`, "unique per manager,
-//! never reused"). There is no connection id minted here either.
-//!
-//! **There is no per-path CID to record, and that is a finding.** The core sends
-//! on one peer CID at a time — `ConnectionIdPool` carries a single `in_use` mark
-//! and one `consumeUnused` (`:332`) — so `draft-ietf-quic-multipath`'s "a
-//! distinct CID per path" has nothing here to mirror, and a CID field would be
-//! the feature rather than a record of it.
-//!
-//! # Decision: validation, and the five things that produce it
-//!
-//! The core keeps **two** fields: `NetworkPath.is_validated` (`:206`) and
-//! `PathValidator.state` (`:91`), a four-value enum whose own doc warns that
-//! "`idle` is both 'never tried' and 'finished', so this field alone cannot tell
-//! a path that was never challenged from one that is proved". This file folds
-//! the two into one `Validation`, and the fold is `advance`.
-//!
-//! `is_validated` wins, and that is not a preference. It is the only one of the
-//! two the core's single path-dependent policy reads: `NetworkPath.canSend`
-//! (`:231`) asks `self.is_validated` and nothing else. A path the core will send
-//! on without an amplification limit is validated here, whatever its validator
-//! is doing.
-//!
-//! Five things set `is_validated` in the core, and all five reach this table:
-//!
-//! | what | where |
-//! |---|---|
-//! | a Retry proved the address | `:1531` |
-//! | a Handshake-epoch packet on a server's active path | `:2105` |
-//! | a PATH_RESPONSE matched the challenge | `:3007` |
-//! | the client confirmed the handshake | `:3281` |
-//! | a port-only migration, where the IP is unchanged | `:4275` |
-//!
-//! The fifth is why the fold is not a straight read of `validator.state`: a NAT
-//! rebinding writes a *fresh* `NetworkPath` (`:4246`), challenges it (`:4258`)
-//! and then marks it validated (`:4275`), so the core really does hold
-//! `is_validated == true` beside `state == .pending`. `advance` reports
-//! `.validated` for that pair, and the test pins it.
-//!
-//! **A validated path does not return to unvalidated, and that is a property of
-//! this file rather than a claim about the core.** `is_validated` is assigned
-//! `true` in five places and `false` in none; what a migration does is write a
-//! *different* pair into a slot, which this table retires and refiles.
-//! `advance` refuses the demotion anyway: a mirror's job is to be usable when
-//! the core is right and obviously wrong when the core is not, and a table that
-//! dropped a validated path on a fact the core cannot produce would fail in the
-//! direction of closing a working path.
-//!
-//! **A path this node has never been told about is not invented here.**
-//! `sample` and `used` both refuse a pair the table does not hold live, because
-//! a measurement of a path the core has left would have to be attributed to
-//! something else, and the figure would then be a round trip nobody measured.
-//!
-//! # Decision: the bound is eight, and at the bound the table refuses
-//!
-//! `max_paths` is 8 for the number `DECISIONS/0001` records — "iroh wants up to 8
-//! concurrent paths per connection" — restated rather than imported from
-//! `net/path_table.zig`. The two bounds are the same number over two different
-//! tables, and importing one from the other would tie a per-connection mirror to
-//! a per-peer selection policy; that module says the same about itself, that its
-//! rules are its own.
-//!
-//! Eight is four times what the core can hold today (`core_slots` is 2), and the
-//! difference is history. A path the core migrates away from is *retired*, not
-//! forgotten: it keeps its addresses, its figures and the instant it was last
-//! live, because `DECISIONS/0001`'s measurement of what a migration throws away
-//! is only legible if the table remembers what was thrown.
-//!
-//! At the bound the answer is a refusal, and the one exception is the same one
-//! `net/path_table.zig` takes and for the same reason: a `.failed` path is the
-//! only entry here that is a *recorded* failure, so freeing its slot sheds
-//! nothing a caller is relying on. A validated path, a challenging one and a
-//! retired one all still carry history and none of them may be displaced. With
-//! nothing displaceable, `observe` answers `.refused` and the table does not
-//! grow, and `mirror` counts the refusal in `Mirror.refused` rather than
-//! dropping it.
-//!
-//! # What this file deliberately does not own
-//!
-//! - **Per-path congestion, RTT or ECN state.** One per connection in the core;
-//!   see the module doc.
-//! - **Which path to send on.** `net/path_select.zig` owns selection, over
-//!   candidates, and this table is not a substitute for it.
-//! - **Idleness.** `Entry.last_active` is a stamp and a comparison; how long a
-//!   quiet path stays usable is a selection policy, and a second timeout here
-//!   would be a second opinion. Only `rtt_max_age` is declared, because a figure
-//!   this file hands out as current when it is stale is this file's own error,
-//!   not a policy call.
-//! - **The wire.** No bytes are read or written here. `Conn.drain` and
-//!   `Bridge.recv` are where the core's ledger is fed by real traffic; this file
-//!   is told what the core holds.
-//!
-//! Line references into the vendored tree are to the tree as it stands in this
-//! repository, which is patched relative to the revision `DECISIONS/0001` cites.
+//! Historical observations and actuators for the two supported native paths.
+//! The eight-entry mirror retains retired address-pair history; it is not an
+//! eight-path transport capability. Initialized slots are read through the
+//! bridge snapshot API, never by inspecting an undefined native array element.
+//! Policy lives in net/path_action.zig. Time and randomness are lifted into the
+//! actuator, and planned slot IDs are rechecked against their address pairs.
 
 const std = @import("std");
 const quic = @import("quic");
 const base_addr = @import("../base/addr.zig");
-const bridge_address = @import("bridge_address.zig");
+const path_action = @import("../net/path_action.zig");
 const bridge_config = @import("bridge_config.zig");
 const bridge_conn = @import("bridge_conn.zig");
 
 const SocketAddr = base_addr.SocketAddr;
 const Conn = bridge_conn.Conn;
-const fromCoreAddress = bridge_address.fromCoreAddress;
-const CorePath = quic.connection.NetworkPath;
+
+pub const ActionError = bridge_conn.PathError || error{StalePath};
+
+/// Copies only initialized bridge snapshots; there is no native-array read.
+pub fn actionSlots(conn: Conn) path_action.Slots {
+    var slots: path_action.Slots = .{ null, null };
+    for (0..core_slots) |index| {
+        const snapshot = conn.pathSnapshot(@intCast(index)) orelse continue;
+        const local = snapshot.local orelse continue;
+        const peer = snapshot.peer orelse continue;
+        slots[index] = .{
+            .key = .{ .local = local, .peer = peer },
+            .validated = snapshot.validated,
+            .selected = snapshot.selected,
+            .probing = snapshot.state == .pending,
+        };
+    }
+    return slots;
+}
+
+/// Applies one bounded policy action. The caller owns the candidate provenance,
+/// connection lifetime, clock and random source; none are acquired here.
+pub fn applyAction(
+    conn: Conn,
+    action: path_action.Action,
+    at: Instant,
+    random: std.Random,
+) ActionError!?u8 {
+    switch (action) {
+        .none => return null,
+        .open => |key| return try conn.openPath(key.local, key.peer, at, random),
+        .probe, .select, .revalidate => |target| {
+            const slots = actionSlots(conn);
+            if (!path_action.matches(target, &slots)) return error.StalePath;
+            switch (action) {
+                .select => {
+                    if (path_action.planSelect(target.key, &slots) == .none) return null;
+                    try conn.selectPath(target.id);
+                },
+                .probe, .revalidate => {
+                    if (path_action.planProbe(target.key, &slots) == .none) return null;
+                    try conn.probePath(target.id, at, random);
+                },
+                .none, .open => unreachable,
+            }
+            return null;
+        },
+    }
+}
 
 /// The instant the core is driven at, on the core's own timeline: `i64`
 /// nanoseconds, and the same type `Conn.drain` and `Bridge.recv` take. Named
@@ -206,18 +73,12 @@ pub const Instant = bridge_config.Instant;
 /// A duration on that timeline — a round trip, or a maximum age for one.
 pub const Nanos = u64;
 
-/// How many paths one connection's mirror carries, retired ones included.
-///
-/// See the module doc under "the bound" for the number and the refusal.
+/// Historical mirror capacity, including retired pairs. Full history refuses
+/// new entries unless a recorded failure can be displaced.
 pub const max_paths: usize = 8;
 
-/// How many slots the core's path array has: `paths: [2]NetworkPath`
-/// (`vendor/quic/src/quic/connection.zig:1148`).
-///
-/// Named rather than written into a comparison because it is the one place this
-/// file's shape is the core's shape, and a core that widened its array is a
-/// change this file should have to answer for.
-pub const core_slots: usize = 2;
+/// Actual supported native capability, separate from historical capacity.
+pub const core_slots: usize = path_action.supported_paths;
 
 /// How old a latency sample may be and still be believed.
 ///
@@ -324,6 +185,9 @@ pub const Report = struct {
     received: u64,
 };
 
+pub const Observation = struct { key: Key, report: Report };
+pub const Observations = [core_slots]?Observation;
+
 /// What one path's entry became.
 pub const Outcome = enum {
     /// The table already carried this pair, live, in the slot the report names.
@@ -363,11 +227,8 @@ pub const Entry = struct {
     key: Key,
     /// Where validation stood at the last `observe`.
     validation: Validation,
-    /// The round trip measured on this pair, or null until `sample` supplies
-    /// one. Never read from the core: the core's RTT is per *connection*
-    /// (`connection.zig:5195` reads one `rtt_stats`) and is discarded outright
-    /// when the IP changes (`:4267`), so the figure here is this project's
-    /// measurement on this pair and the caller's to take.
+    /// Caller-measured round trip on this pair, separate from the core's
+    /// congestion-control estimator.
     rtt: ?Nanos = null,
     /// When that sample was taken. Meaningless, and never read, while `rtt` is
     /// null.
@@ -653,72 +514,51 @@ pub const Table = struct {
         return .{ .evicted = gone };
     }
 
-    /// Fold the core's active path into the table, at `at`.
-    ///
-    /// The whole of this file's read of the core, and the reason the rest of it
-    /// is pure: everything the core knows about a connection's paths is on
-    /// `conn.entry.conn`, and this is the one function that reads it.
-    ///
-    /// **Only the slot the core names active is read, and that is every slot
-    /// the core writes.** `acceptInto` builds the array as
-    /// `.{ initial_path, undefined }` (`:1537`) — the second slot holds *no*
-    /// `NetworkPath` at all, not an empty one — and every later write targets
-    /// the slot that is, or is about to become, active: `handleDatagram` writes
-    /// `paths[active_path_idx]` (`:2251`), and both migration arms write
-    /// `paths[candidate_idx]` and promote it on the next line (`:3443`/`:3450`,
-    /// `:4246`/`:4255`). So the core holds one path it is using and one it left
-    /// behind, and the left-behind one cannot change until it is active again.
-    /// This table therefore carries that second pair forward from the pass that
-    /// saw it active — which is what the core still holds — rather than reading
-    /// it a second time out of a slot that may hold no value at all. A core
-    /// that wrote a slot while it was *not* active would break that reasoning,
-    /// and the write sites named above are where to look first.
-    ///
-    /// A slot the core left with no address is not a path and retires whatever
-    /// that slot held. A slot the core holds for a pair the table does not have
-    /// files it, displacing a `.failed` entry or being refused; `Mirror` says
-    /// which, because a pass that quietly dropped a path would leave a caller
-    /// believing the connection has fewer than it does.
-    ///
-    /// A second call over an unmoved connection is `.kept` and changes no
-    /// figure, so a caller may mirror on every turn.
+    /// Snapshot every initialized slot, including a non-selected candidate.
     pub fn mirror(self: *Table, conn: Conn, at: Instant) Mirror {
-        var result: Mirror = .{
-            .live = 0,
-            .filed = 0,
-            .revived = 0,
-            .retired = 0,
-            .refused = 0,
-            .evicted = 0,
-        };
+        // Only the bridge can distinguish an unopened slot from an address.
         self.conn = conn.id();
-        const core = conn.entry.conn;
-        const slot: u8 = core.active_path_idx;
-        // The core cannot disagree with itself about which slot is active, and
-        // `paths` is `core_slots` long, so this refuses only an index the core
-        // would index out of its own array. Nothing is read and nothing is
-        // retired: a pass that took a path from an index that is not a path
-        // would hand the caller a figure it did not get.
-        if (@as(usize, slot) >= core_slots) {
-            result.refused += 1;
-        } else {
-            const core_path: *const CorePath = &core.paths[@as(usize, slot)];
-            if (pairOf(core_path)) |key| {
-                const applied = self.observe(key, reportOf(core_path, slot), at);
-                result.retired += applied.retired;
-                if (applied.evicted != null) result.evicted += 1;
-                switch (applied.outcome) {
-                    .kept => {},
-                    .filed => result.filed += 1,
-                    .revived => result.revived += 1,
-                    // A foreign slot is the core disagreeing with itself, which
-                    // it cannot do; it is counted with a refusal because the
-                    // effect on this table is the same — the report was not
-                    // taken.
-                    .refused, .foreign_slot => result.refused += 1,
-                }
-            } else {
+        var observations: Observations = .{ null, null };
+        for (0..core_slots) |index| {
+            const id: u8 = @intCast(index);
+            const snapshot = conn.pathSnapshot(id) orelse continue;
+            const local = snapshot.local orelse continue;
+            const peer = snapshot.peer orelse continue;
+            observations[index] = .{
+                .key = .{ .local = local, .peer = peer },
+                .report = .{
+                    .slot = id,
+                    .validated = snapshot.validated,
+                    .state = snapshot.state,
+                    .sent = snapshot.sent,
+                    .received = snapshot.received,
+                },
+            };
+        }
+        return self.mirrorObservations(&observations, at);
+    }
+
+    /// Pure snapshot fold. A null slot retires its previous address pair.
+    pub fn mirrorObservations(self: *Table, observations: *const Observations, at: Instant) Mirror {
+        var result: Mirror = .{
+            .live = 0, .filed = 0, .revived = 0, .retired = 0, .refused = 0, .evicted = 0,
+        };
+        for (observations, 0..) |observation, index| {
+            const slot: u8 = @intCast(index);
+            const path = observation orelse {
                 result.retired += self.retire(slot, null, at);
+                continue;
+            };
+            var report = path.report;
+            report.slot = slot;
+            const applied = self.observe(path.key, report, at);
+            result.retired += applied.retired;
+            if (applied.evicted != null) result.evicted += 1;
+            switch (applied.outcome) {
+                .kept => {},
+                .filed => result.filed += 1,
+                .revived => result.revived += 1,
+                .refused, .foreign_slot => result.refused += 1,
             }
         }
         result.live = self.live();
@@ -726,36 +566,6 @@ pub const Table = struct {
     }
 };
 
-/// The pair a core path names, or null for a slot the core has not been given an
-/// address for.
-///
-/// Either address unset is null, not a half-path: `NetworkPath.init` copies both
-/// and `Connection.connectInto` leaves both unset until the first datagram
-/// (`:2251`), so a path with one address and no other is a value no caller could
-/// send on — and `Egress` carries one address, so half a path has nothing to hand
-/// the socket.
-///
-/// **The slot must be one the core has written.** `acceptInto` puts `undefined`
-/// in the array's second element (`:1537`), so that slot's `local_addr` and
-/// `peer_addr` are not an `Address` at all, and switching on one reads a value
-/// that was never made. `mirror` reads the slot the core names active and no
-/// other; that is the precondition assumed here, and this is what breaks first.
-fn pairOf(slot: *const CorePath) ?Key {
-    const local = fromCoreAddress(&slot.local_addr) orelse return null;
-    const peer = fromCoreAddress(&slot.peer_addr) orelse return null;
-    return .{ .local = local, .peer = peer };
-}
-
-/// A core path as a `Report`, which is the whole of this file's reading of it.
-fn reportOf(slot: *const CorePath, slot_index: u8) Report {
-    return .{
-        .slot = slot_index,
-        .validated = slot.is_validated,
-        .state = slot.validator.state,
-        .sent = slot.bytes_sent,
-        .received = slot.bytes_received,
-    };
-}
 
 // --- tests
 
@@ -909,11 +719,7 @@ test "a path is its two addresses and the connection is the core's own id" {
 
     var table: Table = .{};
     const first = table.mirror(conn, start);
-    // One accepted connection, one path. The core's second slot is `undefined`,
-    // not `.unset` (`acceptInto`, `:1537`): it holds no `NetworkPath` at all, so
-    // it is a candidate nobody proposed *and* a slot this table may not read.
-    // `mirror` reads the one slot the core names active, and a second read of
-    // the candidate is what the three aborting tests were doing.
+    // The unopened slot is absent from the bridge snapshot; it is never read.
     try t.expectEqual(@as(usize, 1), first.live);
     try t.expectEqual(@as(usize, 1), first.filed);
     try t.expectEqual(@as(usize, 0), first.retired);
@@ -1084,8 +890,7 @@ test "a round trip is the caller's, and it stops being believed when it is stale
     var table: Table = .{};
     _ = table.mirror(conn, start);
 
-    // The core holds one RTT per connection and no per-path figure at all, so the
-    // number here is one this project measured on this pair.
+    // This sample is supplied by the caller rather than a congestion estimator.
     const rtt: Nanos = 20 * std.time.ns_per_ms;
     const age: Instant = @intCast(rtt_max_age);
     try t.expect(table.sample(directKey(), rtt, start));
@@ -1207,4 +1012,37 @@ test "at the bound the table refuses a report and only a failure may be displace
     try t.expect(table.get(ninth) == null);
     try t.expectEqual(@as(usize, 7), table.slice().len);
     try t.expect(!table.forget(ninth));
+}
+
+test "a mirror pass observes both initialized slots and retires abandoned slots" {
+    var table: Table = .{};
+    const observations: Observations = .{
+        .{ .key = directKey(), .report = bareReport(0, true, .idle) },
+        .{ .key = reboundKey(), .report = bareReport(1, false, .pending) },
+    };
+    const first = table.mirrorObservations(&observations, start);
+    try t.expectEqual(@as(usize, 2), first.live);
+    try t.expectEqual(@as(usize, 2), first.filed);
+    const remaining: Observations = .{ null, observations[1] };
+    const next = table.mirrorObservations(&remaining, start + 1);
+    try t.expectEqual(@as(usize, 1), next.live);
+    try t.expectEqual(@as(usize, 1), next.retired);
+    try t.expect(!table.get(directKey()).?.live());
+    try t.expectEqual(@as(usize, 2), core_slots);
+    try t.expectEqual(@as(usize, 8), max_paths);
+}
+
+test "actuator refuses actions whose native slot no longer holds the planned pair" {
+    var rig = try Rig.init(12, 9);
+    defer rig.deinit();
+    const conn = try rig.conn();
+    try t.expectError(error.StalePath, applyAction(conn, .{
+        .probe = .{
+            .id = 1,
+            .key = .{ .local = server_addr, .peer = client_addr },
+        },
+    }, start, rig.client.random()));
+    try t.expectEqual(@as(?u8, null), try applyAction(
+        conn, .none, start, rig.client.random(),
+    ));
 }

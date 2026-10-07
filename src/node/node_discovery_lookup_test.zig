@@ -96,6 +96,7 @@ test "identity-only discovery resolves through local DNS and carries authenticat
     const payload = "identity-only DNS lookup application bytes";
     try stream.write(payload);
     stream.close();
+    const stream_id = stream.id();
     var received: std.ArrayList(u8) = .empty;
     defer received.deinit(t.allocator);
     for (0..128) |_| {
@@ -103,8 +104,8 @@ test "identity-only discovery resolves through local DNS and carries authenticat
         _ = try client.step(t.io, at, client.generator());
         _ = try listener.step(t.io, at, listener.generator());
         const accepted = listener.bridge.connectionAt(0).?;
-        if (accepted.entry.conn.streams.streams.get(stream.id())) |entry| {
-            var inbound: bridge.Stream = .{ .entry = entry };
+        if (accepted.stream(stream_id)) |borrowed| {
+            var inbound = borrowed;
             _ = try inbound.drain(t.allocator, &received);
         }
     }

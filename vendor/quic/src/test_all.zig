@@ -23,6 +23,10 @@ test {
     _ = @import("quic/lossy_link_test.zig");
     _ = @import("quic/mont.zig");
     _ = @import("quic/mtu.zig");
+    _ = @import("quic/native_nat.zig");
+    _ = @import("quic/native_nat_state.zig");
+    _ = @import("quic/native_path_state.zig");
+    _ = @import("quic/observed_address.zig");
     _ = @import("quic/packet.zig");
     _ = @import("quic/packet_packer.zig");
     _ = @import("quic/protocol.zig");
