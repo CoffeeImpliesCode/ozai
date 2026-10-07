@@ -16,6 +16,7 @@ const base_addr = @import("../base/addr.zig");
 const batch = @import("batch.zig");
 const bridge_address = @import("bridge_address.zig");
 const bridge_config = @import("bridge_config.zig");
+const incoming_filter = @import("../endpoint/incoming_filter.zig");
 
 const SocketAddr = base_addr.SocketAddr;
 
@@ -52,6 +53,16 @@ pub const Conn = struct {
     pub fn id(self: Conn) u64 {
         return self.entry.id;
     }
+    /// Proof on the opening Initial, not a later path-validation bit. The value
+    /// remains unchanged for the lifetime of this borrowed connection.
+    pub fn initialValidation(self: Conn) incoming_filter.TokenProvenance {
+        return switch (self.entry.initial_validation) {
+            .unvalidated => .unvalidated,
+            .retry => .retry,
+            .new_token => .new_token,
+        };
+    }
+
 
     /// The peer's address on the active path, in this project's address.
     ///

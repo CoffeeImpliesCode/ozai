@@ -75,6 +75,8 @@ pub const ConnEntry = struct {
     conn: *connection.Connection,
     /// Unique per manager, never reused.
     id: u64 = 0,
+    /// Address proof established by the opening Initial, not later path validation.
+    initial_validation: TokenProvenance = .unvalidated,
 
     /// Borrowed application context. The manager neither calls nor releases it.
     datagram_handler_ctx: ?*anyopaque = null,
@@ -236,6 +238,32 @@ pub const ReplyLimits = struct {
     }
 };
 
+/// Provenance of the address proof on a new Initial.
+pub const TokenProvenance = enum { unvalidated, retry, new_token };
+
+/// Borrowed wire metadata after token validation and before connection allocation.
+/// CID slices live only during the policy call; there is no connection id yet.
+pub const Initial = struct {
+    remote: address.Address,
+    local: address.Address,
+    version: u32,
+    dcid: []const u8,
+    scid: []const u8,
+    datagram_size: usize,
+    ecn: u2,
+    validation: TokenProvenance,
+};
+
+/// A Retry for an already validated Initial is refused, never issued twice.
+pub const InitialDecision = enum { accept, retry, refuse, ignore };
+
+/// Pure synchronous policy. Keep context alive while installed. The callback
+/// runs on the receiving thread, must not retain Initial slices or reenter the manager.
+pub const InitialPolicy = struct {
+    ptr: *const anyopaque,
+    decide: *const fn (ptr: *const anyopaque, initial: Initial) InitialDecision,
+};
+
 /// Manages multiple QUIC connections, routing packets by DCID.
 ///
 /// Owns connections, entries and routing tables through the retained allocator.
@@ -285,6 +313,8 @@ pub const ConnectionManager = struct {
     /// Also send Retry once this many connections are live, so a loaded
     /// server spends state only on clients that proved their address.
     retry_threshold: ?usize = null,
+    /// Null accepts subject to the manager's mandatory Retry and refusal rules.
+    initial_policy: ?InitialPolicy = null,
 
     /// When true, every new connection is answered with CONNECTION_REFUSED,
     /// as it is at `max_connections`. Set while a server drains.
@@ -725,69 +755,58 @@ pub const ConnectionManager = struct {
                     return self.refuse(header, out_buf, now);
                 }
 
-                // A token is honoured whether or not Retry is required now:
-                // load may have dropped since we sent the Retry, and its
-                // client will insist on seeing retry_source_connection_id.
+                // Token validation precedes policy and allocation. Preserve the
+                // distinction between Retry's CIDs and a NEW_TOKEN address proof.
                 const token = header.token orelse &[_]u8{};
                 const need_retry = self.require_retry or
                     (if (self.retry_threshold) |n| self.entries.items.len >= n else false);
+                var validation: TokenProvenance = .unvalidated;
                 if (token.len > 0) {
-                    retry_token = packet.validateRetryToken(token, from, self.retry_token_key, now) catch null;
-                    if (retry_token) |*vt| {
-                        entry = self.acceptConnection(
-                            header,
-                            local,
-                            from,
-                            vt.getOdcid(),
-                            vt.getRetryScid(),
-                            now,
-                            random,
-                        ) catch return .{ .dropped = {} };
+                    retry_token = packet.validateRetryToken(
+                        token, from, self.retry_token_key, now,
+                    ) catch null;
+                    if (retry_token != null) {
+                        validation = .retry;
                     } else if (packet.validateNewToken(token, from, self.retry_token_key, now)) {
-                        // Valid NEW_TOKEN — the address is proven already
-                        entry = self.acceptConnection(
-                            header,
-                            local,
-                            from,
-                            header.dcid,
-                            null,
-                            now,
-                            random,
-                        ) catch return .{ .dropped = {} };
-                    } else if (need_retry) {
-                        return .{ .dropped = {} };
+                        validation = .new_token;
                     }
-                } else if (need_retry) {
-                    var retry_scid: [8]u8 = undefined;
-                    random.bytes(&retry_scid);
-
-                    var token_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
-                    const token_len = packet.generateRetryToken(
-                        &token_buf,
-                        header.dcid,
-                        &retry_scid,
-                        from,
-                        self.retry_token_key,
-                        now,
-                        random,
-                    ) catch return .{ .dropped = {} };
-
-                    var retry_fbs = io.fixedBufferStream(out_buf);
-                    packet.retry(header, &retry_scid, token_buf[0..token_len], &retry_fbs) catch
-                        return .{ .dropped = {} };
-                    return .{ .send_response = retry_fbs.buffered() };
                 }
-                if (entry == null) {
-                    entry = self.acceptConnection(
-                        header,
-                        local,
-                        from,
-                        null,
-                        null,
-                        now,
-                        random,
-                    ) catch return .{ .dropped = {} };
+                // Application acceptance cannot bypass a manager mandate.
+                // Preserve automatic Retry's existing invalid-token drop behavior.
+                if (need_retry and validation == .unvalidated) {
+                    if (token.len > 0) return .{ .dropped = {} };
+                    return self.retryInitial(header, from, out_buf, now, random);
                 }
+                const decision = if (self.initial_policy) |policy| policy.decide(policy.ptr, .{
+                    .remote = from,
+                    .local = local,
+                    .version = header.version,
+                    .dcid = header.dcid,
+                    .scid = header.scid,
+                    .datagram_size = bytes.len,
+                    .ecn = ecn_val,
+                    .validation = validation,
+                }) else .accept;
+                switch (decision) {
+                    .accept => {},
+                    .retry => {
+                        if (validation != .unvalidated) return self.refuse(header, out_buf, now);
+                        return self.retryInitial(header, from, out_buf, now, random);
+                    },
+                    .refuse => return self.refuse(header, out_buf, now),
+                    .ignore => return .{ .dropped = {} },
+                }
+                entry = self.acceptConnection(
+                    header,
+                    local,
+                    from,
+                    if (retry_token) |*vt| vt.getOdcid() else
+                        if (validation == .new_token) header.dcid else null,
+                    if (retry_token) |*vt| vt.getRetryScid() else null,
+                    now,
+                    random,
+                ) catch return .{ .dropped = {} };
+                entry.?.initial_validation = validation;
             }
 
             // ReleaseSmall has no safety checks, so `entry.?` on a null
@@ -827,6 +846,26 @@ pub const ConnectionManager = struct {
         if (!quic_lb.extractServerId(lb, dcid, &self.foreign_id)) return null;
         if (std.mem.eql(u8, self.foreign_id[0..n], lb.server_id[0..n])) return null;
         return self.foreign_id[0..n];
+    }
+
+    fn retryInitial(
+        self: *const ConnectionManager,
+        header: packet.Header,
+        from: address.Address,
+        out_buf: []u8,
+        now: i64,
+        random: std.Random,
+    ) RecvAction {
+        var retry_scid: [8]u8 = undefined;
+        random.bytes(&retry_scid);
+        var token_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
+        const token_len = packet.generateRetryToken(
+            &token_buf, header.dcid, &retry_scid, from, self.retry_token_key, now, random,
+        ) catch return .{ .dropped = {} };
+        var retry_fbs = io.fixedBufferStream(out_buf);
+        packet.retry(header, &retry_scid, token_buf[0..token_len], &retry_fbs) catch
+            return .{ .dropped = {} };
+        return .{ .send_response = retry_fbs.buffered() };
     }
 
     /// Answer an Initial we will not serve with CONNECTION_REFUSED (RFC 9000
@@ -1510,4 +1549,206 @@ test "reset index allocation refusal preserves old tokens and retries the new ge
         entry.conn.peer_cid_pool.generation,
         entry.reset_pool_gen,
     );
+}
+
+test "Initial policy sends real Retry before allocation and accepts its echo once" {
+    const alloc = std.testing.allocator;
+    var entropy = TestRandom.init(42);
+    const random = entropy.random();
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var mgr = testManager(failing.allocator(), random);
+    defer mgr.deinit();
+    const policy = struct {
+        fn decide(_: *const anyopaque, initial: Initial) InitialDecision {
+            std.debug.assert(initial.datagram_size >= MIN_INITIAL_DATAGRAM);
+            std.debug.assert(initial.dcid.len >= MIN_INITIAL_DCID_LEN);
+            std.debug.assert(initial.version == protocol.SUPPORTED_VERSIONS[0]);
+            std.debug.assert(initial.local.eql(address.Address.initIpv4(
+                .{ 127, 0, 0, 1 }, 5000,
+            )));
+            return if (initial.validation == .unvalidated) .retry else .accept;
+        }
+    };
+    const context: u8 = 0;
+    mgr.initial_policy = .{ .ptr = &context, .decide = policy.decide };
+    const source = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 4000);
+    const local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 5000);
+    var buf: [1500]u8 = undefined;
+    var out: [1500]u8 = undefined;
+    const client = try clientInitial(alloc, &buf, test_now, random);
+    defer {
+        client.conn.deinit();
+        alloc.destroy(client.conn);
+    }
+    const response = switch (try mgr.recvDatagram(
+        buf[0..client.len], source, local, 0, &out, test_now, random,
+    )) {
+        .send_response => |bytes| bytes,
+        else => return error.TestUnexpectedResult,
+    };
+    var reader = io.fixedBufferStream(@constCast(response));
+    const header = try packet.Header.parse(&reader, 8);
+    try std.testing.expectEqual(packet.PacketType.retry, header.packet_type);
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+    client.conn.handleDatagram(@constCast(response), .{
+        .to = source, .from = local, .datagram_size = response.len,
+    }, test_now, random);
+    try std.testing.expect(client.conn.retry_received);
+    const len = try client.conn.sendAt(&buf, test_now, random);
+    var echo: [1500]u8 = undefined;
+    @memcpy(echo[0..len], buf[0..len]);
+    // A token from another source never becomes validated and costs no allocation.
+    const altered = address.Address.initIpv4(.{ 127, 0, 0, 2 }, 4000);
+    try std.testing.expect((try mgr.recvDatagram(
+        echo[0..len], altered, local, 0, &out, test_now, random,
+    )) == .send_response);
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    failing.fail_index = std.math.maxInt(usize);
+    const accepted = try mgr.recvDatagram(buf[0..len], source, local, 0, &out, test_now, random);
+    try std.testing.expect(accepted == .processed);
+    try std.testing.expectEqual(TokenProvenance.retry, accepted.processed.initial_validation);
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
+    try std.testing.expect((try mgr.recvDatagram(
+        echo[0..len], source, local, 0, &out, test_now, random,
+    )) == .processed);
+    try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
+}
+
+test "Initial policy cannot send a second Retry for a validated flow" {
+    const alloc = std.testing.allocator;
+    var entropy = TestRandom.init(43);
+    const random = entropy.random();
+    var mgr = testManager(alloc, random);
+    defer mgr.deinit();
+    const policy = struct {
+        fn decide(_: *const anyopaque, _: Initial) InitialDecision {
+            return .retry;
+        }
+    };
+    const context: u8 = 0;
+    mgr.initial_policy = .{ .ptr = &context, .decide = policy.decide };
+    const addr = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 4000);
+    var buf: [1500]u8 = undefined;
+    var out: [1500]u8 = undefined;
+    const client = try clientInitial(alloc, &buf, test_now, random);
+    defer {
+        client.conn.deinit();
+        alloc.destroy(client.conn);
+    }
+    const retry = (try mgr.recvDatagram(
+        buf[0..client.len], addr, addr, 0, &out, test_now, random,
+    )).send_response;
+    client.conn.handleDatagram(@constCast(retry), .{
+        .to = addr, .from = addr, .datagram_size = retry.len,
+    }, test_now, random);
+    const len = try client.conn.sendAt(&buf, test_now, random);
+    const refused = (try mgr.recvDatagram(
+        buf[0..len], addr, addr, 0, &out, test_now, random,
+    )).send_response;
+    var reader = io.fixedBufferStream(@constCast(refused));
+    const header = try packet.Header.parse(&reader, 8);
+    try std.testing.expect(header.packet_type != .retry);
+    try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+}
+
+test "Initial policy accept refuse ignore and manager Retry precedence" {
+    const alloc = std.testing.allocator;
+    const policy = struct {
+        fn decide(ptr: *const anyopaque, _: Initial) InitialDecision {
+            const answer: *const InitialDecision = @ptrCast(@alignCast(ptr));
+            return answer.*;
+        }
+    };
+    for ([_]InitialDecision{ .accept, .refuse, .ignore }) |answer| {
+        var entropy = TestRandom.init(71);
+        const random = entropy.random();
+        var mgr = testManager(alloc, random);
+        defer mgr.deinit();
+        mgr.initial_policy = .{ .ptr = &answer, .decide = policy.decide };
+        var buf: [1500]u8 = undefined;
+        var out: [1500]u8 = undefined;
+        const client = try clientInitial(alloc, &buf, test_now, random);
+        defer {
+            client.conn.deinit();
+            alloc.destroy(client.conn);
+        }
+        const action = try mgr.recvDatagram(
+            buf[0..client.len], .unset, .unset, 0, &out, test_now, random,
+        );
+        switch (answer) {
+            .accept => try std.testing.expect(action == .processed),
+            .refuse => try std.testing.expect(action == .send_response),
+            .ignore => try std.testing.expect(action == .dropped),
+            .retry => unreachable,
+        }
+        try std.testing.expectEqual(
+            @as(usize, if (answer == .accept) 1 else 0), mgr.connectionCount(),
+        );
+    }
+    var entropy = TestRandom.init(72);
+    const random = entropy.random();
+    var mgr = testManager(alloc, random);
+    defer mgr.deinit();
+    const accept: InitialDecision = .accept;
+    mgr.initial_policy = .{ .ptr = &accept, .decide = policy.decide };
+    mgr.require_retry = true;
+    var buf: [1500]u8 = undefined;
+    var out: [1500]u8 = undefined;
+    const client = try clientInitial(alloc, &buf, test_now, random);
+    defer {
+        client.conn.deinit();
+        alloc.destroy(client.conn);
+    }
+    const reply = (try mgr.recvDatagram(
+        buf[0..client.len], .unset, .unset, 0, &out, test_now, random,
+    )).send_response;
+    var reader = io.fixedBufferStream(@constCast(reply));
+    const header = try packet.Header.parse(&reader, 8);
+    try std.testing.expectEqual(packet.PacketType.retry, header.packet_type);
+    try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
+}
+
+test "Initial policy sees NEW_TOKEN provenance and cannot retry it" {
+    const alloc = std.testing.allocator;
+    var entropy = TestRandom.init(73);
+    const random = entropy.random();
+    var mgr = testManager(alloc, random);
+    defer mgr.deinit();
+    const policy = struct {
+        fn decide(_: *const anyopaque, initial: Initial) InitialDecision {
+            std.debug.assert(initial.validation == .new_token);
+            return .retry;
+        }
+    };
+    const context: u8 = 0;
+    mgr.initial_policy = .{ .ptr = &context, .decide = policy.decide };
+    const addr = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 4000);
+    var token: [packet.TOKEN_MAX_LEN]u8 = undefined;
+    const token_len = try packet.generateNewToken(
+        &token, addr, mgr.retry_token_key, test_now, random,
+    );
+    var buf: [1500]u8 = .{0} ** 1500;
+    var writer = io.fixedBufferStream(&buf);
+    const dcid = [_]u8{0x11} ** 8;
+    const scid = [_]u8{0x22} ** 8;
+    var initial: packet.Header = .{
+        .packet_type = .initial,
+        .version = protocol.SUPPORTED_VERSIONS[0],
+        .dcid = &dcid,
+        .scid = &scid,
+        .token = token[0..token_len],
+        .remainder_len = 1000,
+    };
+    try initial.encode(&writer);
+    // QUIC two-byte Length encoding (the policy runs before decryption).
+    try writer.writeInt(u16, 0x4000 | 1000, .big);
+    var out: [1500]u8 = undefined;
+    const refused = (try mgr.recvDatagram(
+        &buf, addr, addr, 0, &out, test_now, random,
+    )).send_response;
+    var reader = io.fixedBufferStream(@constCast(refused));
+    const header = try packet.Header.parse(&reader, 8);
+    try std.testing.expect(header.packet_type != .retry);
+    try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
 }

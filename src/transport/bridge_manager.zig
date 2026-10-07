@@ -21,6 +21,7 @@ const bridge_address = @import("bridge_address.zig");
 const bridge_config = @import("bridge_config.zig");
 const bridge_conn = @import("bridge_conn.zig");
 const bridge_ingress = @import("bridge_ingress.zig");
+const incoming_filter = @import("../endpoint/incoming_filter.zig");
 
 const NodeId = base_key.NodeId;
 
@@ -83,6 +84,7 @@ pub const Bridge = struct {
     /// The peer pin a server actually enforces. It points into this struct
     /// for the same reason.
     client_auth: ClientAuth,
+    initial_policy: ?incoming_filter.InitialPolicy,
 
     /// A bridge presenting `config.secret`'s node, with a `ConnectionManager`
     /// built from it.
@@ -110,6 +112,7 @@ pub const Bridge = struct {
         self.* = .{
             .gpa = gpa,
             .manager = undefined,
+            .initial_policy = config.initial_policy,
             .node_id = config.secret.nodeId(),
             .seed = config.secret.toBytes()[0..seed_length].*,
             .spki = undefined,
@@ -131,7 +134,44 @@ pub const Bridge = struct {
             reset_key,
             random,
         );
+        if (config.initial_policy != null) {
+            self.manager.initial_policy = .{ .ptr = self, .decide = decideInitial };
+        }
         return self;
+    }
+
+    fn decideInitial(
+        ptr: *const anyopaque,
+        initial: quic.connection_manager.Initial,
+    ) quic.connection_manager.InitialDecision {
+        const self: *const Bridge = @ptrCast(@alignCast(ptr));
+        const policy = self.initial_policy orelse return .accept;
+        const remote = bridge_address.fromCoreAddress(&initial.remote) orelse return .ignore;
+        const local = bridge_address.fromCoreAddress(&initial.local) orelse return .ignore;
+        const classification = base_ula.classify(remote);
+        const provenance: incoming_filter.TokenProvenance = switch (initial.validation) {
+            .unvalidated => .unvalidated,
+            .retry => .retry,
+            .new_token => .new_token,
+        };
+        return switch (policy.decide(policy.ptr, .{
+            .remote = remote,
+            .local = local,
+            .classification = classification,
+            .validation = if (provenance == .unvalidated) .unvalidated else
+                incoming_filter.proved(classification, remote),
+            .token_provenance = provenance,
+            .version = initial.version,
+            .dcid = initial.dcid,
+            .scid = initial.scid,
+            .datagram_size = initial.datagram_size,
+            .ecn = initial.ecn,
+        })) {
+            .accept => .accept,
+            .retry => .retry,
+            .reject => .refuse,
+            .ignore => .ignore,
+        };
     }
 
     /// Free every connection the core holds and then the bridge.
@@ -828,4 +868,35 @@ test "one egress slot at a time sends as much as the whole array sends" {
     try t.expect(wide_bytes.items.len > 0);
     try t.expectEqual(wide_bytes.items.len, narrow_bytes.items.len);
     try t.expect(passes > 0);
+}
+
+test "project Initial policy retries before accepting and preserves validation" {
+    const incoming = @import("../endpoint/incoming_filter.zig");
+    const policy = struct {
+        fn decide(_: *const anyopaque, initial: incoming.Initial) incoming.Answer {
+            return if (initial.token_provenance == .unvalidated) .retry else .accept;
+        }
+    };
+    const context: u8 = 0;
+    var server_secret = try SecretKey.fromSeed(server_seed);
+    defer server_secret.deinit();
+    var client_secret = try SecretKey.fromSeed(client_seed);
+    defer client_secret.deinit();
+    var engine = Prng.init(61);
+    const bridge = try Bridge.create(t.allocator, t.io, .{
+        .secret = server_secret,
+        .alpn = alpn,
+        .initial_policy = .{ .ptr = &context, .decide = policy.decide },
+    }, engine.random());
+    defer bridge.destroy();
+    var map = addr_map.MappedAddrs.init();
+    defer map.deinit(t.allocator);
+    var client: Client = undefined;
+    try client.init(client_secret, server_secret.nodeId(), 62, start);
+    defer client.deinit();
+    try exchange(&client, bridge, &map, start);
+    const conn = bridge.connectionAt(0) orelse return error.TestUnexpectedResult;
+    try t.expect(conn.established());
+    try t.expectEqual(incoming.TokenProvenance.retry, conn.initialValidation());
+    try t.expectEqual(@as(usize, 1), bridge.manager.connectionCount());
 }

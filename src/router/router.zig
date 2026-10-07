@@ -316,47 +316,6 @@ test "a retry is address validation on a direct path and a cost on a relay" {
     try t.expectEqual(Retry.cost_imposition, retryMeaning(.relay));
 }
 
-test "the filter's four verdicts, and only a refusal reaches the peer" {
-    var recorder: Recorder = .{};
-    var entries: [1]Entry = undefined;
-    const router = try oneHandler("/echo", &entries, &recorder);
-
-    // Carry on: the handshake is owed and nothing is sent.
-    const accept = dispatchStep(&router, .incoming, .{ .filtered = .accept });
-    try t.expectEqual(ConnState.negotiating, accept.state);
-    try t.expectEqual(DispatchAction.negotiate_alpn, accept.action);
-    try t.expectEqual(PeerOutcome.nothing, accept.action.peerOutcome());
-
-    // Retry: the token is sent and the attempt ends. The meaning rides along.
-    const direct = dispatchStep(&router, .incoming, .{
-        .filtered = .{ .retry = retryMeaning(.custom) },
-    });
-    try t.expectEqual(ConnState{ .retried = .source_validation }, direct.state);
-    try t.expectEqual(
-        DispatchAction{ .send_retry = .source_validation },
-        direct.action,
-    );
-    try t.expectEqual(PeerOutcome.nothing, direct.action.peerOutcome());
-
-    // The same verdict on a relayed path is a different value and a different
-    // state, which is the whole point of carrying the meaning.
-    const relayed = dispatchStep(&router, .incoming, .{
-        .filtered = .{ .retry = retryMeaning(.relay) },
-    });
-    try t.expectEqual(ConnState{ .retried = .cost_imposition }, relayed.state);
-
-    // Reject: the one thing the peer is told.
-    const reject = dispatchStep(&router, .incoming, .{ .filtered = .reject });
-    try t.expectEqual(ConnState.refused, reject.state);
-    try t.expectEqual(DispatchAction.refuse, reject.action);
-    try t.expectEqual(PeerOutcome.refused, reject.action.peerOutcome());
-
-    // Ignore: no packet, and unlike every other ending here, no warning.
-    const ignore = dispatchStep(&router, .incoming, .{ .filtered = .ignore });
-    try t.expectEqual(ConnState.ignored, ignore.state);
-    try t.expectEqual(DispatchAction.ignore, ignore.action);
-    try t.expectEqual(PeerOutcome.nothing, ignore.action.peerOutcome());
-}
 
 test "an ALPN nobody registered is dropped, not refused" {
     var recorder: Recorder = .{};
@@ -572,7 +531,6 @@ test "a terminal connection state absorbs every event" {
     // The first ending is the ending, and a later event does not overwrite the
     // record of it.
     const terminal = [_]ConnState{
-        .{ .retried = .cost_imposition },
         .refused,
         .ignored,
         .released,
@@ -771,4 +729,24 @@ test "a lease given up after the close reports the close, once" {
     // And the copy could not have reported anything else even if it tried: the
     // answer comes out of the shutdown, not out of an argument.
     try t.expectEqual(Shutdown.Phase.closed, shutdown.phase);
+}
+
+test "late Retry terminates admission and never reaches a handler" {
+    var recorder: Recorder = .{};
+    var entries: [1]Entry = undefined;
+    const table = try oneHandler("/echo", &entries, &recorder);
+    for ([_]Retry{ .source_validation, .cost_imposition }) |meaning| {
+        const refused = dispatchStep(&table, .incoming, .{
+            .filtered = .{ .retry = meaning },
+        });
+        try t.expectEqual(ConnState.refused, refused.state);
+        try t.expectEqual(DispatchAction.refuse, refused.action);
+        // An ALPN completion arriving after refusal cannot resurrect admission.
+        const stale = dispatchStep(&table, refused.state, .{
+            .outcome = .{ .alpn = "/echo" },
+        });
+        try t.expectEqual(ConnState.refused, stale.state);
+        try t.expectEqual(DispatchAction.none, stale.action);
+        try t.expectEqual(@as(usize, 0), recorder.accept_calls);
+    }
 }
