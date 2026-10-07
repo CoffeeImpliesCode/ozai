@@ -24,6 +24,12 @@ const conn_mod = @import("connection.zig");
 const protocol = @import("protocol.zig");
 const flow_control = @import("flow_control.zig");
 
+/// A bounded off-path payload, never a view of the normal send queues.
+pub const OffPathOptions = struct {
+    challenge: ?[8]u8 = null,
+    response: ?[8]u8 = null,
+};
+
 /// Calculate the overhead of a STREAM frame header (type + stream_id + offset + length varints).
 /// This accounts for the LEN flag always being set.
 fn streamFrameHeaderOverhead(stream_id: u64, offset: u64, max_data_len: u64) usize {
@@ -194,6 +200,16 @@ pub const PacketPacker = struct {
     /// packets the peer will decrypt with the wrong key.
     key_phase: bool = false,
 
+    /// Null keeps legacy 1-RTT protection and ACKs. A negotiated multipath
+    /// connection sets this even for path zero and supplies that path's handler
+    /// to every packing call; the handler owns its independent packet numbers.
+    /// Initial, Handshake and 0-RTT protection never use this path nonce.
+    application_path_id: ?u32 = null,
+
+    /// Whole-packet minimum for a 1-RTT path-validation challenge. The caller
+    /// sets zero for ordinary traffic and NAT probes, which need no expansion.
+    application_padding_min: usize = 0,
+
     /// Spin bit for passive RTT measurement (RFC 9000 §17.4).
     ///
     /// A peer that echoes it proves it received the packet, so it is set to
@@ -299,6 +315,61 @@ pub const PacketPacker = struct {
     pub fn updateDcid(self: *PacketPacker, new_dcid: []const u8) void {
         @memcpy(self.dcid_buf[0..new_dcid.len], new_dcid);
         self.dcid_len = @intCast(new_dcid.len);
+    }
+
+    /// Seal one off-path NAT probe in the real path-zero application PN space.
+    /// Noq's NAT sender emits probing frames only and excludes the datagram
+    /// from recovery/congestion accounting (connection/mod.rs:2157-2168).
+    /// Unlike regular path validation, this packet has no 1200-byte floor.
+    /// Empty or undersized calls allocate no PN. The normal queues and this
+    /// packer's send flags are untouched.
+    pub fn packOffPath(
+        self: *const PacketPacker,
+        buf: []u8,
+        pkt_handler: *ack_handler.PacketHandler,
+        seal: *const crypto_mod.Seal,
+        options: OffPathOptions,
+        random: std.Random,
+    ) !usize {
+        const max_payload = 9 + 9;
+        var payload: [max_payload]u8 = undefined;
+        var writer = io.fixedBufferStream(&payload);
+        if (options.challenge) |challenge| {
+            try (Frame{ .path_challenge = challenge }).write(&writer);
+        }
+        if (options.response) |response| {
+            try (Frame{ .path_response = response }).write(&writer);
+        }
+        if (writer.seek == 0) return 0;
+
+        // Reserve the largest PN before numbering, so every subsequent write
+        // is guaranteed to fit. Nine-byte path frames exceed the HP sample
+        // minimum without padding.
+        const required = 1 + @as(usize, self.dcid_len) + 4 + writer.seek + AEAD_TAG_LEN;
+        if (@min(self.max_packet_size, buf.len) < required) return 0;
+        const pn = pkt_handler.nextPacketNumber(.application, random);
+        var pn_buf: [4]u8 = undefined;
+        const pn_len = crypto_mod.encodePacketNumber(
+            pn, pkt_handler.getLargestAcked(.application), &pn_buf,
+        );
+        var first_byte: u8 = packet_mod.FIXED_BIT;
+        if (self.key_phase) first_byte |= packet_mod.KEY_PHASE_BIT;
+        if (self.spin_bit) first_byte |= packet_mod.PACKET_SPIN_BIT;
+        first_byte |= @as(u8, @intCast(pn_len - 1));
+        buf[0] = first_byte;
+        const pn_offset = 1 + @as(usize, self.dcid_len);
+        @memcpy(buf[1..pn_offset], self.getDcid());
+        @memcpy(buf[pn_offset..][0..pn_len], pn_buf[0..pn_len]);
+        const header_len = pn_offset + pn_len;
+        // Path zero's nonce is independent of whichever application path the
+        // regular packer currently targets. Legacy protection is identical.
+        const encrypted_len = seal.encryptPayloadForPath(
+            0, pn, buf[0..header_len], payload[0..writer.seek], buf[header_len..],
+        );
+        const total_len = header_len + encrypted_len;
+        seal.applyHeaderProtection(buf[0..total_len], pn_offset, pn_len);
+        pkt_handler.onOffPathPacketSent(pn);
+        return total_len;
     }
 
     /// Pack a coalesced packet (Initial + 0-RTT + Handshake + 1-RTT).
@@ -605,6 +676,10 @@ pub const PacketPacker = struct {
         const length_len: usize = if (pkt_type == .one_rtt) 0 else 2;
         const min_packet_plaintext = header_len + length_len + 4 + 4;
         if (buf.len < 64 or effective_max < min_packet_plaintext) return 0;
+        const packet_pad_target = if (pkt_type == .one_rtt)
+            @max(pad_target, self.application_padding_min)
+        else
+            pad_target;
 
         // RFC 9000 §14.1: a datagram carrying a client's Initial is expanded to
         // 1200 bytes, so a buffer that cannot reach the target this packet
@@ -612,7 +687,7 @@ pub const PacketPacker = struct {
         // Padding toward a target the budget cannot reach is not a shorter
         // valid datagram; it is one every peer may drop, carrying a ClientHello
         // that then goes nowhere.
-        if (pad_target > 0 and effective_max + AEAD_TAG_LEN < pad_target) return 0;
+        if (packet_pad_target > 0 and effective_max + AEAD_TAG_LEN < packet_pad_target) return 0;
 
         var fbs = io.fixedBufferStream(tmp[0..effective_max]);
         const writer = &fbs;
@@ -706,7 +781,18 @@ pub const PacketPacker = struct {
                     .ack_ecn => |a| ack_largest_sent = a.largest_ack,
                     else => {},
                 }
-                try ack_frame.write(writer);
+                const wire_ack: Frame = if (pkt_type == .one_rtt)
+                    if (self.application_path_id) |path_id|
+                        switch (ack_frame) {
+                            .ack => |a| .{ .path_ack = .{ .path_id = path_id, .ack = a } },
+                            .ack_ecn => |a| .{ .path_ack_ecn = .{ .path_id = path_id, .ack = a } },
+                            else => ack_frame,
+                        }
+                    else
+                        ack_frame
+                else
+                    ack_frame;
+                try wire_ack.write(writer);
             }
 
             // 2. CRYPTO frames
@@ -812,7 +898,10 @@ pub const PacketPacker = struct {
                     }
                     // A frame this packet cannot record, or has no room for,
                     // waits for the next one rather than going out untracked.
-                    const record = ack_handler.SentControlFrame.from(pcf);
+                    const record: ?ack_handler.SentControlFrame = switch (pcf) {
+                        .observed_address => .{ .observed_address = self.application_path_id },
+                        else => ack_handler.SentControlFrame.from(pcf),
+                    };
                     if (record != null and control_frame_count == control_frames.len) {
                         pending_frames.requeue(pcf);
                         continue;
@@ -994,20 +1083,13 @@ pub const PacketPacker = struct {
             fbs.seek += min_pad;
         }
 
-        // Pad to target size (RFC 9000 §14.1): Initial, 0-RTT, or Handshake
-        // when used to pad a coalesced server datagram to 1200 bytes.
-        //
-        // `effective_max` is the budget `out_buf` and `max_packet_size`
-        // between them allow, so the pad fills toward `pad_target` only as
-        // far as that budget reaches: a caller with a shorter datagram to
-        // spend — an anti-amplification budget, an MTU below 1200 — gets a
-        // shorter packet rather than a write past its own buffer. Reaching
-        // `pad_target` is therefore a lower bound the caller sizes for, not
-        // something this fills in regardless.
-        if (pad_target > 0 and (pkt_type == .initial or pkt_type == .zero_rtt or pkt_type == .handshake)) {
+        // Validation challenges carry the same full-datagram minimum as the
+        // long-header targets. The guard above refuses an unreachable target
+        // before consuming either a packet number or the challenge frame.
+        if (packet_pad_target > 0) {
             const current_total = fbs.seek - header_start + AEAD_TAG_LEN;
-            if (current_total < pad_target) {
-                const pad_needed = @min(pad_target - current_total, effective_max - fbs.seek);
+            if (current_total < packet_pad_target) {
+                const pad_needed = packet_pad_target - current_total;
                 @memset(tmp[fbs.seek..][0..pad_needed], 0x00);
                 fbs.seek += pad_needed;
             }
@@ -1036,12 +1118,13 @@ pub const PacketPacker = struct {
         const encrypted_start = pn_offset + pn_len;
         // RFC 9001 Section 5.2: AD is the header up to and including the packet number field
         const ad = buf[header_start..][0..(pn_offset - header_start + pn_len)];
-        const encrypted_len = seal.encryptPayload(
-            pn,
-            ad,
-            plaintext_payload,
-            buf[encrypted_start..],
-        );
+        const encrypted_len = if (pkt_type == .one_rtt)
+            if (self.application_path_id) |path_id|
+                seal.encryptPayloadForPath(path_id, pn, ad, plaintext_payload, buf[encrypted_start..])
+            else
+                seal.encryptPayload(pn, ad, plaintext_payload, buf[encrypted_start..])
+        else
+            seal.encryptPayload(pn, ad, plaintext_payload, buf[encrypted_start..]);
 
         const total_packet_len = encrypted_start + encrypted_len;
 
@@ -1164,7 +1247,10 @@ pub const PacketPacker = struct {
         // Encrypt
         const encrypted_start = pn_offset + pn_len;
         const ad = buf[0..(pn_offset + pn_len)];
-        const encrypted_len = seal.encryptPayload(pn, ad, plaintext_payload, buf[encrypted_start..]);
+        const encrypted_len = if (self.application_path_id) |path_id|
+            seal.encryptPayloadForPath(path_id, pn, ad, plaintext_payload, buf[encrypted_start..])
+        else
+            seal.encryptPayload(pn, ad, plaintext_payload, buf[encrypted_start..]);
         const total_len = encrypted_start + encrypted_len;
 
         // Apply header protection (uses cached AES HP context when available)
@@ -2745,4 +2831,341 @@ test "PacketPacker: a 0-RTT packet keeps the first flight's version" {
     );
     try testing.expect(handshake_len > 0);
     try testing.expectEqual(protocol.QUIC_V2, std.mem.readInt(u32, out_buf[1..5], .big));
+}
+
+fn expectPathPacket(
+    packet: []u8,
+    dcid: []const u8,
+    path_id: u32,
+    pn: u64,
+) !void {
+    const keys = try testServerKeys();
+    const pn_offset = 1 + dcid.len;
+    const pn_len = crypto_mod.removeHeaderProtection(
+        packet,
+        pn_offset,
+        keys.open.hp_key,
+        keys.open.cipher_suite,
+    );
+    try testing.expect(pn_len > 0);
+    try testing.expectEqual(packet_mod.FIXED_BIT, packet[0] & 0xc0);
+    try testing.expectEqual(@as(u8, 0), packet[0] & 0x18);
+    try testing.expectEqualSlices(u8, dcid, packet[1..pn_offset]);
+    var truncated_pn: u64 = 0;
+    for (packet[pn_offset..][0..pn_len]) |byte| {
+        truncated_pn = (truncated_pn << 8) | byte;
+    }
+    try testing.expectEqual(pn, truncated_pn);
+    const header_len = pn_offset + pn_len;
+    var wrong_path: [1500]u8 = undefined;
+    @memcpy(wrong_path[0..packet.len], packet);
+    try testing.expectError(error.AuthenticationFailed, keys.open.decryptPayloadForPath(
+        path_id ^ 1,
+        pn,
+        wrong_path[0..header_len],
+        wrong_path[header_len..packet.len],
+    ));
+    const plaintext = try keys.open.decryptPayloadForPath(
+        path_id,
+        pn,
+        packet[0..header_len],
+        packet[header_len..],
+    );
+    try testing.expectEqual(@as(u8, 0x01), plaintext[0]);
+}
+
+test "PacketPacker: path probes separate nonces and retain independent packet numbers" {
+    // A path switch selects connection-owned state, never resets a shared counter.
+    var rng = TestRandom{};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(false, &.{0x01}, dcid, protocol.QUIC_V1);
+    var path0 = ack_handler.PacketHandler.init(testing.allocator);
+    defer path0.deinit();
+    var path1 = ack_handler.PacketHandler.init(testing.allocator);
+    defer path1.deinit();
+    const keys = try testClientKeys();
+    var packet0: [1500]u8 = undefined;
+    var packet1: [1500]u8 = undefined;
+    packer.application_path_id = 0;
+    const first0 = try packer.packMtuProbe(&packet0, 1200, &path0, &keys.seal, 1000, rng.random());
+    packer.application_path_id = 1;
+    const first1 = try packer.packMtuProbe(&packet1, 1200, &path1, &keys.seal, 1000, rng.random());
+    try testing.expectEqual(@as(u64, 0), first0.pn);
+    try testing.expectEqual(first0.pn, first1.pn);
+    try testing.expectEqual(first0.bytes_written, first1.bytes_written);
+    try testing.expect(!std.mem.eql(
+        u8,
+        packet0[0..first0.bytes_written],
+        packet1[0..first1.bytes_written],
+    ));
+    try expectPathPacket(packet0[0..first0.bytes_written], dcid, 0, first0.pn);
+    try expectPathPacket(packet1[0..first1.bytes_written], dcid, 1, first1.pn);
+    packer.application_path_id = 0;
+    const next0 = try packer.packMtuProbe(&packet0, 1200, &path0, &keys.seal, 1001, rng.random());
+    try testing.expect(next0.pn > first0.pn);
+    try expectPathPacket(packet0[0..next0.bytes_written], dcid, 0, next0.pn);
+    try testing.expectEqual(@as(usize, 2), path0.sent[2].sent_packets.count());
+    try testing.expectEqual(@as(usize, 1), path1.sent[2].sent_packets.count());
+}
+
+test "PacketPacker: application data uses selected path handler and nonce" {
+    var rng = TestRandom{};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(false, &.{0x01}, dcid, protocol.QUIC_V1);
+    var path0 = ack_handler.PacketHandler.init(testing.allocator);
+    defer path0.deinit();
+    var path1 = ack_handler.PacketHandler.init(testing.allocator);
+    defer path1.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+    var pending_frames = frame_mod.PendingFrameQueue{};
+    var packet: [1500]u8 = undefined;
+    for ([_]u32{ 0, 1, 0 }) |path_id| {
+        packer.application_path_id = path_id;
+        const handler = if (path_id == 0) &path0 else &path1;
+        pending_frames.push(.{ .ping = {} });
+        const written = try packAppOnly(
+            &packer, handler, &crypto_mgr, &streams, &pending_frames, &packet, rng.random(),
+        );
+        try testing.expect(written > 0);
+        const sent = handler.sent[2].sent_packets.values();
+        try expectPathPacket(packet[0..written], dcid, path_id, sent[sent.len - 1].pn);
+    }
+    try testing.expectEqual(@as(usize, 2), path0.sent[2].sent_packets.count());
+    try testing.expectEqual(@as(usize, 1), path1.sent[2].sent_packets.count());
+    try testing.expectEqual(@as(u64, 0), path1.sent[2].sent_packets.values()[0].pn);
+    try testing.expect(path0.sent[2].sent_packets.values()[1].pn > 0);
+}
+
+test "PacketPacker: negotiated path zero emits PATH_ACK and legacy emits ACK" {
+    // Null and zero are distinct configurations even when the path's PN is identical.
+    var rng = TestRandom{};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const path_ids = [_]?u32{ null, 0, 1 };
+    for (path_ids) |path_id| {
+        var packer = PacketPacker.init(false, &.{0x01}, dcid, protocol.QUIC_V1);
+        packer.application_path_id = path_id;
+        var handler = ack_handler.PacketHandler.init(testing.allocator);
+        defer handler.deinit();
+        try handler.recv[2].onPacketReceived(0, true, 1000, 0);
+        try handler.recv[2].onPacketReceived(1, true, 1000, 0);
+        var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+        defer crypto_mgr.deinit();
+        var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+        defer streams.deinit();
+        var pending_frames = frame_mod.PendingFrameQueue{};
+        var packet: [1500]u8 = undefined;
+        const written = try packAppOnly(
+            &packer, &handler, &crypto_mgr, &streams, &pending_frames, &packet, rng.random(),
+        );
+        try testing.expect(written > 0);
+        const keys = try testServerKeys();
+        const pn_offset = 1 + dcid.len;
+        const pn_len = crypto_mod.removeHeaderProtection(
+            packet[0..written], pn_offset, keys.open.hp_key, keys.open.cipher_suite,
+        );
+        try testing.expect(pn_len > 0);
+        const header_len = pn_offset + pn_len;
+        const plaintext = if (path_id) |id|
+            try keys.open.decryptPayloadForPath(
+                id, 0, packet[0..header_len], packet[header_len..written],
+            )
+        else
+            try keys.open.decryptPayload(0, packet[0..header_len], packet[header_len..written]);
+        const ack = try Frame.parse(plaintext);
+        if (path_id) |id| {
+            switch (ack) {
+                .path_ack => |a| {
+                    try testing.expectEqual(id, a.path_id);
+                    try testing.expectEqual(@as(u64, 1), a.ack.largest_ack);
+                },
+                .path_ack_ecn => |a| {
+                    try testing.expectEqual(id, a.path_id);
+                    try testing.expectEqual(@as(u64, 1), a.ack.largest_ack);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else {
+            switch (ack) {
+                .ack => |a| try testing.expectEqual(@as(u64, 1), a.largest_ack),
+                .ack_ecn => |a| try testing.expectEqual(@as(u64, 1), a.largest_ack),
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+}
+
+test "PacketPacker: application path configuration never changes long header protection" {
+    // Initial and Handshake remain on path zero; 0-RTT retains legacy protection too.
+    const cases = [_]struct { level: ack_handler.EncLevel, zero_rtt: bool }{
+        .{ .level = .initial, .zero_rtt = false },
+        .{ .level = .handshake, .zero_rtt = false },
+        .{ .level = .application, .zero_rtt = true },
+    };
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const keys = try testClientKeys();
+    for (cases) |case| {
+        var packets: [2][1500]u8 = undefined;
+        var lengths: [2]usize = undefined;
+        for ([_]?u32{ null, 1 }, 0..) |path_id, i| {
+            var rng = TestRandom{};
+            var packer = PacketPacker.init(false, &.{0x01}, dcid, protocol.QUIC_V1);
+            packer.application_path_id = path_id;
+            var handler = ack_handler.PacketHandler.init(testing.allocator);
+            defer handler.deinit();
+            var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+            defer crypto_mgr.deinit();
+            var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+            defer streams.deinit();
+            var pending_frames = frame_mod.PendingFrameQueue{};
+            if (case.zero_rtt) {
+                streams.setMaxStreams(10, 10);
+                streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+                const stream = try streams.openBidiStream();
+                try stream.send.writeData("early path zero");
+            } else {
+                pending_frames.push(.{ .ping = {} });
+            }
+            lengths[i] = try packer.packSinglePacket(
+                &packets[i], case.level, &handler, &crypto_mgr, &streams,
+                &pending_frames, &keys.seal, 1000, 1200, null,
+                case.zero_rtt, false, rng.random(),
+            );
+            try testing.expectEqual(@as(usize, 1200), lengths[i]);
+            try testing.expect(packets[i][0] & 0x80 != 0);
+        }
+        try testing.expectEqualSlices(u8, packets[0][0..lengths[0]], packets[1][0..lengths[1]]);
+    }
+}
+
+test "PacketPacker: application validation padding preserves challenge and refuses short buffer" {
+    var rng = TestRandom{};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(false, &.{0x01}, dcid, protocol.QUIC_V1);
+    packer.application_path_id = 1;
+    packer.application_padding_min = 1200;
+    var handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer handler.deinit();
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+    var pending_frames = frame_mod.PendingFrameQueue{};
+    const challenge = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    pending_frames.push(.{ .path_challenge = challenge });
+    var packet: [1500]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try packAppOnly(
+        &packer, &handler, &crypto_mgr, &streams, &pending_frames, packet[0..1199], rng.random(),
+    ));
+    try testing.expectEqual(@as(u64, 0), handler.next_pn[2]);
+    try testing.expectEqual(@as(usize, 1), pending_frames.len);
+    const written = try packAppOnly(
+        &packer, &handler, &crypto_mgr, &streams, &pending_frames, &packet, rng.random(),
+    );
+    try testing.expectEqual(@as(usize, 1200), written);
+    const keys = try testServerKeys();
+    const pn_offset = 1 + dcid.len;
+    const pn_len = crypto_mod.removeHeaderProtection(
+        packet[0..written], pn_offset, keys.open.hp_key, keys.open.cipher_suite,
+    );
+    try testing.expect(pn_len > 0);
+    const header_len = pn_offset + pn_len;
+    const plaintext = try keys.open.decryptPayloadForPath(
+        1, 0, packet[0..header_len], packet[header_len..written],
+    );
+    var frame_len: usize = undefined;
+    const decoded = try Frame.parseSized(plaintext, &frame_len);
+    try testing.expectEqualSlices(u8, &challenge, &decoded.path_challenge);
+    for (plaintext[frame_len..]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "PacketPacker: off-path probes preserve pending ACK crypto streams and controls" {
+    var rng = TestRandom{};
+    const dcid = &[_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var packer = PacketPacker.init(false, &.{0x01}, dcid, protocol.QUIC_V1);
+    packer.application_path_id = 0;
+    packer.send_handshake_done = true;
+    var handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer handler.deinit();
+    try handler.onPacketReceived(.application, 0, true, 1000, 0);
+    try handler.onPacketReceived(.application, 1, true, 1000, 0);
+    var crypto_mgr = crypto_stream.CryptoStreamManager.init(testing.allocator);
+    defer crypto_mgr.deinit();
+    try crypto_mgr.getStream(3).writeData("pending crypto");
+    var streams = stream_mod.StreamsMap.init(testing.allocator, false);
+    defer streams.deinit();
+    streams.setMaxStreams(10, 10);
+    streams.setPeerInitialMaxStreamData(65536, 65536, 65536);
+    const stream = try streams.openBidiStream();
+    try stream.send.writeData("pending stream");
+    var pending_frames = frame_mod.PendingFrameQueue{};
+    pending_frames.push(.{ .max_data = 12345 });
+    const challenge = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const response = [_]u8{ 8, 7, 6, 5, 4, 3, 2, 1 };
+    const keys = try testClientKeys();
+    const receiver = try testServerKeys();
+    var packet: [1500]u8 = undefined;
+    for (0..2) |pn| {
+        const written = try packer.packOffPath(
+            &packet, &handler, &keys.seal,
+            .{ .challenge = challenge, .response = response },
+            rng.random(),
+        );
+        try testing.expect(written > 0 and written < 1200);
+        const pn_offset = 1 + dcid.len;
+        const pn_len = crypto_mod.removeHeaderProtection(
+            packet[0..written], pn_offset, receiver.open.hp_key, receiver.open.cipher_suite,
+        );
+        try testing.expect(pn_len > 0);
+        const header_len = pn_offset + pn_len;
+        const plaintext = try receiver.open.decryptPayloadForPath(
+            0, @intCast(pn), packet[0..header_len], packet[header_len..written],
+        );
+        var consumed: usize = undefined;
+        var offset: usize = 0;
+        const decoded_challenge = try Frame.parseSized(plaintext[offset..], &consumed);
+        try testing.expectEqualSlices(u8, &challenge, &decoded_challenge.path_challenge);
+        offset += consumed;
+        const decoded_response = try Frame.parseSized(plaintext[offset..], &consumed);
+        try testing.expectEqualSlices(u8, &response, &decoded_response.path_response);
+        offset += consumed;
+        try testing.expectEqual(plaintext.len, offset);
+        try testing.expect(handler.recv[2].ack_queued);
+        try testing.expect(crypto_mgr.getStream(3).hasData());
+        try testing.expect(stream.send.hasData());
+        try testing.expectEqual(@as(usize, 1), pending_frames.len);
+        try testing.expect(packer.send_handshake_done);
+        try testing.expectEqual(@as(u64, pn + 1), handler.next_pn[2]);
+        try testing.expect(!handler.acksUnsentPacket(.application, @intCast(pn), 0, &.{}));
+        try testing.expectEqual(@as(u64, 0), handler.bytes_in_flight);
+        try testing.expectEqual(@as(usize, 0), handler.sent[2].sent_packets.count());
+    }
+    const normal_written = try packer.packCoalesced(
+        &packet, &handler, &crypto_mgr, &streams, &pending_frames,
+        null, null, null, &keys.seal, 1000, null, false, rng.random(),
+    );
+    try testing.expect(normal_written > 0);
+    try testing.expectEqual(@as(u64, normal_written), handler.bytes_in_flight);
+    try testing.expectEqual(@as(u64, 3), handler.next_pn[2]);
+    try testing.expect(!handler.recv[2].ack_queued);
+    try testing.expectEqual(@as(usize, 0), pending_frames.len);
+}
+
+test "PacketPacker: empty and short off-path calls consume no packet number" {
+    var rng = TestRandom{};
+    var packer = PacketPacker.init(false, &.{1}, &.{2}, protocol.QUIC_V1);
+    var handler = ack_handler.PacketHandler.init(testing.allocator);
+    defer handler.deinit();
+    const keys = try testClientKeys();
+    var packet: [64]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try packer.packOffPath(
+        &packet, &handler, &keys.seal, .{}, rng.random(),
+    ));
+    try testing.expectEqual(@as(usize, 0), try packer.packOffPath(
+        packet[0..20], &handler, &keys.seal, .{ .challenge = .{1} ** 8 }, rng.random(),
+    ));
+    try testing.expectEqual(@as(u64, 0), handler.next_pn[2]);
+    try testing.expectEqual(@as(?u64, null), handler.skipped_pns[0]);
 }

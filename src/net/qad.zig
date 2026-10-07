@@ -44,40 +44,25 @@
 //! pinned once in `wire/quic_varint.zig`, which this file calls rather than
 //! restating.
 //!
-//! **Not pinned:** no upstream bytes were captured on this node. The golden
-//! frame in the test below is *derived* — §4.1's field order composed with
-//! RFC 9000 §16 — and it agrees with noq's own round-trip fixture, which
-//! asserts only that its encode and its decode agree and names no bytes. So
-//! the layout rests on two written specifications and on a peer
-//! implementation read, not on a packet. What closes that gap is one
-//! golden-vector test carrying bytes captured from a real iroh relay's
-//! `/iroh-qad/0` connection; this node has no such capture and cannot make
-//! one, so that test does not exist yet.
+//! **Derived, not captured:** the golden frame below composes §4.1's field
+//! order with RFC 9000 §16. It is not a packet capture. The separate
+//! `test/native_observed_upstream_oracle.rs` generator calls the actual private
+//! Noq 1.3.0 codecs to produce upstream vectors; those are codec fixtures,
+//! not evidence of a live `/iroh-qad/0` exchange.
 //!
-//! # Deliberately unwired, and not waiting on a forgotten call
+//! # Native transport integration
 //!
-//! Nothing in `src/` sends or receives these bytes, and the reserved ALPN
-//! `router/alpn_table.zig` names for them is refused at `Builder.accept`
-//! rather than registered. `router/qad_route.zig` holds the one way past that
-//! refusal and is likewise uncalled; its module doc records why, which is the
-//! same answer given here: the vendored core has no frame type for an
-//! OBSERVED_ADDRESS (`vendor/quic/src/quic/frame.zig:45-75`, `:670`) and no
-//! `address_discovery` transport parameter
-//! (`vendor/quic/src/quic/transport_params.zig:24-46`, `:609-612`), and
-//! `vendor/quic/` is read-only in this tree. Until both exist there is nowhere
-//! for an encoded frame to go, so a live route would negotiate QAD and report
-//! silence — which is why the reservation is the honest state rather than a
-//! route that is merely unwired.
+//! The vendor now has native OBSERVED_ADDRESS frame and transport-parameter
+//! codecs in `vendor/quic/src/quic/observed_address.zig`, `frame.zig` and
+//! `transport_params.zig`. The connection owns per-path report state and
+//! negotiated roles; `transport/bridge_conn.zig` exposes `observedAddress`
+//! and `observedRoles` using the project address types from this module.
 //!
-//! **What closes it, in order:** those two vendored-core features; a transport
-//! seam on `router.Connection`, which is an opaque `*anyopaque` the router
-//! never dereferences, so a handler can neither read the peer's role nor write
-//! a frame; and `node/node_accept.zig`'s `max_alpns` raised to 2 with the two
-//! `alpn_list` widenings in `transport/bridge_manager.zig` and
-//! `transport/dial_client.zig`. The third is the cheap one and is the only one
-//! reachable without a vendor patch — it is also the one that would be wrong to
-//! do alone, since a node offering a protocol it cannot serve is the failure
-//! `AGENTS.md` §2's fail-closed rule exists to prevent.
+//! This module remains a pure byte codec. Native reports belong to the
+//! authenticated QUIC connection, not to application stream payloads.
+//! Negotiating the frame extension is separate from serving the reserved
+//! `/iroh-qad/0` service ALPN. Codec and getter availability alone are not a
+//! claim that a live service exchange has been exercised.
 //!
 //! # What is not implemented here, and said here rather than left to be assumed
 //!

@@ -21,6 +21,7 @@ const bridge_address = @import("bridge_address.zig");
 const bridge_config = @import("bridge_config.zig");
 const bridge_conn = @import("bridge_conn.zig");
 const bridge_ingress = @import("bridge_ingress.zig");
+const native_candidate_policy = @import("native_candidate_policy.zig");
 
 const NodeId = base_key.NodeId;
 
@@ -305,11 +306,30 @@ pub const Bridge = struct {
 fn connectionConfig(config: Config, retry_token_key: [16]u8) quic.connection.ConnectionConfig {
     return .{
         .max_idle_timeout = config.idle_timeout_ms,
+        .address_discovery_role = config.address_discovery_role,
+        .max_remote_nat_traversal_addresses = config.max_remote_nat_traversal_addresses,
+        .initial_max_path_id = config.initial_max_path_id,
+        .candidateAdmission = native_candidate_policy.admit,
+        .supportedIPv6 = config.ipv6_supported,
         .token_key = retry_token_key,
     };
 }
 
 const t = std.testing;
+
+test "bridge factory preserves Retry and enables pure native candidate policy by default" {
+    var secret = try SecretKey.fromSeed(@splat(41));
+    defer secret.deinit();
+    const retry_key: [16]u8 = @splat(7);
+    const core = connectionConfig(.{ .secret = secret, .alpn = "ozai-test" }, retry_key);
+    try t.expect(core.supportedIPv6);
+    try t.expectEqual(retry_key, core.token_key.?);
+    const admit = core.candidateAdmission orelse return error.TestUnexpectedResult;
+    try t.expect(admit(quic.address.Address.initIpv4(.{ 192, 0, 2, 1 }, 443)));
+    try t.expect(!admit(bridge_address.toCoreAddress(
+        base_ula.socketAddrFor(.relay, @splat(1)),
+    )));
+}
 
 // The peer's half of a handshake and the virtual clock, named here so the tests
 // below stand as they were written.

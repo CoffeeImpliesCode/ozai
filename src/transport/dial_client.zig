@@ -16,6 +16,7 @@ const addr_map = @import("addr_map.zig");
 const quic_bridge = @import("quic_bridge.zig");
 const dial_config = @import("dial_config.zig");
 const dial_route = @import("dial_route.zig");
+const native_candidate_policy = @import("native_candidate_policy.zig");
 
 const NodeId = base_key.NodeId;
 const SecretKey = base_key.SecretKey;
@@ -303,7 +304,14 @@ pub const Dialer = struct {
 /// *presents* is `Config.initial_token`, and `connectInto` copies it into the
 /// connection's own buffer, so the caller's slice is not retained.
 fn connectionConfig(config: Config) ConnectionConfig {
-    return .{ .max_idle_timeout = config.idle_timeout_ms };
+    return .{
+        .max_idle_timeout = config.idle_timeout_ms,
+        .address_discovery_role = config.address_discovery_role,
+        .max_remote_nat_traversal_addresses = config.max_remote_nat_traversal_addresses,
+        .initial_max_path_id = config.initial_max_path_id,
+        .candidateAdmission = native_candidate_policy.admit,
+        .supportedIPv6 = config.ipv6_supported,
+    };
 }
 
 /// Record `key` on `entry` so `removeConnection` takes it back out of the
@@ -359,6 +367,210 @@ const relayTarget = pair_mod.relayTarget;
 const Pair = pair_mod.Pair;
 const StateLog = pair_mod.StateLog;
 const exchange = pair_mod.exchange;
+
+test "dial factory enables pure native candidate policy by default" {
+    var secret = try SecretKey.fromSeed(@splat(42));
+    defer secret.deinit();
+    const core = connectionConfig(.{ .secret = secret, .alpn = alpn });
+    try t.expect(core.supportedIPv6);
+    const admit = core.candidateAdmission orelse return error.TestUnexpectedResult;
+    try t.expect(admit(quic.address.Address.initIpv4(.{ 192, 0, 2, 1 }, 443)));
+    try t.expect(!admit(toCoreAddress(base_ula.socketAddrFor(.any_path, @splat(1)))));
+}
+
+test "native transport options reach peers through the bridge and dial handshake" {
+    // Peer parameters are decoded from TLS flights, not copied from either config.
+    // Cover absence, mutual negotiation, and a peer that declines the extensions.
+    for ([_]struct { server: bool, client: bool, ipv6: bool = false }{
+        .{ .server = false, .client = false },
+        .{ .server = true, .client = true },
+        .{ .server = true, .client = true, .ipv6 = true },
+        .{ .server = true, .client = false },
+        .{ .server = false, .client = true },
+    }) |enabled| {
+        var pair: Pair = undefined;
+        {
+            const secret = try SecretKey.fromSeed(client_seed);
+            errdefer {
+                var failed_secret = secret;
+                failed_secret.deinit();
+            }
+            pair = .{
+                .dialer_secret = secret,
+                .server_secret = try SecretKey.fromSeed(server_seed),
+                .dialer_bridge = undefined,
+                .server_bridge = undefined,
+                .dialer = undefined,
+                .map = addr_map.MappedAddrs.init(),
+                .engine = Prng.init(891),
+            };
+            errdefer pair.server_secret.deinit();
+            errdefer pair.map.deinit(t.allocator);
+            pair.dialer_bridge = try Bridge.create(t.allocator, t.io, .{
+                .secret = pair.dialer_secret,
+                .alpn = alpn,
+            }, pair.engine.random());
+            errdefer pair.dialer_bridge.destroy();
+            var server_config: quic_bridge.Config = .{
+                .secret = pair.server_secret,
+                .expect_peer = pair.dialer_secret.nodeId(),
+                .alpn = alpn,
+                .ipv6_supported = enabled.ipv6,
+            };
+            if (enabled.server) {
+                server_config.address_discovery_role = .send_only;
+                server_config.max_remote_nat_traversal_addresses = 32;
+                server_config.initial_max_path_id = 1;
+            }
+            pair.server_bridge = try Bridge.create(
+                t.allocator, t.io, server_config, pair.engine.random(),
+            );
+            errdefer pair.server_bridge.destroy();
+            var client_config: Config = .{
+                .secret = pair.dialer_secret,
+                .alpn = alpn,
+                .ipv6_supported = enabled.ipv6,
+            };
+            if (enabled.client) {
+                client_config.address_discovery_role = .receive_only;
+                client_config.max_remote_nat_traversal_addresses = 7;
+                client_config.initial_max_path_id = 1;
+            }
+            pair.dialer = try Dialer.create(t.allocator, pair.dialer_bridge, client_config);
+        }
+        defer pair.deinit();
+        const dial = try pair.dialer.dial(
+            if (enabled.server and enabled.client) try relayTarget() else .{ .ip = direct_addr },
+            pair.server_secret.nodeId(),
+            client_addr,
+            &pair.map,
+            start,
+            pair.engine.random(),
+        );
+        var log: StateLog = .{};
+        try exchange(
+            pair.dialer, dial.conn, pair.server_bridge, &pair.map,
+            &log, start, pair.engine.random(),
+        );
+        const accepted = pair.server_bridge.connectionAt(0) orelse
+            return error.TestUnexpectedResult;
+        const client = dial.conn.entry.conn;
+        const server = accepted.entry.conn;
+        try t.expectEqual(State.connected, client.state);
+        try t.expectEqual(State.connected, server.state);
+        try t.expectEqual(enabled.ipv6, client.supportedIPv6);
+        try t.expectEqual(enabled.ipv6, server.supportedIPv6);
+        const client_peer = client.peer_params orelse return error.TestUnexpectedResult;
+        const server_peer = server.peer_params orelse return error.TestUnexpectedResult;
+        try t.expectEqual(
+            @as(quic.observed_address.Role, if (enabled.server) .send_only else .disabled),
+            client_peer.address_discovery_role,
+        );
+        try t.expectEqual(
+            @as(quic.observed_address.Role, if (enabled.client) .receive_only else .disabled),
+            server_peer.address_discovery_role,
+        );
+        try t.expectEqual(
+            @as(?u8, if (enabled.server) 32 else null),
+            client_peer.max_remote_nat_traversal_addresses,
+        );
+        try t.expectEqual(
+            @as(?u8, if (enabled.client) 7 else null),
+            server_peer.max_remote_nat_traversal_addresses,
+        );
+        try t.expectEqual(
+            @as(?u32, if (enabled.server) 1 else null),
+            client_peer.initial_max_path_id,
+        );
+        try t.expectEqual(
+            @as(?u32, if (enabled.client) 1 else null),
+            server_peer.initial_max_path_id,
+        );
+        try t.expectEqual(enabled.server and enabled.client, client.multipathNegotiated());
+        try t.expectEqual(enabled.server and enabled.client, server.multipathNegotiated());
+        try t.expectEqual(enabled.server and enabled.client, client.nat_state != null);
+        try t.expectEqual(enabled.server and enabled.client, server.nat_state != null);
+        if (enabled.server and enabled.client) {
+            // A virtual path0 still completes TLS. Only NAT candidates are filtered.
+            try t.expect(base_ula.classify(dial.conn.peer().?) != .ip);
+            var candidates: [32]quic.address.Address = undefined;
+            var packet_bytes: [max_datagram]u8 = undefined;
+            for ([_]base_ula.Path{ .any_path, .relay, .custom }) |path| {
+                const virtual = toCoreAddress(base_ula.socketAddrFor(path, @splat(9)));
+                const reach: quic.frame.Frame = .{
+                    .reach_address = .{ .round = 1, .address = virtual },
+                };
+                const add: quic.frame.Frame = .{
+                    .add_address = .{ .sequence = 0, .address = virtual },
+                };
+                try server.processFrame(&reach, .application, start, pair.engine.random());
+                try client.processFrame(&add, .application, start, pair.engine.random());
+                try server.addNatTraversalAddress(virtual);
+                try client.addNatTraversalAddress(virtual);
+                try t.expectEqual(@as(u8, 0), server.nat_state.?.local_count);
+                try t.expectEqual(@as(u8, 0), client.nat_state.?.local_count);
+                try t.expectEqual(@as(usize, 0), server.remoteTraversalCandidates(&candidates).len);
+                try t.expectEqual(@as(usize, 0), client.remoteTraversalCandidates(&candidates).len);
+                const pn = server.pkt_handler.next_pn[2];
+                try t.expectEqual(@as(usize, 0), try server.sendAt(
+                    &packet_bytes, start, pair.engine.random(),
+                ));
+                try t.expectEqual(pn, server.pkt_handler.next_pn[2]);
+                const client_pn = client.pkt_handler.next_pn[2];
+                try t.expectEqual(@as(usize, 0), try client.sendAt(
+                    &packet_bytes, start, pair.engine.random(),
+                ));
+                try t.expectEqual(client_pn, client.pkt_handler.next_pn[2]);
+            }
+            const physical_v6 = quic.address.Address.initIpv6(
+                .{ 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+                4040, 0,
+            );
+            const v6_reach: quic.frame.Frame = .{
+                .reach_address = .{ .round = 1, .address = physical_v6 },
+            };
+            try server.processFrame(&v6_reach, .application, start, pair.engine.random());
+            const v6_add: quic.frame.Frame = .{
+                .add_address = .{ .sequence = 0, .address = physical_v6 },
+            };
+            try client.processFrame(&v6_add, .application, start, pair.engine.random());
+            try t.expectEqual(
+                @as(usize, if (enabled.ipv6) 1 else 0),
+                client.remoteTraversalCandidates(&candidates).len,
+            );
+            const pn = server.pkt_handler.next_pn[2];
+            const v6_sent = try server.sendAt(&packet_bytes, start, pair.engine.random());
+            if (enabled.ipv6) {
+                try t.expect(v6_sent > 0);
+                try t.expect(server.last_send_peer.eql(physical_v6));
+                try t.expect(server.pkt_handler.next_pn[2] > pn);
+            } else {
+                try t.expectEqual(@as(usize, 0), v6_sent);
+                try t.expectEqual(pn, server.pkt_handler.next_pn[2]);
+                try t.expectEqual(@as(usize, 0), server.remoteTraversalCandidates(&candidates).len);
+            }
+            const physical = quic.address.Address.initIpv4(.{ 192, 0, 2, 11 }, 4040);
+            const reach: quic.frame.Frame = .{
+                .reach_address = .{ .round = 1, .address = physical },
+            };
+            try server.processFrame(&reach, .application, start, pair.engine.random());
+            try t.expect((try server.sendAt(&packet_bytes, start, pair.engine.random())) > 0);
+            try t.expect(server.last_send_peer.eql(physical));
+            try t.expect(server.peerAddress().eql(toCoreAddress(client_addr)));
+            const add: quic.frame.Frame = .{
+                .add_address = .{ .sequence = 1, .address = physical },
+            };
+            try client.processFrame(&add, .application, start, pair.engine.random());
+            try client.addNatTraversalAddress(
+                quic.address.Address.initIpv4(.{ 192, 0, 2, 12 }, 5050),
+            );
+            try client.initiateNatTraversalRound(start, pair.engine.random());
+            try t.expect((try client.sendAt(&packet_bytes, start, pair.engine.random())) > 0);
+            try t.expect(client.last_send_peer.eql(if (enabled.ipv6) physical_v6 else physical));
+            try t.expect(client.peerAddress().eql(toCoreAddress(dial.route.socket)));
+        }
+    }
+}
 
 test "the configuration the core is handed is this node's SPKI and the peer's pin" {
     var pair: Pair = undefined;

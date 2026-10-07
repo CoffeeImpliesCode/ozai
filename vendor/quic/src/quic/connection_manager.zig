@@ -103,11 +103,11 @@ pub const ConnEntry = struct {
     initial_dcid: ?CidKey = null,
 
     /// Reset-map keys for peer CIDs; only `reset_key_count` slots are initialized.
-    reset_keys: [8]ResetKey = undefined,
-    /// Initialized reset keys, in 0..8.
+    reset_keys: [16]ResetKey = undefined,
+    /// Initialized reset keys, in 0..16 across the two native paths.
     reset_key_count: u8 = 0,
-    /// Last synchronized peer-CID generation; null before the first synchronization.
-    reset_pool_gen: ?u32 = null,
+    /// Last synchronized generations for path zero and one; null before synchronization.
+    reset_pool_gens: ?[2]u32 = null,
 
     /// Tell the owner there is data to send; see `wake_fn`.
     pub fn wake(self: *ConnEntry) void {
@@ -396,22 +396,24 @@ pub const ConnectionManager = struct {
         if (self.reset_token_map.capacity() > 0) self.reset_token_map.rehash(std.hash_map.AutoContext(ResetKey){});
     }
 
-    fn resetKeys(self: *const ConnectionManager, entry: *const ConnEntry, keys: *[8]ResetKey) u8 {
+    fn resetKeys(self: *const ConnectionManager, entry: *const ConnEntry, keys: *[16]ResetKey) u8 {
         var count: u8 = 0;
-        for (&entry.conn.peer_cid_pool.entries) |*cid_entry| {
-            if (!cid_entry.occupied) continue;
-            const key = self.resetKey(&cid_entry.stateless_reset_token);
-            var duplicate = false;
-            for (keys[0..count]) |existing| {
-                if (std.mem.eql(u8, &existing, &key)) {
-                    duplicate = true;
-                    break;
+        for (0..2) |path_id| {
+            for (entry.conn.peerPathCidEntries(@intCast(path_id))) |*cid_entry| {
+                if (!cid_entry.occupied) continue;
+                const key = self.resetKey(&cid_entry.stateless_reset_token);
+                var duplicate = false;
+                for (keys[0..count]) |existing| {
+                    if (std.mem.eql(u8, &existing, &key)) {
+                        duplicate = true;
+                        break;
+                    }
                 }
+                if (duplicate) continue;
+                std.debug.assert(count < keys.len);
+                keys[count] = key;
+                count += 1;
             }
-            if (duplicate) continue;
-            std.debug.assert(count < keys.len);
-            keys[count] = key;
-            count += 1;
         }
         return count;
     }
@@ -502,9 +504,15 @@ pub const ConnectionManager = struct {
             if (!self.cid_map.contains(key)) cid_growth += 1;
         }
 
-        const peer_pool = &entry.conn.peer_cid_pool;
-        const update_resets = entry.reset_pool_gen != peer_pool.generation;
-        var reset_keys: [8]ResetKey = undefined;
+        const peer_generations = [2]u32{
+            entry.conn.peerPathCidGeneration(0),
+            entry.conn.peerPathCidGeneration(1),
+        };
+        const update_resets = if (entry.reset_pool_gens) |previous|
+            !std.mem.eql(u32, &previous, &peer_generations)
+        else
+            true;
+        var reset_keys: [16]ResetKey = undefined;
         const reset_count = if (update_resets) self.resetKeys(entry, &reset_keys) else 0;
         var reset_growth: u32 = 0;
         for (reset_keys[0..reset_count]) |key| {
@@ -537,7 +545,7 @@ pub const ConnectionManager = struct {
             }
             @memcpy(entry.reset_keys[0..reset_count], reset_keys[0..reset_count]);
             entry.reset_key_count = reset_count;
-            entry.reset_pool_gen = peer_pool.generation;
+            entry.reset_pool_gens = peer_generations;
         }
     }
 
@@ -1484,7 +1492,7 @@ test "reset index allocation refusal preserves old tokens and retries the new ge
     const old_token: [16]u8 = @splat(0xe0);
     entry.conn.peer_cid_pool.addPeerCid(0, &.{0xe0}, old_token);
     try mgr.syncCids(entry);
-    const previous_generation = entry.reset_pool_gen;
+    const previous_generation = entry.reset_pool_gens;
     var reset: [stateless_reset.MIN_PACKET_LEN]u8 = @splat(0x41);
     @memcpy(reset[reset.len - old_token.len ..], &old_token);
     try std.testing.expect(mgr.findByResetToken(&reset) == entry);
@@ -1496,7 +1504,7 @@ test "reset index allocation refusal preserves old tokens and retries the new ge
     }
     failing.fail_index = failing.alloc_index;
     try std.testing.expectError(error.OutOfMemory, mgr.syncCids(entry));
-    try std.testing.expectEqual(previous_generation, entry.reset_pool_gen);
+    try std.testing.expectEqual(previous_generation, entry.reset_pool_gens);
     try std.testing.expect(mgr.findByResetToken(&reset) == entry);
 
     failing.fail_index = std.math.maxInt(usize);
@@ -1508,6 +1516,127 @@ test "reset index allocation refusal preserves old tokens and retries the new ge
     }
     try std.testing.expectEqual(
         entry.conn.peer_cid_pool.generation,
-        entry.reset_pool_gen,
+        entry.reset_pool_gens.?[0],
     );
+}
+
+test "path one CID routes share entry identity and retire within bounded route storage" {
+    var entropy = TestRandom.init(29);
+    const random = entropy.random();
+    var mgr = testManager(std.testing.allocator, random);
+    defer mgr.deinit();
+    const entry = try testAcceptedEntry(&mgr, random);
+    const id = entry.id;
+    const initial = entry.initial_dcid.?;
+    const path_zero = CidKey.fromSlice(entry.conn.local_cid_pool.entries[0].getCid());
+
+    // Reuse one path-one slot repeatedly: manager routes bytes, not path-local sequence IDs.
+    for (0..24) |_| {
+        const issued = entry.conn.local_cid_pool.issueNewCid(8, null, random) orelse
+            return error.TestUnexpectedResult;
+        const key = CidKey.fromSlice(issued.getCid());
+        issued.path_id = 1;
+        try mgr.syncCids(entry);
+        try std.testing.expect(mgr.findByDcid(key.getSlice()) == entry);
+        try std.testing.expect(mgr.findByDcid(path_zero.getSlice()) == entry);
+        try std.testing.expectEqual(id, mgr.findByDcid(key.getSlice()).?.id);
+        try std.testing.expectEqual(@as(u8, 3), entry.registered_cid_count);
+        try std.testing.expectEqual(@as(u32, 3), mgr.cid_map.count());
+        issued.occupied = false;
+        issued.retired = true;
+        try mgr.syncCids(entry);
+        try std.testing.expect(mgr.findByDcid(key.getSlice()) == null);
+        try std.testing.expect(mgr.findByDcid(initial.getSlice()) == entry);
+        try std.testing.expectEqual(@as(u8, 2), entry.registered_cid_count);
+    }
+
+    mgr.removeConnection(entry);
+    try std.testing.expectEqual(id, entry.id);
+    try std.testing.expectEqual(@as(usize, 1), mgr.dead_entries.items.len);
+    try std.testing.expectEqual(@as(u32, 0), mgr.cid_map.count());
+    mgr.freeDeadEntries();
+}
+
+test "path one reset generation replacement is atomic on index refusal" {
+    var entropy = TestRandom.init(31);
+    const random = entropy.random();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var mgr = testManager(failing.allocator(), random);
+    defer mgr.deinit();
+    const entry = try testAcceptedEntry(&mgr, random);
+    const transport = try mgr.allocator.create(connection.Connection.PathTransport);
+    transport.* = .{
+        .handler = @import("ack_handler.zig").PacketHandler.init(mgr.allocator),
+    };
+    entry.conn.path1_transport = transport;
+    const old_token: [16]u8 = @splat(0xf0);
+    const old_local = entry.conn.local_cid_pool.issueNewCid(8, null, random) orelse
+        return error.TestUnexpectedResult;
+    old_local.path_id = 1;
+    const old_route = CidKey.fromSlice(old_local.getCid());
+    transport.peer_cids.addPeerCid(0, &.{0xf0}, old_token);
+    try mgr.syncCids(entry);
+    const previous_generations = entry.reset_pool_gens;
+    const path_zero_generation = entry.conn.peer_cid_pool.generation;
+    var reset: [stateless_reset.MIN_PACKET_LEN]u8 = @splat(0x41);
+    @memcpy(reset[reset.len - old_token.len ..], &old_token);
+    try std.testing.expect(mgr.findByResetToken(&reset) == entry);
+
+    old_local.occupied = false;
+    old_local.retired = true;
+    const new_local = entry.conn.local_cid_pool.issueNewCid(8, null, random) orelse
+        return error.TestUnexpectedResult;
+    new_local.path_id = 1;
+    const new_route = CidKey.fromSlice(new_local.getCid());
+    transport.peer_cids.removeBySeq(0);
+    for (0..8) |i| {
+        const byte: u8 = @intCast(i + 1);
+        entry.conn.peer_cid_pool.addPeerCid(i, &.{byte}, @splat(byte));
+        transport.peer_cids.addPeerCid(i + 1, &.{byte + 8}, @splat(byte + 8));
+    }
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, mgr.syncCids(entry));
+    try std.testing.expectEqual(previous_generations, entry.reset_pool_gens);
+    try std.testing.expectEqual(@as(u8, 1), entry.reset_key_count);
+    try std.testing.expect(mgr.findByResetToken(&reset) == entry);
+    try std.testing.expect(mgr.findByDcid(old_route.getSlice()) == entry);
+    try std.testing.expect(mgr.findByDcid(new_route.getSlice()) == null);
+    try std.testing.expectEqual(@as(u8, 3), entry.registered_cid_count);
+    failing.fail_index = std.math.maxInt(usize);
+    try mgr.syncCids(entry);
+    try std.testing.expect(mgr.findByResetToken(&reset) == null);
+    try std.testing.expect(mgr.findByDcid(old_route.getSlice()) == null);
+    try std.testing.expect(mgr.findByDcid(new_route.getSlice()) == entry);
+    try std.testing.expectEqual(@as(u8, 16), entry.reset_key_count);
+    try std.testing.expectEqual(@as(u32, 16), mgr.reset_token_map.count());
+    for (1..17) |i| {
+        @memset(reset[reset.len - 16 ..], @intCast(i));
+        try std.testing.expect(mgr.findByResetToken(&reset) == entry);
+    }
+
+    // Change only path one: its independent generation must trigger reconciliation.
+    const synchronized_zero = entry.reset_pool_gens.?[0];
+    try std.testing.expect(synchronized_zero != path_zero_generation);
+    transport.peer_cids.removeBySeq(1);
+    try mgr.syncCids(entry);
+    try std.testing.expectEqual(synchronized_zero, entry.reset_pool_gens.?[0]);
+    try std.testing.expectEqual(transport.peer_cids.generation, entry.reset_pool_gens.?[1]);
+    @memset(reset[reset.len - 16 ..], 9);
+    try std.testing.expect(mgr.findByResetToken(&reset) == null);
+    transport.peer_cids.addPeerCid(99, &.{0xfe}, @splat(1));
+    try mgr.syncCids(entry);
+    try std.testing.expectEqual(@as(u8, 15), entry.reset_key_count);
+    try std.testing.expectEqual(@as(u32, 15), mgr.reset_token_map.count());
+    @memset(reset[reset.len - 16 ..], 1);
+    try std.testing.expect(mgr.findByResetToken(&reset) == entry);
+    const allocations = failing.alloc_index;
+    try mgr.syncCids(entry);
+    try std.testing.expectEqual(allocations, failing.alloc_index);
+
+    const id = entry.id;
+    mgr.removeConnection(entry);
+    try std.testing.expectEqual(id, entry.id);
+    try std.testing.expectEqual(@as(u32, 0), mgr.reset_token_map.count());
+    try std.testing.expectEqual(@as(usize, 1), mgr.dead_entries.items.len);
+    mgr.freeDeadEntries();
 }

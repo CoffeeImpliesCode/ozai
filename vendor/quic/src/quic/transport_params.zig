@@ -13,6 +13,8 @@ const address = @import("../address.zig");
 
 const packet = @import("packet.zig");
 const protocol = @import("protocol.zig");
+const observed_address = @import("observed_address.zig");
+const native_nat = @import("native_nat.zig");
 
 /// QUIC Transport Parameter IDs (RFC 9000 Section 18.2).
 ///
@@ -42,6 +44,9 @@ pub const ParamId = enum(u64) {
     version_information = 0x11, // RFC 9368
     max_datagram_frame_size = 0x20,
     min_ack_delay = 0xff04de1b, // draft-ietf-quic-ack-frequency (provisional)
+    observed_address = observed_address.transport_parameter_id,
+    initial_max_path_id = 0x3e,
+    n0_nat_traversal = native_nat.transport_parameter_id,
     _,
 };
 
@@ -254,6 +259,12 @@ pub const TransportParams = struct {
     /// the list the peer sent rather than the one in hand.
     version_info_chosen_in_available: bool = false,
 
+    address_discovery_role: observed_address.Role = .disabled,
+    /// Peer capacity is a nonzero raw byte, not a QUIC varint.
+    max_remote_nat_traversal_addresses: ?u8 = null,
+    /// Local advertisement is bounded to path IDs zero and one.
+    initial_max_path_id: ?u32 = null,
+
     /// Check if a version is listed in the peer's available versions.
     ///
     /// Reads only the first `version_info_available_count` entries, so a
@@ -409,6 +420,18 @@ pub const TransportParams = struct {
             try Helper.writeParam(writer, .min_ack_delay, delay);
         }
 
+        if (self.address_discovery_role.transportValue()) |role| {
+            try Helper.writeParam(writer, .observed_address, role);
+        }
+        if (self.initial_max_path_id) |maximum| {
+            if (maximum > 1) return error.TransportParameterError;
+            try Helper.writeParam(writer, .initial_max_path_id, maximum);
+        }
+        if (self.max_remote_nat_traversal_addresses) |capacity| {
+            if (capacity == 0) return error.TransportParameterError;
+            try Helper.writeParamBytes(writer, .n0_nat_traversal, &.{capacity});
+        }
+
         // RFC 9000 §18.1: Transport parameter greasing — send a reserved parameter
         // with ID of form 31*N+27 so peers learn to ignore unknown parameters.
         //
@@ -464,9 +487,8 @@ pub const TransportParams = struct {
     /// parameter ID. Neither error returns a partial value, and those two are
     /// the whole set this signature can return.
     ///
-    /// Unknown IDs — every greased ID of RFC 9000 §18.1 among them — are
-    /// skipped by their declared length, not rejected. A parameter repeated by
-    /// a peer is decoded twice and the last occurrence wins.
+    /// Unknown IDs, including grease, are skipped by their declared length.
+    /// Native extension duplicates fail closed; other fields retain existing behavior.
     pub fn decode(data: []const u8) error{ TransportParameterError, EndOfStream }!TransportParams {
         var params = TransportParams{};
         var fbs = io.fixedBufferStream(data);
@@ -482,6 +504,30 @@ pub const TransportParams = struct {
             const param_start = fbs.seek;
 
             switch (param_id) {
+                @intFromEnum(ParamId.observed_address) => {
+                    if (params.address_discovery_role != .disabled)
+                        return error.TransportParameterError;
+                    params.address_discovery_role = observed_address.Role.decodeTransportValue(
+                        data[fbs.seek..][0..param_len],
+                    ) catch return error.TransportParameterError;
+                    fbs.seek += param_len;
+                },
+                @intFromEnum(ParamId.initial_max_path_id) => {
+                    if (params.initial_max_path_id != null) return error.TransportParameterError;
+                    const maximum = try readParamVarInt(reader, param_len);
+                    if (maximum > std.math.maxInt(u32)) return error.TransportParameterError;
+                    if (param_len != packet.varIntLength(maximum))
+                        return error.TransportParameterError;
+                    params.initial_max_path_id = @intCast(maximum);
+                },
+                @intFromEnum(ParamId.n0_nat_traversal) => {
+                    if (params.max_remote_nat_traversal_addresses != null)
+                        return error.TransportParameterError;
+                    if (param_len != 1) return error.TransportParameterError;
+                    const capacity = try reader.takeByte();
+                    if (capacity == 0) return error.TransportParameterError;
+                    params.max_remote_nat_traversal_addresses = capacity;
+                },
                 @intFromEnum(ParamId.original_destination_connection_id) => {
                     params.original_destination_connection_id = data[fbs.seek..][0..param_len];
                     fbs.seek += param_len;
@@ -1098,4 +1144,64 @@ test "TransportParams: preferred addresses require complete fixed fields and res
             buffer[0 .. length + 2],
         ));
     }
+}
+
+test "Noq native extension parameters source vectors and duplicates" {
+    // Source oracle: transport_parameters.rs encodes NAT capacity as one raw byte.
+    var buffer: [64]u8 = undefined;
+    var writer = io.fixedBufferStream(&buffer);
+    try packet.writeVarInt(&writer, 0x9f81a176);
+    try writer.writeAll(&.{ 1, 2 });
+    try writer.writeAll(&.{ 0x3e, 1, 1 });
+    try packet.writeVarInt(&writer, 0x3d7f91120401);
+    try writer.writeAll(&.{ 1, 255 });
+    const parsed = try TransportParams.decode(writer.buffered());
+    try testing.expectEqual(observed_address.Role.both, parsed.address_discovery_role);
+    try testing.expectEqual(@as(?u32, 1), parsed.initial_max_path_id);
+    try testing.expectEqual(@as(?u8, 255), parsed.max_remote_nat_traversal_addresses);
+    const prefix_len = writer.seek;
+    @memcpy(buffer[prefix_len..][0..prefix_len], buffer[0..prefix_len]);
+    try testing.expectError(error.TransportParameterError,
+        TransportParams.decode(buffer[0 .. prefix_len * 2]));
+    writer.seek = 0;
+    try packet.writeVarInt(&writer, 0x3d7f91120401);
+    try writer.writeAll(&.{ 1, 0 });
+    try testing.expectError(error.TransportParameterError,
+        TransportParams.decode(writer.buffered()));
+}
+
+test "native transport parameters reject malformed lengths and canonicality" {
+    const ids = [_]u64{ 0x9f81a176, 0x3e, 0x3d7f91120401 };
+    for (ids) |id| {
+        var buffer: [32]u8 = undefined;
+        var writer = io.fixedBufferStream(&buffer);
+        try packet.writeVarInt(&writer, id);
+        const start = writer.seek;
+        for ([_][]const u8{ &.{0}, &.{ 2, 0x40, 1 }, &.{ 2, 1, 0 } }) |value| {
+            writer.seek = start;
+            try writer.writeAll(value);
+            try testing.expectError(error.TransportParameterError,
+                TransportParams.decode(writer.buffered()));
+        }
+        writer.seek = start;
+        try writer.writeAll(&.{ 1, 1 });
+        const length = writer.seek;
+        @memcpy(buffer[length..][0..length], buffer[0..length]);
+        try testing.expectError(error.TransportParameterError,
+            TransportParams.decode(buffer[0 .. length * 2]));
+    }
+    try testing.expectError(error.TransportParameterError,
+        TransportParams.decode(&.{ 0x3e, 8, 0xc0, 0, 0, 1, 0, 0, 0, 0 }));
+}
+
+test "native transport parameter fuzz remains bounded and fails closed" {
+    try testing.fuzz({}, fuzzNativeParams, .{});
+}
+
+fn fuzzNativeParams(_: void, smith: *testing.Smith) !void {
+    var input: [128]u8 = undefined;
+    const count = smith.slice(&input);
+    const params = TransportParams.decode(input[0..count]) catch return;
+    if (params.max_remote_nat_traversal_addresses) |capacity| try testing.expect(capacity != 0);
+    if (params.address_discovery_role.transportValue()) |role| try testing.expect(role <= 2);
 }
