@@ -624,7 +624,6 @@ test "egress is the batcher's value, and a burst of one size is one send" {
         conn.openPath(peer_mod.server_addr, client_addr, start, engine.random()),
     );
     try t.expectError(error.InvalidPathId, conn.selectPath(2));
-    try t.expectError(error.NatTraversalNotNegotiated, conn.addTraversalAddress(client_addr));
     try t.expectEqual(before, conn.peer().?);
     try t.expect(conn.pathSnapshot(2) == null);
     try t.expect(conn.observedAddress(0) == null);

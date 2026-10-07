@@ -5,6 +5,7 @@ const Error = @import("node_config.zig").Error;
 const wire = @import("node_gossip_wire.zig");
 const bridge = @import("../transport/quic_bridge.zig");
 const hyparview = @import("../gossip/hyparview.zig");
+const plumtree = @import("../gossip/plumtree.zig");
 const NodeId = @import("../base/key.zig").NodeId;
 
 pub const named_ring = 8;
@@ -27,7 +28,7 @@ pub fn broadcast(
     self: *Node,
     topic: hyparview.TopicId,
     content: []const u8,
-    scope: hyparview.Scope,
+    scope: plumtree.Scope,
     at: bridge.Instant,
 ) Error!void {
     wire.learn(self);

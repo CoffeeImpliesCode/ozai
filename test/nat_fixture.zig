@@ -22,10 +22,10 @@ pub fn main(init: std.process.Init) !void {
     }
     const config = options.parse(args[1..]) catch |err| {
         try std.Io.File.stderr().writeStreamingAll(init.io,
-            "usage: unshare -Urn -- ozai-nat-fixture --zig-peer ABS --rust-peer ABS " ++
-            "--evidence-dir ABS --qad-cert ABS.der --qad-key ABS.pkcs8.der " ++
+            "usage: unshare -Urn -- ozai-nat-fixture --node-peer ABS --rust-relay ABS " ++
+            "--evidence-dir ABS " ++
             "--original-netns 'net:[N]' --original-userns 'user:[N]' " ++
-            "[--zig-role server|client|both] [--for-ms 45000]\n" ++
+            "[--endpoint-a-role server|client|both] [--for-ms 45000]\n" ++
             "Source ~/.local/lib/host-scratch.sh first. Capture your own net/user " ++
             "namespace identities before unshare. Existing evidence directory must be " ++
             "caller-owned, canonical, under /tmp/scratch/.\n");
@@ -47,9 +47,11 @@ pub fn main(init: std.process.Init) !void {
         .user, &namespace_buffer);
     try records.save(init.io, "controller-userns.txt", current_user);
     try records.save(init.io, "supervisor.txt",
-        "Linux caller-owned user+netns; PID keepers; masquerade only; " ++
+        "Linux caller-owned user+netns; PID keepers; conntrack source SNAT only; " ++
+        "UDP 4444 preserves each configured WAN endpoint; no DNAT; translated counters. " ++
         "phase1 exact authenticated peer output gates forwarding. " ++
-        "Zig WAN candidate provenance=configured; Rust real QAD certificate.\n");
+        "Two independent Node/Noq endpoints; stock Rust relay only, QAD disabled. " ++
+        "WAN candidate provenance=configured; actual port-preserving SNAT sources.\n");
     const self = try std.Io.Dir.cwd().realPathFileAlloc(init.io, args[0], init.gpa);
     defer init.gpa.free(self);
     var network = try topology.Topology.init(init.io, init.gpa, self, config.baseline);
@@ -88,4 +90,5 @@ test "keeper invocation without real namespace baselines fails closed" {
 test {
     std.testing.refAllDecls(@import("nat_proof.zig"));
     std.testing.refAllDecls(options);
+    std.testing.refAllDecls(runtime);
 }

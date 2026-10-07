@@ -42,7 +42,7 @@ const Consumer = struct {
         content: []const u8,
     ) void {
         const self: *Consumer = @ptrCast(@alignCast(context.?));
-        if (!std.mem.eql(u8, &topic, &received_topic) or
+        if (!topic.eql(received_topic) or
             !std.mem.eql(u8, &self.expected_peer.toBytes(), &delivered_from.toBytes()))
         {
             self.unexpected = true;
@@ -65,7 +65,6 @@ const Consumer = struct {
 
 comptime {
     std.debug.assert(ack_prefix.len == 16);
-    std.debug.assert(topic.len == 32);
 }
 
 test "actual Node gossip consumer exchanges exact topic and ACK with Rust server" {
@@ -96,7 +95,7 @@ fn exchange(role: Role, wrong_pin: bool) !void {
     const zig_id = zig_secret.nodeId();
     const rust_id = rust_secret.nodeId();
     const expected_hex = rust_peer.hexId(if (wrong_pin) wrong_secret.nodeId() else zig_id);
-    const topic_hex = std.fmt.bytesToHex(topic, .lower);
+    const topic_hex = std.fmt.bytesToHex(topic.toBytes(), .lower);
     const topics_hex = [_][]const u8{&topic_hex};
     var consumer: Consumer = .{ .expected_peer = rust_id };
     var peers: [1]ozai.node.Peer = undefined;
@@ -207,7 +206,7 @@ fn assertProof(
 ) !void {
     const expected = try std.fmt.allocPrint(arena,
         "{s} scope neighbors, topic {s}, sender {s}, payload {x}, received {d}, broadcast {d}",
-        .{ prefix, &std.fmt.bytesToHex(topic, .lower), &rust_peer.hexId(expected_sender),
+        .{ prefix, &std.fmt.bytesToHex(topic.toBytes(), .lower), &rust_peer.hexId(expected_sender),
             payload, payload.len, payload.len });
     const observed = child.line(prefix) orelse child.gaveUp("missing {s}", .{prefix});
     try t.expectEqualStrings(expected, observed);

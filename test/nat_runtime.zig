@@ -5,17 +5,36 @@ const evidence = @import("nat_evidence.zig");
 const options = @import("nat_options.zig");
 const proof = @import("nat_proof.zig");
 
-const zig_pin = "0d7550754e0800a5d237eef5826035766b9b3e5a15868a940ab289958788e3b0";
-const rust_pin = "6d44f939f829d43598bcdedda90de01db69faa50caa33e8c6c328a4b900d4dac";
+const endpoint_a_seed = "5a" ** 32;
+const endpoint_b_seed = "6c" ** 32;
 const message = "ozai-rootless-nat-same-connection";
 const Role = enum { server, client };
+
+test "WAN gate opens only after blocked source NAT probes and no direct frames" {
+    const baseline: topology.Counters = .{ .blocked = 4, .direct = 2, .translated = 6 };
+    try std.testing.expect(!try relayGateReady(baseline, baseline));
+    try std.testing.expect(!try relayGateReady(baseline,
+        .{ .blocked = 5, .direct = 2, .translated = 6 }));
+    try std.testing.expect(!try relayGateReady(baseline,
+        .{ .blocked = 4, .direct = 2, .translated = 7 }));
+    try std.testing.expect(try relayGateReady(baseline,
+        .{ .blocked = 5, .direct = 2, .translated = 7 }));
+    try std.testing.expectError(error.InitialUdpNotBlocked, relayGateReady(baseline,
+        .{ .blocked = 5, .direct = 3, .translated = 7 }));
+}
+
+fn relayGateReady(baseline: topology.Counters, current: topology.Counters) !bool {
+    if (current.direct != baseline.direct) return error.InitialUdpNotBlocked;
+    return current.blocked > baseline.blocked and current.translated > baseline.translated;
+}
 
 pub fn run(io: std.Io, gpa: std.mem.Allocator, config: options.Options,
     network: *topology.Topology, records: *evidence.Evidence, role: Role) !void
 {
-    try network.blockDirect();
     const label = @tagName(role);
-    const baseline = try snapshot(io, gpa, network, records, label, "initial");
+    // Match SecretKey.fromSeed in the Node fixture, not another implementation's pin.
+    const endpoint_a_pin = try seedPin(endpoint_a_seed);
+    const endpoint_b_pin = try seedPin(endpoint_b_seed);
     var output: [3][65536]u8 = undefined;
     var errors: [3][65536]u8 = undefined;
     var children: [3]processes.Process = undefined;
@@ -26,36 +45,45 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, config: options.Options,
             std.log.err("NAT owned-process cleanup/evidence failed: {s}", .{@errorName(err)});
         };
     };
+    // Retain actual post-transition counters before peers and namespaces are reaped.
+    errdefer {
+        if (snapshot(io, gpa, network, records, label, "failed")) |_| {} else |err| {
+            std.log.err("NAT failure topology evidence failed: {s}", .{@errorName(err)});
+        }
+    }
+    try network.blockDirect();
+    const baseline = try snapshot(io, gpa, network, records, label, "initial");
     var duration_buffer: [16]u8 = undefined;
     const duration = try std.fmt.bufPrint(&duration_buffer, "{d}", .{config.duration_ms});
     var relay_duration_buffer: [16]u8 = undefined;
     const relay_duration = try std.fmt.bufPrint(&relay_duration_buffer, "{d}",
         .{config.duration_ms + 5000});
-    try children[0].spawn(io, &.{ config.rust_peer, "--protocol", "relay", "--tls",
+    try children[0].spawn(io, &.{ config.rust_relay, "--protocol", "relay", "--tls",
         "iroh", "--role", "server", "--bind", "0.0.0.0:3340", "--seed-hex",
-        "44" ** 32, "--for", relay_duration, "--relay-qad-bind", "0.0.0.0:3341",
-        "--relay-qad-cert", config.qad_cert, "--relay-qad-key", config.qad_key });
+        "44" ** 32, "--for", relay_duration });
     const deadline = now(io) + @as(i96, config.duration_ms) * std.time.ns_per_ms;
     try ready(io, &children[0],
-        "relay-ready: url http://0.0.0.0:3340/ qad 0.0.0.0:3341\n", deadline);
-    const zig_args = [_][]const u8{ config.zig_peer, "--protocol", "relay-endpoint",
+        "relay-ready: url http://0.0.0.0:3340/ qad disabled\n", deadline);
+    const endpoint_a_args = [_][]const u8{ config.node_peer, "--protocol", "relay-endpoint",
         "--tls", "iroh", "--role", label, "--bind", "10.78.1.2:4444", "--seed-hex",
-        "5a" ** 32, "--expect-peer", rust_pin, "--relay-url", "http://10.77.0.1:3340/",
-        "--message", message, "--for", duration, "--local-candidate", "10.77.0.2:4444" };
-    const rust_args = [_][]const u8{ config.rust_peer, "--protocol", "relay-endpoint",
-        "--tls", "iroh", "--role", if (role == .server) "client" else "server",
-        "--bind", "10.78.2.2:4444", "--seed-hex", "6c" ** 32, "--expect-peer", zig_pin,
+        endpoint_a_seed, "--expect-peer", &endpoint_b_pin,
         "--relay-url", "http://10.77.0.1:3340/", "--message", message, "--for", duration,
-        "--relay-qad-bind", "10.77.0.1:3341", "--relay-qad-cert", config.qad_cert };
+        "--local-candidate", "10.77.0.2:4444" };
+    const endpoint_b_args = [_][]const u8{ config.node_peer, "--protocol", "relay-endpoint",
+        "--tls", "iroh", "--role", if (role == .server) "client" else "server",
+        "--bind", "10.78.2.2:4444", "--seed-hex", endpoint_b_seed,
+        "--expect-peer", &endpoint_a_pin, "--relay-url", "http://10.77.0.1:3340/",
+        "--message", message, "--for", duration, "--local-candidate", "10.77.0.3:4444" };
     const server: usize = if (role == .server) 1 else 2;
     const client: usize = if (role == .server) 2 else 1;
     try spawnPeer(io, &children[server], if (server == 1) network.alice_pid else
-        network.bob_pid, if (server == 1) &zig_args else &rust_args);
-    try ready(io, &children[server], if (server == 1)
-        "relay-endpoint-ready: remote_id " ++ rust_pin ++ "\n" else
-        "relay-endpoint-ready: remote_id " ++ zig_pin ++ "\n", deadline);
+        network.bob_pid, if (server == 1) &endpoint_a_args else &endpoint_b_args);
+    var ready_buffer: [128]u8 = undefined;
+    try ready(io, &children[server], try std.fmt.bufPrint(&ready_buffer,
+        "relay-endpoint-ready: remote_id {s}\n",
+        .{if (server == 1) &endpoint_b_pin else &endpoint_a_pin}), deadline);
     try spawnPeer(io, &children[client], if (client == 1) network.alice_pid else
-        network.bob_pid, if (client == 1) &zig_args else &rust_args);
+        network.bob_pid, if (client == 1) &endpoint_a_args else &endpoint_b_args);
     var scans: [2]proof.Scan = .{ .{}, .{} };
     var opened = false;
     const ticks_max = config.duration_ms / 10 + 2;
@@ -67,7 +95,7 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, config: options.Options,
             if (index == 0 and exited) return error.RelayExitedEarly;
             if (index != 0) {
                 try scans[index - 1].consume(child.stdout(),
-                    if (index == 1) rust_pin else zig_pin, message);
+                    if (index == 1) &endpoint_b_pin else &endpoint_a_pin, message);
                 if (exited) {
                     try child.assertSuccess();
                     if (scans[index - 1].phase2 == null) return error.PeerExitedEarly;
@@ -77,11 +105,17 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, config: options.Options,
         if (!opened and (scans[0].phase2 != null or scans[1].phase2 != null))
             return error.DirectBeforeTransition;
         if (!opened and scans[0].phase1 != null and scans[1].phase1 != null) {
-            const relay_counters = try snapshot(io, gpa, network, records,
-                label, "relay-authenticated");
-            if (relay_counters.direct != baseline.direct) return error.InitialUdpNotBlocked;
-            try network.openDirect();
-            opened = true;
+            // Keep the gate closed until native probes have created source NAT mappings.
+            const relay_evidence = try network.snapshot();
+            defer gpa.free(relay_evidence);
+            const relay_counters = try topology.counters(relay_evidence);
+            if (try relayGateReady(baseline, relay_counters)) {
+                var name_buffer: [128]u8 = undefined;
+                try records.save(io, try std.fmt.bufPrint(&name_buffer,
+                    "{s}-relay-authenticated-topology.txt", .{label}), relay_evidence);
+                try network.openDirect();
+                opened = true;
+            }
         }
         if (scans[0].phase2 != null and scans[1].phase2 != null and
             children[1].term != null and children[2].term != null) {
@@ -89,7 +123,7 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, config: options.Options,
             const counters = try snapshot(io, gpa, network, records,
                 label, "direct-authenticated");
             if (counters.direct <= baseline.direct or
-                counters.masqueraded <= baseline.masqueraded) return error.NoPhysicalForwarding;
+                counters.translated <= baseline.translated) return error.NoPhysicalForwarding;
             try children[1].assertSuccess();
             try children[2].assertSuccess();
             try (scans[0].counts orelse return error.MissingConnectionCounts)
@@ -105,13 +139,14 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, config: options.Options,
             }
             var summary_buffer: [1024]u8 = undefined;
             const summary = try std.fmt.bufPrint(&summary_buffer,
-                "nat-smoke: zig_role {s} zig_stable_id {d} rust_stable_id {d} " ++
-                "zig_pin {s} rust_pin {s} route relay->direct bytes {d} " ++
+                "nat-smoke: endpoint_a_role {s} endpoint_a_stable_id {d} " ++
+                "endpoint_b_stable_id {d} endpoint_a_pin {s} endpoint_b_pin {s} " ++
+                "route relay->direct bytes {d} " ++
                 "payload {s} peer_exits 0,0 relay_owned_exit {s} " ++
-                "blocked_packets {d} direct_packets {d} masqueraded_packets {d}\n",
+                "blocked_packets {d} direct_packets {d} translated_packets {d}\n",
                 .{ label, scans[0].phase1.?.stable_id, scans[1].phase1.?.stable_id,
-                    zig_pin, rust_pin, message.len, message, @tagName(relay_term),
-                    counters.blocked, counters.direct, counters.masqueraded });
+                    endpoint_a_pin, endpoint_b_pin, message.len, message, @tagName(relay_term),
+                    counters.blocked, counters.direct, counters.translated });
             try std.Io.File.stdout().writeStreamingAll(io, children[1].stdout());
             try std.Io.File.stdout().writeStreamingAll(io, children[2].stdout());
             try std.Io.File.stdout().writeStreamingAll(io, summary);
@@ -125,6 +160,27 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, config: options.Options,
         try std.Io.sleep(io, .fromMilliseconds(10), .awake);
     }
     return error.PhaseDeadline;
+}
+
+fn seedPin(seed_hex: []const u8) ![64]u8 {
+    var seed: [32]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&seed, seed_hex);
+    if (bytes.len != seed.len) return error.InvalidSeed;
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    return std.fmt.bytesToHex(&pair.public_key.toBytes(), .lower);
+}
+
+test "Node NAT pins derive from the actual fixture seeds" {
+    try std.testing.expectEqualStrings(
+        "0d7550754e0800a5d237eef5826035766b9b3e5a15868a940ab289958788e3b0",
+        &try seedPin(endpoint_a_seed),
+    );
+    try std.testing.expectEqualStrings(
+        "6d44f939f829d43598bcdedda90de01db69faa50caa33e8c6c328a4b900d4dac",
+        &try seedPin(endpoint_b_seed),
+    );
+    try std.testing.expect(!std.mem.eql(u8,
+        &try seedPin(endpoint_a_seed), &try seedPin(endpoint_b_seed)));
 }
 
 fn spawnPeer(io: std.Io, child: *processes.Process, pid: std.process.Child.Id,

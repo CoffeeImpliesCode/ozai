@@ -129,8 +129,11 @@ Its reachability counts are history, not a current wiring inventory.
   This node has `tshark`, but lacks `docker` and
   `quic-network-simulator`. The matrix still needs a node with that toolchain.
   Four additional relay role routes passed with exact application bytes and peer pins.
-  Mixed Bao/gossip socket exchange and the fresh native NAT run remain unverified.
-  Captured Rust Bao, gossip and Noq codec files do not close those live proof gaps.
+  Live stock Rust/Node gossip passed 7/7 in Debug, including both roles and both wrong-pin rejections.
+  Live Rust/Node Bao passed 5/5 tests over 6/6 steps in Debug.
+  It covers six actual transfers: whole, cross-group range and partial tail in both roles.
+  The fresh native NAT direct-phase proof remains unverified.
+  Captured Noq codec files do not prove live mapping learning or traversal.
   Node-level 0-RTT also remains open.
 - **Willow and docs** stay out of scope, as the plan says.
 

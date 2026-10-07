@@ -484,6 +484,8 @@ fn pumpSide(io: std.Io, peer: *Process, side: *Side, clock: *Clock) !void {
     }
     try take(io, side, clock);
     try peer.pump(io);
+    // The foreign runtime uses host time, not the virtual QUIC clock.
+    try std.Io.sleep(io, .{ .nanoseconds = std.time.ns_per_ms }, .awake);
 }
 
 /// Take a bounded number of socket reads and hand each datagram to the bridge.

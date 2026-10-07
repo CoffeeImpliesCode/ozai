@@ -225,11 +225,12 @@ test "orphan continuation and wrong masking are protocol errors" {
 
 test "close payload rejects truncated status forbidden codes and invalid UTF8 reasons" {
     const malformed = [_][]const u8{
-        &.{ 0x03 }, &.{ 0x03, 0xed }, &.{ 0x03, 0xee }, &.{ 0x03, 0xef },
+        &.{ 0x03 }, &.{ 0x03, 0xec }, &.{ 0x03, 0xed }, &.{ 0x03, 0xee },
         &.{ 0x03, 0xf7 }, &.{ 0x00, 0x01 }, &.{ 0x13, 0x88 },
         &.{ 0x03, 0xe8, 0xff },
     };
     for (malformed) |payload| {
+        // A close error terminates this connection; each payload needs its own session.
         var connection: Session = .{ .stream = undefined };
         const encoded = try ws.encode(&connection.rx, .client,
             .{ .fin = true, .opcode = .close, .key = .{ 1, 2, 3, 4 } }, payload);
@@ -239,8 +240,11 @@ test "close payload rejects truncated status forbidden codes and invalid UTF8 re
     }
 }
 
-test "close permits no status normal status and registered application status" {
-    const valid = [_][]const u8{ "", &.{ 0x03, 0xe8 }, &.{ 0x0b, 0xb8, 'o', 'k' } };
+test "close permits empty payload and valid protocol and application statuses" {
+    const valid = [_][]const u8{
+        // Status 1007 reports invalid data, but is itself a valid close status.
+        "", &.{ 0x03, 0xe8 }, &.{ 0x03, 0xef }, &.{ 0x0b, 0xb8, 'o', 'k' },
+    };
     for (valid) |payload| {
         var connection: Session = .{ .stream = undefined };
         const encoded = try ws.encode(&connection.rx, .client,

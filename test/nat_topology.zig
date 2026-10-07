@@ -13,19 +13,84 @@ test "blocked counter evidence rejects missing and malformed counters" {
     try std.testing.expectError(error.MissingBlockedCounter, blockedPackets("packets 7"));
     try std.testing.expectError(error.InvalidBlockedCounter,
         blockedPackets("counter blocked_peer_udp { packets nope bytes 4 }"));
+    try std.testing.expectError(error.InvalidBlockedCounter, blockedPackets(
+        "counter blocked_peer_udp { packets 7 bytes 4 }\n" ++
+            "counter blocked_peer_udp { packets 8 bytes 4 }"));
 }
 
-test "initial router rules preserve masquerade and reject non relay UDP" {
+test "router rules allow candidate UDP to reach source NAT before the WAN gate" {
+    const sides = [_]struct { subnet: []const u8, public: []const u8, address: []const u8 }{
+        .{ .subnet = "10.78.1.0/24", .public = "10.77.0.2/24", .address = "10.77.0.2" },
+        .{ .subnet = "10.78.2.0/24", .public = "10.77.0.3/24", .address = "10.77.0.3" },
+    };
+    for (sides) |side| {
+        var storage: [4096]u8 = undefined;
+        const rules = try routerRules(&storage, side.subnet, side.public);
+        var expected_storage: [256]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_storage,
+            "ip saddr {s} oifname \"wan\" udp sport 4444 " ++
+                "counter name translated snat ip to {s}:4444\n",
+            .{ side.subnet, side.address });
+        try std.testing.expect(std.mem.indexOf(u8, rules, expected) != null);
+        const relay_snat = try std.fmt.bufPrint(&expected_storage,
+            "ip saddr {s} oifname \"wan\" snat ip to {s}\n",
+            .{ side.subnet, side.address });
+        try std.testing.expect(std.mem.indexOf(u8, rules, relay_snat) != null);
+        try std.testing.expect(std.mem.indexOf(u8, rules, "masquerade") == null);
+        try std.testing.expect(std.mem.indexOf(u8, rules, "dnat") == null);
+        try std.testing.expect(std.mem.indexOf(u8, rules, "tcp dport 3340 accept") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rules, "udp dport 3341 accept") != null);
+        const candidate = try std.fmt.bufPrint(&expected_storage,
+            "iifname \"lan\" oifname \"wan\" ip saddr {s} ip daddr {s} " ++
+                "udp sport 4444 udp dport 4444 accept\n",
+            .{ side.subnet, if (std.mem.eql(u8, side.address, "10.77.0.2"))
+                "10.77.0.3" else "10.77.0.2" });
+        try std.testing.expect(std.mem.indexOf(u8, rules, candidate) != null);
+        try std.testing.expect(std.mem.indexOf(u8, rules, "peer_udp") == null);
+        try std.testing.expect(std.mem.indexOf(u8, rules, "reject") == null);
+        try std.testing.expect(std.mem.indexOf(u8, rules,
+            "ct state established,related accept") != null);
+    }
+}
+
+test "shared bridge gates only reciprocal post SNAT candidate frames" {
+    try std.testing.expect(std.mem.indexOf(u8, bridge_rules, "table bridge ozai_wan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bridge_rules,
+        "type filter hook forward priority 0; policy accept;") != null);
+    for ([_][]const u8{
+        "iifname \"ozwa\" oifname \"ozwb\" ether type ip " ++
+            "ip saddr 10.77.0.2 ip daddr 10.77.0.3 " ++
+            "udp sport 4444 udp dport 4444 jump peer_udp",
+        "iifname \"ozwb\" oifname \"ozwa\" ether type ip " ++
+            "ip saddr 10.77.0.3 ip daddr 10.77.0.2 " ++
+            "udp sport 4444 udp dport 4444 jump peer_udp",
+    }) |candidate| {
+        try std.testing.expect(std.mem.indexOf(u8, bridge_rules, candidate) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, bridge_rules,
+        "counter name blocked_peer_udp drop") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bridge_rules, "reject") == null);
+    try std.testing.expectEqualStrings(
+        "flush chain bridge ozai_wan peer_udp\n" ++
+            "add rule bridge ozai_wan peer_udp counter name direct_peer_udp accept\n",
+        open_gate_rules);
+    try std.testing.expectEqualStrings(
+        "flush chain bridge ozai_wan peer_udp\n" ++
+            "add rule bridge ozai_wan peer_udp counter name blocked_peer_udp drop\n",
+        block_gate_rules);
+}
+
+test "router rules reject mismatched or forged WAN addresses" {
     var storage: [4096]u8 = undefined;
-    const rules = try routerRules(&storage, "10.78.1.0/24");
-    try std.testing.expect(std.mem.indexOf(u8, rules, "masquerade") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rules, "dnat") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rules, "tcp dport 3340 accept") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rules, "udp dport 3341 accept") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rules,
-        "ip daddr != 10.77.0.1 ip saddr != 10.77.0.1 jump peer_udp") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rules,
-        "counter name blocked_peer_udp reject") != null);
+    for ([_][]const u8{ "10.77.0.3/24", "10.77.0.2", "10.77.0.2/16",
+        "10.77.0.2/24\nadd rule inet ozai forward accept" }) |public| {
+        try std.testing.expectError(error.InvalidRouterAddress,
+            routerRules(&storage, "10.78.1.0/24", public));
+    }
+    try std.testing.expectError(error.InvalidRouterAddress,
+        routerRules(&storage, "10.78.2.0/24", "10.77.0.2/24"));
+    try std.testing.expectError(error.InvalidRouterAddress,
+        routerRules(&storage, "10.78.3.0/24", "10.77.0.3/24"));
 }
 
 test "keeper cleanup rejects forced kills and abnormal termination" {
@@ -89,6 +154,7 @@ pub const Topology = struct {
         try topology.ip(null, &.{ "link", "add", "ozwan", "type", "bridge" });
         try topology.ip(null, &.{ "addr", "add", "10.77.0.1/24", "dev", "ozwan" });
         try topology.ip(null, &.{ "link", "set", "ozwan", "up" });
+        try topology.nft(null, bridge_rules);
         try topology.side(0, 2, "ozwa", "10.77.0.2/24",
             "10.78.1.1/24", "10.78.1.2/24", "10.78.1.1", "10.78.1.0/24");
         try topology.side(1, 3, "ozwb", "10.77.0.3/24",
@@ -104,6 +170,8 @@ pub const Topology = struct {
         public: []const u8, gateway: []const u8, private: []const u8,
         route: []const u8, subnet: []const u8) !void
     {
+        var rules: [4096]u8 = undefined;
+        const rendered_rules = try routerRules(&rules, subnet, public);
         var buffer: [32]u8 = undefined;
         const router_pid = try std.fmt.bufPrint(&buffer, "{d}", .{topology.pid(router)});
         try topology.ip(null, &.{ "link", "add", wan, "type", "veth",
@@ -121,8 +189,7 @@ pub const Topology = struct {
         for ([_][]const u8{ "peer", "lo" }) |device|
             try topology.ip(peer, &.{ "link", "set", device, "up" });
         try topology.ip(peer, &.{ "route", "add", "default", "via", route });
-        var rules: [4096]u8 = undefined;
-        try topology.nft(router, try routerRules(&rules, subnet));
+        try topology.nft(router, rendered_rules);
     }
 
     fn ip(topology: *Topology, namespace: ?usize, args: []const []const u8) !void {
@@ -130,28 +197,24 @@ pub const Topology = struct {
         topology.gpa.free(output);
     }
 
-    fn nft(topology: *Topology, namespace: usize, rules: []const u8) !void {
+    fn nft(topology: *Topology, namespace: ?usize, rules: []const u8) !void {
         const output = try topology.command(namespace, "nft", &.{ "-f", "-" }, rules);
         topology.gpa.free(output);
     }
 
-    /// Parent drives this transition only after both authenticated relay proofs.
+    /// Parent opens the post-SNAT gate only after authenticated relay and blocked probe evidence.
     pub fn openDirect(topology: *Topology) !void {
         if (topology.direct_open) return error.DirectAlreadyOpen;
-        for (0..2) |router| try topology.nft(router,
-            "flush chain inet ozai peer_udp\n" ++
-            "add rule inet ozai peer_udp counter name direct_peer_udp accept\n");
+        try topology.nft(null, open_gate_rules);
         topology.direct_open = true;
     }
 
     pub fn blockDirect(topology: *Topology) !void {
-        for (0..2) |router| try topology.nft(router,
-            "flush chain inet ozai peer_udp\n" ++
-            "add rule inet ozai peer_udp counter name blocked_peer_udp reject\n");
+        try topology.nft(null, block_gate_rules);
         topology.direct_open = false;
     }
 
-    /// Caller owns this <=64KiB raw evidence, including all namespace routes.
+    /// Caller owns this <=64KiB raw evidence, including routes and the post-SNAT bridge gate.
     pub fn snapshot(topology: *Topology) ![]u8 {
         var evidence: std.ArrayList(u8) = .empty;
         errdefer evidence.deinit(topology.gpa);
@@ -169,6 +232,11 @@ pub const Topology = struct {
             if (index < 2) {
                 const rules = try topology.command(namespace, "nft",
                     &.{ "list", "table", "inet", "ozai" }, null);
+                defer topology.gpa.free(rules);
+                try appendEvidence(topology.gpa, &evidence, rules);
+            } else if (index == 4) {
+                const rules = try topology.command(null, "nft",
+                    &.{ "list", "table", "bridge", "ozai_wan" }, null);
                 defer topology.gpa.free(rules);
                 try appendEvidence(topology.gpa, &evidence, rules);
             }
@@ -279,33 +347,55 @@ fn appendEvidence(gpa: std.mem.Allocator, evidence: *std.ArrayList(u8), bytes: [
 }
 
 pub fn blockedPackets(text: []const u8) !u64 {
-    const start = std.mem.indexOf(u8, text, "counter blocked_peer_udp") orelse
+    if (std.mem.indexOf(u8, text, "counter blocked_peer_udp {") == null)
         return error.MissingBlockedCounter;
-    const end = std.mem.indexOfScalar(u8, text[start..], '}') orelse
-        return error.InvalidBlockedCounter;
-    var tokens = std.mem.tokenizeAny(u8, text[start..][0..end], " \t\r\n{");
-    while (tokens.next()) |token| {
-        if (std.mem.eql(u8, token, "packets")) {
-            return std.fmt.parseInt(u64, tokens.next() orelse
-                return error.InvalidBlockedCounter, 10) catch error.InvalidBlockedCounter;
-        }
-    }
-    return error.InvalidBlockedCounter;
+    return counter_summary.single(text, "blocked_peer_udp") catch error.InvalidBlockedCounter;
 }
 
-fn routerRules(buffer: []u8, subnet: []const u8) ![]const u8 {
+// Router postrouting has already committed source NAT before these WAN frames arrive.
+const bridge_rules =
+    "table bridge ozai_wan {\n" ++
+    " counter blocked_peer_udp { }\n counter direct_peer_udp { }\n" ++
+    " chain peer_udp {\n counter name blocked_peer_udp drop\n }\n" ++
+    " chain forward { type filter hook forward priority 0; policy accept;\n" ++
+    "  iifname \"ozwa\" oifname \"ozwb\" ether type ip " ++
+    "ip saddr 10.77.0.2 ip daddr 10.77.0.3 " ++
+    "udp sport 4444 udp dport 4444 jump peer_udp\n" ++
+    "  iifname \"ozwb\" oifname \"ozwa\" ether type ip " ++
+    "ip saddr 10.77.0.3 ip daddr 10.77.0.2 " ++
+    "udp sport 4444 udp dport 4444 jump peer_udp\n }\n}\n";
+
+const open_gate_rules =
+    "flush chain bridge ozai_wan peer_udp\n" ++
+    "add rule bridge ozai_wan peer_udp counter name direct_peer_udp accept\n";
+const block_gate_rules =
+    "flush chain bridge ozai_wan peer_udp\n" ++
+    "add rule bridge ozai_wan peer_udp counter name blocked_peer_udp drop\n";
+
+fn routerRules(buffer: []u8, subnet: []const u8, public: []const u8) ![]const u8 {
+    const valid_alice = std.mem.eql(u8, subnet, "10.78.1.0/24") and
+        std.mem.eql(u8, public, "10.77.0.2/24");
+    const valid_bob = std.mem.eql(u8, subnet, "10.78.2.0/24") and
+        std.mem.eql(u8, public, "10.77.0.3/24");
+    if (!valid_alice and !valid_bob) return error.InvalidRouterAddress;
+    const address = public[0 .. public.len - "/24".len];
+    const candidate = if (valid_alice) "10.77.0.3" else "10.77.0.2";
     return std.fmt.bufPrint(buffer,
         "table inet ozai {{\n" ++
-        " counter blocked_peer_udp {{ }}\n counter direct_peer_udp {{ }}\n" ++
-        " counter masqueraded {{ }}\n" ++
-        " chain peer_udp {{\n counter name blocked_peer_udp reject\n }}\n" ++
+        " counter translated {{ }}\n" ++
         " chain forward {{ type filter hook forward priority 0; policy drop;\n" ++
-        "  ip protocol udp ip daddr != 10.77.0.1 ip saddr != 10.77.0.1 jump peer_udp\n" ++
+        // Candidate probes must reach postrouting even while the WAN gate is closed.
+        "  iifname \"lan\" oifname \"wan\" ip saddr {s} ip daddr {s} " ++
+        "udp sport 4444 udp dport 4444 accept\n" ++
         "  ct state established,related accept\n" ++
         "  iifname \"lan\" ip daddr 10.77.0.1 tcp dport 3340 accept\n" ++
         "  iifname \"lan\" ip daddr 10.77.0.1 udp dport 3341 accept\n" ++
         " }}\n" ++
         " chain postrouting {{ type nat hook postrouting priority 100; policy accept;\n" ++
-        "  ip saddr {s} oifname \"wan\" counter name masqueraded masquerade\n }}\n}}\n",
-        .{subnet});
+        // Fix the peer socket's source endpoint across destinations without opening inbound NAT.
+        "  ip saddr {s} oifname \"wan\" udp sport 4444 " ++
+        "counter name translated snat ip to {s}:4444\n" ++
+        // Relay TCP still needs source address translation, but not the UDP port constraint.
+        "  ip saddr {s} oifname \"wan\" snat ip to {s}\n }}\n}}\n",
+        .{ subnet, candidate, subnet, address, subnet, address });
 }

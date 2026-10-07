@@ -2005,7 +2005,7 @@ pub const Connection = struct {
             self.tls13_hs = null;
         }
         self.ack_result.deinit(self.allocator); // its packets are pkt_handler's
-        self.packetHandler().*.deinit();
+        self.pkt_handler.deinit();
         if (self.path1_transport) |other| {
             other.handler.deinit();
             other.retiring_cids.deinit(self.allocator);
@@ -7495,11 +7495,16 @@ test "DatagramQueue: peekDataSkipExpired with no max age" {
 // --- Connection state and method tests ---
 
 fn testConnection(allocator: std.mem.Allocator) Connection {
+    return testConnectionForRole(allocator, true);
+}
+
+/// State-only fixture without TLS; packet and stream roles match the connection.
+fn testConnectionForRole(allocator: std.mem.Allocator, is_server: bool) Connection {
     const dcid_val = "dest1234" ++ ([_]u8{0} ** 12);
     const scid_val = "src12345" ++ ([_]u8{0} ** 12);
     return Connection{
         .allocator = allocator,
-        .is_server = true,
+        .is_server = is_server,
         .dcid = dcid_val.*,
         .dcid_len = 8,
         .scid = scid_val.*,
@@ -7507,10 +7512,10 @@ fn testConnection(allocator: std.mem.Allocator) Connection {
         .version = protocol.SUPPORTED_VERSIONS[0],
         .pkt_handler = ack_handler.PacketHandler.init(allocator),
         .conn_flow_ctrl = flow_control.ConnectionFlowController.init(1048576, 6 * 1024 * 1024),
-        .streams = stream_mod.StreamsMap.init(allocator, true),
+        .streams = stream_mod.StreamsMap.init(allocator, is_server),
         .crypto_streams = crypto_stream.CryptoStreamManager.init(allocator),
         .packer = packet_packer.PacketPacker.init(
-            true,
+            is_server,
             dcid_val[0..8],
             scid_val[0..8],
             protocol.SUPPORTED_VERSIONS[0],
@@ -9133,25 +9138,34 @@ test "NEW_CONNECTION_ID: unacked retirements past twice the limit close the conn
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
     var cid = [_]u8{0xab} ** 8;
+    var token = [_]u8{0} ** 16;
     const limit = conn.local_params.active_connection_id_limit;
     try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 100, .retire_prior_to = 100, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0, rng.random());
     // Late CIDs below Retire Prior To are retired on arrival; a retransmit
     // of one is not retired twice.
     var seq: u64 = 1;
     while (seq < 2 * limit) : (seq += 1) {
-        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0, rng.random());
-        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0, rng.random());
+        std.mem.writeInt(u64, &cid, seq, .big);
+        std.mem.writeInt(u64, token[8..16], seq, .big);
+        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = token } }, .application, 0, rng.random());
+        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = token } }, .application, 0, rng.random());
     }
     try std.testing.expect(conn.local_err == null);
     try std.testing.expectEqual(@as(usize, @intCast(2 * limit)), conn.retiring_cids.items.len);
 
     // An ACK frees a slot.
     conn.onRetireCidAcked(0, 0);
-    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 50, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0, rng.random());
+    std.mem.writeInt(u64, &cid, 50, .big);
+    std.mem.writeInt(u64, token[8..16], 50, .big);
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 50, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = token } }, .application, 0, rng.random());
     try std.testing.expect(conn.local_err == null);
+    try std.testing.expectEqual(@as(usize, @intCast(2 * limit)), conn.retiring_cids.items.len);
 
-    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 51, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0, rng.random()));
+    std.mem.writeInt(u64, &cid, 51, .big);
+    std.mem.writeInt(u64, token[8..16], 51, .big);
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 51, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = token } }, .application, 0, rng.random()));
     try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.connection_id_limit_error)), conn.local_err.?.code);
+    try std.testing.expectEqual(State.closing, conn.state);
 }
 
 test "connection flow control: the window bounds the sum over streams" {
@@ -9629,11 +9643,13 @@ test "native path packet numbers and source decoded ACK route independently" {
     try std.testing.expectEqual(@as(u8, 0), conn.transport_path);
     conn.receive_path = 1;
     conn.activateTransport(1);
-    const ordinary = try Frame.parse(&.{ 0x02, 0, 0, 0, 0 });
+    var ordinary_bytes = [_]u8{ 0x02, 0, 0, 0, 0 };
+    const ordinary = try Frame.parse(&ordinary_bytes);
     try conn.processFrame(&ordinary, .application, 100_001, random.random());
     try std.testing.expectEqual(@as(usize, 0), conn.pkt_handler.sent[2].sent_packets.count());
     try std.testing.expectEqual(@as(u8, 1), conn.transport_path);
-    const ordinary_ecn = try Frame.parse(&.{ 0x03, 0, 0, 0, 0, 0, 0, 0 });
+    var ordinary_ecn_bytes = [_]u8{ 0x03, 0, 0, 0, 0, 0, 0, 0 };
+    const ordinary_ecn = try Frame.parse(&ordinary_ecn_bytes);
     try conn.processFrame(&ordinary_ecn, .application, 100_002, random.random());
     conn.activateTransport(0);
 }
@@ -9641,9 +9657,9 @@ test "native path packet numbers and source decoded ACK route independently" {
 test "native path CID duplicate changes and unvalidated selection are rejected" {
     var cid_bytes: [8]u8 = "native01".*;
     var changed_cid_bytes: [8]u8 = "native02".*;
-    var conn = testConnection(std.testing.allocator);
+    var conn = testConnectionForRole(std.testing.allocator, false);
     defer conn.deinit();
-    conn.is_server = false;
+    conn.state = .connected;
     conn.local_params.initial_max_path_id = 1;
     conn.peer_params = .{ .initial_max_path_id = 8 };
     conn.handshake_confirmed = true;
@@ -9655,16 +9671,19 @@ test "native path CID duplicate changes and unvalidated selection are rejected" 
         },
     } };
     try conn.processFrame(&cid, .application, 0, random.random());
-    var changed = cid;
-    changed.path_new_connection_id.cid.conn_id = changed_cid_bytes[0..];
-    try std.testing.expectError(error.ProtocolViolation,
-        conn.processFrame(&changed, .application, 0, random.random()));
     const local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1234);
     const peer = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 5678);
     const id = try conn.openPath(local, peer, 0, random.random());
     try std.testing.expectError(error.PathNotValidated, conn.selectPath(id));
     try std.testing.expectEqual(@as(u8, 0), conn.active_path_idx);
     try std.testing.expectError(error.AlreadyOpen, conn.openPath(local, peer, 1, random.random()));
+    var changed = cid;
+    changed.path_new_connection_id.cid.conn_id = changed_cid_bytes[0..];
+    try std.testing.expectError(error.ProtocolViolation,
+        conn.processFrame(&changed, .application, 0, random.random()));
+    try std.testing.expectEqual(State.closing, conn.state);
+    try std.testing.expectEqual(@as(u64, 0x0a), conn.local_err.?.code);
+    try std.testing.expectError(error.ClosedPath, conn.openPath(local, peer, 2, random.random()));
 }
 
 test "native NAT probe offer commits only real packet and preserves primary route" {
@@ -9892,17 +9911,33 @@ test "shared key retention PTO includes slow active path but excludes abandoned"
 }
 
 test "native queued challenge retry is not consumed by timeout" {
-    var conn = testConnection(std.testing.allocator);
+    var conn = testConnectionForRole(std.testing.allocator, false);
     defer conn.deinit();
+    conn.state = .connected;
+    conn.handshake_confirmed = true;
     conn.local_params.initial_max_path_id = 1;
     conn.peer_params = .{ .initial_max_path_id = 1 };
-    conn.native_paths.entries[1].opened = true;
     var random = std.Random.DefaultPrng.init(93);
-    try conn.probePath(1, 0, random.random());
+    var cid_bytes: [8]u8 = "retrycid".*;
+    const cid: Frame = .{ .path_new_connection_id = .{ .path_id = 1, .cid = .{
+        .seq_num = 0, .retire_prior_to = 0, .conn_id = &cid_bytes,
+        .stateless_reset_token = .{9} ** 16,
+    } } };
+    try conn.processFrame(&cid, .application, 0, random.random());
+    const local = address.Address.initIpv4(.{127, 0, 0, 1}, 1234);
+    const peer = address.Address.initIpv4(.{127, 0, 0, 1}, 5678);
+    try std.testing.expectEqual(@as(u8, 1), try conn.openPath(local, peer, 0, random.random()));
     const before = conn.paths[1].validator.retries;
     conn.activateTransport(1);
-    try conn.onPathTimeout(1, random.random());
+    const pto = conn.packetHandler().*.rtt_stats.pto();
+    const timeout_at = pto + 1;
+    try std.testing.expect(conn.paths[1].validator.needsRetry(timeout_at, pto));
+    const queued = conn.path_control[1].len;
+    try conn.onPathTimeout(timeout_at, random.random());
     try std.testing.expectEqual(before, conn.paths[1].validator.retries);
+    try std.testing.expectEqual(PathValidationState.pending, conn.paths[1].validator.state);
+    try std.testing.expect(conn.challenge_queued[1]);
+    try std.testing.expectEqual(queued, conn.path_control[1].len);
 }
 
 test "native path zero CID conflicts and current CID retirement close" {
@@ -10038,9 +10073,8 @@ test "native wrong-side NAT and forbidden observed reports close transport" {
 }
 
 test "authenticated pure NAT probe preserves virtual route but nonprobing packet migrates" {
-    var receiver = testConnection(std.testing.allocator);
+    var receiver = testConnectionForRole(std.testing.allocator, false);
     defer receiver.deinit();
-    receiver.is_server = false;
     receiver.state = .connected;
     receiver.handshake_confirmed = true;
     receiver.local_params.initial_max_path_id = 1;
@@ -10053,17 +10087,18 @@ test "authenticated pure NAT probe preserves virtual route but nonprobing packet
     const relay = address.Address.initIpv4(.{127, 0, 0, 1}, 2000);
     const direct = address.Address.initIpv4(.{127, 0, 0, 1}, 3000);
     receiver.paths[0] = NetworkPath.init(local, relay, true);
+    receiver.paths[0].is_validated = true;
     receiver.path_initialized = true;
     const receiver_keys = try quic_crypto.deriveInitialKeyMaterial("offpath-receive", receiver.version, false);
     receiver.installAppKeys(receiver_keys[0], receiver_keys[1]);
-    var sender = testConnection(std.testing.allocator);
+    var sender = testConnectionForRole(std.testing.allocator, true);
     defer sender.deinit();
-    sender.is_server = true;
     sender.state = .connected;
     sender.handshake_confirmed = true;
     sender.local_params.initial_max_path_id = 1;
     sender.peer_params = .{ .initial_max_path_id = 1 };
     sender.paths[0] = NetworkPath.init(direct, local, true);
+    sender.paths[0].is_validated = true;
     sender.path_initialized = true;
     const sender_keys = try quic_crypto.deriveInitialKeyMaterial("offpath-receive", sender.version, true);
     sender.installAppKeys(sender_keys[0], sender_keys[1]);
@@ -10072,21 +10107,62 @@ test "authenticated pure NAT probe preserves virtual route but nonprobing packet
     var wire: [1500]u8 = undefined;
     const probe_length = try sender.packer.packOffPath(&wire, &sender.pkt_handler,
         sender.appSeal().?, .{ .challenge = .{1} ** 8 }, random.random());
+    // Inspect a copy: decryption mutates the packet, while recv must consume
+    // the original ciphertext with its own packet-number state.
+    var inspected_wire: [1500]u8 = undefined;
+    @memcpy(inspected_wire[0..probe_length], wire[0..probe_length]);
+    var inspect_space: packet.PacketNumSpace = .{
+        .crypto_open = receiver_keys[0], .crypto_seal = receiver_keys[1],
+    };
+    var inspect_reader = io.fixedBufferStream(inspected_wire[0..probe_length]);
+    var inspect_header = try packet.Header.parse(&inspect_reader, sender.packer.dcid_len);
+    var remaining = try packet.decrypt(&inspect_header, &inspect_reader, &inspect_space);
+    const probe_pn = inspect_header.packet_number;
+    var found_challenge = false;
+    while (remaining.len > 0) {
+        var consumed: usize = undefined;
+        const frame = try Frame.parseSized(remaining, &consumed);
+        try std.testing.expect(consumed > 0);
+        try std.testing.expect(frame.isProbing());
+        if (frame == .path_challenge) {
+            try std.testing.expectEqualSlices(u8, &([_]u8{1} ** 8), &frame.path_challenge);
+            found_challenge = true;
+        }
+        remaining = remaining[consumed..];
+    }
+    try std.testing.expect(found_challenge);
     var probe_reader = io.fixedBufferStream(wire[0..probe_length]);
     var probe_header = try packet.Header.parse(&probe_reader, sender.packer.dcid_len);
     try receiver.recv(&probe_header, &probe_reader,
         .{ .from = direct, .to = local, .datagram_size = probe_length }, 1, random.random());
     try std.testing.expect(receiver.paths[0].peer_addr.eql(relay));
     try std.testing.expectEqual(@as(u64, 0), receiver.paths[0].bytes_received);
+    try std.testing.expect(receiver.paths[0].is_validated);
     try std.testing.expect(receiver.nat_reply != null);
-    try std.testing.expect(receiver.pkt_handler.recv[2].largest_received != null);
+    try std.testing.expectEqual(@as(?u64, probe_pn), receiver.pkt_handler.recv[2].largest_received);
     sender.pending_frames.push(.{ .ping = {} });
     const length = try sender.sendAt(&wire, 2, random.random());
     try std.testing.expect(length > 0);
+    @memcpy(inspected_wire[0..length], wire[0..length]);
+    inspect_reader = io.fixedBufferStream(inspected_wire[0..length]);
+    inspect_header = try packet.Header.parse(&inspect_reader, sender.packer.dcid_len);
+    remaining = try packet.decrypt(&inspect_header, &inspect_reader, &inspect_space);
+    try std.testing.expect(inspect_header.packet_number > probe_pn);
+    const ping_pn = inspect_header.packet_number;
+    var found_ping = false;
+    while (remaining.len > 0) {
+        var consumed: usize = undefined;
+        const frame = try Frame.parseSized(remaining, &consumed);
+        try std.testing.expect(consumed > 0);
+        if (frame == .ping) found_ping = true;
+        remaining = remaining[consumed..];
+    }
+    try std.testing.expect(found_ping);
     var reader = io.fixedBufferStream(wire[0..length]);
     var header = try packet.Header.parse(&reader, sender.packer.dcid_len);
     try receiver.recv(&header, &reader,
         .{ .from = direct, .to = local, .datagram_size = length }, 2, random.random());
+    try std.testing.expectEqual(@as(?u64, ping_pn), receiver.pkt_handler.recv[2].largest_received);
     try std.testing.expect(receiver.paths[0].peer_addr.eql(direct));
     try std.testing.expect(!receiver.paths[0].is_validated);
     try std.testing.expect(receiver.paths[0].bytes_received > 0);
@@ -10299,10 +10375,8 @@ test "lifted physical policy omits virtual observed report but emits configured 
             return candidate.eql(address.Address.initIpv4(.{203, 0, 113, 7}, 2000));
         }
     };
-    var conn = testConnection(std.testing.allocator);
+    var conn = testConnectionForRole(std.testing.allocator, false);
     defer conn.deinit();
-    conn.is_server = false;
-    conn.packer.is_server = false;
     conn.state = .connected;
     conn.handshake_confirmed = true;
     conn.local_params.address_discovery_role = .send_only;
@@ -10318,26 +10392,49 @@ test "lifted physical policy omits virtual observed report but emits configured 
     conn.installAppKeys(keys[0], keys[1]);
     var random = std.Random.DefaultPrng.init(103);
     var wire: [1500]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 0), try conn.sendAt(&wire, 0, random.random()));
-    try std.testing.expectEqual(@as(usize, 0), conn.path_control[0].len);
+    const peer_keys = try quic_crypto.deriveInitialKeyMaterial("observed-physical", conn.version, true);
+    var space: packet.PacketNumSpace = .{ .crypto_open = peer_keys[0], .crypto_seal = peer_keys[1] };
+    const virtual_length = try conn.sendAt(&wire, 0, random.random());
+    try std.testing.expect(virtual_length > 0);
+    var virtual_reader = io.fixedBufferStream(wire[0..virtual_length]);
+    var virtual_header = try packet.Header.parse(&virtual_reader, 8);
+    var remaining = try packet.decrypt(&virtual_header, &virtual_reader, &space);
+    while (remaining.len > 0) {
+        var consumed: usize = undefined;
+        const frame = try Frame.parseSized(remaining, &consumed);
+        try std.testing.expect(consumed > 0);
+        try std.testing.expect(frame != .observed_address);
+        remaining = remaining[consumed..];
+    }
+    var sent_packets = conn.pkt_handler.sent[2].sent_packets.iterator();
+    while (sent_packets.next()) |entry| {
+        for (entry.value_ptr.*.getControlFrames()) |control| {
+            try std.testing.expect(control != .observed_address);
+        }
+    }
     try std.testing.expect(conn.observed_queued[0] == null);
     try std.testing.expectEqual(@as(u64, 0), conn.observed_next_sequence);
-    try std.testing.expectEqual(@as(u64, 0), conn.pkt_handler.next_pn[2]);
     try std.testing.expect(conn.paths[0].peer_addr.eql(virtual));
     conn.paths[0].peer_addr = wan;
     const length = try conn.sendAt(&wire, 1, random.random());
     try std.testing.expect(length > 0);
-    const peer_keys = try quic_crypto.deriveInitialKeyMaterial("observed-physical", conn.version, true);
-    var space: packet.PacketNumSpace = .{ .crypto_open = peer_keys[0], .crypto_seal = peer_keys[1] };
     var reader = io.fixedBufferStream(wire[0..length]);
     var header = try packet.Header.parse(&reader, 8);
-    const payload = try packet.decrypt(&header, &reader, &space);
-    const report = (try Frame.parse(payload)).observed_address;
-    try std.testing.expect(report.address.eql(wan));
-    try std.testing.expectEqual(@as(u64, 0), report.sequence);
+    remaining = try packet.decrypt(&header, &reader, &space);
+    var found_report = false;
+    while (remaining.len > 0) {
+        var consumed: usize = undefined;
+        const frame = try Frame.parseSized(remaining, &consumed);
+        try std.testing.expect(consumed > 0);
+        if (frame == .observed_address) {
+            try std.testing.expect(frame.observed_address.address.eql(wan));
+            try std.testing.expectEqual(@as(u64, 0), frame.observed_address.sequence);
+            found_report = true;
+        }
+        remaining = remaining[consumed..];
+    }
+    try std.testing.expect(found_report);
     try std.testing.expectEqual(@as(u64, 1), conn.observed_next_sequence);
-    try std.testing.expectEqual(observed.Role.send_only, conn.observedRoles().local);
-    try std.testing.expectEqual(observed.Role.receive_only, conn.observedRoles().peer);
 }
 
 test "native retirement ACK and ACK_ECN release only matching path credit repeatedly" {
@@ -10690,5 +10787,23 @@ test "ordered CE feedback for already in-flight packet does not restart native p
         try std.testing.expectEqual(recovery_window, cc.congestion_window);
         try std.testing.expectEqual(recovery_start, cc.congestion_recovery_start_time);
         try std.testing.expectEqual(cubic_epoch, cc.epoch_start);
+    }
+}
+
+test "native teardown releases both owned packet handlers regardless of active transport" {
+    var random = std.Random.DefaultPrng.init(109);
+    for ([_]u8{0, 1}) |active| {
+        var conn = testConnectionForRole(std.testing.allocator, false);
+        defer conn.deinit();
+        const other = try conn.ensurePathTransport();
+        for ([_]*ack_handler.PacketHandler{&conn.pkt_handler, &other.handler}) |handler| {
+            const pn = handler.nextPacketNumber(.application, random.random());
+            try handler.onPacketSent(.{
+                .pn = pn, .time_sent = 1, .size = 100, .enc_level = .application,
+                .ack_eliciting = true, .in_flight = true,
+            });
+            try std.testing.expectEqual(@as(usize, 1), handler.sent[2].sent_packets.count());
+        }
+        conn.activateTransport(active);
     }
 }

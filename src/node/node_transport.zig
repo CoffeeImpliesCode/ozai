@@ -316,17 +316,40 @@ test "carrier sender preserves every GSO segment and short tail under authentica
             .address = server.address, .host = "localhost", .secret = first_secret,
         } },
     }, 75);
-    defer first.deinit();
+    defer {
+        defer first.deinit();
+        first.close(t.io, 0, first.generator()) catch |err|
+            std.debug.panic("node close failed during test teardown: {t}", .{err});
+    }
     const second = try Node.create(t.allocator, t.io, .{
         .secret = second_secret,
         .relay = .{ .client = .{
             .address = server.address, .host = "localhost", .secret = second_secret,
         } },
     }, 76);
-    defer second.deinit();
+    defer {
+        defer second.deinit();
+        second.close(t.io, 0, second.generator()) catch |err|
+            std.debug.panic("node close failed during test teardown: {t}", .{err});
+    }
     const address = try first.map.get(t.allocator,
         .{ .any_path = second.nodeId() }, first.generator());
     const target = base_ula.socketAddrFor(.any_path, addr_map.hostBitsOf(address));
+    // A ready sender does not imply a registered destination. Real TCP also needs
+    // time for kernel delivery and delayed ACKs; a zero-time poll count is not a deadline.
+    // Only this socket fixture yields: the node's protocol clock remains explicitly zero.
+    for (0..256) |_| {
+        try server.poll(t.io);
+        try first.relay_runtime.poll(t.io);
+        while (try first.relay_runtime.receive()) |_| {}
+        try second.relay_runtime.poll(t.io);
+        while (try second.relay_runtime.receive()) |_| {}
+        if (first.relay_runtime.client.?.isReady() and
+            second.relay_runtime.client.?.isReady()) break;
+        try std.Io.sleep(t.io, .fromMilliseconds(1), .awake);
+    }
+    try t.expect(first.relay_runtime.client.?.isReady());
+    try t.expect(second.relay_runtime.client.?.isReady());
     try send(first, t.io, target, try batch.Send.batch("abcdefgh", 3, null));
     const expected = [_][]const u8{ "abc", "def", "gh" };
     var received: usize = 0;
@@ -342,11 +365,10 @@ test "carrier sender preserves every GSO segment and short tail under authentica
             received += 1;
         }
         if (received == expected.len) break;
+        try std.Io.sleep(t.io, .fromMilliseconds(1), .awake);
     }
     try t.expectEqual(expected.len, received);
     try t.expectEqual(@as(u64, 3), first.stats.datagrams_out);
-    try first.close(t.io, 0, first.generator());
-    try second.close(t.io, 0, second.generator());
 }
 
 test "carrier claimed origin is not an authenticated TLS identity" {

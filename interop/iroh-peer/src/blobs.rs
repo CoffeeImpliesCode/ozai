@@ -119,9 +119,12 @@ async fn provide(
                 RequestUpdate::Completed(event) => {
                     ensure!(started, "provider completed without a transfer start");
                     counters.blob_sent_bytes += event.stats.payload_bytes_sent + event.stats.other_bytes_sent;
-                    counters.blob_received_bytes += event.stats.other_bytes_read;
+                    // Pinned Request::read_async consumes one read_u8 discriminant before
+                    // returning the GET body length counted by StreamPair::read_request.
+                    let request_wire_bytes = event.stats.other_bytes_read + 1;
+                    counters.blob_received_bytes += request_wire_bytes;
                     println!("blob provided hash {hash} size {size} payload_sent {} proof_sent {} request_read {}",
-                        event.stats.payload_bytes_sent, event.stats.other_bytes_sent, event.stats.other_bytes_read);
+                        event.stats.payload_bytes_sent, event.stats.other_bytes_sent, request_wire_bytes);
                     counters.print()?;
                     connection.closed().await;
                     return Ok(());

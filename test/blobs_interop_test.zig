@@ -100,7 +100,7 @@ fn runCase(direction: Direction, case: Case) !void {
             .run_ms = deadline_ms,
             .peers = &.{peer},
             .extra = &.{
-                "--blob-role", "getter", "--blob-dir", directory,
+                "--blob-role", "getter",
                 "--blob-hash", &hash, "--blob-size", "49189",
                 "--blob-range", case.range, "--blob-output", output,
             },
@@ -129,11 +129,12 @@ fn runCase(direction: Direction, case: Case) !void {
     }
     try awaitSummary(node, rust, direction, summary);
     if (direction == .rust_provider) {
+        const expected = data[case.start..case.end];
         const downloaded = try temporary.dir.readFileAlloc(
-            t.io, "download.bin", t.allocator, .limited(49_189),
+            t.io, "download.bin", t.allocator, .limited(expected.len + 1),
         );
         defer t.allocator.free(downloaded);
-        try t.expectEqualSlices(u8, data[case.start..case.end], downloaded);
+        try t.expectEqualSlices(u8, expected, downloaded);
     }
     try node.stop();
     try awaitFinished(node, rust);

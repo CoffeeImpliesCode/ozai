@@ -77,8 +77,9 @@ fn runNode(
     defer releaseStream(node, stable_id, stream_id);
     for (0..options.run_ms * 100) |_| {
         const now_ns = std.Io.Clock.awake.now(init.io).nanoseconds;
-        if (now_ns - start_ns >= @as(i128, options.run_ms) * std.time.ns_per_ms)
+        if (now_ns - start_ns >= @as(i128, options.run_ms) * std.time.ns_per_ms) {
             return error.DeadlineExceeded;
+        }
         const now: bridge.Instant = @intCast(now_ns);
         const moved = try node.step(init.io, now, random);
         var connection: ?bridge.Conn = null;

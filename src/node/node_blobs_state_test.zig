@@ -18,12 +18,16 @@ const Fixture = struct {
     map: addr_map.MappedAddrs,
 
     fn init(self: *Fixture) !void {
+        try self.initAllocator(t.allocator);
+    }
+
+    fn initAllocator(self: *Fixture, gpa: std.mem.Allocator) !void {
         var server_secret = try key.SecretKey.fromSeed(peer.server_seed);
         defer server_secret.deinit();
         var client_secret = try key.SecretKey.fromSeed(peer.client_seed);
         defer client_secret.deinit();
         var engine = peer.Prng.init(917);
-        self.bridge = try bridge_mod.Bridge.create(t.allocator, t.io, .{
+        self.bridge = try bridge_mod.Bridge.create(gpa, t.io, .{
             .secret = server_secret,
             .alpn = protocol.alpn,
         }, engine.random());
@@ -194,26 +198,84 @@ test "blob provider handles more than sixteen streams and prunes disconnected st
     try t.expectEqual(@as(usize, 0), state.transfers.items.len);
 }
 
-// A native sorter copy-out allocation failure is not an empty receive queue.
-test "blob getter propagates receive copy out OOM instead of decoding EOF" {
+test "blob getter propagates allocation failure until verified completion" {
+    for (0..64) |fail_index| {
+        var failing = t.FailingAllocator.init(t.allocator, .{});
+        getterAllocationBoundary(&failing, fail_index) catch |err| {
+            try t.expectEqual(error.OutOfMemory, err);
+            try t.expect(failing.has_induced_failure);
+            try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            continue;
+        };
+        try t.expect(!failing.has_induced_failure);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn getterAllocationBoundary(failing: *t.FailingAllocator, fail_index: usize) !void {
+    const gpa = failing.allocator();
     var fixture: Fixture = undefined;
-    try fixture.init();
+    try fixture.initAllocator(gpa);
     defer fixture.deinit();
-    var state: blobs.State = .init(.{ .getter = .{ .hash = @splat(0) } });
-    defer state.deinit(t.allocator);
-    try t.expect(try state.drive(t.allocator, t.io, fixture.bridge));
+    const data = try t.allocator.alloc(u8, 49189);
+    defer t.allocator.free(data);
+    for (data, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    const tree = bao.BaoTree.init(data.len);
+    const hash = try tree.rootHash(data);
+    const outboard = try t.allocator.alloc(u8, @intCast(bao.bytes(tree)));
+    defer t.allocator.free(outboard);
+    const written = try bao.encode(tree, data, outboard);
+    var tmp = try @import("test_scratch").tmpDir(.{});
+    defer tmp.cleanup();
+    var names: store.NameStorage = undefined;
+    const paths = store.names(&names, hash);
+    {
+        const partial = try store.createPartial(t.io, tmp.dir, paths);
+        defer partial.close(t.io);
+        try partial.data.writeStreamingAll(t.io, data);
+        try partial.outboard.writeStreamingAll(t.io, outboard[0..written]);
+    }
+    try store.commit(t.io, tmp.dir, paths);
+    var scratch: [16384]u8 = undefined;
+    const provider = try provider_mod.Provider.init(tmp.dir, &names, hash, &scratch);
+    var response: std.Io.Writer.Allocating = .init(t.allocator);
+    defer response.deinit();
+    try t.expectEqual(.answered, try provider.answer(
+        t.io, &response.writer, protocol.GetRequest.blob(hash),
+    ));
+    var state: blobs.State = .init(.{ .getter = .{ .hash = hash, .size = data.len } });
+    defer state.deinit(gpa);
+    try t.expect(try state.drive(gpa, t.io, fixture.bridge));
     const conn = fixture.bridge.connectionAt(0).?;
-    const core = conn.entry.conn.streams.streams.get(1).?;
-    try core.recv.handleStreamFrame(0, "x", false);
-    try core.recv.handleStreamFrame(1, "y", true);
-    try state.transfers.items[0].bytes.ensureUnusedCapacity(t.allocator, 2);
-    var refusing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
-    core.recv.sorter.allocator = refusing.allocator();
-    defer core.recv.sorter.allocator = t.allocator;
-    try t.expectError(error.OutOfMemory, state.drive(t.allocator, t.io, fixture.bridge));
-    try t.expect(core.recv.peekLen() != null);
-    try t.expectEqual(@as(u64, 0), state.completed);
-    try t.expect(state.payload(conn.id()) == null);
+    const stream = state.transfers.items[0].stream.?;
+    try stream.pin();
+    defer stream.unpin();
+    const core = conn.entry.conn.streams.streams.get(stream.id()).?;
+    const wire = response.written();
+    core.recv.receive_window = wire.len;
+    try core.recv.handleStreamFrame(0, wire, true);
+    // Arm only after the real response is queued; transport setup is not the boundary.
+    failing.fail_index = failing.alloc_index + fail_index;
+    for (0..4) |_| {
+        _ = state.drive(gpa, t.io, fixture.bridge) catch |err| {
+            try t.expectEqual(error.OutOfMemory, err);
+            try t.expectEqual(@as(u64, 0), state.completed);
+            try t.expect(state.payload(conn.id()) == null);
+            try t.expectEqual(state.transfers.items[0].bytes.items.len, state.received_bytes);
+            if (state.transfers.items[0].bytes.items.len == 0) {
+                try t.expect(core.recv.peekLen() != null);
+                try t.expectEqual(@as(u64, 0), core.recv.bytes_read);
+            }
+            return err;
+        };
+        if (state.completed != 0) break;
+    }
+    try t.expectEqual(@as(u64, 1), state.completed);
+    try t.expectEqual(wire.len, state.received_bytes);
+    try t.expectEqualSlices(u8, data, state.payload(conn.id()).?);
+    try t.expect(!try state.drive(gpa, t.io, fixture.bridge));
 }
 
 // An interrupted getter owns no export, so removing its connection must release accumulation.

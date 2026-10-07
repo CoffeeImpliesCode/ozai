@@ -2004,7 +2004,7 @@ test "KeyUpdateManager local rotation waits for peer acknowledgment and prior ke
     );
     const path_zero_pto_ns: i64 = 100;
     const path_one_pto_ns: i64 = 500;
-    const max_active_pto_ns = @max(path_zero_pto_ns, path_one_pto_ns);
+    const max_active_pto_ns: i64 = @max(path_zero_pto_ns, path_one_pto_ns);
     manager.onPeerKeyUpdate(1000, max_active_pto_ns);
     manager.first_acked_with_current = true;
     try std.testing.expect(!manager.canUpdate());

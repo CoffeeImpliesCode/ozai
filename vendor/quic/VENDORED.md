@@ -829,7 +829,8 @@ Retired IDs retain their slots. Eight historical project address pairs do not ex
 and `test/native_multipath_upstream_oracle.rs` capture pinned Noq private codec output.
 The actual generator captures produced 19-byte observed-address, 43-byte NAT and 24-byte multipath files.
 `src/net/native_oracle_test.zig` is the Zig fixture consumer.
-The current handover has not run that consumer against the fresh captures.
+The fresh Zig consumer passed 9/9: three actual codec cases and six collectors.
+It compares observed-address roles and varint widths, NAT frames and capacity, and ten multipath variants plus the MaxPath TLV.
 Captured files prove encoder/decoder bytes, not live mapping learning or a successful NAT round.
 
 ### 11. Retry policy before connection allocation

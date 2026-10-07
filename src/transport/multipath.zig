@@ -584,7 +584,6 @@ const client_addr = peer_mod.client_addr;
 const server_addr = peer_mod.server_addr;
 const start = peer_mod.start;
 const Prng = peer_mod.Prng;
-const max_datagram = peer_mod.max_datagram;
 const Client = peer_mod.Client;
 const exchange = peer_mod.exchange;
 
@@ -672,34 +671,6 @@ const Rig = struct {
         return self.bridge.connectionAt(0) orelse error.TestUnexpectedResult;
     }
 
-    /// Hand the client one 1-RTT datagram claiming to have come from `from`.
-    ///
-    /// The bytes are the client's own and the core decrypts them the same way it
-    /// decrypts any other — the addresses are not part of packet protection — so
-    /// the only thing this call changes is what the core believes about where
-    /// they came from. An address the connection has never heard of is exactly
-    /// what RFC 9000 §9 migration is.
-    fn clientSaysFrom(self: *Rig, from: SocketAddr) !void {
-        var scratch: [2 * max_datagram]u8 = undefined;
-        const stream = try self.client.conn.openStream();
-        try stream.send.writeData("the frames that make this a non-probing packet");
-        stream.send.close();
-        var rounds: usize = 0;
-        while (rounds < 8) : (rounds += 1) {
-            const len = self.client.conn.sendAt(
-                &self.client.buffer,
-                start,
-                self.client.random(),
-            ) catch break;
-            if (len == 0) break;
-            _ = try self.bridge.recv(&self.map, .{
-                .bytes = self.client.buffer[0..len],
-                .from = from,
-                .local = server_addr,
-                .ecn = null,
-            }, scratch[0..], start, self.client.random());
-        }
-    }
 };
 
 test "a path is its two addresses and the connection is the core's own id" {
@@ -791,96 +762,41 @@ test "every combination of the core's two validation fields folds to one state" 
     try t.expectEqual(Validation.challenging, advance(.unvalidated, false, .pending));
 }
 
-test "a migration fills the second slot, retires what the next overwrites, revives the way back" {
-    var rig = try Rig.init(6, 3);
-    defer rig.deinit();
-    const conn = try rig.conn();
+test "historical snapshots retire missing pairs and revive history without duplication" {
+    // Synthetic observations exercise retained history, not native path admission.
     var table: Table = .{};
-    _ = table.mirror(conn, start);
-    try t.expectEqual(@as(usize, 1), table.live());
+    const initial: Observations = .{
+        .{ .key = directKey(), .report = bareReport(0, true, .idle) },
+        null,
+    };
+    _ = table.mirrorObservations(&initial, start);
+    const next: Observations = .{
+        initial[0],
+        .{ .key = reboundKey(), .report = bareReport(1, false, .pending) },
+    };
+    const added = table.mirrorObservations(&next, start + 1);
+    try t.expectEqual(@as(usize, 2), added.live);
+    try t.expectEqual(@as(usize, 1), added.filed);
+    try t.expectEqual(@as(usize, 0), added.retired);
+    try t.expectEqual(Validation.challenging, table.get(reboundKey()).?.validation);
 
-    // First migration: the peer rebinds to a second port on the same address.
-    // `handleMigration` writes the *candidate* slot (`:4246`) and promotes it
-    // (`:4255`), and the slot the connection started on still holds the address
-    // it started on — so the core now holds two paths and this table says so
-    // rather than reporting a switch as a loss.
-    try rig.clientSaysFrom(reboundKey().peer);
-    const first = table.mirror(conn, start);
-    try t.expectEqual(@as(usize, 2), first.live);
-    try t.expectEqual(@as(usize, 1), first.filed);
-    try t.expectEqual(@as(usize, 0), first.retired);
-    try t.expectEqual(@as(usize, 0), first.revived);
-
-    const started = table.get(directKey()).?;
-    try t.expect(started.live());
-    try t.expectEqual(@as(?u8, 0), started.slot);
-    try t.expect(started.tx_bytes > 0);
-
-    const rebound = table.get(reboundKey()).?;
-    try t.expect(rebound.live());
-    try t.expectEqual(@as(?u8, 1), rebound.slot);
-    // Same IP, so the core carries validation over (`:4275`) and this table
-    // reports that rather than inferring it: a NAT rebinding is not a new
-    // address to prove.
-    try t.expectEqual(Validation.validated, rebound.validation);
-    // A fresh slot starts with the core's counters at zero, and those counters
-    // are the core's, so no figure from the path this one sits beside rides
-    // along on it. What did arrive is the datagram that triggered the switch,
-    // which the core credits to both (`:2146`, `:2264`).
-    try t.expectEqual(@as(u64, 0), rebound.tx_bytes);
-    try t.expect(rebound.rx_bytes > 0);
-
-    // Second migration: the peer moves to another subnet, so the IP changed. The
-    // candidate slot is now the one the connection started on, and writing it is
-    // what retires the first path — which is the only way a path leaves this
-    // table's running.
-    try rig.clientSaysFrom(otherSubnetKey().peer);
-    const second = table.mirror(conn, start);
-    try t.expectEqual(@as(usize, 2), second.live);
-    try t.expectEqual(@as(usize, 1), second.filed);
-    try t.expectEqual(@as(usize, 1), second.retired);
-
+    const remaining: Observations = .{ null, next[1] };
+    const retired = table.mirrorObservations(&remaining, start + 2);
+    try t.expectEqual(@as(usize, 1), retired.live);
+    try t.expectEqual(@as(usize, 1), retired.retired);
     const gone = table.get(directKey()).?;
     try t.expect(!gone.live());
     try t.expectEqual(@as(?u8, null), gone.slot);
-    try t.expectEqual(start, gone.retired_at.?);
-    // A retired path keeps what it was: the addresses, the figures, the filing
-    // instant. `DECISIONS/0001`'s measurement of what a migration throws away is
-    // only legible if the table remembers what was thrown.
-    try t.expect(gone.key.eql(directKey()));
-    try t.expect(gone.tx_bytes > 0);
-    try t.expectEqual(Validation.validated, gone.validation);
+    try t.expectEqual(@as(?Instant, start + 2), gone.retired_at);
 
-    // The core discards its congestion, RTT, MTU and ECN state on an IP change
-    // (`:4265-4270`), so the path it arrives on is unvalidated with a challenge
-    // outstanding, and the rebound path is still live beside it.
-    try t.expectEqual(Validation.challenging, table.get(otherSubnetKey()).?.validation);
-    try t.expect(table.get(otherSubnetKey()).?.live());
-    try t.expect(table.get(reboundKey()).?.live());
-    try t.expectEqual(@as(usize, 2), table.live());
-
-    // Third migration, back to the address the connection started on. The
-    // candidate slot is the one holding the rebound path, so that path leaves the
-    // running and the first one comes back — a revival, not a second entry.
-    try rig.clientSaysFrom(client_addr);
-    const third = table.mirror(conn, start);
-    try t.expectEqual(@as(usize, 2), third.live);
-    try t.expectEqual(@as(usize, 0), third.filed);
-    try t.expectEqual(@as(usize, 1), third.revived);
-    try t.expectEqual(@as(usize, 1), third.retired);
-
-    const returned = table.get(directKey()).?;
-    try t.expect(returned.live());
-    // Its history is real and its `since` is still the first time the table filed
-    // it, because a path returning is one path returning rather than a new one.
-    try t.expectEqual(start, returned.since);
-    try t.expectEqual(@as(u64, 0), returned.tx_bytes);
-    try t.expect(!table.get(reboundKey()).?.live());
-    try t.expect(table.get(otherSubnetKey()).?.live());
-    // Three pairs, three entries: a returning path was refiled, not duplicated.
-    try t.expectEqual(@as(usize, 3), table.slice().len);
-    // And the table agrees with the core about which slot is active.
-    try t.expectEqual(conn.entry.conn.active_path_idx, returned.slot.?);
+    const returned = table.mirrorObservations(&next, start + 3);
+    try t.expectEqual(@as(usize, 2), returned.live);
+    try t.expectEqual(@as(usize, 0), returned.filed);
+    try t.expectEqual(@as(usize, 1), returned.revived);
+    try t.expectEqual(@as(usize, 0), returned.retired);
+    try t.expectEqual(@as(usize, 2), table.slice().len);
+    try t.expectEqual(start, table.get(directKey()).?.since);
+    try t.expectEqual(@as(?Instant, null), table.get(directKey()).?.retired_at);
 }
 
 test "a round trip is the caller's, and it stops being believed when it is stale" {
@@ -918,13 +834,9 @@ test "a round trip is the caller's, and it stops being believed when it is stale
     try t.expect(table.get(reboundKey()) == null);
     try t.expectEqual(@as(usize, 1), table.slice().len);
 
-    // And a retired pair is refused too, which is the rule the migration test
-    // earns its right to: the path is still in the table and is not a path.
-    // Two migrations, because the first one fills the core's second slot and
-    // leaves the first path live beside it.
-    try rig.clientSaysFrom(reboundKey().peer);
-    try rig.clientSaysFrom(otherSubnetKey().peer);
-    _ = table.mirror(conn, start);
+    // A missing snapshot retires the measured pair without discarding history.
+    const absent: Observations = .{ null, null };
+    _ = table.mirrorObservations(&absent, start + 3);
     try t.expect(table.get(directKey()) != null);
     try t.expect(!table.get(directKey()).?.live());
     try t.expect(!table.sample(directKey(), rtt, start));
@@ -1036,6 +948,29 @@ test "actuator refuses actions whose native slot no longer holds the planned pai
     var rig = try Rig.init(12, 9);
     defer rig.deinit();
     const conn = try rig.conn();
+    const snapshot = conn.pathSnapshot(0) orelse return error.TestUnexpectedResult;
+    const slots = actionSlots(conn);
+    const selected = slots[0] orelse return error.TestUnexpectedResult;
+    try t.expect(selected.key.eql(.{
+        .local = snapshot.local orelse return error.TestUnexpectedResult,
+        .peer = snapshot.peer orelse return error.TestUnexpectedResult,
+    }));
+    try t.expectEqual(snapshot.validated, selected.validated);
+    try t.expect(selected.selected);
+    try t.expect(slots[1] == null);
+    try t.expect(conn.pathSnapshot(@intCast(core_slots)) == null);
+    try t.expectEqual(@as(?u8, null), try applyAction(conn, .{
+        .select = .{ .id = 0, .key = selected.key },
+    }, start, rig.client.random()));
+    try t.expectError(error.StalePath, applyAction(conn, .{
+        .select = .{
+            .id = 0,
+            .key = .{ .local = server_addr, .peer = reboundKey().peer },
+        },
+    }, start, rig.client.random()));
+    try t.expectError(error.StalePath, applyAction(conn, .{
+        .select = .{ .id = @intCast(core_slots), .key = selected.key },
+    }, start, rig.client.random()));
     try t.expectError(error.StalePath, applyAction(conn, .{
         .probe = .{
             .id = 1,
@@ -1045,4 +980,5 @@ test "actuator refuses actions whose native slot no longer holds the planned pai
     try t.expectEqual(@as(?u8, null), try applyAction(
         conn, .none, start, rig.client.random(),
     ));
+    try t.expectEqualDeep(snapshot, conn.pathSnapshot(0).?);
 }

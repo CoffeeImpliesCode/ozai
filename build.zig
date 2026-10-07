@@ -183,8 +183,8 @@ pub fn build(b: *std.Build) void {
             native_step.dependOn(&run_nat.step);
         } else {
             native_step.dependOn(&b.addFail(
-                "test-native-interop requires -- --zig-peer ABS --rust-peer ABS " ++
-                    "--evidence-dir ABS --qad-cert ABS.der --qad-key ABS.pkcs8.der",
+                "test-native-interop requires -- --node-peer ABS --rust-relay ABS " ++
+                    "--evidence-dir ABS --original-netns net:[N] --original-userns user:[N]",
             ).step);
         }
     } else {

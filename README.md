@@ -17,7 +17,7 @@ from the certificate, moves bytes both ways, and carries ECN over a real socket.
 `test/relay_wire_test.zig` and `test/two_process_test.zig` exercise relay
 forwarding, payload delivery, and independent shutdown on loopback.
 
-The full iroh matrix, mixed blob/gossip sockets, native NAT and node-level authenticated 0-RTT remain open.
+The full iroh matrix, native NAT and node-level authenticated 0-RTT remain open.
 The TLS smoke below has a separate, bounded proof.
 Four additional relay routes passed with exact 34-byte application payloads and peer pins.
 They cover both carrier roles and both UDP-blocked, relay-only inner QUIC roles.
@@ -27,6 +27,25 @@ These results do not prove mixed Bao/gossip transfer or native NAT traversal.
 
 The node executes the gossip codec through its incoming and outgoing QUIC stream routes.
 The current call-site map below replaces the older unwired-codec claim.
+
+The live `test-gossip-interop` Debug run passed 7/7.
+Stock Rust and Node exercised both roles with the exact 32-byte topic, broadcast payload and application acknowledgment.
+Both wrong-pin routes rejected the peer.
+The deliberate pin rejection produced an expected `UnknownIssuer` warning.
+This is separate from the 15 pinned upstream gossip codec captures.
+Those captures prove enum and encoding agreement, not a captured 4,096-byte payload boundary.
+The 4,096/4,097 boundary tests use hand-built declarations.
+They test the source-derived strict write limit and inclusive read limit separately.
+
+The live `test-blobs-interop` Debug run passed 5/5 tests over 6/6 steps.
+Two grouped tests exercised six actual Rust/Node transfers, with each implementation as getter and provider.
+The cases cover the 49,189-byte whole blob, cross-group chunks `15:18` and partial-tail chunks `47:49`.
+The ranges returned exactly 3,072 and 1,061 bytes.
+The verified root is `978923a54590809177bc22cccb4aeef32fe1e9d82e40df31ce3ac1eaa2360009`.
+The oracle source is pinned iroh-blobs `e82cbdcbdac9a78033174aad55e3199b2cf4c0dc`.
+Its response captures contain 49,389, 3,656 and 1,453 bytes.
+The live checks retain exact output equality, verified completion and EOF.
+Rust provider accounting includes the one-byte GET tag that upstream reads before the request body.
 
 ### RFC 7250 live TLS and stream proof
 
@@ -49,6 +68,15 @@ bytes.
 This proof covers the TLS handshake and one application stream only. It does
 not cover the full upstream matrix, mixed blob/gossip/relay protocols, NAT or
 0-RTT.
+
+The fresh expanded standalone Rust interop run passed 8/8 over 4/4 steps in Debug.
+It covers four direct TLS profiles in both roles.
+The harness now sleeps one host millisecond after each `peer.pump`.
+This lets Rust's Tokio runtime run between Zig's virtual-time rounds.
+The explicit virtual clock and 4,000-round limit remain unchanged.
+The earlier 6/8 run timed out on two stock-iroh routes without that scheduler wait.
+This harness change does not add a wall-clock dependency to the protocol.
+It does not change production TLS, pins, resumption or native extension defaults.
 
 Source `~/.local/lib/host-scratch.sh` first. It selects an approved absolute
 scratch root and sets the Zig caches. Do not use `/tmp` or `/var/tmp`. Set
@@ -312,7 +340,7 @@ Their retained dispositions are in [`docs/COVERAGE-LEDGER.md`](docs/COVERAGE-LED
 
 | Subsystem | Production call chain | Remaining admission |
 |---|---|---|
-| Gossip codec | `Node.step` → `node_gossip.receive/gossip`. Outbound: `feedGossip` → `node_gossip_wire.send` → `gossip.codec.encode` → QUIC unidirectional stream. Inbound decode feeds the node handler. | Mixed Rust/Zig gossip socket exchange is not yet verified. |
+| Gossip codec | `Node.step` → `node_gossip.receive/gossip`. Outbound: `feedGossip` → `node_gossip_wire.send` → `gossip.codec.encode` → QUIC unidirectional stream. Inbound decode feeds the node handler. | Live stock Rust/Node both-role exchange and wrong-pin rejection passed in the 7/7 Debug run. |
 | DNS, PKARR, TLS | `Node.step` → `node_discovery.pass` → `node_discovery_wire` → `dns_live.Retrieval.ask` or `pkarr_live`. PKARR uses `tls_client` over TCP. | Discovery is opt-in. Default configuration performs no lookup or publication. |
 | TCP | `tls_client` uses `transport/tcp`. `tcp_carrier.Client.init` connects the relay stream. | Standalone TCP tests alone do not prove these consumers. |
 | WebSocket, HTTP upgrade, relay | Outbound: `node_transport.send` → `State.sendMapped` → `Client.send` → `Session.relay`. Inbound: `takeRelay` → runtime poll/receive → carrier → WebSocket/relay decode → `Bridge.recv`. | The carrier lifetime is separate from the inner QUIC lifetime. |
@@ -338,18 +366,51 @@ Native terminal state does not feed generic `holepunch.Outcome`.
 Accepted physical-source 1-RTT packet evidence does not prove per-path application bytes.
 Node ticket capture, storage, reconnect offer, early-send limits and replay policy remain unwired.
 
-The pending mixed-protocol checks use the existing opt-in targets:
+The mixed-protocol checks and controlled NAT acceptance use separate opt-in targets:
 
 ```sh
 "$ZIG" build test-blobs-interop test-gossip-interop -Doptimize=Debug \
   -Diroh-peer="$CARGO_TARGET_DIR/release/ozai-iroh-peer"
-"$ZIG" build test-native-interop -- --zig-peer "$ZIG_PEER" \
-  --rust-peer "$RUST_PEER" --evidence-dir "$EVIDENCE_DIR" \
-  --qad-cert "$QAD_CERT" --qad-key "$QAD_KEY"
+source ~/.local/lib/host-scratch.sh
+ORIGINAL_NETNS=$(readlink /proc/self/ns/net)
+ORIGINAL_USERNS=$(readlink /proc/self/ns/user)
+"$ZIG" build test-native-interop -- --node-peer "$NODE_PEER" \
+  --rust-relay "$RUST_RELAY" --evidence-dir "$EVIDENCE_DIR" \
+  --original-netns "$ORIGINAL_NETNS" --original-userns "$ORIGINAL_USERNS" \
+  --endpoint-a-role both --for-ms 45000
 ```
 
-The native fixture needs private Linux namespaces and explicit absolute paths.
-These commands describe checks to run, not completed proof rows.
+The NAT fixture runs two independent `ozai-relay-fixture` Node/Noq processes behind
+separate controlled Linux NATs, with a stock Rust 1.3 relay server as the third process.
+It is not a mixed Rust/Zig endpoint NAT proof. Bao, gossip and the mixed Rust relay
+carrier checks retain their separate live evidence. Controlled NAT acceptance remains
+pending until both endpoint-A roles pass.
+
+Set `NODE_PEER` to the absolute path of `ozai-relay-fixture`, `RUST_RELAY` to the
+absolute path of `ozai-iroh-peer`, and `EVIDENCE_DIR` to an existing caller-owned,
+canonical directory under `/tmp/scratch/`.
+Capture the original namespace identities before the build target enters its private
+user and network namespaces. The fixture opens no host-network sockets.
+No QAD listener, certificate, PEM file or private-key file is used by this NAT run.
+
+Endpoint A binds `10.78.1.2:4444` with seed `5a` repeated 32 times and configured
+WAN candidate `10.77.0.2:4444`. Endpoint B binds `10.78.2.2:4444` with seed `6c`
+repeated 32 times and configured candidate `10.77.0.3:4444`.
+Both pins are derived from the same deterministic Ed25519 seed construction used
+by the Node fixture, rather than copied from another implementation's identity.
+The candidates match the routers' actual port-preserving source SNAT endpoints;
+they are configured, not learned by QAD. There is no destination NAT.
+
+By default both roles run: A server/B client, then A client/B server.
+`--endpoint-a-role server` or `client` selects one execution.
+Only the QUIC client initiates traversal; the server advertises and responds.
+Each execution requires authenticated relay-first and direct-phase exact application
+bytes on the same stable connection and pinned identity at each endpoint, one
+dial/accept pair, both peer exits zero, and positive physical forwarding and translated
+counters after the relay evidence opens the initially blocked UDP gate.
+The phase deadline is at most 45 seconds. Evidence preserves each process's output,
+exit status, command, topology counters and cleanup record.
+This does not close the separate Zig mapping-learning or strict X.509 QAD admissions.
 
 ### Earlier records, kept as dated history
 
@@ -474,8 +535,8 @@ zig build             # static library + the node binary, both installed
 zig build test        # unit + integration tests
 zig build test-portable # socket-free protocol and state-machine tests
 zig build run-ozai-node-id
-devenv shell -- gate  # fmt, build, test, ast-check, ziglint, zlint, zbc, zwanzig, cross-test
-devenv shell -- gate-strict  # same gate without zbc, plus coverage
+devenv shell -- gate  # configured checks plus strict Debug/ReleaseSafe coverage
+devenv shell -- gate-strict  # exact alias of gate
 ```
 
 `zig build run-ozai-node-id` prints this machine's node id in every form ozai
@@ -488,40 +549,30 @@ can wait for a connection, delivery, or departure before sending SIGTERM.
 Without `--progress`, the node prints only its banner and final report.
 The SIGINT/SIGTERM handlers are installed before the listening banner is published.
 
-`devenv shell -- gate` needs the pinned toolchain in `~/.local/bin` and the
-shared devenv sandbox it wraps; both `nix` and the wrapper resolve to that one
-sandbox. Where it is absent, run the driver with the exclusions spelled out by
-hand, because `GATE_EXCLUDE` is what makes it the same gate, `.envrc` does not
-set it, and the driver takes no other source for it:
+Both entry points run the same project-owned, fail-closed gate. It validates
+the pinned Zig version, runs `zig-gate` with `ZBC_STRICT=1` and the project
+exclusions, then measures Debug and ReleaseSafe and validates the embedded
+coverage ledger. `gate-strict` is an exact alias, not a separate weaker or
+stronger configuration.
 
-```sh
-GATE_EXCLUDE='^[.]/vendor/ /[.]zig-cache/ /zig-out/ /zig-cache/ /zig-global-cache/' zig-gate
-```
+The configured `zig-gate` sections are fmt, build, test, ast-check, ziglint,
+zlint, zbc, zwanzig and cross-test. The project measurement additionally
+builds and tests `test`, `test-portable`, `quic-test`, `invariants` and
+`test-gate-policy` in both modes. There is no separate section named
+`refdecls` or `compile-all`; declaration checks run through the registered
+`std.testing.refAllDecls` tests in the roots.
 
-A bare `zig-gate` is not that configuration. With those exclusions it is the
-whole of `scripts.gate.exec` bar the version cross-check, which is one `zig
-version` against `.minimum_zig_version`.
+The measurement and raw counter files stay under an owned host-scratch
+evidence root. The validator checks the current source digest, compiler,
+scope, modes and one disposition for every cold item. Coverage rows are
+inferred line hits, not branch or path coverage. To collect evidence before
+updating the ledger, use the project driver's `measure` command; the normal
+`gate` command also requires the current embedded record.
 
-The driver runs the sections in the order above and prints one line for each:
-`OK`, or a count beside the tool's exit status. Any section that finds
-something marks the whole run failed — `zbc` is the one exception, advisory
-unless `ZBC_STRICT=1` — and the driver ends on `GATE FAILED` and exit 1. The
-section output names each failure; the exit status reports overall failure, not
-a standing claim that the tree is clean.
-
-`gate-strict` is that gate with exactly two changes: `--no-zbc` drops the `zbc`
-section and nothing else, so fmt, build, test, ast-check, ziglint, zlint,
-zwanzig and cross-test all still run, and `--cov` adds coverage on top, which
-is advisory until `ZIG_COV_FAIL_UNDER` is set. It is a design pass that a
-failing zbc advisory cannot block, not a cheaper gate.
-
-`GATE_EXCLUDE` names what is not this project's source: `vendor/quic`, plus
-`.zig-cache/`, `zig-out/`, `zig-cache/` and `zig-global-cache/`. It overrides
-the driver's built-in default rather than adding to it, which is why the
-default's patterns are spelled out here. `vendor/quic` is excluded on purpose
-and pays that back through `zig build quic-test`; the cache roots are there
-because a lint section reports whatever the file list hands it, and build
-output is not a defect.
+`GATE_EXCLUDE` is set by the project gate to exclude `vendor/quic`,
+`.zig-cache/`, `zig-out/`, `zig-cache/`, `zig-global-cache/` and
+`zig-pkg/` from the configured source scan. The vendored core is still built
+and tested by `quic-test` in both measured modes.
 
 ### Consume as a package
 
