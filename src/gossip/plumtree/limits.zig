@@ -26,8 +26,9 @@ pub const nanos_per_second: Nanos = 1_000_000_000;
 /// A `MessageId` is BLAKE3's output width and nothing else.
 pub const id_length = 32;
 
-/// The largest payload one cached message may hold, in bytes.
-pub const max_content = 1024;
+/// The largest content fitting a 4096-byte received neighbor Gossip:
+/// two tags, 32 hash bytes, two length bytes, and one scope tag.
+pub const max_content = 4096 - 37;
 
 /// How many messages the payload cache holds at once.
 pub const cache_slots = 16;
@@ -51,8 +52,9 @@ pub const max_claims = 8;
 /// is expected to have run.
 pub const max_queued_ihaves = 16;
 
-/// The largest `IHave` list put in one `Message::IHave`.
-pub const max_ihaves_per_message = 16;
+/// The largest frame-fitting IHave vector: two tags, one count, and at least
+/// 32 hash bytes plus one round byte per record.
+pub const max_ihaves_per_message = @divFloor(4096 - 3, 33);
 
 /// How many peers may have a lazy-push queue at once.
 pub const max_queue_peers = 32;

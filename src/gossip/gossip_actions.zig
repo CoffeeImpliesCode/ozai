@@ -28,9 +28,8 @@
 //! because a question about which topics this node is in has no time component
 //! and a signature that carried a clock would invite one.
 //!
-//! The frame is a pointer rather than a value because `hyparview.Message` is
-//! about a kilobyte — a `Shuffle` carries eight `PeerInfo` and an `IHave`
-//! carries sixteen `MessageId`s — and this runs on every received frame.
+//! The frame is a pointer rather than a value because `hyparview.Message`
+//! carries frame-fitting PeerInfo/IHave arrays and runs on every received frame.
 //!
 //! **The actions borrow the caller's buffer.** A `peer_data` entry's `data`
 //! names the bytes the decoded frame carried, exactly as every `peer_data`
