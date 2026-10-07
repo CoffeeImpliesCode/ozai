@@ -3,13 +3,12 @@
 //! `Process` is the shape `test/two_process_child.zig` gives an `ozai-node`
 //! child: two pipes and a `poll`, a banner, live `progress:` snapshots and a
 //! final report, all arriving on the child's own stdout and each read as it
-//! completes. The `progress:` line is the exact 15-field one
-//! `test/two_process_progress.zig` parses, so [`progress`] and its `Want` gates
-//! are that module's, reused rather than reimplemented.
+//! completes. Rust and Node publish the same exact 12-field `progress:` schema,
+//! parsed solely by `test/two_process_progress.zig`.
 //!
 //! **Why this is not `two_process_child.zig`.** That module's `Process.start`
 //! builds its command line with `two_process_launch.flags`, whose `Plan` is an
-//! `ozai-node` plan — a fixed seed byte, `--peer`, `--relay-peer`, `--send`.
+//! `ozai-node` plan — a fixed seed byte, peer routes and application roles.
 //! The peer takes a seed in hex, an expected peer node id in hex, a TLS mode and
 //! a deadline, and none of those map onto that struct. Widening
 //! `two_process_launch.Plan` is the parent's file and this change does not edit
@@ -49,6 +48,14 @@ pub const Plan = struct {
     /// `--tls`: `rpk` for the strict direct noq peer, `iroh` for stock iroh.
     /// Both configurations negotiate raw public keys.
     tls: []const u8 = "rpk",
+    /// Actual application handler, never an ALPN-labelled transport echo.
+    protocol: []const u8 = "transport",
+    /// Omit to infer the transport role from `connect_address`.
+    role: ?[]const u8 = null,
+    /// Explicit gossip topic membership, passed as repeated `--topic-hex`.
+    topics_hex: []const []const u8 = &.{},
+    /// Actual gossip payload for the dedicated protocol driver.
+    message: ?[]const u8 = null,
     /// `--seed-hex`: 64 hex characters, the peer's Ed25519 seed.
     seed_hex: []const u8,
     /// `--expect-peer`: the node id this peer must compare with the raw key.
@@ -67,6 +74,20 @@ pub fn flags(arena: std.mem.Allocator, plan: Plan) ![]const []const u8 {
     try argv.append(arena, peer_executable);
     try argv.append(arena, "--tls");
     try argv.append(arena, plan.tls);
+    try argv.append(arena, "--protocol");
+    try argv.append(arena, plan.protocol);
+    if (plan.role) |role| {
+        try argv.append(arena, "--role");
+        try argv.append(arena, role);
+    }
+    for (plan.topics_hex) |topic| {
+        try argv.append(arena, "--topic-hex");
+        try argv.append(arena, topic);
+    }
+    if (plan.message) |message| {
+        try argv.append(arena, "--message");
+        try argv.append(arena, message);
+    }
     try argv.append(arena, "--bind");
     try argv.append(arena, "127.0.0.1:0");
     try argv.append(arena, "--seed-hex");
@@ -233,6 +254,23 @@ pub const Process = struct {
         return std.mem.trim(u8, found[prefix.len..], " ");
     }
 
+    /// The dynamically bound peer address, once its complete banner arrives.
+    pub fn address(self: *const Process) !?ozai.SocketAddr {
+        const text = self.value("listening") orelse self.value("bound") orelse return null;
+        const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse
+            return error.InvalidPeerAddress;
+        var host_text = text[0..colon];
+        if (host_text.len >= 2 and host_text[0] == '[' and
+            host_text[host_text.len - 1] == ']')
+        {
+            host_text = host_text[1 .. host_text.len - 1];
+        }
+        const host = ozai.IpAddress.parse(host_text) orelse
+            return error.InvalidPeerAddress;
+        const port = try std.fmt.parseInt(u16, text[colon + 1 ..], 10);
+        return .{ .ip = host, .port = port };
+    }
+
     /// Every line beginning with `prefix`, in the order the peer wrote them.
     ///
     /// The peer's `offer` lines are a list rather than one line, and a reader
@@ -338,4 +376,73 @@ pub fn hexId(node_id: ozai.NodeId) [64]u8 {
         out[index * 2 + 1] = digits[byte & 0x0f];
     }
     return out;
+}
+
+test "gossip child flags preserve explicit topics and actual role" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const argv = try flags(arena.allocator(), .{
+        .tls = "iroh",
+        .protocol = "gossip",
+        .role = "server",
+        .topics_hex = &.{ "topic-a", "topic-b" },
+        .message = "actual gossip",
+        .seed_hex = "seed",
+        .expect_peer_hex = "pin",
+        .run_ms = 15000,
+    });
+    const expected = [_][]const u8{
+        peer_executable, "--tls", "iroh", "--protocol", "gossip",
+        "--role", "server", "--topic-hex", "topic-a", "--topic-hex", "topic-b",
+        "--message", "actual gossip", "--bind", "127.0.0.1:0",
+        "--seed-hex", "seed", "--expect-peer", "pin", "--for", "15000",
+    };
+    try std.testing.expectEqual(expected.len, argv.len);
+    for (expected, argv) |want, actual| {
+        try std.testing.expectEqualStrings(want, actual);
+    }
+}
+
+test "peer address waits for a complete banner and parses its dynamic port" {
+    var peer: Process = .{
+        .child = undefined,
+        .gpa = std.testing.allocator,
+        .name = "banner-test",
+    };
+    defer peer.out.deinit(std.testing.allocator);
+    try peer.out.appendSlice(std.testing.allocator, "listening  127.0.0.1:42731");
+    try std.testing.expect((try peer.address()) == null);
+    try peer.out.append(std.testing.allocator, '\n');
+    const parsed = (try peer.address()).?;
+    try std.testing.expectEqual(@as(u16, 42731), parsed.port);
+    try std.testing.expectEqualDeep(ozai.IpAddress.parse("127.0.0.1").?, parsed.ip);
+    peer.out.clearRetainingCapacity();
+    try peer.out.appendSlice(std.testing.allocator, "bound  [::1]:42732\n");
+    const ipv6 = (try peer.address()).?;
+    try std.testing.expectEqual(@as(u16, 42732), ipv6.port);
+    try std.testing.expectEqualDeep(ozai.IpAddress.parse("::1").?, ipv6.ip);
+}
+
+test "transport child selects the real transport handler and client route" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const argv = try flags(arena.allocator(), .{
+        .tls = "iroh",
+        .seed_hex = "seed",
+        .expect_peer_hex = "pin",
+        .connect_address = .{
+            .ip = ozai.IpAddress.parse("127.0.0.1").?,
+            .port = 42731,
+        },
+        .run_ms = 15000,
+    });
+    const expected = [_][]const u8{
+        peer_executable, "--tls", "iroh", "--protocol", "transport",
+        "--bind", "127.0.0.1:0", "--seed-hex", "seed", "--expect-peer", "pin",
+        "--for", "15000", "--connect", "127.0.0.1:42731",
+    };
+    try std.testing.expectEqual(expected.len, argv.len);
+    for (expected, argv) |want, actual| {
+        try std.testing.expectEqualStrings(want, actual);
+    }
 }

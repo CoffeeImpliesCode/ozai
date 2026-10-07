@@ -47,16 +47,14 @@ pub const Plan = struct {
     seed: u64,
     /// Peers to dial, as `nodeid@ip:port`.
     peers: []const []const u8 = no_peers,
-    /// `--relay`: this node serves as a relay rather than answering peers.
-    serve_relay: bool = false,
-    /// `--relay-peer <nodeid>@<url>`: the relay to reach, in the spelling a
-    /// peer is handed one. **A peer holds a URL and nothing else**, so this is
-    /// a URL and never a socket this file kept to itself: the program under
-    /// test is the one that turns it into an address.
-    relay_peer: ?[]const u8 = null,
-    /// `--send <nodeid>:<bytes>`: one datagram to put on the relay wire, once
-    /// the relay connection is up. The gossip codec's job, asked for by hand.
-    send: ?[]const u8 = null,
+    /// Actual HTTP/WebSocket carrier listener, as `ip:port`.
+    relay_listen: ?[]const u8 = null,
+    /// Actual carrier connection address, separate from the pinned inner peer.
+    relay_server: ?[]const u8 = null,
+    /// HTTP Host value for the carrier upgrade.
+    relay_host: ?[]const u8 = null,
+    /// Pinned inner QUIC peers, as `nodeid@relayURL`.
+    peer_relays: []const []const u8 = no_peers,
     /// Flags appended as written, for a command line that is meant to be
     /// refused and has no field above.
     extra: []const []const u8 = &.{},
@@ -252,6 +250,15 @@ pub const Process = struct {
     /// the split that gave this module its own name introduced.
     pub fn saidWhereItListens(self: *const Process) bool {
         return self.line("listening") != null;
+    }
+
+    /// The production banner's actual TCP carrier listener, including its chosen port.
+    pub fn carrierBound(self: *const Process) ?[]const u8 {
+        return self.value("relay TCP  serving ");
+    }
+
+    pub fn saidWhereCarrierListens(self: *const Process) bool {
+        return self.carrierBound() != null;
     }
 
     /// The newest complete `progress:` line this node has written.

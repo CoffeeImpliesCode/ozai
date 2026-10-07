@@ -87,7 +87,7 @@ in
     . "$HOME/.local/lib/host-scratch.sh"
     : "''${HOST_SCRATCH_ROOT:?host scratch helper did not select a root}"
     export ZIG="''${ZIG:-$(command -v zig)}"
-    export OZAI_COVERAGE_RT="''${OZAI_COVERAGE_RT:-$HOME/.local/bin/zig-cov-rt.o}"
+    export OZAI_COVERAGE_RT="''${OZAI_COVERAGE_RT:-$HOME/tools/zcov/zig-out/lib/zig-cov-rt.o}"
     export ZIG_LOCAL_CACHE_DIR="''${ZIG_LOCAL_CACHE_DIR:-$HOST_SCRATCH_ROOT/scratch/gate-driver-cache}"
     exec "$ZIG" run --cache-dir "$ZIG_LOCAL_CACHE_DIR" scripts/project_gate.zig -- gate
   '';

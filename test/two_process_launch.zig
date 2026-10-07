@@ -2,11 +2,8 @@
 //!
 //! `flags` is the command line and nothing else: everything the node needs to be
 //! identifiable, reproducible and finite, and nothing this file reads back.
-//! `peer`, `peers` and `relayPeer` build the `--peer` and `--relay-peer` values
-//! out of what a node printed about itself — and the relay one is the only
-//! reading of a relay's address in this whole tree: the string it returns is the
-//! whole of what a client holds, and the program under test is what turns it
-//! into a socket.
+//! `peer` and `peers` name direct pinned peers. `relayUrl` names the actual TCP
+//! carrier listener, not the node's UDP socket or a relay identity.
 
 const std = @import("std");
 const ozai = @import("ozai");
@@ -74,14 +71,21 @@ pub fn flags(arena: Allocator, plan: child.Plan) ![]const []const u8 {
         try argv.append(arena, "--peer");
         try argv.append(arena, target);
     }
-    if (plan.serve_relay) try argv.append(arena, "--relay");
-    if (plan.relay_peer) |target| {
-        try argv.append(arena, "--relay-peer");
-        try argv.append(arena, target);
+    if (plan.relay_listen) |address| {
+        try argv.append(arena, "--relay-listen");
+        try argv.append(arena, address);
     }
-    if (plan.send) |datagram| {
-        try argv.append(arena, "--send");
-        try argv.append(arena, datagram);
+    if (plan.relay_server) |address| {
+        try argv.append(arena, "--relay-server");
+        try argv.append(arena, address);
+    }
+    if (plan.relay_host) |host| {
+        try argv.append(arena, "--relay-host");
+        try argv.append(arena, host);
+    }
+    for (plan.peer_relays) |target| {
+        try argv.append(arena, "--peer-relay");
+        try argv.append(arena, target);
     }
     try argv.appendSlice(arena, plan.extra);
 
@@ -134,54 +138,10 @@ pub fn peers(
     return list;
 }
 
-/// The `--relay-peer` value naming one relay: its node id and the URL that names
-/// it, in the spelling a peer is handed one and `ozai-node` parses.
-///
-/// **The URL is the whole of what a peer holds**, and this is where it is
-/// built: out of the address the relay printed, once. Nothing after this reads
-/// that address again — the clients below are given this string, and the
-/// program under test is what turns it into a socket.
-///
-/// The check in the middle is the step being taken at all, and it is the only
-/// thing this file asserts about the resolution: `RelayUrl.socketAddr` is
-/// literal-only and answers `error.NotAnIpLiteral` for a name, so a URL that
-/// came out naming somewhere else would name a relay this file did not start.
-pub fn relayPeer(arena: Allocator, relay: *const child.Process) ![]const u8 {
-    const side = try named(relay);
-    const url = try std.fmt.allocPrint(arena, "http://{s}/", .{side.address});
-    const parsed = ozai.RelayUrl.parse(url) catch |err| return relay.gaveUp(
-        "is bound at {s}, which is not a relay URL host: {t}",
-        .{ side.address, err },
-    );
-    const route = parsed.socketAddr() catch |err| return relay.gaveUp(
-        "is bound at {s}, which no relay URL can name: {t}",
-        .{ side.address, err },
-    );
-    var text: [80]u8 = undefined;
-    var out = std.Io.Writer.fixed(&text);
-    try route.format(&out);
-    if (!std.mem.eql(u8, out.buffered(), side.address)) return relay.gaveUp(
-        "is bound at {s} and its own relay URL resolves to {s}",
-        .{ side.address, out.buffered() },
-    );
-    return std.fmt.allocPrint(arena, "{s}@{s}", .{ side.id, url });
-}
-
-/// The z-base-32 node id a plan with this `tag` will present.
-///
-/// A plan's identity is a byte repeated into a seed (`flags`), so the id is
-/// known before the process is started, and that is what lets two clients name
-/// each other on their command lines: `--send` names its peer as text, and a
-/// report appears only at exit. Every test that uses this compares it against
-/// what the node printed, so a change to how a plan's identity is built fails
-/// loudly here rather than quietly sending a datagram to a stranger.
-pub fn nodeIdOf(arena: Allocator, tag: u8) ![]const u8 {
-    var key = try SecretKey.fromSeed(@splat(tag));
-    defer key.deinit();
-    return arena.dupe(u8, &key.nodeId().toZ32());
-}
-
-/// The `--send` value: one datagram for the node a plan with `tag` presents.
-pub fn sendValue(arena: Allocator, tag: u8, payload: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{s}:{s}", .{ try nodeIdOf(arena, tag), payload });
+/// The actual HTTP/WebSocket carrier URL from its production TCP banner.
+/// Inner peer identities are independent of the carrier service.
+pub fn relayUrl(arena: Allocator, relay: *const child.Process) ![]const u8 {
+    const address = relay.carrierBound() orelse
+        return relay.gaveUp("printed no TCP carrier listener in its banner", .{});
+    return std.fmt.allocPrint(arena, "http://{s}/", .{address});
 }

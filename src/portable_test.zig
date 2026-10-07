@@ -1,5 +1,6 @@
 //! Existing protocol and state-machine tests without the Linux live adapters.
 //! Importing `root.zig` here would pull socket and process tests into this scope.
+//! TCP carriers, file-backed stores and Node/Bridge orchestration stay in the live root.
 
 const std = @import("std");
 
@@ -53,6 +54,10 @@ const relay_http_upgrade = @import("relay/http_upgrade.zig");
 const relay_version_translate = @import("relay/version_translate.zig");
 const relay_ws_frame = @import("relay/ws_frame.zig");
 const relay_ws_frame_mask = @import("relay/ws_frame_mask.zig");
+const native_nat = @import("net/native_nat.zig");
+const native_nat_state = @import("net/native_nat_state.zig");
+const native_nat_probe = @import("net/native_nat_probe.zig");
+const path_action = @import("net/path_action.zig");
 
 test {
     std.testing.refAllDecls(@This());
@@ -102,14 +107,19 @@ test {
     std.testing.refAllDecls(relay_version_translate);
     std.testing.refAllDecls(relay_ws_frame);
     std.testing.refAllDecls(relay_ws_frame_mask);
+    std.testing.refAllDecls(native_nat);
+    std.testing.refAllDecls(native_nat_state);
+    std.testing.refAllDecls(native_nat_probe);
+    std.testing.refAllDecls(path_action);
     const blobs_bao_tree = @import("blobs/bao_tree.zig");
     const blobs_bao_plan = @import("blobs/bao_plan.zig");
     const blobs_bao_outboard = @import("blobs/bao_outboard.zig");
     const blobs_bao_proof_encode = @import("blobs/bao_proof_encode.zig");
     const blobs_bao_proof_verify = @import("blobs/bao_proof_verify.zig");
+    const blobs_getter = @import("blobs/getter.zig");
+    const blobs_ranges = @import("blobs/ranges.zig");
     const discovery_pkarr_body = @import("discovery/pkarr_body.zig");
     const discovery_publisher = @import("discovery/publisher.zig");
-    const node_node_relay_route = @import("node/node_relay_route.zig");
     const relay_access_policy = @import("relay/access_policy.zig");
     const relay_carrier = @import("relay/carrier.zig");
     const relay_conn_version = @import("relay/conn_version.zig");
@@ -124,9 +134,10 @@ test {
     std.testing.refAllDecls(blobs_bao_outboard);
     std.testing.refAllDecls(blobs_bao_proof_encode);
     std.testing.refAllDecls(blobs_bao_proof_verify);
+    std.testing.refAllDecls(blobs_getter);
+    std.testing.refAllDecls(blobs_ranges);
     std.testing.refAllDecls(discovery_pkarr_body);
     std.testing.refAllDecls(discovery_publisher);
-    std.testing.refAllDecls(node_node_relay_route);
     std.testing.refAllDecls(relay_access_policy);
     std.testing.refAllDecls(relay_carrier);
     std.testing.refAllDecls(relay_conn_version);
@@ -146,23 +157,15 @@ test {
     std.testing.refAllDecls(net_holepunch_trigger);
     const net_observed_address = @import("net/observed_address.zig");
     const net_observed_reporter = @import("net/observed_reporter.zig");
-    const relay_auth_challenge = @import("relay/auth_challenge.zig");
-    const relay_auth_credential = @import("relay/auth_credential.zig");
     std.testing.refAllDecls(net_observed_address);
     std.testing.refAllDecls(net_observed_reporter);
-    std.testing.refAllDecls(relay_auth_challenge);
-    std.testing.refAllDecls(relay_auth_credential);
     const blobs_blob_set = @import("blobs/blob_set.zig");
     const net_blobs_route = @import("net/blobs_route.zig");
     const net_path_revalidate = @import("net/path_revalidate.zig");
-    const relay_relay_egress = @import("relay/relay_egress.zig");
-    const relay_relay_ingress = @import("relay/relay_ingress.zig");
     const transport_multipath = @import("transport/multipath.zig");
     std.testing.refAllDecls(blobs_blob_set);
     std.testing.refAllDecls(net_blobs_route);
     std.testing.refAllDecls(net_path_revalidate);
-    std.testing.refAllDecls(relay_relay_egress);
-    std.testing.refAllDecls(relay_relay_ingress);
     std.testing.refAllDecls(transport_multipath);
     const blobs_blob_claim = @import("blobs/blob_claim.zig");
     const blobs_observe = @import("blobs/observe.zig");
@@ -187,8 +190,6 @@ test {
     const node_shutdown_budget = @import("node/shutdown_budget.zig");
     const node_ticket_cache = @import("node/ticket_cache.zig");
     const node_ticket_lifecycle = @import("node/ticket_lifecycle.zig");
-    const relay_relay_auth_wiring = @import("relay/relay_auth_wiring.zig");
-    const relay_relay_auth_policy = @import("relay/relay_auth_policy.zig");
     std.testing.refAllDecls(blobs_blob_claim);
     std.testing.refAllDecls(blobs_observe);
     std.testing.refAllDecls(blobs_push);
@@ -212,6 +213,4 @@ test {
     std.testing.refAllDecls(node_shutdown_budget);
     std.testing.refAllDecls(node_ticket_cache);
     std.testing.refAllDecls(node_ticket_lifecycle);
-    std.testing.refAllDecls(relay_relay_auth_wiring);
-    std.testing.refAllDecls(relay_relay_auth_policy);
 }

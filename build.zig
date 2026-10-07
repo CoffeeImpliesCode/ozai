@@ -129,6 +129,54 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(node_exe);
 
+    // Protocol fixtures are optional smoke scopes, not normal coverage artifacts.
+    const relay_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("test/relay_carrier_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    relay_fixture_mod.addImport("ozai", lib_mod);
+    const relay_fixture = b.addExecutable(.{
+        .name = "ozai-relay-fixture",
+        .root_module = relay_fixture_mod,
+    });
+    const relay_fixture_install = b.addInstallArtifact(relay_fixture, .{});
+    b.step("relay-fixture", "Install the real relay carrier peer fixture")
+        .dependOn(&relay_fixture_install.step);
+
+    if (target.result.os.tag == .linux) {
+        const nat_fixture = b.addExecutable(.{
+            .name = "ozai-nat-fixture",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/nat_fixture.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        b.step("nat-fixture", "Install the private-namespace NAT supervisor")
+            .dependOn(&b.addInstallArtifact(nat_fixture, .{}).step);
+        const native_step = b.step(
+            "test-native-interop",
+            "Run same-connection NAT interop in private namespaces (explicit fixture CLI required)",
+        );
+        if (b.args) |args| {
+            const run_nat = b.addSystemCommand(&.{ "unshare", "-Urn", "--" });
+            run_nat.addArtifactArg(nat_fixture);
+            run_nat.addArgs(args);
+            native_step.dependOn(&run_nat.step);
+        } else {
+            native_step.dependOn(&b.addFail(
+                "test-native-interop requires -- --zig-peer ABS --rust-peer ABS " ++
+                    "--evidence-dir ABS --qad-cert ABS.der --qad-key ABS.pkcs8.der",
+            ).step);
+        }
+    } else {
+        b.step("test-native-interop", "Run Linux private-namespace NAT interop")
+            .dependOn(&b.addFail("test-native-interop requires a Linux target").step);
+    }
+
     const run_node = b.addRunArtifact(node_exe);
     run_node.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_node.addArgs(args);
@@ -329,6 +377,21 @@ pub fn build(b: *std.Build) void {
         "test-rust-interop",
         "Run the Rust peer interop tests (`-Diroh-peer=/absolute/binary`)",
     );
+    const gossip_interop_step = b.step(
+        "test-gossip-interop",
+        "Run real Gossip actors in both roles (`-Diroh-peer=/absolute/binary`)",
+    );
+    const blobs_interop_step = b.step(
+        "test-blobs-interop",
+        "Run Bao-verified blob transfers in both roles (`-Diroh-peer=/absolute/binary`)",
+    );
+    const relay_interop_step = b.step(
+        "test-relay-interop",
+        "Run real relay carrier and relay-only peers (`-Diroh-peer=/absolute/binary`)",
+    );
+    const optional_interop_steps = [_]*std.Build.Step{
+        rust_interop_step, gossip_interop_step, blobs_interop_step, relay_interop_step,
+    };
     if (b.option(
         []const u8,
         "iroh-peer",
@@ -338,7 +401,7 @@ pub fn build(b: *std.Build) void {
             const invalid_peer = b.addFail(
                 "-Diroh-peer must be an absolute path to a prebuilt peer executable",
             );
-            rust_interop_step.dependOn(&invalid_peer.step);
+            for (optional_interop_steps) |step| step.dependOn(&invalid_peer.step);
         } else {
             const rust_interop_mod = b.createModule(.{
                 .root_source_file = b.path("test/rust_interop_test.zig"),
@@ -356,12 +419,60 @@ pub fn build(b: *std.Build) void {
             });
             const run_rust_interop_tests = b.addRunArtifact(rust_interop_tests);
             rust_interop_step.dependOn(&run_rust_interop_tests.step);
+            const protocol_interop_roots = [_]struct {
+                name: []const u8,
+                file: []const u8,
+                step: *std.Build.Step,
+            }{
+                .{
+                    .name = "ozai-gossip-interop-test",
+                    .file = "test/gossip_interop_test.zig",
+                    .step = gossip_interop_step,
+                },
+                .{
+                    .name = "ozai-blobs-interop-test",
+                    .file = "test/blobs_interop_test.zig",
+                    .step = blobs_interop_step,
+                },
+            };
+            for (protocol_interop_roots) |root| {
+                const mod = b.createModule(.{
+                    .root_source_file = b.path(root.file),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                });
+                mod.addImport("ozai", lib_mod);
+                mod.addOptions("peer_test_options", peer_test_options);
+                mod.addOptions("node_test_options", node_test_options);
+                const tests = b.addTest(.{
+                    .name = root.name,
+                    .root_module = mod,
+                    .test_runner = .{
+                        .path = b.path("test/expected_log_runner.zig"),
+                        .mode = .server,
+                    },
+                });
+                root.step.dependOn(&b.addRunArtifact(tests).step);
+            }
+            // Both roles must pass both carrier and authenticated inner QUIC;
+            // these external smokes are intentionally outside coverage-all.
+            for ([_][]const u8{ "carrier", "relay-only" }) |mode| {
+                for ([_][]const u8{ "server", "client" }) |role| {
+                    const smoke = b.addSystemCommand(&.{"python3"});
+                    smoke.addFileArg(b.path("test/relay_endpoint_smoke.py"));
+                    smoke.addArgs(&.{ "--rust-peer", peer_executable, "--zig-peer" });
+                    smoke.addArtifactArg(relay_fixture);
+                    smoke.addArgs(&.{ "--mode", mode, "--zig-role", role });
+                    relay_interop_step.dependOn(&smoke.step);
+                }
+            }
         }
     } else {
         const missing_peer = b.addFail(
-            "test-rust-interop requires -Diroh-peer=/absolute/binary",
+            "Rust/protocol interop requires -Diroh-peer=/absolute/binary",
         );
-        rust_interop_step.dependOn(&missing_peer.step);
+        for (optional_interop_steps) |step| step.dependOn(&missing_peer.step);
     }
 
     // The relay reached the way a peer reaches one: by a relay URL, over a
@@ -372,7 +483,7 @@ pub fn build(b: *std.Build) void {
     // purpose and an error log here is a finding about the relay rather than
     // an expectation.
     const relay_wire_mod = b.createModule(.{
-        .root_source_file = b.path("test/relay_wire_test.zig"),
+        .root_source_file = b.path("test/relay_carrier_interop.zig"),
         .target = target,
         .optimize = optimize,
     });
