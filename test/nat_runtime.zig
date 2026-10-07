@@ -26,6 +26,12 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, config: options.Options,
             std.log.err("NAT owned-process cleanup/evidence failed: {s}", .{@errorName(err)});
         };
     };
+    // Retain actual post-transition counters before peers and namespaces are reaped.
+    errdefer {
+        if (snapshot(io, gpa, network, records, label, "failure")) |_| {} else |err| {
+            std.log.err("NAT failure topology evidence failed: {s}", .{@errorName(err)});
+        }
+    }
     var duration_buffer: [16]u8 = undefined;
     const duration = try std.fmt.bufPrint(&duration_buffer, "{d}", .{config.duration_ms});
     var relay_duration_buffer: [16]u8 = undefined;
