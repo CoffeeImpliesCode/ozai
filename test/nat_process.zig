@@ -9,6 +9,8 @@ const verifyProcOwner = safety.verifyProcOwner;
 const encodeCommand = safety.encodeCommand;
 
 pub const Namespace = safety.Namespace;
+pub const Baseline = safety.Baseline;
+pub const validateBaseline = safety.validateBaseline;
 pub const verifyUidMapping = safety.verifyUidMapping;
 pub const namespaceIdentity = safety.namespaceIdentity;
 pub const assertPrivate = safety.assertPrivate;

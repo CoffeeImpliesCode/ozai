@@ -6,12 +6,83 @@ pub const Error = error{
     InvalidCommand, CommandOverflow,
 };
 
+/// Borrowed identities captured by the caller before entering private namespaces.
+pub const Baseline = struct {
+    net: []const u8,
+    user: []const u8,
+};
+
+/// Reject noncanonical or missing baseline identities without accessing proc.
+pub fn validateBaseline(baseline: Baseline) Error!void {
+    try validateNamespaceIdentity(baseline.net, .net);
+    try validateNamespaceIdentity(baseline.user, .user);
+}
+
+fn validateNamespaceIdentity(identity: []const u8, kind: Namespace) Error!void {
+    const prefix = switch (kind) {
+        .net => "net:[",
+        .user => "user:[",
+    };
+    if (identity.len <= prefix.len + 1 or identity.len > prefix.len + 21)
+        return error.UnsafeNamespace;
+    if (!std.mem.startsWith(u8, identity, prefix) or identity[identity.len - 1] != ']')
+        return error.UnsafeNamespace;
+    const digits = identity[prefix.len .. identity.len - 1];
+    if (digits[0] < '1' or digits[0] > '9') return error.UnsafeNamespace;
+    for (digits) |digit| {
+        if (digit < '0' or digit > '9') return error.UnsafeNamespace;
+    }
+    _ = std.fmt.parseInt(u64, digits, 10) catch return error.UnsafeNamespace;
+}
+
+fn checkNamespaceSeparation(baseline: Baseline, own: Baseline) Error!void {
+    try validateBaseline(baseline);
+    try validateBaseline(own);
+    if (std.mem.eql(u8, own.net, baseline.net)) return error.UnsafeNamespace;
+    if (std.mem.eql(u8, own.user, baseline.user)) return error.UnsafeNamespace;
+}
+
+test "namespace baselines require canonical nonzero bounded decimal identities" {
+    try validateBaseline(.{ .net = "net:[1]", .user = "user:[18446744073709551615]" });
+    const malformed = [_][]const u8{
+        "", "net:[]", "net:[0]", "net:[01]", "net:[+1]", "net:[-1]",
+        "net:[ 1]", "net:[1 ]", "net:[1]\n", "net:[1]junk", "user:[1]",
+        "net:[18446744073709551616]", "net:[100000000000000000000]",
+    };
+    for (malformed) |net| {
+        try std.testing.expectError(error.UnsafeNamespace,
+            validateBaseline(.{ .net = net, .user = "user:[2]" }));
+    }
+    for ([_][]const u8{ "", "user:[0]", "user:[01]", "user:[+2]", "net:[2]" }) |user| {
+        try std.testing.expectError(error.UnsafeNamespace,
+            validateBaseline(.{ .net = "net:[1]", .user = user }));
+    }
+}
+
+test "private namespaces must both differ from the explicit outside baseline" {
+    const baseline: Baseline = .{ .net = "net:[1]", .user = "user:[2]" };
+    try checkNamespaceSeparation(baseline, .{ .net = "net:[3]", .user = "user:[4]" });
+    try std.testing.expectError(error.UnsafeNamespace,
+        checkNamespaceSeparation(baseline, .{ .net = "net:[1]", .user = "user:[4]" }));
+    try std.testing.expectError(error.UnsafeNamespace,
+        checkNamespaceSeparation(baseline, .{ .net = "net:[3]", .user = "user:[2]" }));
+    try std.testing.expectError(error.UnsafeNamespace, checkNamespaceSeparation(baseline, baseline));
+    try std.testing.expectError(error.UnsafeNamespace,
+        checkNamespaceSeparation(baseline, .{ .net = "net:[03]", .user = "user:[4]" }));
+}
+
 test "uid map permits only root mapped to one specified caller" {
     try checkUidMap("         0       1000          1\n", 1000);
     try std.testing.expectError(error.UnsafeNamespace, checkUidMap("0 0 1\n", 0));
     try std.testing.expectError(error.UnsafeNamespace, checkUidMap("0 1001 1\n", 1000));
     try std.testing.expectError(error.UnsafeNamespace, checkUidMap("0 1000 2\n", 1000));
     try std.testing.expectError(error.UnsafeNamespace, checkUidMap("0 1000 1\n1 1001 1\n", 1000));
+}
+
+test "uid mapping rejects a split row and signed mapping fields" {
+    try std.testing.expectError(error.UnsafeNamespace, checkUidMap("0\n1000 1\n", 1000));
+    try std.testing.expectError(error.UnsafeNamespace, checkUidMap("+0 1000 1\n", 1000));
+    try std.testing.expectError(error.UnsafeNamespace, checkUidMap("0 +1000 1\n", 1000));
 }
 
 test "proc status requires four caller uids and direct child parent" {
@@ -89,11 +160,16 @@ fn readPath(path: [:0]const u8, buffer: []u8) Error![]const u8 {
 
 fn checkUidMap(map: []const u8, caller_uid: u32) Error!void {
     if (caller_uid == 0) return error.UnsafeNamespace;
-    var fields = std.mem.tokenizeAny(u8, map, " \t\r\n");
+    const row = std.mem.trim(u8, map, " \t\r\n");
+    if (std.mem.indexOfAny(u8, row, "\r\n") != null) return error.UnsafeNamespace;
+    var fields = std.mem.tokenizeAny(u8, row, " \t");
     const expected = [_]u32{ 0, caller_uid, 1 };
     for (expected) |value| {
-        const parsed = std.fmt.parseInt(u32, fields.next() orelse
-            return error.UnsafeNamespace, 10) catch return error.UnsafeNamespace;
+        const field = fields.next() orelse return error.UnsafeNamespace;
+        for (field) |digit| {
+            if (digit < '0' or digit > '9') return error.UnsafeNamespace;
+        }
+        const parsed = std.fmt.parseInt(u32, field, 10) catch return error.UnsafeNamespace;
         if (parsed != value) return error.UnsafeNamespace;
     }
     if (fields.next() != null) return error.UnsafeNamespace;
@@ -122,7 +198,8 @@ pub fn namespaceIdentity(
     return buffer[0..@intCast(count)];
 }
 
-pub fn assertPrivate(io: std.Io) Error!void {
+pub fn assertPrivate(io: std.Io, baseline: Baseline) Error!void {
+    try validateBaseline(baseline);
     if (c.getuid() != 0 or c.geteuid() != 0) return error.UnsafeNamespace;
     var map_buffer: [256]u8 = undefined;
     const map = try procRead(c.getpid(), "uid_map", &map_buffer);
@@ -131,20 +208,24 @@ pub fn assertPrivate(io: std.Io) Error!void {
     const outside = std.fmt.parseInt(u32, fields.next() orelse
         return error.UnsafeNamespace, 10) catch return error.UnsafeNamespace;
     try checkUidMap(map, outside);
-    // The one-entry nonzero root map excludes the initial user namespace.
-    // Parent is the caller-owned launcher/controller, not inaccessible host PID 1.
-    const parent = c.getppid();
-    if (parent <= 1) return error.UnsafeNamespace;
-    try verifyProcOwner(parent, c.geteuid());
-    var own_buffer: [128]u8 = undefined;
-    var parent_buffer: [128]u8 = undefined;
-    const own = try namespaceIdentity(io, c.getpid(), .net, &own_buffer);
-    const original = try namespaceIdentity(io, parent, .net, &parent_buffer);
-    if (std.mem.eql(u8, own, original)) return error.UnsafeNamespace;
+    // Read only our identities: a rootless user namespace cannot inspect its parent.
+    const own_pid = c.getpid();
+    var net_buffer: [128]u8 = undefined;
+    var user_buffer: [128]u8 = undefined;
+    const own: Baseline = .{
+        .net = try namespaceIdentity(io, own_pid, .net, &net_buffer),
+        .user = try namespaceIdentity(io, own_pid, .user, &user_buffer),
+    };
+    try checkNamespaceSeparation(baseline, own);
 }
 
-pub fn setPrivateForwarding(io: std.Io, expected_netns: []const u8) Error!void {
-    try assertPrivate(io);
+pub fn setPrivateForwarding(
+    io: std.Io,
+    baseline: Baseline,
+    expected_netns: []const u8,
+) Error!void {
+    try assertPrivate(io, baseline);
+    try validateNamespaceIdentity(expected_netns, .net);
     var own_buffer: [128]u8 = undefined;
     const own = try namespaceIdentity(io, c.getpid(), .net, &own_buffer);
     if (!std.mem.eql(u8, own, expected_netns)) return error.UnsafeNamespace;
