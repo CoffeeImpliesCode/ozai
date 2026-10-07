@@ -14,18 +14,15 @@ let
     bash
     git
     pkg-config
+    binutils
+    llvmPackages.llvm
+    coreutils
+    util-linux
+    gnused
+    gawk
+    inetutils
   ];
 
-  # Zig flocks every global-cache manifest. A build that dies holding one of
-  # its manifest locks wedges every later build that wants the same cache, so
-  # each project gets its own root under the node-local scratch disk.
-  #
-  # The anyzig shim resolves its toolchain through this same variable, at
-  # `<root>/p/<hash>`. A root without `p` makes the shim re-fetch the tarball
-  # from ziglang.org, fail extraction, and exit 1 in silence, so `p` is a
-  # symlink to the one shared toolchain store: build caches stay per-project,
-  # downloaded toolchains stay shared.
-  zigCache = "/tmp/zig-caches/ozai";
 
   # `zig` and `zig-gate` live in the user's own bin directory, which a devenv
   # shell's PATH does not carry — it is assembled from the nix store, so both
@@ -45,17 +42,15 @@ in
   inherit packages;
 
   env = {
-    ZIG_GLOBAL_CACHE_DIR = zigCache;
-
     LD_LIBRARY_PATH = lib.makeLibraryPath packages;
     INCLUDE_DIRECTORIES = lib.makeIncludePath packages;
   };
 
   # https://devenv.sh/basics/
   enterShell = ''
-    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     ${pinnedToolPath}
-    [ -e "$ZIG_GLOBAL_CACHE_DIR/p" ] || ln -s /tmp/zig-global-cache/p "$ZIG_GLOBAL_CACHE_DIR/p"
+    . "$HOME/.local/lib/host-scratch.sh"
+    : "''${HOST_SCRATCH_ROOT:?host scratch helper did not select a root}"
     echo "zig $(zig version 2>/dev/null || echo '<unresolved: check .minimum_zig_version>')"
   '';
 
@@ -64,9 +59,8 @@ in
   # The house gate: `zig-gate`'s sections in order — fmt, build, test,
   # ast-check, ziglint, zlint, zbc, zwanzig, cross-test. The version cross-check
   # above runs first because every later step is meaningless against a
-  # toolchain the manifest does not describe. `zbc` is the only advisory
-  # section here (`ZBC_STRICT=1` makes it binding) and `cross-test` is the only
-  # one that leaves this host, so this gate is as slow as its slowest section.
+  # toolchain the manifest does not describe. Every configured check, including
+  # zbc, is binding; cross-test is the only check that leaves this host.
   #
   # `GATE_EXCLUDE` is the driver's named mechanism for what is not this
   # project's source, and it overrides the built-in default rather than adding
@@ -85,42 +79,21 @@ in
   # section reads whatever the file list hands it, and a build leaves
   # `.zig-cache/` and `zig-out/` in the tree; reporting build output as a
   # defect is a measurement of build state, not of this repository.
-  # AGENTS.md §4 gates 2-3 require Debug AND ReleaseSafe. zig-gate sections 2-3
-  # run the default mode only, so the ReleaseSafe passes run here, after the
-  # default gate is green (issue #15).
+  # Both entry points run the same project-owned fail-closed policy. Coverage
+  # reports, raw counters, executables and command logs remain on host scratch.
   scripts.gate.exec = ''
     set -eu
     ${pinnedToolPath}
-    version="$(zig version)"
-    pin="$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' build.zig.zon)"
-    test "$version" = "$pin" || {
-      echo "zig $version does not match .minimum_zig_version $pin" >&2
-      exit 1
-    }
-    GATE_EXCLUDE='^[.]/vendor/ /[.]zig-cache/ /zig-out/ /zig-cache/ /zig-global-cache/' zig-gate
-    zig build -Doptimize=ReleaseSafe
-    zig build test -Doptimize=ReleaseSafe --summary all
+    . "$HOME/.local/lib/host-scratch.sh"
+    : "''${HOST_SCRATCH_ROOT:?host scratch helper did not select a root}"
+    export ZIG="''${ZIG:-$(command -v zig)}"
+    export OZAI_COVERAGE_RT="''${OZAI_COVERAGE_RT:-$HOME/.local/bin/zig-cov-rt.o}"
+    export ZIG_LOCAL_CACHE_DIR="''${ZIG_LOCAL_CACHE_DIR:-$HOST_SCRATCH_ROOT/scratch/gate-driver-cache}"
+    exec "$ZIG" run --cache-dir "$ZIG_LOCAL_CACHE_DIR" scripts/project_gate.zig -- gate
   '';
 
-  # The same gate with two changes, and only two. `--no-zbc` drops section 7
-  # and nothing else — fmt, build, test, ast-check, ziglint, zlint, zwanzig
-  # and cross-test all still run — and `--cov` adds the coverage section on
-  # top, advisory until `ZIG_COV_FAIL_UNDER` is set. It is kept separate so a
-  # failing zbc advisory never blocks a design pass, and it is not a cheaper
-  # gate: only the zbc section is gone.
   scripts.gate-strict.exec = ''
-    set -eu
-    ${pinnedToolPath}
-    version="$(zig version)"
-    pin="$(sed -n 's/.*\.minimum_zig_version = "\(.*\)".*/\1/p' build.zig.zon)"
-    test "$version" = "$pin" || {
-      echo "zig $version does not match .minimum_zig_version $pin" >&2
-      exit 1
-    }
-    GATE_EXCLUDE='^[.]/vendor/ /[.]zig-cache/ /zig-out/ /zig-cache/ /zig-global-cache/' \
-      zig-gate --no-zbc --cov
-    zig build -Doptimize=ReleaseSafe
-    zig build test -Doptimize=ReleaseSafe --summary all
+    exec gate "$@"
   '';
 
   # See full reference at https://devenv.sh/reference/options/
