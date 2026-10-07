@@ -52,6 +52,7 @@ const encode_mod = @import("bao_proof_encode.zig");
 const provider_mod = @import("provider.zig");
 const requests = @import("requests.zig");
 
+const tree_mod_pair_length = @import("bao_tree.zig").pair_length;
 /// A decoded `get`, as the transport hands one over.
 pub const GetRequest = requests.GetRequest;
 
@@ -128,6 +129,59 @@ pub fn expectedAnswer(
     return encode_mod.encode(plan, tree, data, out);
 }
 
+pub const Decoded = struct { size: u64, written: usize };
+pub const DecodeError = Refused || error{
+    SizeMismatch,
+    HashMismatch,
+    BufferTooSmall,
+};
+
+/// Verify a complete `/iroh-bytes/4` response before exposing requested data.
+/// The wire size is untrusted until the Bao walk reaches the requested hash.
+pub fn decode(
+    request: GetRequest,
+    expected_size: ?u64,
+    trusted_root: core.CvBytes,
+    wire: []const u8,
+    out: []u8,
+) DecodeError!Decoded {
+    if (!std.meta.eql(request.hash, trusted_root)) return error.HashMismatch;
+    if (wire.len < 8) return error.ResponseTruncated;
+    const size = std.mem.readInt(u64, wire[0..8], .little);
+    if (expected_size) |expected| {
+        if (size != expected) return error.SizeMismatch;
+    }
+    const tree = BaoTree.init(size);
+    const selected = provider_mod.selectedRange(request, tree.chunks()) orelse
+        return error.NoRangeRequested;
+    const proof = wire[8..];
+    try verify_mod.verify(tree, selected, trusted_root, proof);
+    const start = selected.start * ranges.chunk_size;
+    const end = @min(selected.end *| ranges.chunk_size, size);
+    const length: usize = @intCast(end - start);
+    if (length > out.len) return error.BufferTooSmall;
+    const plan = plan_mod.planOf(tree, selected);
+    var at: usize = 0;
+    var written: usize = 0;
+    for (plan.items[0..plan.len], 0..) |item, index| {
+        const count = plan.itemBytes(tree, index);
+        if (item == .data) {
+            const bytes = item.data.bytes(tree);
+            const left = @max(start, bytes.start);
+            const right = @min(end, bytes.end);
+            if (left < right) {
+                const offset: usize = @intCast(left - bytes.start);
+                const take: usize = @intCast(right - left);
+                @memcpy(out[written..][0..take], proof[at + offset ..][0..take]);
+                written += take;
+            }
+        }
+        at += count;
+    }
+    std.debug.assert(written == length);
+    return .{ .size = size, .written = written };
+}
+
 const t = std.testing;
 const published = @import("../gossip/plumtree/blake3_vectors.zig");
 
@@ -141,7 +195,7 @@ test "a whole-blob answer is the blob, and the walk accepts it" {
     defer t.allocator.free(data);
     const tree = BaoTree.init(data.len);
     const hash: core.CvBytes = try tree.rootHash(data);
-    var scratch: [whole_blob]u8 = undefined;
+    var scratch: [whole_blob + 3 * tree_mod_pair_length]u8 = undefined;
     const request = GetRequest.blob(hash);
     const written = try encode_mod.encode(
         plan_mod.planOf(tree, .{ .start = 0, .end = tree.chunks() }),
@@ -269,7 +323,7 @@ test "a request naming no single range is refused by the verifier's name" {
     const tree = BaoTree.init(data.len);
     const hash: core.CvBytes = try tree.rootHash(data);
 
-    var scratch: [whole_blob]u8 = undefined;
+    var scratch: [whole_blob + 3 * tree_mod_pair_length]u8 = undefined;
     const written = try encode_mod.encode(
         plan_mod.planOf(tree, .{ .start = 0, .end = tree.chunks() }),
         tree,
@@ -294,4 +348,31 @@ test "a request naming no single range is refused by the verifier's name" {
         try t.expectEqual(error.NoRangeRequested, outcome.refused.?);
         try t.expect(!outcome.empty);
     }
+}
+
+// A real response is size + Bao, and consumers get only requested bytes.
+test "decode verifies wire size and clips partial final chunk payload" {
+    const data = try published.blake3Input(49189);
+    defer t.allocator.free(data);
+    const tree = BaoTree.init(data.len);
+    const root = try tree.rootHash(data);
+    const items = [_]range_spec.Item{
+        .{ .delta = 0, .spec = .{ .widths = &.{ 47, 2 } } },
+        .{ .delta = 1, .spec = range_spec.RangeSpec.empty },
+    };
+    const request = GetRequest{ .hash = root, .ranges = .{ .items = &items } };
+    var wire: [49189 + 1024]u8 = undefined;
+    std.mem.writeInt(u64, wire[0..8], tree.size, .little);
+    const proof_len = try expectedAnswer(request, tree, data, wire[8..]);
+    var payload: [2048]u8 = undefined;
+    const decoded = try decode(request, tree.size, root, wire[0 .. 8 + proof_len], &payload);
+    try t.expectEqual(@as(u64, 49189), decoded.size);
+    try t.expectEqualSlices(u8, data[47 * 1024 ..], payload[0..decoded.written]);
+    try t.expectError(error.SizeMismatch, decode(
+        request, tree.size + 1, root, wire[0 .. 8 + proof_len], &payload,
+    ));
+    wire[8 + proof_len - 1] ^= 1;
+    try t.expectError(error.ChildMismatch, decode(
+        request, tree.size, root, wire[0 .. 8 + proof_len], &payload,
+    ));
 }

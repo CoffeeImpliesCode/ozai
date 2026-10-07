@@ -1,27 +1,8 @@
 //! Answering a decoded `GetRequest` out of the store.
 //!
-//! The answer to a `get` is bao data and nothing else: no length prefix, no
-//! size prefix, no error frame. `framing.zig` argues that at length and
-//! `responses.zig` applies it, so what is left for this file is the bytes
-//! themselves and the one way to refuse.
-//!
-//! # What the answer is
-//!
-//! Preorder. `bao_plan.planOf` fixes the walk before a byte is read, and every
-//! item of that plan contributes its bytes in plan order: a `.pair` item
-//! contributes `pair_length` bytes of its children's values, a `.data` item
-//! contributes the node's own bytes, and a `.skip` item contributes none. A
-//! request for every chunk of a blob therefore has a one-item plan and its
-//! answer is the blob — which is why a whole-blob answer needs no header to be
-//! read, and why nothing here writes one.
-//!
-//! A pair comes out of the outboard when its node is an outboard parent, and is
-//! computed from the data when it is not. That split is the whole reason a
-//! store holds two files: `bao_outboard.encode` writes the pairs of the
-//! outboard parents and no others, and a plan that is not group-aligned asks
-//! for pairs below a group as well. The outboard index advances only on an
-//! outboard parent, which is what keeps it the index into the file `encode`
-//! wrote.
+//! A response starts with the actual blob size as u64 little-endian, followed
+//! by validated Bao preorder pairs and data. Persisted parents are loaded by
+//! their tree index, not by the number of parents selected by the request.
 //!
 //! # Why an empty answer is the only refusal
 //!
@@ -84,6 +65,9 @@ pub const Error = std.Io.File.OpenError ||
         /// hold. Only a store written behind this module's back, or one whose
         /// data was truncated under an open reader, can produce one.
         ShortData,
+        ShortOutboard,
+        InvalidOutboard,
+        PlanTooLarge,
         /// `init` was handed no scratch to stream through, and streaming needs
         /// at least one byte. A programmer error, refused rather than looped on.
         NoScratch,
@@ -145,10 +129,14 @@ pub const Provider = struct {
         };
         defer handles.close(io);
 
-        const tree = BaoTree.init(try handles.data.length(t.io));
+        const tree = BaoTree.init(try handles.data.length(io));
         const selected = selectedRange(request, tree.chunks()) orelse return .absent;
         const plan = plan_mod.planOf(tree, selected);
+        if (plan.overflow) return error.PlanTooLarge;
         if (plan.isEmpty()) return .absent;
+        var size_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &size_bytes, tree.size, .little);
+        try writer.writeAll(&size_bytes);
         try writePlan(self, io, writer, &handles, tree, plan);
         return .answered;
     }
@@ -194,31 +182,51 @@ fn writePlan(
     tree: BaoTree,
     plan: plan_mod.Plan,
 ) Error!void {
-    var outboard_index: u64 = 0;
+    var verifier = @import("bao_proof_verify.zig").Verifier.init(
+        tree, plan, provider.hash,
+    ) catch return error.InvalidOutboard;
     var pair: [pair_length]u8 = undefined;
     for (plan.items[0..plan.len]) |item| switch (item) {
-        .skip => {},
-        .data => |node| try runRange(
-            io,
-            handles.data,
-            node.bytes(tree),
-            provider.scratch,
-            &.{ .answer = writer },
-        ),
+        .skip => verifier.take(&.{}) catch return error.InvalidOutboard,
+        .data => |node| {
+            var hasher = try subtree.Hasher.init(node.bytes(tree).start);
+            try runRange(io, handles.data, node.bytes(tree), provider.scratch, &.{
+                .both = .{ .answer = writer, .hasher = &hasher },
+            });
+            const cv = if (verifier.depth == 0)
+                hasher.final()
+            else
+                hasher.finalChainingValue();
+            verifier.takeDataHash(cv) catch return error.InvalidOutboard;
+        },
         .pair => |node| {
             if (node.isOutboardParent()) {
-                _ = try handles.outboard.readPositionalAll(
-                    io,
-                    &pair,
-                    outboard_index * pair_length,
+                const index = outboard_mod.pairIndex(tree, node) orelse
+                    return error.InvalidOutboard;
+                const read = try handles.outboard.readPositionalAll(
+                    io, &pair, @as(u64, @intCast(index)) * pair_length,
                 );
-                outboard_index += 1;
+                if (read != pair_length) return error.ShortOutboard;
             } else {
                 try computePair(io, handles.data, tree, node, provider.scratch, &pair);
             }
+            const values = tree_mod.readPair(&pair);
+            const computed = if (verifier.depth == 0)
+                subtree.mergeRoot(values.left, values.right)
+            else
+                subtree.merge(values.left, values.right);
+            const expected = if (verifier.depth == 0)
+                provider.hash
+            else if (verifier.stack[verifier.depth - 1].side == 0)
+                verifier.stack[verifier.depth - 1].left
+            else
+                verifier.stack[verifier.depth - 1].right;
+            if (!std.meta.eql(computed, expected)) return error.InvalidOutboard;
             try writer.writeAll(&pair);
+            verifier.take(&pair) catch return error.InvalidOutboard;
         },
     };
+    verifier.finish() catch return error.InvalidOutboard;
 }
 
 /// The `pair_length` bytes of the pair about `node`, computed from the data.
@@ -262,6 +270,7 @@ const Sink = union(enum) {
     answer: *std.Io.Writer,
     /// Into a subtree hasher, which is the same walk over a narrower range.
     hasher: *subtree.Hasher,
+    both: struct { answer: *std.Io.Writer, hasher: *subtree.Hasher },
 };
 
 /// Read `range` of `data` in pieces no larger than `scratch`, in order.
@@ -280,6 +289,10 @@ fn runRange(
         switch (sink.*) {
             .answer => |answer| try answer.writeAll(scratch[0..read]),
             .hasher => |hasher| hasher.update(scratch[0..read]),
+            .both => |both| {
+                both.hasher.update(scratch[0..read]);
+                try both.answer.writeAll(scratch[0..read]);
+            },
         }
         at += read;
     }
@@ -306,11 +319,8 @@ const off_group_items = [_]range_spec.Item{
     .{ .delta = 1, .spec = range_spec.RangeSpec.empty },
 };
 
-// A whole-blob answer is the blob. Nothing is prepended, because the plan of
-// every chunk is the root and the root's own bytes are the answer; and a blob
-// the store does not have is answered with nothing, which is the one refusal a
-// getter can read without hashing anything.
-test "a whole blob is answered with its own bytes, and a miss with none" {
+// Whole responses include a size and persisted pairs; a missing hash is EOF.
+test "a whole blob is answered with size and Bao, and a miss with none" {
     const data = try published.blake3Input(49153);
     defer t.allocator.free(data);
     const tree = BaoTree.init(data.len);
@@ -324,11 +334,17 @@ test "a whole blob is answered with its own bytes, and a miss with none" {
     var scratch: [1024]u8 = undefined;
     const provider = try Provider.init(tmp.dir, &name_storage, hash, &scratch);
 
-    const answer = try t.allocator.alloc(u8, data.len);
+    const answer = try t.allocator.alloc(u8, data.len + 8 + 3 * pair_length);
     defer t.allocator.free(answer);
     var writer = std.Io.Writer.fixed(answer);
     try t.expectEqual(.answered, try provider.answer(t.io, &writer, GetRequest.blob(hash)));
-    try t.expectEqualSlices(u8, data, writer.buffered());
+    try t.expectEqual(tree.size, std.mem.readInt(u64, writer.buffered()[0..8], .little));
+    const payload = try t.allocator.alloc(u8, data.len);
+    defer t.allocator.free(payload);
+    const decoded = try @import("getter.zig").decode(
+        GetRequest.blob(hash), tree.size, hash, writer.buffered(), payload,
+    );
+    try t.expectEqualSlices(u8, data, payload[0..decoded.written]);
 
     // A hash nobody stored: the writer is untouched, which is what "closes
     // just that stream with nothing written" means at this layer.
@@ -362,19 +378,16 @@ test "a partial range is the plan's own encoding, pairs in preorder" {
     var scratch: [1024]u8 = undefined;
     const provider = try Provider.init(tmp.dir, &name_storage, hash, &scratch);
 
-    const answer = try t.allocator.alloc(u8, expected.len);
+    const answer = try t.allocator.alloc(u8, expected.len + 8);
     defer t.allocator.free(answer);
     var writer = std.Io.Writer.fixed(answer);
     const request = off_groupFor(hash);
     try t.expectEqual(.answered, try provider.answer(t.io, &writer, request));
-    try t.expectEqualSlices(u8, expected[0..expected_len], writer.buffered());
+    try t.expectEqualSlices(u8, expected[0..expected_len], writer.buffered()[8..]);
 }
 
-// The pairs come out of the outboard file and not out of a recomputation of the
-// data. A flipped byte in the stored outboard therefore reaches the answer,
-// which is the observable half of that claim: recomputation would have
-// answered the truth and hidden the damage.
-test "an outboard parent is read from the file, not recomputed" {
+// Corrupt persisted pairs cannot produce a successfully completed response.
+test "an invalid outboard parent aborts the provider response" {
     const data = try published.blake3Input(49153);
     defer t.allocator.free(data);
     const tree = BaoTree.init(data.len);
@@ -399,8 +412,7 @@ test "an outboard parent is read from the file, not recomputed" {
     const provider = try Provider.init(tmp.dir, &name_storage, hash, &scratch);
     var answer: [1024 * 3]u8 = undefined;
     var writer = std.Io.Writer.fixed(&answer);
-    try t.expectEqual(.answered, try provider.answer(t.io, &writer, off_groupFor(hash)));
-    try t.expectEqualSlices(u8, damaged[0..pair_length], writer.buffered()[0..pair_length]);
+    try t.expectError(error.InvalidOutboard, provider.answer(t.io, &writer, off_groupFor(hash)));
 }
 
 // Both refusals the store's shape forces: an unbounded hash sequence, and a
