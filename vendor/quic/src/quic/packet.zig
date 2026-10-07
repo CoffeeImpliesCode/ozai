@@ -281,6 +281,10 @@ pub const Header = struct {
     /// protection is removed.
     key_phase: bool = false,
 
+    /// True only when opening authenticated the next generation, not a reordered
+    /// previous-generation packet with the same phase bit. The connection owns rotation.
+    key_update_authenticated: bool = false,
+
     /// The spin bit for passive RTT measurement (RFC 9000 §17.4).
     /// Only meaningful for short (1-RTT) headers.
     spin_bit: bool = false,
@@ -430,8 +434,8 @@ fn splitProtected(header: *const Header, fbs: anytype, first_byte: u8, ad_buf: [
     };
 }
 
-/// Remove header protection from `header` and open its payload with the keys
-/// `space` holds for its epoch, in place.
+/// Remove header protection and open with the epoch's legacy noMP nonce.
+/// Negotiated multipath 1-RTT callers must use `decryptForPath`, including path zero.
 ///
 /// Returns the plaintext, which is the same memory the ciphertext was in: the
 /// AEAD tag is consumed and the caller keeps the buffer it had, so this
@@ -445,6 +449,28 @@ fn splitProtected(header: *const Header, fbs: anytype, first_byte: u8, ad_buf: [
 /// Failure may advance the cursor and mutate header or buffer bytes: discard
 /// the packet rather than retrying that mutated input.
 pub fn decrypt(header: *Header, fbs: anytype, space: *const PacketNumSpace) ![]u8 {
+    return decryptImpl(header, fbs, space, null);
+}
+
+/// Open negotiated multipath 1-RTT traffic using the externally CID-mapped path.
+/// Long-header epochs retain the legacy nonce; path zero is not a noMP alias.
+pub fn decryptForPath(
+    header: *Header,
+    fbs: anytype,
+    space: *const PacketNumSpace,
+    path_id: u32,
+) ![]u8 {
+    return decryptImpl(
+        header, fbs, space, if (header.packet_type == .one_rtt) path_id else null,
+    );
+}
+
+fn decryptImpl(
+    header: *Header,
+    fbs: anytype,
+    space: *const PacketNumSpace,
+    path_id: ?u32,
+) ![]u8 {
     // We need at least 4 bytes for packet number + 16 for sample
     if (fbs.seek + 4 + crypto.SAMPLE_LEN > fbs.buffer.len) {
         std.log.debug("Not enough data for packet number + sample: pos={d}, buffer.len={d}", .{ fbs.seek, fbs.buffer.len });
@@ -454,6 +480,7 @@ pub fn decrypt(header: *Header, fbs: anytype, space: *const PacketNumSpace) ![]u
     var first_byte = fbs.buffer[header.packet_start];
 
     // unprotect header
+    if (space.crypto_open == null) return error.UndecryptablePacket;
     const aead = &space.crypto_open.?;
 
     // RFC 9001 Section 5.4.2: Sample is taken 4 bytes after START of packet number field
@@ -520,10 +547,8 @@ pub fn decrypt(header: *Header, fbs: anytype, space: *const PacketNumSpace) ![]u
     // Decode packet number
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
 
-    const decrypted = try aead.decryptPayload(
-        header.packet_number,
-        header_bytes,
-        encrypted_payload,
+    const decrypted = try openPayload(
+        aead, path_id, header.packet_number, header_bytes, encrypted_payload,
     );
 
     // Write decrypted first byte back into the input buffer for further processing.
@@ -532,14 +557,56 @@ pub fn decrypt(header: *Header, fbs: anytype, space: *const PacketNumSpace) ![]u
     return decrypted;
 }
 
-/// Decrypt a 1-RTT packet using the KeyUpdateManager for key phase handling.
-/// Uses the (unchanging) HP key for header unprotection, then selects the
-/// appropriate AEAD keys based on the key phase bit (RFC 9001 Section 6).
+const KeyUpdateDecryptError = error{
+    InvalidPacket,
+    AuthenticationFailed,
+    KeyUpdateError,
+    NoSpaceLeft,
+};
+
+/// Decrypt a legacy noMP 1-RTT packet using the KeyUpdateManager.
+/// Uses the (unchanging) HP key for header unprotection, then authenticates the
+/// appropriate generation based on the key phase bit (RFC 9001 Section 6).
 /// Borrows every receiver for the call and returns plaintext in `fbs.buffer`.
 /// As with `decrypt`, failure can mutate the header, cursor and bytes; discard
-/// the packet. Null phase keys or malformed bounds return `error.InvalidPacket`;
-/// AEAD authentication errors propagate. Allocates nothing.
-pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *const PacketNumSpace, ku: *crypto.KeyUpdateManager) ![]u8 {
+/// the packet. Malformed bounds return `error.InvalidPacket`; AEAD authentication
+/// errors propagate. An authenticated next-generation PN at or below this space's
+/// receive watermark, or a second peer update before sending with the first,
+/// returns `error.KeyUpdateError` without authorizing rotation. The caller must
+/// transport-close and discard the packet. Allocates nothing.
+pub fn decryptWithKeyUpdate(
+    header: *Header,
+    fbs: anytype,
+    space: *const PacketNumSpace,
+    ku: *crypto.KeyUpdateManager,
+) KeyUpdateDecryptError![]u8 {
+    return decryptWithKeyUpdateImpl(header, fbs, space, ku, null);
+}
+
+/// Open multipath 1-RTT traffic without changing the invariant HP key.
+/// Reports next-generation authentication through `header.key_update_authenticated`;
+/// Failed authentication, non-increasing next-generation PNs, and a second peer
+/// update before acknowledging the first never authorize rotation. `space` must
+/// be the receiving path's own receive space; `error.KeyUpdateError` requires
+/// transport-close and discarding the packet.
+pub fn decryptWithKeyUpdateForPath(
+    header: *Header,
+    fbs: anytype,
+    space: *const PacketNumSpace,
+    ku: *crypto.KeyUpdateManager,
+    path_id: u32,
+) KeyUpdateDecryptError![]u8 {
+    return decryptWithKeyUpdateImpl(header, fbs, space, ku, path_id);
+}
+
+fn decryptWithKeyUpdateImpl(
+    header: *Header,
+    fbs: anytype,
+    space: *const PacketNumSpace,
+    ku: *crypto.KeyUpdateManager,
+    path_id: ?u32,
+) KeyUpdateDecryptError![]u8 {
+    header.key_update_authenticated = false;
     if (fbs.seek + 4 + crypto.SAMPLE_LEN > fbs.buffer.len) {
         return error.InvalidPacket;
     }
@@ -605,18 +672,55 @@ pub fn decryptWithKeyUpdate(header: *Header, fbs: anytype, space: *const PacketN
     // Decode packet number
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
 
-    // Select the right Open keys based on key phase
-    var aead = ku.getOpenKeys(header.key_phase) orelse return error.InvalidPacket;
-
-    const decrypted = try aead.decryptPayload(
-        header.packet_number,
-        header_bytes,
-        encrypted_payload,
-    );
+    const decrypted = if (header.key_phase == ku.key_phase)
+        try openPayload(
+            &ku.current_open, path_id, header.packet_number, header_bytes, encrypted_payload,
+        )
+    else blk: {
+        if (ku.prev_open) |*previous| {
+            // Failed AEAD opening can destroy its output. Preserve ciphertext only
+            // when the phase is ambiguous and another generation must be attempted.
+            if (encrypted_payload.len > MAX_PACKET_LEN) return error.InvalidPacket;
+            var saved: [MAX_PACKET_LEN]u8 = undefined;
+            @memcpy(saved[0..encrypted_payload.len], encrypted_payload);
+            if (openPayload(
+                previous, path_id, header.packet_number, header_bytes, encrypted_payload,
+            )) |plaintext| {
+                break :blk plaintext;
+            } else |err| switch (err) {
+                error.AuthenticationFailed => {
+                    @memcpy(encrypted_payload, saved[0..encrypted_payload.len]);
+                },
+            }
+        }
+        const plaintext = try openPayload(
+            &ku.next_open, path_id, header.packet_number, header_bytes, encrypted_payload,
+        );
+        // next_packet_number is largest received + 1 (zero before any receive).
+        // Check only after next-key authentication: a reordered previous-key
+        // packet is valid and a forged phase bit cannot cause a transport close.
+        if (header.packet_number < space.next_packet_number) return error.KeyUpdateError;
+        if (ku.peer_update_unacked) return error.KeyUpdateError;
+        header.key_update_authenticated = true;
+        break :blk plaintext;
+    };
 
     fbs.buffer[header.packet_start] = first_byte;
 
     return decrypted;
+}
+
+fn openPayload(
+    aead: *const crypto.Open,
+    path_id: ?u32,
+    packet_number: u64,
+    associated_data: []const u8,
+    payload: []u8,
+) error{AuthenticationFailed}![]u8 {
+    if (path_id) |id| {
+        return aead.decryptPayloadForPath(id, packet_number, associated_data, payload);
+    }
+    return aead.decryptPayload(packet_number, associated_data, payload);
 }
 
 /// Whether the header-form bit selects the long-header layout.
@@ -1613,4 +1717,353 @@ test "a version negotiation packet carries no length field, so it is the whole d
     // coalesced datagram by this number steps over the whole thing instead of
     // a value it never had.
     try std.testing.expectEqual(bytes.len - fbs.seek, header.remainder_len);
+}
+
+fn sealPathTestPacket(
+    out: []u8,
+    seal: *const crypto.Seal,
+    path_id: u32,
+    pn: u64,
+    phase: bool,
+) []u8 {
+    out[0] = FIXED_BIT | 3 | (if (phase) KEY_PHASE_BIT else @as(u8, 0));
+    std.mem.writeInt(u32, out[1..5], @truncate(pn), ENDIAN);
+    const len = seal.encryptPayloadForPath(path_id, pn, out[0..5], "path payload", out[5..]);
+    const mask = seal.newMask(out[5..][0..crypto.SAMPLE_LEN]);
+    out[0] ^= mask[0] & 0x1f;
+    for (0..4) |i| out[1 + i] ^= mask[1 + i];
+    return out[0 .. 5 + len];
+}
+
+test "path decrypt authenticates both paths and rejects cross-path nonces" {
+    // Equal packet numbers on distinct paths must authenticate only on their own path.
+    const secret = [_]u8{0x31} ** 32;
+    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    var ku = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+    var space = PacketNumSpace{ .crypto_open = ku.current_open };
+    for ([_]u32{ 0, 1 }) |path_id| {
+        var bytes: [128]u8 = undefined;
+        const packet_bytes = sealPathTestPacket(&bytes, &ku.current_seal, path_id, 7, false);
+        var wrong_bytes: [128]u8 = undefined;
+        @memcpy(wrong_bytes[0..packet_bytes.len], packet_bytes);
+        var wrong = io.fixedBufferStream(wrong_bytes[0..packet_bytes.len]);
+        var wrong_header = try Header.parse(&wrong, 0);
+        try std.testing.expectError(
+            error.AuthenticationFailed,
+            decryptForPath(&wrong_header, &wrong, &space, path_id ^ 1),
+        );
+        var fbs = io.fixedBufferStream(packet_bytes);
+        var header = try Header.parse(&fbs, 0);
+        try std.testing.expectEqualStrings(
+            "path payload",
+            try decryptForPath(&header, &fbs, &space, path_id),
+        );
+        try std.testing.expectEqual(@as(u64, 7), header.packet_number);
+    }
+}
+
+test "path key update rejects wrong path and reconstructed packet number without rotation" {
+    // Authentication failure must not authorize a generation change.
+    const secret = [_]u8{0x31} ** 32;
+    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+    var sender = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+    sender.rollKeys(0, 100);
+    for (0..2) |case| {
+        var bytes: [128]u8 = undefined;
+        const packet_bytes = sealPathTestPacket(&bytes, &sender.current_seal, 1, 7, true);
+        var fbs = io.fixedBufferStream(packet_bytes);
+        var header = try Header.parse(&fbs, 0);
+        var space = PacketNumSpace{};
+        if (case == 1) space.next_packet_number = (@as(u64, 1) << 32) + 7;
+        try std.testing.expectError(
+            error.AuthenticationFailed,
+            decryptWithKeyUpdateForPath(
+                &header, &fbs, &space, &receiver, if (case == 0) 0 else 1,
+            ),
+        );
+        try std.testing.expect(!header.key_update_authenticated);
+        try std.testing.expect(!receiver.key_phase);
+        try std.testing.expect(receiver.prev_open == null);
+    }
+}
+
+test "path key update preserves ciphertext between previous and next generation attempts" {
+    // Both adjacent generations have the opposite phase; failed previous-key opening
+    // must not destroy the ciphertext needed to authenticate the next generation.
+    const secret = [_]u8{0x31} ** 32;
+    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+    var sender = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+    const previous_seal = sender.current_seal;
+    receiver.rollKeys(0, 100);
+    sender.rollKeys(0, 100);
+    sender.rollKeys(1, 100);
+    var space = PacketNumSpace{};
+    for ([_]u32{ 0, 1 }) |path_id| {
+        for ([_]bool{ false, true }) |next| {
+            var bytes: [128]u8 = undefined;
+            const seal = if (next) &sender.current_seal else &previous_seal;
+            const packet_bytes = sealPathTestPacket(&bytes, seal, path_id, 7, false);
+            var fbs = io.fixedBufferStream(packet_bytes);
+            var header = try Header.parse(&fbs, 0);
+            try std.testing.expectEqualStrings(
+                "path payload",
+                try decryptWithKeyUpdateForPath(&header, &fbs, &space, &receiver, path_id),
+            );
+            try std.testing.expectEqual(next, header.key_update_authenticated);
+            try std.testing.expect(receiver.key_phase);
+        }
+    }
+}
+
+test "authenticated next key updates reject lower and equal packet numbers on both paths" {
+    // Next-generation authentication is not permission to rotate at or below
+    // the receiving path's watermark, even when previous keys share its phase.
+    const secret = [_]u8{0x31} ** 32;
+    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    const watermarks = [_]u64{ 100, 10 };
+    for ([_]bool{ false, true }) |has_previous| {
+        var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+        var sender = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+        if (has_previous) {
+            receiver.rollKeys(0, 100);
+            sender.rollKeys(0, 100);
+        }
+        sender.rollKeys(1, 100);
+        const original = receiver;
+        for ([_]u32{ 0, 1 }) |path_id| {
+            const watermark = watermarks[path_id];
+            const space = PacketNumSpace{ .next_packet_number = watermark + 1 };
+            for ([_]u64{ watermark - 1, watermark }) |pn| {
+                var bytes: [128]u8 = undefined;
+                const wire = sealPathTestPacket(
+                    &bytes, &sender.current_seal, path_id, pn, sender.key_phase,
+                );
+                var fbs = io.fixedBufferStream(wire);
+                var header = try Header.parse(&fbs, 0);
+                header.key_update_authenticated = true;
+                try std.testing.expectError(
+                    error.KeyUpdateError,
+                    decryptWithKeyUpdateForPath(&header, &fbs, &space, &receiver, path_id),
+                );
+                try std.testing.expectEqual(pn, header.packet_number);
+                try std.testing.expect(!header.key_update_authenticated);
+                try std.testing.expectEqualDeep(original, receiver);
+                try std.testing.expectEqual(watermark + 1, space.next_packet_number);
+            }
+        }
+    }
+}
+
+test "next key update permission uses only the receiving path watermark" {
+    // A valid path-1 update may be below path 0's largest PN; the converse
+    // must use path 0's own high watermark, not the low one from path 1.
+    const secret = [_]u8{0x31} ** 32;
+    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+    var sender = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+    sender.rollKeys(0, 100);
+    const spaces = [_]PacketNumSpace{
+        .{ .next_packet_number = 101 },
+        .{ .next_packet_number = 11 },
+    };
+    const original = receiver;
+    for ([_]u32{ 0, 1 }) |path_id| {
+        var bytes: [128]u8 = undefined;
+        const wire = sealPathTestPacket(&bytes, &sender.current_seal, path_id, 11, true);
+        var fbs = io.fixedBufferStream(wire);
+        var header = try Header.parse(&fbs, 0);
+        if (path_id == 0) {
+            try std.testing.expectError(
+                error.KeyUpdateError,
+                decryptWithKeyUpdateForPath(&header, &fbs, &spaces[path_id], &receiver, path_id),
+            );
+            try std.testing.expect(!header.key_update_authenticated);
+        } else {
+            try std.testing.expectEqualStrings(
+                "path payload",
+                try decryptWithKeyUpdateForPath(
+                    &header, &fbs, &spaces[path_id], &receiver, path_id,
+                ),
+            );
+            try std.testing.expect(header.key_update_authenticated);
+        }
+        try std.testing.expectEqualDeep(original, receiver);
+    }
+}
+
+test "current and previous generation duplicate packets never authorize rotation" {
+    // Duplicate suppression belongs to the caller. Authentic reordered packets
+    // must not be mistaken for next-generation updates by their phase bit.
+    const secret = [_]u8{0x31} ** 32;
+    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+    const previous_seal = receiver.current_seal;
+    receiver.rollKeys(0, 100);
+    const original = receiver;
+    const space = PacketNumSpace{ .next_packet_number = 11 };
+    for ([_]u32{ 0, 1 }) |path_id| {
+        for ([_]bool{ false, true }) |previous| {
+            for ([_]u64{ 9, 10 }) |pn| {
+                var bytes: [128]u8 = undefined;
+                const seal = if (previous) &previous_seal else &receiver.current_seal;
+                const phase = if (previous) !receiver.key_phase else receiver.key_phase;
+                const wire = sealPathTestPacket(&bytes, seal, path_id, pn, phase);
+                var fbs = io.fixedBufferStream(wire);
+                var header = try Header.parse(&fbs, 0);
+                header.key_update_authenticated = true;
+                try std.testing.expectEqualStrings(
+                    "path payload",
+                    try decryptWithKeyUpdateForPath(&header, &fbs, &space, &receiver, path_id),
+                );
+                try std.testing.expect(!header.key_update_authenticated);
+                try std.testing.expectEqualDeep(original, receiver);
+            }
+        }
+    }
+}
+
+test "new paths accept next generation packet zero but unauthenticated updates cannot close" {
+    // With no received packet the watermark is absent, not packet zero.
+    // A forged update below a real watermark must remain an authentication drop.
+    const secret = [_]u8{0x31} ** 32;
+    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+    var sender = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+    sender.rollKeys(0, 100);
+    const original = receiver;
+    for ([_]u32{ 0, 1 }) |path_id| {
+        var bytes: [128]u8 = undefined;
+        const wire = sealPathTestPacket(&bytes, &sender.current_seal, path_id, 0, true);
+        var forged: [128]u8 = undefined;
+        @memcpy(forged[0..wire.len], wire);
+        forged[wire.len - 1] ^= 1;
+        var bad_fbs = io.fixedBufferStream(forged[0..wire.len]);
+        var bad_header = try Header.parse(&bad_fbs, 0);
+        const received = PacketNumSpace{ .next_packet_number = 11 };
+        try std.testing.expectError(
+            error.AuthenticationFailed,
+            decryptWithKeyUpdateForPath(
+                &bad_header, &bad_fbs, &received, &receiver, path_id,
+            ),
+        );
+        try std.testing.expect(!bad_header.key_update_authenticated);
+        var fbs = io.fixedBufferStream(wire);
+        var header = try Header.parse(&fbs, 0);
+        const fresh = PacketNumSpace{};
+        try std.testing.expectEqualStrings(
+            "path payload",
+            try decryptWithKeyUpdateForPath(&header, &fbs, &fresh, &receiver, path_id),
+        );
+        try std.testing.expect(header.key_update_authenticated);
+        try std.testing.expectEqual(@as(u64, 0), header.packet_number);
+        try std.testing.expectEqualDeep(original, receiver);
+    }
+}
+
+test "second authenticated peer update waits for an actual send on either path" {
+    // Shared keys cannot rotate twice on peer request before we send with the
+    // first update. Authentication drops and old/current packets remain allowed.
+    const secret = [_]u8{0x31} ** 32;
+    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    for ([_]u32{ 0, 1 }) |path_id| {
+        var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+        var sender = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+        const previous_seal = sender.current_seal;
+        sender.rollKeys(0, 100);
+        var bytes: [128]u8 = undefined;
+        const first_wire = sealPathTestPacket(&bytes, &sender.current_seal, path_id, 7, true);
+        var first_fbs = io.fixedBufferStream(first_wire);
+        var first_header = try Header.parse(&first_fbs, 0);
+        var space = PacketNumSpace{};
+        try std.testing.expectEqualStrings(
+            "path payload",
+            try decryptWithKeyUpdateForPath(
+                &first_header, &first_fbs, &space, &receiver, path_id,
+            ),
+        );
+        try std.testing.expect(first_header.key_update_authenticated);
+        receiver.onPeerKeyUpdate(0, 100);
+        space.next_packet_number = 8;
+        try std.testing.expect(receiver.peer_update_unacked);
+        const pending = receiver;
+        const current_seal = sender.current_seal;
+        sender.rollKeys(1, 100);
+
+        for ([_]bool{ false, true }) |previous| {
+            const seal = if (previous) &previous_seal else &current_seal;
+            const wire = sealPathTestPacket(&bytes, seal, path_id, 7, !previous);
+            var fbs = io.fixedBufferStream(wire);
+            var header = try Header.parse(&fbs, 0);
+            try std.testing.expectEqualStrings(
+                "path payload",
+                try decryptWithKeyUpdateForPath(&header, &fbs, &space, &receiver, path_id),
+            );
+            try std.testing.expect(!header.key_update_authenticated);
+            try std.testing.expectEqualDeep(pending, receiver);
+        }
+
+        for ([_]bool{ true, false }) |forged| {
+            const wire = sealPathTestPacket(&bytes, &sender.current_seal, path_id, 8, false);
+            if (forged) wire[wire.len - 1] ^= 1;
+            var fbs = io.fixedBufferStream(wire);
+            var header = try Header.parse(&fbs, 0);
+            try std.testing.expectError(
+                if (forged) error.AuthenticationFailed else error.KeyUpdateError,
+                decryptWithKeyUpdateForPath(&header, &fbs, &space, &receiver, path_id),
+            );
+            try std.testing.expect(!header.key_update_authenticated);
+            try std.testing.expectEqualDeep(pending, receiver);
+        }
+
+        // Sending on the other path acknowledges the shared generation too.
+        receiver.onPacketSentForPath(@intCast(path_id ^ 1), 0);
+        try std.testing.expect(!receiver.peer_update_unacked);
+        const acknowledged = receiver;
+        const wire = sealPathTestPacket(&bytes, &sender.current_seal, path_id, 8, false);
+        var fbs = io.fixedBufferStream(wire);
+        var header = try Header.parse(&fbs, 0);
+        try std.testing.expectEqualStrings(
+            "path payload",
+            try decryptWithKeyUpdateForPath(&header, &fbs, &space, &receiver, path_id),
+        );
+        try std.testing.expect(header.key_update_authenticated);
+        try std.testing.expectEqualDeep(acknowledged, receiver);
+    }
+}
+
+test "path opening leaves Initial and Handshake legacy protection unchanged" {
+    // Multipath is a 1-RTT extension; even the path-aware entry must open long
+    // headers with the original epoch nonce and header-protection mask.
+    const secret = [_]u8{0x31} ** 32;
+    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    var ku = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+    var space = PacketNumSpace{ .crypto_open = ku.current_open };
+    for ([_]PacketType{ .initial, .handshake }) |packet_type| {
+        var bytes: [128]u8 = undefined;
+        var output = io.fixedBufferStream(&bytes);
+        var encoded_header = Header{
+            .version = protocol.QUIC_V1,
+            .packet_type = packet_type,
+            .packet_number_len = 4,
+        };
+        try encoded_header.encode(&output);
+        try writeVarInt(&output, 4 + "path payload".len + crypto.Aead.tag_length);
+        const pn_offset = output.seek;
+        try output.writeInt(u32, 7, ENDIAN);
+        const payload_offset = output.seek;
+        const len = ku.current_seal.encryptPayload(
+            7, bytes[0..payload_offset], "path payload", bytes[payload_offset..],
+        );
+        const mask = ku.current_seal.newMask(bytes[pn_offset + 4 ..][0..crypto.SAMPLE_LEN]);
+        bytes[0] ^= mask[0] & 0x0f;
+        for (0..4) |i| bytes[pn_offset + i] ^= mask[1 + i];
+        var fbs = io.fixedBufferStream(bytes[0 .. payload_offset + len]);
+        var header = try Header.parse(&fbs, 0);
+        try std.testing.expectEqualStrings(
+            "path payload",
+            try decryptForPath(&header, &fbs, &space, 0),
+        );
+    }
 }

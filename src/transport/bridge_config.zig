@@ -116,11 +116,8 @@ pub const CreateError = error{
 
 /// The configuration a caller supplies, in this project's vocabulary.
 ///
-/// Nothing here is named after a field in the vendored tree. A bridge whose
-/// configuration is a bag of upstream field names is a wrapper, and a
-/// wrapper has to be updated whenever the thing it wraps is renamed; this one
-/// is a node id, two keys and an ALPN, and the translation to the core's
-/// spelling happens once, in `Bridge.create`.
+/// Identity and transport settings for every connection accepted by this bridge.
+/// Native extension options use the core's types and wire-limit semantics.
 pub const Config = struct {
     /// Null applies only core admission rules. A supplied pure policy runs
     /// after token validation, before connection allocation. Borrow its context
@@ -163,6 +160,18 @@ pub const Config = struct {
     /// milliseconds. The core's unit is milliseconds and so is this one:
     /// converting at the call site would be one more unit in the project.
     idle_timeout_ms: u64 = 30_000,
+    /// Observed-address reporting/receiving role. Disabled omits its parameter.
+    address_discovery_role: quic.observed_address.Role = .disabled,
+    /// Native NAT address capacity. Null disables NAT traversal; supported
+    /// advertised counts are 1 through 32, without count-minus-one conversion.
+    max_remote_nat_traversal_addresses: ?u8 = null,
+    /// Largest native path ID, 0 or 1. Null disables multipath; 1 permits two
+    /// paths, with IDs 0 and 1.
+    initial_max_path_id: ?u32 = null,
+    /// Whether the actual sending UDP socket supports IPv6 destinations.
+    /// Derive this from its bind family, never from a synthetic relay path0.
+    /// Defaults to true for socket-independent callers; Node supplies its bind family.
+    ipv6_supported: bool = true,
     /// The secret that signs Retry tokens and NEW_TOKENs. Null draws one
     /// from the `std.Io` `create` was handed; see `create` for why that is
     /// not a global.

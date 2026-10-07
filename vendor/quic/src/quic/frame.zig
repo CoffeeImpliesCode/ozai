@@ -12,6 +12,8 @@ const std = @import("std");
 const io = @import("../io_compat.zig");
 
 const packet = @import("packet.zig");
+const observed_address = @import("observed_address.zig");
+const native_nat = @import("native_nat.zig");
 
 /// Length of the run of PADDING (zero) bytes at the start of `bytes`.
 /// Padded Initials and PMTU probes carry ~1000 of them, so it scans a vector
@@ -71,6 +73,20 @@ pub const FrameType = enum(u64) {
     datagram = 0x30,
     datagram_with_length = 0x31,
     ack_frequency = 0xaf,
+    observed_address = 0x9f81a6,
+    add_address = 0x3d7f90,
+    reach_address = 0x3d7f92,
+    remove_address = 0x3d7f94,
+    path_ack = 0x3e,
+    path_ack_ecn = 0x3f,
+    path_abandon = 0x3e75,
+    path_status_backup = 0x3e76,
+    path_status_available = 0x3e77,
+    path_new_connection_id = 0x3e78,
+    path_retire_connection_id = 0x3e79,
+    max_path_id = 0x3e7a,
+    paths_blocked = 0x3e7b,
+    path_cids_blocked = 0x3e7c,
     _,
 };
 
@@ -343,6 +359,27 @@ pub const Frame = union(FrameType) {
         reordering_threshold: u64,
     },
 
+    observed_address: observed_address.Report,
+    add_address: native_nat.AddAddress,
+    reach_address: native_nat.ReachAddress,
+    remove_address: u64,
+    path_ack: struct { path_id: u32, ack: @FieldType(Frame, "ack") },
+    path_ack_ecn: struct { path_id: u32, ack: @FieldType(Frame, "ack_ecn") },
+    path_abandon: struct { path_id: u32, error_code: u64 },
+    path_status_backup: struct { path_id: u32, status_seq_no: u64 },
+    path_status_available: struct { path_id: u32, status_seq_no: u64 },
+    path_new_connection_id: struct { path_id: u32, cid: @FieldType(Frame, "new_connection_id") },
+    path_retire_connection_id: struct { path_id: u32, seq_num: u64 },
+    max_path_id: u32,
+    paths_blocked: u32,
+    path_cids_blocked: struct { path_id: u32, next_seq: u64 },
+
+    fn readPathId(reader: anytype) error{ FrameEncodingError, EndOfStream }!u32 {
+        const value = try packet.readVarInt(reader);
+        if (value > std.math.maxInt(u32)) return error.FrameEncodingError;
+        return @intCast(value);
+    }
+
     /// A frame body cannot extend past the datagram it was decoded from.
     /// Wire lengths are u64 varints, so this is also where they narrow to
     /// usize (RFC 9000 12.4: a violation is FRAME_ENCODING_ERROR).
@@ -404,8 +441,10 @@ pub const Frame = union(FrameType) {
             },
 
             // ack (0x02) and ack_ecn (0x03)
-            0x02, 0x03 => blk: {
-                const is_ecn = (frame_type == 0x03);
+            0x02, 0x03, 0x3e, 0x3f => blk: {
+                const is_path = frame_type == 0x3e or frame_type == 0x3f;
+                const path_id = if (is_path) try readPathId(reader) else 0;
+                const is_ecn = frame_type == 0x03 or frame_type == 0x3f;
                 const largest_ack = try packet.readVarInt(reader);
                 const ack_delay = try packet.readVarInt(reader);
                 const ack_range_count = try packet.readVarInt(reader);
@@ -445,6 +484,26 @@ pub const Frame = union(FrameType) {
                     ecn_ce = try packet.readVarInt(reader);
                 }
 
+
+                if (is_path) {
+                    if (is_ecn) break :blk .{ .path_ack_ecn = .{
+                        .path_id = path_id,
+                        .ack = .{
+                            .largest_ack = largest_ack, .ack_delay = ack_delay,
+                            .first_ack_range = first_ack_range, .ack_range_count = range_count,
+                            .ack_ranges = additional_ranges,
+                            .ecn_ect0 = ecn_ect0, .ecn_ect1 = ecn_ect1, .ecn_ce = ecn_ce,
+                        },
+                    } };
+                    break :blk .{ .path_ack = .{
+                        .path_id = path_id,
+                        .ack = .{
+                            .largest_ack = largest_ack, .ack_delay = ack_delay,
+                            .first_ack_range = first_ack_range, .ack_range_count = range_count,
+                            .ack_ranges = additional_ranges,
+                        },
+                    } };
+                }
                 if (is_ecn) {
                     break :blk .{
                         .ack_ecn = .{
@@ -667,6 +726,47 @@ pub const Frame = union(FrameType) {
                 .reordering_threshold = try packet.readVarInt(reader),
             } },
 
+            0x9f81a6, 0x9f81a7 => .{ .observed_address =
+                try observed_address.Report.read(reader, frame_type == 0x9f81a7) },
+            0x3d7f90, 0x3d7f91 => .{ .add_address =
+                try native_nat.AddAddress.read(reader, frame_type == 0x3d7f91) },
+            0x3d7f92, 0x3d7f93 => .{ .reach_address =
+                try native_nat.ReachAddress.read(reader, frame_type == 0x3d7f93) },
+            0x3d7f94 => .{ .remove_address = try packet.readVarInt(reader) },
+            0x3e75 => .{ .path_abandon = .{
+                .path_id = try readPathId(reader), .error_code = try packet.readVarInt(reader),
+            } },
+            0x3e76 => .{ .path_status_backup = .{
+                .path_id = try readPathId(reader), .status_seq_no = try packet.readVarInt(reader),
+            } },
+            0x3e77 => .{ .path_status_available = .{
+                .path_id = try readPathId(reader), .status_seq_no = try packet.readVarInt(reader),
+            } },
+            0x3e78 => blk: {
+                const path_id = try readPathId(reader);
+                const sequence = try packet.readVarInt(reader);
+                const retire = try packet.readVarInt(reader);
+                if (retire > sequence) return error.FrameEncodingError;
+                const length = try reader.takeByte();
+                if (length == 0 or length > 20) return error.FrameEncodingError;
+                const cid = try body(bytes, &stream.seek, length);
+                var token: [16]u8 = undefined;
+                try reader.readSliceAll(&token);
+                break :blk .{ .path_new_connection_id = .{
+                    .path_id = path_id, .cid = .{
+                        .seq_num = sequence, .retire_prior_to = retire,
+                        .conn_id = cid, .stateless_reset_token = token,
+                    },
+                } };
+            },
+            0x3e79 => .{ .path_retire_connection_id = .{
+                .path_id = try readPathId(reader), .seq_num = try packet.readVarInt(reader),
+            } },
+            0x3e7a => .{ .max_path_id = try readPathId(reader) },
+            0x3e7b => .{ .paths_blocked = try readPathId(reader) },
+            0x3e7c => .{ .path_cids_blocked = .{
+                .path_id = try readPathId(reader), .next_seq = try packet.readVarInt(reader),
+            } },
             else => return error.FrameEncodingError,
         };
     }
@@ -883,6 +983,66 @@ pub const Frame = union(FrameType) {
                 try packet.writeVarInt(writer, af.request_max_ack_delay);
                 try packet.writeVarInt(writer, af.reordering_threshold);
             },
+            .observed_address => |report| try report.write(writer),
+            .add_address => |add| try add.write(writer),
+            .reach_address => |reach| try reach.write(writer),
+            .remove_address => |sequence| {
+                try packet.writeVarInt(writer, 0x3d7f94);
+                try packet.writeVarInt(writer, sequence);
+            },
+            inline .path_ack, .path_ack_ecn => |value| {
+                try packet.writeVarInt(writer, @intFromEnum(std.meta.activeTag(self)));
+                try packet.writeVarInt(writer, value.path_id);
+                const ack = &value.ack;
+                try packet.writeVarInt(writer, ack.largest_ack);
+                try packet.writeVarInt(writer, ack.ack_delay);
+                try packet.writeVarInt(writer, ack.ack_range_count);
+                try packet.writeVarInt(writer, ack.first_ack_range);
+                var previous = ack.largest_ack - ack.first_ack_range;
+                for (ack.ack_ranges[0..ack.ack_range_count]) |range| {
+                    try packet.writeVarInt(writer, previous - range.end - 2);
+                    try packet.writeVarInt(writer, range.end - range.start);
+                    previous = range.start;
+                }
+                if (@hasField(@TypeOf(value.ack), "ecn_ect0")) {
+                    try packet.writeVarInt(writer, ack.ecn_ect0);
+                    try packet.writeVarInt(writer, ack.ecn_ect1);
+                    try packet.writeVarInt(writer, ack.ecn_ce);
+                }
+            },
+            .path_abandon => |value| {
+                try packet.writeVarInt(writer, 0x3e75);
+                try packet.writeVarInt(writer, value.path_id);
+                try packet.writeVarInt(writer, value.error_code);
+            },
+            inline .path_status_backup, .path_status_available => |value| {
+                try packet.writeVarInt(writer, @intFromEnum(std.meta.activeTag(self)));
+                try packet.writeVarInt(writer, value.path_id);
+                try packet.writeVarInt(writer, value.status_seq_no);
+            },
+            .path_new_connection_id => |value| {
+                try packet.writeVarInt(writer, 0x3e78);
+                try packet.writeVarInt(writer, value.path_id);
+                try packet.writeVarInt(writer, value.cid.seq_num);
+                try packet.writeVarInt(writer, value.cid.retire_prior_to);
+                try writer.writeByte(@intCast(value.cid.conn_id.len));
+                try writer.writeAll(value.cid.conn_id);
+                try writer.writeAll(&value.cid.stateless_reset_token);
+            },
+            .path_retire_connection_id => |value| {
+                try packet.writeVarInt(writer, 0x3e79);
+                try packet.writeVarInt(writer, value.path_id);
+                try packet.writeVarInt(writer, value.seq_num);
+            },
+            .max_path_id, .paths_blocked => |value| {
+                try packet.writeVarInt(writer, @intFromEnum(std.meta.activeTag(self)));
+                try packet.writeVarInt(writer, value);
+            },
+            .path_cids_blocked => |value| {
+                try packet.writeVarInt(writer, 0x3e7c);
+                try packet.writeVarInt(writer, value.path_id);
+                try packet.writeVarInt(writer, value.next_seq);
+            },
         }
     }
 
@@ -895,22 +1055,23 @@ pub const Frame = union(FrameType) {
     /// so a decoded frame and a hand-built one answer the same.
     pub fn isAckEliciting(self: Frame) bool {
         return switch (self) {
-            .padding, .ack, .ack_ecn, .connection_close, .application_close => false,
+            .padding, .ack, .ack_ecn, .path_ack, .path_ack_ecn,
+            .connection_close, .application_close => false,
             .datagram, .datagram_with_length => true,
             else => true,
         };
     }
 
-    /// Whether this frame is path validation (RFC 9000 §8.2): it proves a path
-    /// is live but carries no application data.
+    /// Whether Noq classifies this frame as part of a probing packet.
     ///
-    /// True for PADDING, NEW_CONNECTION_ID, PATH_CHALLENGE and
-    /// PATH_RESPONSE, and false for every other frame including STREAM and
-    /// the CLOSE forms. A caller uses this to keep packets that only prove a
-    /// path out of the congestion controller's accounting.
+    /// True only for PADDING, PATH_CHALLENGE, PATH_RESPONSE,
+    /// NEW_CONNECTION_ID and OBSERVED_ADDR; PATH_NEW_CONNECTION_ID and every
+    /// other frame are false. A packet is probing only when all its frames
+    /// answer true.
     pub fn isProbing(self: Frame) bool {
         return switch (self) {
-            .padding, .new_connection_id, .path_challenge, .path_response => true,
+            .padding, .path_challenge, .path_response, .new_connection_id,
+            .observed_address => true,
             else => false,
         };
     }
@@ -941,6 +1102,10 @@ pub const Frame = union(FrameType) {
             .handshake_done,
             .ack_frequency,
             .immediate_ack,
+            .observed_address, .add_address, .reach_address, .remove_address,
+            .path_ack, .path_ack_ecn, .path_abandon,
+            .path_status_backup, .path_status_available, .path_new_connection_id,
+            .path_retire_connection_id, .max_path_id, .paths_blocked, .path_cids_blocked,
             => pkt_type == .one_rtt,
             // All others: 0-RTT and 1-RTT only
             .reset_stream,
@@ -1069,6 +1234,21 @@ pub const PendingControlFrame = union(enum) {
         reordering_threshold: u64,
     },
     immediate_ack: void,
+    observed_address: observed_address.Report,
+    add_address: native_nat.AddAddress,
+    reach_address: native_nat.ReachAddress,
+    remove_address: u64,
+    path_abandon: @FieldType(Frame, "path_abandon"),
+    path_status_backup: @FieldType(Frame, "path_status_backup"),
+    path_status_available: @FieldType(Frame, "path_status_available"),
+    path_retire_connection_id: @FieldType(Frame, "path_retire_connection_id"),
+    max_path_id: u32,
+    paths_blocked: u32,
+    path_cids_blocked: @FieldType(Frame, "path_cids_blocked"),
+    path_new_connection_id: struct {
+        path_id: u32,
+        cid: @FieldType(PendingControlFrame, "new_connection_id"),
+    },
 
     /// Write this pending control frame directly on the wire.
     /// For new_connection_id we serialize directly (avoids dangling slice from toFrame()).
@@ -1091,6 +1271,16 @@ pub const PendingControlFrame = union(enum) {
                 try writer.writeByte(ncid.cid_len);
                 try writer.writeAll(ncid.cid_buf[0..ncid.cid_len]);
                 try writer.writeAll(&ncid.stateless_reset_token);
+            },
+            .path_new_connection_id => |value| {
+                const cid = value.cid;
+                try packet.writeVarInt(writer, 0x3e78);
+                try packet.writeVarInt(writer, value.path_id);
+                try packet.writeVarInt(writer, cid.seq_num);
+                try packet.writeVarInt(writer, cid.retire_prior_to);
+                try writer.writeByte(cid.cid_len);
+                try writer.writeAll(cid.cid_buf[0..cid.cid_len]);
+                try writer.writeAll(&cid.stateless_reset_token);
             },
             else => {
                 const f = self.toFrame();
@@ -1136,6 +1326,18 @@ pub const PendingControlFrame = union(enum) {
                 .reordering_threshold = af.reordering_threshold,
             } },
             .immediate_ack => .{ .immediate_ack = {} },
+            .observed_address => |value| .{ .observed_address = value },
+            .add_address => |value| .{ .add_address = value },
+            .reach_address => |value| .{ .reach_address = value },
+            .remove_address => |value| .{ .remove_address = value },
+            .path_abandon => |value| .{ .path_abandon = value },
+            .path_status_backup => |value| .{ .path_status_backup = value },
+            .path_status_available => |value| .{ .path_status_available = value },
+            .path_retire_connection_id => |value| .{ .path_retire_connection_id = value },
+            .max_path_id => |value| .{ .max_path_id = value },
+            .paths_blocked => |value| .{ .paths_blocked = value },
+            .path_cids_blocked => |value| .{ .path_cids_blocked = value },
+            .path_new_connection_id => unreachable, // Written from inline storage.
             .new_token => unreachable, // handled directly in write()
             .new_connection_id => unreachable, // handled directly in write()
         };
@@ -1912,4 +2114,131 @@ test "PendingFrameQueue: full refuses new frames but always admits CONNECTION_CL
     const f = q.pop().?;
     q.requeue(f);
     try std.testing.expectEqual(@as(usize, @import("limits.zig").pending_frames), q.len);
+}
+
+test "Noq 1.3 native traversal and multipath source wire vectors" {
+    // Source oracle: noq-proto 1.3.0 frame.rs encoders, including path prefix.
+    const vectors = [_][]const u8{
+        &.{ 0x80, 0x3d, 0x7f, 0x94, 0x40, 0x40 },
+        &.{ 0x7e, 0x75, 1, 0 },
+        &.{ 0x7e, 0x76, 1, 2 },
+        &.{ 0x7e, 0x77, 1, 2 },
+        &.{ 0x7e, 0x79, 1, 0 },
+        &.{ 0x7e, 0x7a, 1 },
+        &.{ 0x7e, 0x7b, 1 },
+        &.{ 0x7e, 0x7c, 1, 2 },
+        &.{ 0x3e, 1, 10, 0, 0, 3 },
+        &.{ 0x3f, 1, 10, 0, 0, 3, 1, 2, 3 },
+    };
+    for (vectors) |vector| {
+        var bytes: [64]u8 = undefined;
+        @memcpy(bytes[0..vector.len], vector);
+        var consumed: usize = 0;
+        const decoded = try Frame.parseSized(bytes[0..vector.len], &consumed);
+        try std.testing.expectEqual(vector.len, consumed);
+        var encoded: [64]u8 = undefined;
+        var writer = io.fixedBufferStream(&encoded);
+        try decoded.write(&writer);
+        try std.testing.expectEqualSlices(u8, vector, writer.buffered());
+        for (0..vector.len) |cut| {
+            if (Frame.parse(bytes[0..cut])) |_| return error.AcceptedTruncatedFrame else |_| {}
+        }
+        try std.testing.expect(decoded.isAllowedIn(.one_rtt));
+        try std.testing.expect(!decoded.isAllowedIn(.zero_rtt));
+    }
+}
+
+test "native extension malformed path IDs and ACK ranges" {
+    var overflow = [_]u8{ 0x7e, 0x75, 0xc0, 0, 0, 1, 0, 0, 0, 0, 0 };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&overflow));
+    var range = [_]u8{ 0x3e, 1, 0, 0, 0, 1 };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&range));
+    var gap = [_]u8{ 0x3e, 1, 0, 0, 1, 0, 0, 0 };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&gap));
+    var cid = [_]u8{ 0x7e, 0x78, 1, 0, 1, 1, 0 };
+    try std.testing.expectError(error.FrameEncodingError, Frame.parse(&cid));
+}
+
+test "native extension frame fuzz canonical encoding fixed point" {
+    try std.testing.fuzz({}, fuzzNativeFrame, .{});
+}
+
+fn fuzzNativeFrame(_: void, smith: *std.testing.Smith) !void {
+    const types = [_]u64{
+        0x9f81a6, 0x9f81a7, 0x3d7f90, 0x3d7f91, 0x3d7f92, 0x3d7f93, 0x3d7f94,
+        0x3e, 0x3f, 0x3e75, 0x3e76, 0x3e77, 0x3e78, 0x3e79, 0x3e7a, 0x3e7b, 0x3e7c,
+    };
+    var input: [128]u8 = undefined;
+    var stream = io.fixedBufferStream(&input);
+    const selected = smith.value(u8) % types.len;
+    try packet.writeVarInt(&stream, types[selected]);
+    const body_start = stream.seek;
+    const body_length = smith.slice(input[body_start..]);
+    var consumed: usize = 0;
+    const decoded = Frame.parseSized(input[0 .. body_start + body_length], &consumed) catch return;
+    try std.testing.expect(consumed <= body_start + body_length);
+    var encoded: [640]u8 = undefined;
+    var writer = io.fixedBufferStream(&encoded);
+    try decoded.write(&writer);
+    const again = try Frame.parseSized(encoded[0..writer.seek], &consumed);
+    try std.testing.expectEqual(writer.seek, consumed);
+    var fixed_bytes: [640]u8 = undefined;
+    var fixed_writer = io.fixedBufferStream(&fixed_bytes);
+    try again.write(&fixed_writer);
+    try std.testing.expectEqualSlices(u8, writer.buffered(), fixed_writer.buffered());
+}
+
+test "multipath pending CID owns storage and writes complete body" {
+    const pending = PendingControlFrame{ .path_new_connection_id = .{
+        .path_id = 1,
+        .cid = .{
+            .seq_num = 0, .retire_prior_to = 0,
+            .cid_buf = .{0xab} ** 20, .cid_len = 1,
+            .stateless_reset_token = .{0xcd} ** 16,
+        },
+    } };
+    var buffer: [64]u8 = undefined;
+    var writer = io.fixedBufferStream(&buffer);
+    try pending.write(&writer);
+    var consumed: usize = 0;
+    const frame = try Frame.parseSized(buffer[0..writer.seek], &consumed);
+    try std.testing.expectEqual(writer.seek, consumed);
+    try std.testing.expectEqual(@as(u32, 1), frame.path_new_connection_id.path_id);
+    try std.testing.expectEqualSlices(u8, &.{0xab}, frame.path_new_connection_id.cid.conn_id);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xcd} ** 16),
+        &frame.path_new_connection_id.cid.stateless_reset_token);
+    try std.testing.expect(!frame.isProbing());
+    for (0..writer.seek) |cut| {
+        if (Frame.parse(buffer[0..cut])) |_| return error.AcceptedTruncatedCid else |_| {}
+    }
+}
+
+test "Frame.isProbing matches native Noq classification" {
+    const probes = [_]Frame{
+        .{ .padding = 1 },
+        .{ .path_challenge = .{0} ** 8 },
+        .{ .path_response = .{0} ** 8 },
+        .{ .new_connection_id = .{
+            .seq_num = 0,
+            .retire_prior_to = 0,
+            .conn_id = @constCast(&[_]u8{0xab}),
+            .stateless_reset_token = .{0} ** 16,
+        } },
+        .{ .observed_address = .{
+            .sequence = 0,
+            .address = .initIpv4(.{ 127, 0, 0, 1 }, 443),
+        } },
+    };
+    for (probes) |frame| try std.testing.expect(frame.isProbing());
+
+    const path_new_connection_id: Frame = .{ .path_new_connection_id = .{
+        .path_id = 1,
+        .cid = .{
+            .seq_num = 0,
+            .retire_prior_to = 0,
+            .conn_id = @constCast(&[_]u8{0xab}),
+            .stateless_reset_token = .{0} ** 16,
+        },
+    } };
+    try std.testing.expect(!path_new_connection_id.isProbing());
 }

@@ -136,14 +136,29 @@ pub const SentControlFrame = union(enum) {
     /// retransmission, because a token this peer never accepted is not one
     /// it needs again.
     new_token: void,
+    /// Re-arm reporting on the actual sending path; never replay old address bytes.
+    observed_address: u32,
+    add_address: @FieldType(frame_mod.PendingControlFrame, "add_address"),
+    reach_address: @FieldType(frame_mod.PendingControlFrame, "reach_address"),
+    remove_address: u64,
+    path_abandon: @FieldType(frame_mod.PendingControlFrame, "path_abandon"),
+    /// Rebuild the current status and sequence for this path.
+    path_status: u32,
+    path_new_connection_id: struct { path_id: u32, seq_num: u64 },
+    path_retire_connection_id: @FieldType(frame_mod.PendingControlFrame, "path_retire_connection_id"),
+    /// Rebuild the current advertised path limit.
+    max_path_id: void,
+    /// Blocked notifications preserve the historical limit, like Noq.
+    paths_blocked: u32,
+    path_cids_blocked: @FieldType(frame_mod.PendingControlFrame, "path_cids_blocked"),
 
     /// The record for a queued frame, or null for one that is never repeated
-    /// (PING, PATH_*, CONNECTION_CLOSE, ACK_FREQUENCY, IMMEDIATE_ACK).
+    /// (PING, PATH_CHALLENGE/RESPONSE, CONNECTION_CLOSE, ACK_FREQUENCY, IMMEDIATE_ACK).
+    /// OBSERVED_ADDRESS also returns null here: the packer must supply its
+    /// actual sending path, which the queued wire payload does not contain.
     ///
-    /// `null` means the frame is fire-and-forget, not that the frame is
-    /// invalid: a caller that wants loss-driven repetition cannot have it for
-    /// these, and must not send a frame expecting a retransmission that
-    /// nothing here will produce.
+    /// Except for that context-dependent report, `null` means fire-and-forget,
+    /// not an invalid frame.
     pub fn from(pcf: frame_mod.PendingControlFrame) ?SentControlFrame {
         return switch (pcf) {
             .max_data => .max_data,
@@ -159,6 +174,20 @@ pub const SentControlFrame = union(enum) {
             .new_connection_id => |n| .{ .new_connection_id = n.seq_num },
             .retire_connection_id => |seq| .{ .retire_connection_id = seq },
             .new_token => .new_token,
+            .add_address => |value| .{ .add_address = value },
+            .reach_address => |value| .{ .reach_address = value },
+            .remove_address => |value| .{ .remove_address = value },
+            .path_abandon => |value| .{ .path_abandon = value },
+            .path_status_backup => |value| .{ .path_status = value.path_id },
+            .path_status_available => |value| .{ .path_status = value.path_id },
+            .path_new_connection_id => |value| .{ .path_new_connection_id = .{
+                .path_id = value.path_id, .seq_num = value.cid.seq_num,
+            } },
+            .path_retire_connection_id => |value| .{ .path_retire_connection_id = value },
+            .max_path_id => .max_path_id,
+            .paths_blocked => |value| .{ .paths_blocked = value },
+            .path_cids_blocked => |value| .{ .path_cids_blocked = value },
+            .observed_address => null,
             .ping, .path_challenge, .path_response, .connection_close, .ack_frequency, .immediate_ack => null,
         };
     }
@@ -606,18 +635,29 @@ pub const SentPacketTracker = struct {
 
         const first_range_start = largest_ack -| first_ack_range;
         const largest_acked = @max(self.largest_acked orelse 0, largest_ack);
+        var acked_count: usize = 0;
+        for (self.sent_packets.values()) |pkt| {
+            if (ackCovers(pkt.pn, first_range_start, largest_ack, ack_ranges)) acked_count += 1;
+        }
+        // Noq updates the ACK watermark, then stops if no recovery packet was
+        // newly acknowledged (connection/mod.rs:2960,2993-2995). Off-path PNs
+        // are valid ACK targets but cannot trigger on-path loss or recovery.
+        if (acked_count == 0) {
+            self.largest_acked = largest_acked;
+            result.owner = self;
+            return;
+        }
         var next_rtt = rtt_stats.*;
         if (self.sent_packets.get(largest_ack)) |pkt| {
             next_rtt.updateRtt(now - pkt.time_sent, ack_delay_ns, true);
         }
         const lost_send_time = now - next_rtt.lossDelay();
 
-        var acked_count: usize = 0;
         var lost_count: usize = 0;
         for (self.sent_packets.values()) |pkt| {
-            if (ackCovers(pkt.pn, first_range_start, largest_ack, ack_ranges)) {
-                acked_count += 1;
-            } else if (isLost(pkt, largest_acked, lost_send_time)) {
+            if (!ackCovers(pkt.pn, first_range_start, largest_ack, ack_ranges) and
+                isLost(pkt, largest_acked, lost_send_time))
+            {
                 lost_count += 1;
             }
         }
@@ -1281,6 +1321,19 @@ pub const PacketHandler = struct {
         }
     }
 
+    /// Off-path NAT probes consume real path-zero numbers and can be ACKed,
+    /// but are not recovery packets on the working path. Retain the sent
+    /// watermark; next_pn and skipped_pns already validate their ACKs. Do not
+    /// allocate a recovery record, arm PTO, sample RTT or return these bytes
+    /// through ACK/loss results to the on-path congestion controller.
+    pub fn onOffPathPacketSent(self: *PacketHandler, pn: u64) void {
+        const idx = @intFromEnum(EncLevel.application);
+        assert(pn < self.next_pn[idx]);
+        assert(!self.sent[idx].sent_packets.contains(pn));
+        if (self.sent[idx].largest_sent) |largest| assert(pn > largest);
+        self.sent[idx].largest_sent = pn;
+    }
+
     /// Records a received packet against `level`, which is the space its
     /// header said, not the one the caller would have guessed. `ecn` is the
     /// two-bit codepoint from that header.
@@ -1340,6 +1393,7 @@ pub const PacketHandler = struct {
             now,
             result,
         );
+        if (result.acked.count() == 0) return;
 
         // ACK-of-ACK pruning (RFC 9000 §13.2.4): when an acked packet contained
         // our ACK frame, prune received ranges below that ACK's largest_ack
@@ -2255,4 +2309,164 @@ test "PacketHandler: a refused loss pass leaves the loss timer armed and is safe
     try testing.expectEqual(@as(u32, 0), app.ack_eliciting_in_flight);
     try testing.expectEqual(@as(u64, 0), handler.bytes_in_flight);
     try testing.expectEqual(@as(?i64, null), app.loss_time);
+}
+
+test "native control records survive packet-threshold loss with owned payloads" {
+    const address = @import("../address.zig").Address.initIpv4(.{ 192, 0, 2, 7 }, 443);
+    const pending = [_]frame_mod.PendingControlFrame{
+        .{ .add_address = .{ .sequence = 9, .address = address } },
+        .{ .reach_address = .{ .round = 4, .address = address } },
+        .{ .remove_address = 9 },
+        .{ .path_abandon = .{ .path_id = 2, .error_code = 17 } },
+        .{ .path_status_backup = .{ .path_id = 2, .status_seq_no = 6 } },
+        .{ .path_status_available = .{ .path_id = 2, .status_seq_no = 7 } },
+        .{ .path_new_connection_id = .{ .path_id = 2, .cid = .{
+            .seq_num = 8, .retire_prior_to = 3, .cid_buf = [_]u8{0xab} ** 20,
+            .cid_len = 1, .stateless_reset_token = [_]u8{0xcd} ** 16,
+        } } },
+        .{ .path_retire_connection_id = .{ .path_id = 2, .seq_num = 8 } },
+        .{ .max_path_id = 12 },
+        .{ .paths_blocked = 11 },
+        .{ .path_cids_blocked = .{ .path_id = 2, .next_seq = 10 } },
+    };
+    const expected = [_]SentControlFrame{
+        .{ .add_address = .{ .sequence = 9, .address = address } },
+        .{ .reach_address = .{ .round = 4, .address = address } },
+        .{ .remove_address = 9 },
+        .{ .path_abandon = .{ .path_id = 2, .error_code = 17 } },
+        .{ .path_status = 2 },
+        .{ .path_status = 2 },
+        .{ .path_new_connection_id = .{ .path_id = 2, .seq_num = 8 } },
+        .{ .path_retire_connection_id = .{ .path_id = 2, .seq_num = 8 } },
+        .max_path_id,
+        .{ .paths_blocked = 11 },
+        .{ .path_cids_blocked = .{ .path_id = 2, .next_seq = 10 } },
+    };
+    for (pending, expected) |frame, expected_record| {
+        var handler = PacketHandler.init(testing.allocator);
+        defer handler.deinit();
+        var result = AckResult{};
+        defer result.deinit(testing.allocator);
+        const record = SentControlFrame.from(frame) orelse return error.UntrackedNativeControl;
+        try testing.expectEqualDeep(expected_record, record);
+        var lost: SentPacket = .{
+            .pn = 0, .time_sent = 1_000_000_000, .size = 1200,
+            .ack_eliciting = true, .in_flight = true, .enc_level = .application,
+        };
+        lost.control_frames[0] = record;
+        lost.control_frame_count = 1;
+        try handler.onPacketSent(lost);
+        try handler.onPacketSent(.{
+            .pn = 3, .time_sent = 1_000_000_001, .size = 1200,
+            .ack_eliciting = true, .in_flight = true, .enc_level = .application,
+        });
+        try handler.onAckReceived(.application, 3, 0, 3, &.{}, 0, 1_050_000_000, &result);
+        try testing.expectEqual(@as(usize, 1), result.lost.count());
+        try testing.expectEqualDeep(record, result.lost.constSlice()[0].getControlFrames()[0]);
+    }
+}
+
+test "ACK on another path cannot clear an observed report loss record" {
+    var first = PacketHandler.init(testing.allocator);
+    defer first.deinit();
+    var second = PacketHandler.init(testing.allocator);
+    defer second.deinit();
+    var result = AckResult{};
+    defer result.deinit(testing.allocator);
+    var sent: SentPacket = .{
+        .pn = 0, .time_sent = 1_000_000_000, .size = 1200,
+        .ack_eliciting = true, .in_flight = true, .enc_level = .application,
+    };
+    sent.control_frame_count = 1;
+    sent.control_frames[0] = .{ .observed_address = 1 };
+    try first.onPacketSent(sent);
+    sent.control_frames[0] = .{ .observed_address = 2 };
+    try second.onPacketSent(sent);
+    try first.onAckReceived(.application, 0, 0, 3, &.{}, 0, 1_050_000_000, &result);
+    try testing.expectEqual(@as(u32, 1), result.acked.constSlice()[0].getControlFrames()[0].observed_address);
+    try testing.expectEqual(@as(usize, 1), second.sent[2].sent_packets.count());
+    result.release(testing.allocator);
+    try second.onPacketSent(.{
+        .pn = 3, .time_sent = 1_050_000_001, .size = 1200,
+        .ack_eliciting = true, .in_flight = true, .enc_level = .application,
+    });
+    try second.onAckReceived(.application, 3, 0, 3, &.{}, 0, 1_100_000_000, &result);
+    try testing.expectEqual(@as(usize, 1), result.lost.count());
+    try testing.expectEqual(@as(u32, 2), result.lost.constSlice()[0].getControlFrames()[0].observed_address);
+}
+
+test "PacketHandler: off-path numbering leaves fallback recovery unchanged after timeout" {
+    var handler = PacketHandler.init(testing.allocator);
+    defer handler.deinit();
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+    const normal_pn = handler.nextPacketNumber(.application, random);
+    try handler.onPacketSent(.{
+        .pn = normal_pn, .time_sent = 1000, .size = 1200,
+        .ack_eliciting = true, .in_flight = true, .enc_level = .application,
+    });
+    const deadline = handler.spacePtoDeadline(handler.sent[2], 2);
+    const probe_pn = handler.nextPacketNumber(.application, random);
+    handler.onOffPathPacketSent(probe_pn);
+    try testing.expectEqual(@as(?u64, probe_pn), handler.sent[2].largest_sent);
+    try testing.expect(!handler.acksUnsentPacket(.application, probe_pn, 0, &.{}));
+    try testing.expect(handler.acksUnsentPacket(.application, probe_pn + 1, 0, &.{}));
+    try testing.expectEqual(deadline, handler.spacePtoDeadline(handler.sent[2], 2));
+    var result: AckResult = .{};
+    defer result.deinit(testing.allocator);
+    try handler.detectLossesForSpace(.application, 10_000_000_000, &result);
+    try testing.expectEqual(@as(usize, 0), result.lost.count());
+    try testing.expectEqual(@as(u64, 1200), handler.bytes_in_flight);
+    try testing.expectEqual(@as(u32, 1), handler.sent[2].ack_eliciting_in_flight);
+}
+
+test "PacketHandler: acknowledging off-path probe returns no on-path recovery credit" {
+    var handler = PacketHandler.init(testing.allocator);
+    defer handler.deinit();
+    var prng = std.Random.DefaultPrng.init(42);
+    const pn = handler.nextPacketNumber(.application, prng.random());
+    handler.onOffPathPacketSent(pn);
+    var result: AckResult = .{};
+    defer result.deinit(testing.allocator);
+    try handler.onAckReceived(.application, pn, 0, 3, &.{}, 0, 1001, &result);
+    try testing.expectEqual(@as(usize, 0), result.acked.count());
+    try testing.expectEqual(@as(usize, 0), result.lost.count());
+    try testing.expect(!handler.rtt_stats.has_measurement);
+    try testing.expectEqual(@as(u64, 0), handler.bytes_in_flight);
+    try testing.expectEqual(@as(u32, 0), handler.sent[2].ack_eliciting_in_flight);
+    try testing.expectEqual(@as(?i64, null), handler.spacePtoDeadline(handler.sent[2], 2));
+}
+
+test "PacketHandler: ACK only off-path probes cannot lose outstanding fallback packet" {
+    var handler = PacketHandler.init(testing.allocator);
+    defer handler.deinit();
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+    const normal_pn = handler.nextPacketNumber(.application, random);
+    try handler.onPacketSent(.{
+        .pn = normal_pn, .time_sent = 1000, .size = 1200,
+        .ack_eliciting = true, .in_flight = true, .enc_level = .application,
+    });
+    for (0..3) |_| {
+        handler.onOffPathPacketSent(handler.nextPacketNumber(.application, random));
+    }
+    handler.pto_count = 2;
+    handler.sent[2].pto_count = 2;
+    const deadline = handler.spacePtoDeadline(handler.sent[2], 2);
+    var result: AckResult = .{};
+    defer result.deinit(testing.allocator);
+    // Both the packet threshold and elapsed loss delay would otherwise lose PN 0.
+    try handler.onAckReceived(.application, 3, 0, 3, &.{}, 0, 10_000_000_000, &result);
+    try testing.expectEqual(@as(?u64, 3), handler.sent[2].largest_acked);
+    try testing.expectEqual(@as(usize, 0), result.acked.count());
+    try testing.expectEqual(@as(usize, 0), result.lost.count());
+    try testing.expect(handler.sent[2].sent_packets.contains(normal_pn));
+    try testing.expectEqual(@as(u64, 1200), handler.bytes_in_flight);
+    try testing.expectEqual(@as(u32, 1), handler.sent[2].ack_eliciting_in_flight);
+    try testing.expectEqual(@as(u32, 2), handler.pto_count);
+    try testing.expectEqual(@as(u32, 2), handler.sent[2].pto_count);
+    try testing.expectEqual(deadline, handler.spacePtoDeadline(handler.sent[2], 2));
+    try testing.expectEqual(@as(?i64, null), handler.sent[2].loss_time);
+    try testing.expect(!handler.rtt_stats.has_measurement);
+    try testing.expect(!result.persistent_congestion);
 }

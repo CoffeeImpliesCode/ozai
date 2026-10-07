@@ -63,6 +63,12 @@ pub const packet = @import("quic/packet.zig");
 /// decoded from, and a queued `PendingControlFrame` copies what it must keep.
 pub const frame = @import("quic/frame.zig");
 
+/// Negotiated observed-address roles, reports and per-path report processing.
+pub const observed_address = @import("quic/observed_address.zig");
+
+/// Native Noq NAT-traversal frame values and their bounded wire codec.
+pub const native_nat = @import("quic/native_nat.zig");
+
 /// Packet protection: key derivation, AEAD, header protection and key updates.
 /// `Open` and `Seal` have inline state and no allocation; copies are independent.
 pub const crypto = @import("quic/crypto.zig");

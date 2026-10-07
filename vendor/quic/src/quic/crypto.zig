@@ -224,6 +224,34 @@ pub const Open = struct {
         associated_data: []const u8,
         payload: []u8,
     ) error{AuthenticationFailed}![]u8 {
+        return self.decryptWithNonce(makeNonce(self.nonce, packet_number), associated_data, payload);
+    }
+
+    /// Opens negotiated multipath 1-RTT data using Noq's path-bound nonce.
+    /// Path IDs span u32; the connection enforces its negotiated path limit.
+    /// A packet number above 2^62-1 returns AuthenticationFailed without writing.
+    /// Otherwise ownership, aliasing and failure residue match decryptPayload.
+    /// This authenticates packets but does not detect replay: the caller owns
+    /// the packet-number space for each path. No keys are copied or expanded.
+    pub fn decryptPayloadForPath(
+        self: *const Open,
+        path_id: u32,
+        packet_number: u64,
+        associated_data: []const u8,
+        payload: []u8,
+    ) error{AuthenticationFailed}![]u8 {
+        if (packet_number > (@as(u64, 1) << 62) - 1) return error.AuthenticationFailed;
+        return self.decryptWithNonce(
+            makeNonceForPath(self.nonce, path_id, packet_number), associated_data, payload,
+        );
+    }
+
+    fn decryptWithNonce(
+        self: *const Open,
+        aead_nonce: [nonce_len]u8,
+        associated_data: []const u8,
+        payload: []u8,
+    ) error{AuthenticationFailed}![]u8 {
         const tag_len = 16; // Same for both AES-128-GCM and ChaCha20-Poly1305
         const payload_len = payload.len;
 
@@ -237,7 +265,6 @@ pub const Open = struct {
             break :tag t;
         };
 
-        const aead_nonce = makeNonce(self.nonce, packet_number);
         const bytes = payload[0..(payload_len - tag_len)];
 
         switch (self.cipher_suite) {
@@ -375,7 +402,39 @@ pub const Seal = struct {
         plaintext: []const u8,
         out: []u8,
     ) usize {
-        const aead_nonce = makeNonce(self.nonce, packet_number);
+        return self.encryptWithNonce(
+            makeNonce(self.nonce, packet_number), associated_data, plaintext, out,
+        );
+    }
+
+    /// Seals negotiated multipath 1-RTT data using Noq's path-bound nonce.
+    /// Path IDs span u32; the connection enforces its negotiated path limit.
+    /// packet_number must be at most 2^62-1, asserted in Debug/ReleaseSafe and
+    /// unchecked in ReleaseFast/ReleaseSmall, like encryptPayload's buffer bound.
+    /// Never repeat a (path_id, packet_number) pair under the same key.
+    /// Buffer ownership and in-place operation match encryptPayload.
+    /// No keys are copied or expanded; prepared AES contexts remain shared.
+    pub fn encryptPayloadForPath(
+        self: *const Seal,
+        path_id: u32,
+        packet_number: u64,
+        associated_data: []const u8,
+        plaintext: []const u8,
+        out: []u8,
+    ) usize {
+        assert(packet_number <= (@as(u64, 1) << 62) - 1);
+        return self.encryptWithNonce(
+            makeNonceForPath(self.nonce, path_id, packet_number), associated_data, plaintext, out,
+        );
+    }
+
+    fn encryptWithNonce(
+        self: *const Seal,
+        aead_nonce: [nonce_len]u8,
+        associated_data: []const u8,
+        plaintext: []const u8,
+        out: []u8,
+    ) usize {
         const tag_len = 16; // Same for both
 
         assert(out.len >= plaintext.len + tag_len);
@@ -401,13 +460,24 @@ pub const Seal = struct {
 /// Construct the AEAD nonce by XORing the IV with the packet number.
 /// RFC 9001 Section 5.3.
 fn makeNonce(iv: [nonce_len]u8, packet_number: u64) [nonce_len]u8 {
-    var n = iv;
-    var pn_bytes: [nonce_len]u8 = .{0} ** nonce_len;
-    std.mem.writeInt(u64, pn_bytes[4..nonce_len], packet_number, .big);
-    for (0..nonce_len) |i| {
-        n[i] ^= pn_bytes[i];
+    return makeNonceForPath(iv, 0, packet_number);
+}
+
+// Noq 1.3.0 delegates to Rustls v/0.23.42 Nonce::for_path
+// (crypto/cipher.rs), shared by Ring's AES-GCM and ChaCha packet keys.
+// Encode directly into the result, then XOR the IV: no key/context copies.
+fn makeNonceForPath(
+    iv: [nonce_len]u8,
+    path_id: u32,
+    packet_number: u64,
+) [nonce_len]u8 {
+    var nonce: [nonce_len]u8 = undefined;
+    std.mem.writeInt(u32, nonce[0..4], path_id, .big);
+    std.mem.writeInt(u64, nonce[4..nonce_len], packet_number, .big);
+    for (&nonce, iv) |*byte, iv_byte| {
+        byte.* ^= iv_byte;
     }
-    return n;
+    return nonce;
 }
 
 /// Compute a QUIC Header Protection mask from a sample.
@@ -944,12 +1014,21 @@ pub const KeyUpdateManager = struct {
     /// by the first `onPacketSent` after a rotation and null before that.
     first_sent_with_current: ?u64 = null,
 
+    /// First sent packet number under current keys in each supported MP path.
+    /// Null means this generation has not sent on that path. rollKeys clears
+    /// both; independent packet-number spaces cannot share the scalar marker.
+    first_sent_for_path: [2]?u64 = .{ null, null },
+
     /// Whether the peer has acknowledged a packet sent under the current
-    /// keys. Nothing here sets it: the caller compares an incoming
-    /// acknowledgement against `first_sent_with_current` and writes the
-    /// answer, because only it knows which packet numbers the peer has
-    /// acknowledged. A `rollKeys` clears it again.
+    /// keys. onAckForPath sets it only from that path's current-generation
+    /// marker; legacy callers may still compare first_sent_with_current.
+    /// A rollKeys clears it again.
     first_acked_with_current: bool = false,
+
+    /// A received key update still needs an application send in the new phase.
+    /// The packet opener rejects another authenticated next-generation update
+    /// while true. ACK frames cannot clear this connection-wide Noq guard.
+    peer_update_unacked: bool = false,
 
     /// Packets sent under the current keys, counted by `onPacketSent` and
     /// reset by `rollKeys`. It is the number `shouldInitiateUpdate` compares
@@ -1086,8 +1165,19 @@ pub const KeyUpdateManager = struct {
 
         // Reset tracking for the new generation
         self.first_sent_with_current = null;
+        self.first_sent_for_path = .{ null, null };
         self.first_acked_with_current = false;
         self.packets_sent_with_current = 0;
+    }
+
+    /// Installs an authenticated peer-initiated update and requires a send
+    /// before another peer update. The packet opener must first authenticate
+    /// and reject peer_update_unacked; this precondition is asserted here.
+    /// Uses the same caller clock and PTO retention contract as rollKeys.
+    pub fn onPeerKeyUpdate(self: *KeyUpdateManager, now: i64, pto_ns: i64) void {
+        assert(!self.peer_update_unacked);
+        self.rollKeys(now, pto_ns);
+        self.peer_update_unacked = true;
     }
 
     /// Get the Open keys for decrypting a packet based on its key phase bit.
@@ -1137,7 +1227,38 @@ pub const KeyUpdateManager = struct {
         if (self.first_sent_with_current == null) {
             self.first_sent_with_current = pn;
         }
+        self.onPacketSentForPath(0, pn);
+    }
+
+    /// Records one actual send under shared current keys on path 0 or 1.
+    /// Increments the connection-wide confidentiality count exactly once.
+    /// The caller must not also call onPacketSent for the same packet.
+    /// Clears the peer-update guard only for a normal application-space send.
+    /// Off-path challenge/response packets use onOffPathPacketSentForPath.
+    pub fn onPacketSentForPath(self: *KeyUpdateManager, path_id: u1, pn: u64) void {
+        self.onOffPathPacketSentForPath(path_id, pn);
+        self.peer_update_unacked = false;
+    }
+
+    /// Counts one encrypted off-path application packet and records its first
+    /// PN without confirming the peer update. Noq's off-path challenge/response
+    /// route bypasses the normal send's update acknowledgment transition.
+    /// The caller must not also count this packet with onPacketSentForPath.
+    pub fn onOffPathPacketSentForPath(self: *KeyUpdateManager, path_id: u1, pn: u64) void {
+        if (self.first_sent_for_path[path_id] == null) {
+            self.first_sent_for_path[path_id] = pn;
+        }
         self.packets_sent_with_current += 1;
+    }
+
+    /// Records an actually acknowledged sent packet in the identified path's
+    /// PN space. An ACK before that path's first current-generation send, or
+    /// on a path that has not sent in this generation, cannot permit update.
+    /// The caller validates ACK ranges against sent packets before calling.
+    pub fn onAckForPath(self: *KeyUpdateManager, path_id: u1, pn: u64) void {
+        if (self.first_sent_for_path[path_id]) |first| {
+            if (pn >= first) self.first_acked_with_current = true;
+        }
     }
 
     /// Drop previous-generation keys if they have expired.
@@ -1169,12 +1290,17 @@ pub const KeyUpdateManager = struct {
     /// Check if we are allowed to initiate a key update.
     /// Must have sent and received ACK for a packet with current keys.
     ///
-    /// It reads `first_acked_with_current`, which the caller writes when an
-    /// acknowledgement of a packet at or after `first_sent_with_current`
-    /// arrives and which a `rollKeys` clears. It says nothing about the
-    /// confidentiality limit; both answers are needed before rotating.
+    /// It reads first_acked_with_current, set by onAckForPath or by the legacy
+    /// caller's path-zero acknowledgement check and cleared by rollKeys.
+    /// A pending peer update also requires a normal application send first;
+    /// off-path traffic or an ACK cannot bypass that acknowledgment.
+    /// Like Noq force_key_update, local rotation also waits until previous
+    /// keys are discarded; otherwise it would overwrite retained shared keys.
+    /// It says nothing about the confidentiality limit; both answers are
+    /// needed before rotating.
     pub fn canUpdate(self: *const KeyUpdateManager) bool {
-        return self.first_acked_with_current;
+        return self.first_acked_with_current and
+            !self.peer_update_unacked and self.prev_open == null;
     }
 };
 
@@ -1653,6 +1779,12 @@ test "RFC 9001 A.5: ChaCha20-Poly1305 short header packet" {
     var expected_ct: [17]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected_ct, "655e5cd55c41f69080575d7999c25a5bfb");
     try std.testing.expectEqualSlices(u8, &expected_ct, pkt[4..]);
+    // Rustls v/0.23.42 ring/quic.rs uses this same RFC fixture. Its
+    // Nonce::for_path(0) equals Nonce::new, so MP0 must reproduce the bytes.
+    var multipath_ciphertext: [17]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 17),
+        seal.encryptPayloadForPath(0, pn, &header, &[_]u8{0x01}, &multipath_ciphertext));
+    try std.testing.expectEqualSlices(u8, &expected_ct, &multipath_ciphertext);
 
     // Header protection: the sample starts one byte past the 3-byte pn.
     var expected_sample: [16]u8 = undefined;
@@ -1668,4 +1800,227 @@ test "RFC 9001 A.5: ChaCha20-Poly1305 short header packet" {
     var expected_packet: [21]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected_packet, "4cfe4189655e5cd55c41f69080575d7999c25a5bfb");
     try std.testing.expectEqualSlices(u8, &expected_packet, &pkt);
+}
+
+// Authentication is path-scoped; replay rejection remains the packet-number
+// space's responsibility, not the stateless AEAD's.
+test "multipath protection separates paths and packet numbers for both suites" {
+    inline for (.{ CipherSuite.aes_128_gcm_sha256, CipherSuite.chacha20_poly1305_sha256 }) |suite| {
+        var seal = Seal{
+            .key = .{0x42} ** max_key_len,
+            .nonce = .{0xa5} ** nonce_len,
+            .cipher_suite = suite,
+        };
+        var open = Open{
+            .key = seal.key,
+            .nonce = seal.nonce,
+            .cipher_suite = suite,
+        };
+        seal.prepareCtx();
+        open.prepareCtx();
+        const plaintext = "path-bound payload";
+        const header = "unprotected header";
+        var path_zero: [plaintext.len + 16]u8 = undefined;
+        var path_one: [plaintext.len + 16]u8 = undefined;
+        try std.testing.expectEqual(path_zero.len,
+            seal.encryptPayloadForPath(0, 7, header, plaintext, &path_zero));
+        var legacy: [plaintext.len + 16]u8 = undefined;
+        try std.testing.expectEqual(legacy.len,
+            seal.encryptPayload(7, header, plaintext, &legacy));
+        try std.testing.expectEqualSlices(u8, &legacy, &path_zero);
+        try std.testing.expectEqual(path_one.len,
+            seal.encryptPayloadForPath(1, 7, header, plaintext, &path_one));
+        try std.testing.expect(!std.mem.eql(u8, &path_zero, &path_one));
+        var attempt = path_one;
+        try std.testing.expectError(error.AuthenticationFailed,
+            open.decryptPayloadForPath(0, 7, header, &attempt));
+        attempt = path_one;
+        try std.testing.expectError(error.AuthenticationFailed,
+            open.decryptPayloadForPath(1, 8, header, &attempt));
+        attempt = path_one;
+        try std.testing.expectEqualStrings(plaintext,
+            try open.decryptPayloadForPath(1, 7, header, &attempt));
+        attempt = path_one;
+        try std.testing.expectEqualStrings(plaintext,
+            try open.decryptPayloadForPath(1, 7, header, &attempt));
+        attempt = path_one;
+        try std.testing.expectError(error.AuthenticationFailed,
+            open.decryptPayloadForPath(1, @as(u64, 1) << 62, header, &attempt));
+        try std.testing.expectEqualSlices(u8, &path_one, &attempt);
+        try std.testing.expectError(error.AuthenticationFailed,
+            open.decryptPayloadForPath(1, 7, header, attempt[0..15]));
+
+        const packet_number_max = (@as(u64, 1) << 62) - 1;
+        const path_id_max = std.math.maxInt(u32);
+        try std.testing.expectEqual(path_one.len,
+            seal.encryptPayloadForPath(path_id_max, packet_number_max,
+                header, plaintext, &path_one));
+        try std.testing.expectEqualStrings(plaintext,
+            try open.decryptPayloadForPath(path_id_max, packet_number_max,
+                header, &path_one));
+    }
+}
+
+// Rustls v/0.23.42 crypto/cipher.rs Nonce::for_path is the nonce oracle:
+// IV XOR (path_id.to_be_bytes() || pn.to_be_bytes()), for either AEAD.
+test "pinned rustls multipath nonce layout and full domain boundaries" {
+    const iv = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    const expected = [_]u8{
+        0x01, 0x03, 0x01, 0x07, 0x15, 0x27, 0x35, 0x43, 0x5d, 0x6f, 0x7d, 0x83,
+    };
+    try std.testing.expectEqualSlices(u8, &expected,
+        &makeNonceForPath(iv, 0x01020304, 0x1122334455667788));
+    const zero_iv = [_]u8{0} ** nonce_len;
+    const max_expected = [_]u8{
+        0xff, 0xff, 0xff, 0xff, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    };
+    try std.testing.expectEqualSlices(u8, &max_expected,
+        &makeNonceForPath(zero_iv, std.math.maxInt(u32), (@as(u64, 1) << 62) - 1));
+    try std.testing.expectEqualSlices(u8, &iv, &makeNonceForPath(iv, 0, 0));
+    try std.testing.expectEqualSlices(u8, &makeNonce(iv, 12345),
+        &makeNonceForPath(iv, 0, 12345));
+}
+
+// Exact Rustls v/0.23.42 crypto/ring/quic.rs test_multipath_aead_basic.
+// Upstream attributes these bytes to picoquic be0d99e6d4f8759cb7920425351c06a1c6f4a958.
+test "pinned rustls ring multipath AES path two golden ciphertext" {
+    const secret = [_]u8{
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 35, 26, 27, 28, 29, 30, 31,
+    };
+    const plaintext = "The quick brown fox jumps over the lazy dog";
+    const header = "This is a test";
+    const expected = [_]u8{
+        123, 139, 232, 52, 136, 25, 201, 143, 250, 89, 87, 39, 37, 63, 0, 210,
+        220, 227, 186, 140, 183, 251, 13, 203, 6, 116, 204, 100, 166, 64, 43, 185,
+        174, 85, 212, 163, 242, 141, 24, 166, 62, 228, 187, 137, 248, 31, 152,
+        126, 240, 151, 79, 51, 253, 130, 43, 114, 173, 234, 254,
+    };
+    var seal = Seal{
+        .key = deriveKeyPaddedV(secret, 16, protocol.QUIC_V1),
+        .nonce = hkdfExpandLabel(secret, "quic iv", "", nonce_len),
+    };
+    seal.prepareCtx();
+    var ciphertext: [expected.len]u8 = undefined;
+    try std.testing.expectEqual(expected.len,
+        seal.encryptPayloadForPath(2, 12345, header, plaintext, &ciphertext));
+    try std.testing.expectEqualSlices(u8, &expected, &ciphertext);
+    var open = Open{ .key = seal.key, .nonce = seal.nonce };
+    open.prepareCtx();
+    try std.testing.expectEqualStrings(plaintext,
+        try open.decryptPayloadForPath(2, 12345, header, &ciphertext));
+}
+
+// Independent PN spaces must never make an ACK for one path confirm a key
+// generation on another; encryption usage still belongs to the shared key.
+test "KeyUpdateManager multipath ACK markers and global encryption count" {
+    var manager = KeyUpdateManager.init(
+        .{0xaa} ** 32, .{0xbb} ** 32,
+        .{0xcc} ** max_key_len, .{0xdd} ** max_key_len,
+    );
+    manager.onPacketSentForPath(0, 100);
+    manager.onAckForPath(1, 100);
+    try std.testing.expect(!manager.canUpdate());
+    manager.onPacketSentForPath(1, 7);
+    manager.onPacketSentForPath(0, 101);
+    try std.testing.expectEqual(@as(u64, 3), manager.packets_sent_with_current);
+    try std.testing.expectEqual(@as(?u64, 100), manager.first_sent_for_path[0]);
+    try std.testing.expectEqual(@as(?u64, 7), manager.first_sent_for_path[1]);
+    manager.onAckForPath(0, 7);
+    manager.onAckForPath(1, 6);
+    try std.testing.expect(!manager.canUpdate());
+    manager.onAckForPath(1, 7);
+    try std.testing.expect(manager.canUpdate());
+    manager.rollKeys(1000, 100);
+    try std.testing.expectEqual(@as(u64, 0), manager.packets_sent_with_current);
+    try std.testing.expectEqual(@as(?u64, null), manager.first_sent_for_path[0]);
+    try std.testing.expectEqual(@as(?u64, null), manager.first_sent_for_path[1]);
+    manager.onAckForPath(1, 7);
+    try std.testing.expect(!manager.canUpdate());
+    manager.onPacketSentForPath(1, 8);
+    manager.onPacketSentForPath(0, 8);
+    manager.onAckForPath(0, 8);
+    try std.testing.expect(!manager.canUpdate());
+    manager.maybeDropPrevKeys(1299);
+    try std.testing.expect(!manager.canUpdate());
+    manager.maybeDropPrevKeys(1300);
+    try std.testing.expect(manager.canUpdate());
+    try std.testing.expectEqual(@as(u64, 2), manager.packets_sent_with_current);
+}
+
+// Noq packet_crypto.rs sets update_unacked on remote rotation, and mod.rs
+// clears it only when an application packet is selected for sending.
+test "KeyUpdateManager peer update guard waits for actual application send" {
+    var manager = KeyUpdateManager.init(
+        .{0xaa} ** 32, .{0xbb} ** 32,
+        .{0xcc} ** max_key_len, .{0xdd} ** max_key_len,
+    );
+    try std.testing.expect(!manager.peer_update_unacked);
+    manager.onPeerKeyUpdate(1000, 100);
+    try std.testing.expect(manager.peer_update_unacked);
+    manager.onAckForPath(0, 0);
+    manager.first_acked_with_current = true;
+    try std.testing.expect(manager.peer_update_unacked);
+    try std.testing.expectEqual(@as(u64, 0), manager.packets_sent_with_current);
+    manager.onPacketSentForPath(1, 0);
+    try std.testing.expect(!manager.peer_update_unacked);
+    try std.testing.expectEqual(@as(u64, 1), manager.packets_sent_with_current);
+    manager.onPeerKeyUpdate(2000, 100);
+    try std.testing.expect(manager.peer_update_unacked);
+    manager.onPacketSent(10);
+    try std.testing.expect(!manager.peer_update_unacked);
+    try std.testing.expectEqual(@as(u64, 1), manager.packets_sent_with_current);
+}
+
+// Noq mod.rs off-path challenge/response sends return before the normal
+// packet-space send clears update_unacked. Both routes consume shared keys.
+test "KeyUpdateManager off-path sends count without confirming peer update" {
+    var manager = KeyUpdateManager.init(
+        .{0xaa} ** 32, .{0xbb} ** 32,
+        .{0xcc} ** max_key_len, .{0xdd} ** max_key_len,
+    );
+    manager.onPeerKeyUpdate(1000, 100);
+    manager.onOffPathPacketSentForPath(1, 7);
+    manager.onOffPathPacketSentForPath(0, 100);
+    try std.testing.expect(manager.peer_update_unacked);
+    try std.testing.expectEqual(@as(u64, 2), manager.packets_sent_with_current);
+    try std.testing.expectEqual(@as(?u64, 100), manager.first_sent_for_path[0]);
+    try std.testing.expectEqual(@as(?u64, 7), manager.first_sent_for_path[1]);
+    manager.onAckForPath(1, 7);
+    try std.testing.expect(manager.peer_update_unacked);
+    manager.onPacketSentForPath(1, 8);
+    try std.testing.expect(!manager.peer_update_unacked);
+    try std.testing.expectEqual(@as(u64, 3), manager.packets_sent_with_current);
+    try std.testing.expectEqual(@as(?u64, 7), manager.first_sent_for_path[1]);
+    manager.onPeerKeyUpdate(2000, 100);
+    try std.testing.expect(manager.peer_update_unacked);
+    try std.testing.expectEqual(@as(u64, 0), manager.packets_sent_with_current);
+}
+
+test "KeyUpdateManager local rotation waits for peer acknowledgment and prior key expiry" {
+    var manager = KeyUpdateManager.init(
+        .{0xaa} ** 32, .{0xbb} ** 32,
+        .{0xcc} ** max_key_len, .{0xdd} ** max_key_len,
+    );
+    const path_zero_pto_ns: i64 = 100;
+    const path_one_pto_ns: i64 = 500;
+    const max_active_pto_ns = @max(path_zero_pto_ns, path_one_pto_ns);
+    manager.onPeerKeyUpdate(1000, max_active_pto_ns);
+    manager.first_acked_with_current = true;
+    try std.testing.expect(!manager.canUpdate());
+    manager.onOffPathPacketSentForPath(1, 7);
+    manager.onAckForPath(1, 7);
+    try std.testing.expect(!manager.canUpdate());
+    manager.onPacketSentForPath(1, 8);
+    try std.testing.expect(!manager.peer_update_unacked);
+    try std.testing.expect(!manager.canUpdate());
+    manager.maybeDropPrevKeys(1000 + 3 * path_zero_pto_ns);
+    try std.testing.expect(!manager.canUpdate());
+    manager.maybeDropPrevKeys(1000 + 3 * max_active_pto_ns - 1);
+    try std.testing.expect(!manager.canUpdate());
+    manager.maybeDropPrevKeys(1000 + 3 * max_active_pto_ns);
+    try std.testing.expect(manager.canUpdate());
+    manager.rollKeys(2500, max_active_pto_ns);
+    try std.testing.expect(!manager.canUpdate());
+    try std.testing.expectEqual(@as(u64, 0), manager.packets_sent_with_current);
 }

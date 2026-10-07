@@ -10,6 +10,7 @@
 //! config next to the machine that copies it by value is a second answer to the
 //! same question.
 
+const quic = @import("quic");
 const base_key = @import("../base/key.zig");
 const base_addr = @import("../base/addr.zig");
 const addr_map = @import("addr_map.zig");
@@ -73,9 +74,9 @@ pub const DestroyError = error{
 
 /// The configuration a caller supplies, in this project's vocabulary.
 ///
-/// Nothing here is named after a field in the vendored tree, for
-/// `quic_bridge.zig`'s reason, and there is deliberately no pin: the pin
-/// belongs to a dial, not to a dialer, because one dialer dials many peers.
+/// Native extension options use the core's types and wire-limit semantics.
+/// There is deliberately no pin: a pin belongs to a dial, not to a dialer,
+/// because one dialer dials many peers.
 pub const Config = struct {
     /// This node's identity: the seed the presented certificate is built from,
     /// and the node id a peer compares the certificate against.
@@ -89,6 +90,18 @@ pub const Config = struct {
     /// How long a connection may sit idle before the core gives it up, in
     /// milliseconds. The core's unit is milliseconds and so is this one.
     idle_timeout_ms: u64 = 30_000,
+    /// Observed-address reporting/receiving role. Disabled omits its parameter.
+    address_discovery_role: quic.observed_address.Role = .disabled,
+    /// Native NAT address capacity. Null disables NAT traversal; supported
+    /// advertised counts are 1 through 32, without count-minus-one conversion.
+    max_remote_nat_traversal_addresses: ?u8 = null,
+    /// Largest native path ID, 0 or 1. Null disables multipath; 1 permits two
+    /// paths, with IDs 0 and 1.
+    initial_max_path_id: ?u32 = null,
+    /// Whether the actual sending UDP socket supports IPv6 destinations.
+    /// Derive this from its bind family, never from a synthetic relay path0.
+    /// Defaults to true for socket-independent callers; Node supplies its bind family.
+    ipv6_supported: bool = true,
     /// A NEW_TOKEN for the first Initial. Null sends no token.
     /// The dialer retains this slice for later dials. Keep it alive and
     /// unchanged until `destroy`. Each connection copies the token bytes.
