@@ -42,7 +42,7 @@ pub(crate) async fn run(options: &Options, node_id_hex: &str) -> Result<()> {
         address = address.with_relay_url(url.clone());
     }
     lookup.add_endpoint_info(address);
-    endpoint.address_lookup().as_ref().context("endpoint lookup")?.add(lookup);
+    endpoint.address_lookup().context("endpoint lookup")?.add(lookup);
     let bound = endpoint.addr().ip_addrs().next().copied().context("bound IP address")?;
     match options.role {
         Role::Server => crate::announce(node_id_hex, bound, options.tls)?,
@@ -51,8 +51,8 @@ pub(crate) async fn run(options: &Options, node_id_hex: &str) -> Result<()> {
     let gossip = Gossip::builder().spawn(endpoint.clone());
     let mut counters = Counters::default();
     let outcome = tokio::time::timeout(options.deadline, async {
-        // Subscribe without bootstrap first: no actor dial before the observed
-        // certificate pin barrier. The helper accepts in server role.
+        // Subscribe without bootstrap first: the actor must not dial before our
+        // observed certificate pin barrier. handle_connection precedes bootstrap.
         let mut topic = gossip.subscribe(topic_id, vec![]).await?;
         let connection = crate::connect_iroh(options, &endpoint, ALPN, &mut counters).await?;
         let peer_hex = crate::observed_peer_node_id(connection.peer_identity(), &pin)?;
@@ -83,7 +83,6 @@ pub(crate) async fn run(options: &Options, node_id_hex: &str) -> Result<()> {
                                 topic.broadcast_neighbors(payload.to_vec().into()).await?;
                                 broadcast = true;
                             }
-                            // APP ACK is real Gossip, sent only after exact pinned payload receipt.
                             topic.broadcast_neighbors(ack.clone().into()).await?;
                         }
                     } else {

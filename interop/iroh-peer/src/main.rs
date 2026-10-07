@@ -39,7 +39,10 @@
 //! what to do about a deadline. Every wait there is therefore on an observed
 //! counter and not on a duration.
 
+mod blobs;
 mod contract;
+mod gossip;
+mod relay;
 mod rpk;
 
 use std::io::Write;
@@ -360,10 +363,15 @@ async fn run(options: Options) -> Result<()> {
     );
     let node_id = rpk::node_id_of(&options.seed);
     let node_id_hex = contract::node_id_hex(&node_id);
-    match (options.tls, options.connect) {
-        (Tls::Rpk, None) => run_noq_server(&options, &node_id_hex).await,
-        (Tls::Rpk, Some(address)) => run_noq_client(&options, &node_id_hex, address).await,
-        (Tls::Iroh, address) => run_iroh(&options, &node_id_hex, address).await,
+    match options.protocol {
+        Protocol::Gossip => gossip::run(&options, &node_id_hex).await,
+        Protocol::Blobs => blobs::run(&options, &node_id_hex).await,
+        Protocol::Relay | Protocol::RelayEndpoint => relay::run(&options, &node_id_hex).await,
+        Protocol::Transport => match (options.tls, options.connect) {
+            (Tls::Rpk, None) => run_noq_server(&options, &node_id_hex).await,
+            (Tls::Rpk, Some(address)) => run_noq_client(&options, &node_id_hex, address).await,
+            (Tls::Iroh, address) => run_iroh(&options, &node_id_hex, address).await,
+        },
     }
 }
 
