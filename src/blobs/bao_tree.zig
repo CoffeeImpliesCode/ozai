@@ -22,14 +22,9 @@
 //! rather than rewritten, and the widths, which come from
 //! `crypto/blake3_core.zig`.
 //!
-//! Not pinned: the *form* of "the two halves" for a span that is not a power
-//! of two. The requirement is forced — a parent's children must be the halves
-//! BLAKE3 splits at, or the root is not the blob's hash — and this file writes
-//! that rule out as `splitAt` and tests it against every boundary below. The
-//! byte-for-byte agreement with the Rust `bao-tree` crate is not established:
-//! no captured Bao bytes exist on this machine. What would close it is one
-//! outboard, or one range proof, captured from that crate and kept beside
-//! `crypto/blake3_subtree_vectors.zig`. Nothing here claims interoperability.
+//! The split rule is the largest power of two strictly below the chunk count.
+//! `oracle_test.zig` compares roots, outboards and responses with captures
+//! emitted by the pinned upstream Store, including a partial final group.
 //!
 //! The parent-pair layout is pinned by `crypto/blake3_nodes.zig` rather than by
 //! any capture: it is the same left word then right word that file compresses
@@ -128,7 +123,7 @@ pub const Node = struct {
     pub fn bytes(self: Node, tree: BaoTree) ranges.ByteRange {
         return .{
             .start = self.start_chunk * chunk_size,
-            .end = @min(self.endChunk() * chunk_size, tree.size),
+            .end = @min(self.endChunk() *| chunk_size, tree.size),
         };
     }
 
@@ -555,4 +550,11 @@ test "a tree refuses bytes that are not its declared length" {
     try t.expectError(error.SizeMismatch, tree.rootHash(longer));
     try t.expectError(error.SizeMismatch, tree.rootHash(data[0..0]));
     try t.expectError(error.SizeMismatch, tree.nodeCv(tree.root(), data[0..0]));
+}
+
+test "last byte range at maximum declared size does not overflow" {
+    const tree = BaoTree.init(std.math.maxInt(u64));
+    const node = Node{ .start_chunk = tree.chunks() - 1, .span = 1 };
+    try t.expectEqual(tree.size, node.bytes(tree).end);
+    try t.expectEqual(@as(u64, 1023), node.bytes(tree).end - node.bytes(tree).start);
 }
