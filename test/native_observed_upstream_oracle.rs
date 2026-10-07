@@ -33,7 +33,7 @@ fn ozai_generate_observed_fixtures() {
             report.encode(&mut bytes);
             assert_eq!(report.size(), bytes.len());
             let mut input = bytes.as_slice();
-            let _: VarInt = input.get().unwrap();
+            let _: VarInt = BufExt::get(&mut input).unwrap();
             let decoded = ObservedAddr::read(&mut input, address.is_ipv6()).unwrap();
             assert_eq!(decoded, report);
             assert!(input.is_empty());
@@ -49,7 +49,7 @@ fn ozai_generate_observed_fixtures() {
         let mut bytes = Vec::new();
         bytes.write(value);
         let mut input = bytes.as_slice();
-        assert_eq!(Role::try_from(input.get::<VarInt>().unwrap()).unwrap(), role);
+        assert_eq!(Role::try_from(BufExt::get::<VarInt>(&mut input).unwrap()).unwrap(), role);
         assert!(input.is_empty());
         fs::write(output.join(format!("observed_role_{name}.bin")), bytes).unwrap();
     }

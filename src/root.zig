@@ -348,6 +348,7 @@ test {
     std.testing.refAllDecls(native_nat_probe);
     const blobs_oracle_test = @import("blobs/oracle_test.zig");
     std.testing.refAllDecls(blobs_oracle_test);
+    std.testing.refAllDecls(@import("net/native_oracle_test.zig"));
     const node_blobs = @import("node/node_blobs.zig");
     const node_native = @import("node/node_native.zig");
     const node_holepunch = @import("node/node_holepunch.zig");

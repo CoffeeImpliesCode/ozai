@@ -53,7 +53,7 @@ pub fn receive(self: *Node, at: bridge.Instant) Error!bool {
     wire.learn(self);
     var moved = try reapStale(self, now);
     moved = wire.flush(self) or moved;
-    return wire.receive(self, now) or moved;
+    return (try wire.receive(self, now)) or moved;
 }
 
 pub fn gossip(self: *Node, at: bridge.Instant) Error!bool {

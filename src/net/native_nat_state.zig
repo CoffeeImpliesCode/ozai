@@ -260,10 +260,10 @@ test "nine probes bounded by default four second schedule" {
     var server = try State.init(.server, 1, 1, false);
     _ = try server.receive(.{ .reach = .{ .round = 1, .address = example } }, 0);
     var now: u64 = 0;
-    var count: u64 = 0;
-    while (count < 9) : (count += 1) {
+    var probes_sent_count: u64 = 0;
+    while (probes_sent_count < 9) : (probes_sent_count += 1) {
         try t.expect(server.nextProbe() != null);
-        try server.markProbeSent(example, count + 1);
+        try server.markProbeSent(example, probes_sent_count + 1);
         try t.expect(server.nextProbe() == null);
         if (server.deadline(333_000_000)) |delay| {
             now += delay;

@@ -23,7 +23,6 @@ pub const Packet = struct {
 };
 
 pub const Client = struct {
-    pub const Error = CarrierError;
     connection: Session,
     secret: SecretKey,
     host: [256]u8 = undefined,
@@ -32,7 +31,7 @@ pub const Client = struct {
     accept: [upgrade.accept_length]u8 = undefined,
     packet: ?Packet = null,
 
-    pub fn init(config: Config) Error!Client {
+    pub fn init(config: Config) CarrierError!Client {
         if (config.host.len == 0 or config.host.len > 256) return error.InvalidHost;
         for (config.host) |byte| {
             if (byte <= 32 or byte >= 127) return error.InvalidHost;
@@ -60,7 +59,7 @@ pub const Client = struct {
         return self.state == .ready;
     }
 
-    pub fn send(self: *Client, target: NodeId, datagram: []const u8) Error!void {
+    pub fn send(self: *Client, target: NodeId, datagram: []const u8) CarrierError!void {
         if (!self.isReady()) return error.WouldBlock;
         try self.connection.relay(.{ .client_to_relay_datagram = .{
             .node_id = target,
@@ -69,13 +68,13 @@ pub const Client = struct {
     }
 
     /// Packet storage is invalidated by the next poll, not by receive.
-    pub fn receive(self: *Client) Error!?Packet {
+    pub fn receive(self: *Client) CarrierError!?Packet {
         const packet = self.packet;
         self.packet = null;
         return packet;
     }
 
-    pub fn poll(self: *Client, io: std.Io) Error!void {
+    pub fn poll(self: *Client, io: std.Io) CarrierError!void {
         self.packet = null;
         self.pollInner(io) catch |err| {
             self.state = .closed;
@@ -83,7 +82,7 @@ pub const Client = struct {
         };
     }
 
-    fn pollInner(self: *Client, io: std.Io) Error!void {
+    fn pollInner(self: *Client, io: std.Io) CarrierError!void {
         if (self.state == .closed) return error.Closed;
         if (self.state == .connecting) {
             if (!try self.connection.stream.finishConnect(io)) return;

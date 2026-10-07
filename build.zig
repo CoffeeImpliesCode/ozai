@@ -137,6 +137,13 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     relay_fixture_mod.addImport("ozai", lib_mod);
+    const node_cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/node/cli_values.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    node_cli_mod.addImport("ozai", lib_mod);
+    relay_fixture_mod.addImport("node_cli", node_cli_mod);
     const relay_fixture = b.addExecutable(.{
         .name = "ozai-relay-fixture",
         .root_module = relay_fixture_mod,

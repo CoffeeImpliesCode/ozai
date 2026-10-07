@@ -1,6 +1,7 @@
 //! A bounded consumer of the production Node carrier and pinned inner QUIC connection.
 const std = @import("std");
 const ozai = @import("ozai");
+const node_cli = @import("node_cli");
 const bridge = ozai.transport_quic_bridge;
 const Node = ozai.node.Node;
 const alpn = "ozai-relay-endpoint/1";
@@ -23,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
     const peer: [1]ozai.node.Peer = .{.{ .id = expected, .addr = .{ .relay = url } }};
     var config: ozai.node.Config = .{
         .secret = secret,
-        .listen = try ozai.SocketAddr.parse(options.bind),
+        .listen = try node_cli.parseSocket(options.bind),
         .alpn = alpn,
         .peers = if (options.client) &peer else &.{},
         .relay = .{ .client = .{
@@ -32,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     };
     var candidates: [1]ozai.SocketAddr = undefined;
     if (!options.relay_only) {
-        candidates[0] = try ozai.SocketAddr.parse(
+        candidates[0] = try node_cli.parseSocket(
             options.local_candidate orelse return error.MissingConfiguredCandidate,
         );
         config.traversal = .{ .local_candidates = &candidates, .initiate = options.client };

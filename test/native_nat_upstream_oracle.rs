@@ -10,6 +10,10 @@ use crate::{coding::{BufExt, Encodable}, frame::{AddAddress, ReachOut, RemoveAdd
 fn emit(name: &str, bytes: &[u8]) {
     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     println!("NATIVE_NAT_ORACLE {name} {hex}");
+    let output = std::path::PathBuf::from(std::env::var_os("OZAI_NATIVE_NAT_FIXTURE_DIR")
+        .expect("set OZAI_NATIVE_NAT_FIXTURE_DIR to the fixture output directory"));
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(output.join(format!("{name}.bin")), bytes).unwrap();
 }
 
 #[test]
@@ -56,8 +60,8 @@ fn native_nat_private_codec_oracle() {
         assert_eq!(decoded.max_remote_nat_traversal_addresses, NonZeroU8::new(limit));
         let mut rest = &bytes[..];
         while !rest.is_empty() {
-            let id: VarInt = rest.get().unwrap();
-            let len: VarInt = rest.get().unwrap();
+            let id: VarInt = BufExt::get(&mut rest).unwrap();
+            let len: VarInt = BufExt::get(&mut rest).unwrap();
             let length = usize::try_from(len.into_inner()).unwrap();
             let value = &rest[..length];
             if id.into_inner() == 0x3d7f91120401 {

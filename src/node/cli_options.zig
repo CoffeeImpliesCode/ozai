@@ -366,7 +366,7 @@ pub const Options = struct {
         else null;
         if (refusal) |err| {
             try out.print("ozai-node: incompatible options: {t}\n", .{err});
-            return err;
+            return @as(?CliError, err);
         }
         return null;
     }
