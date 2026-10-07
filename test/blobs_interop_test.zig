@@ -50,7 +50,7 @@ fn runCase(direction: Direction, case: Case) !void {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var temporary = t.tmpDir(.{});
+    var temporary = try @import("test_scratch").tmpDir(.{});
     defer temporary.cleanup();
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const directory = path_buffer[0..try temporary.dir.realPath(t.io, &path_buffer)];

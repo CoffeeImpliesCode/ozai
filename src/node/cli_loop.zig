@@ -86,7 +86,7 @@ fn writeBlobOutput(io: std.Io, dir: std.Io.Dir, path: []const u8, payload: []con
 
 test "blob output truncates stale bytes and preserves the complete verified binary payload" {
     const t = std.testing;
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     const stale = try tmp.dir.createFile(t.io, "blob", .{});
     try stale.writeStreamingAll(t.io, "stale bytes to truncate");

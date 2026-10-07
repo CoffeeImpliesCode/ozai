@@ -1,6 +1,7 @@
 //! CLI consumer of the same production HTTP/WebSocket carrier used by Node.
 const std = @import("std");
 const ozai = @import("ozai");
+const node_cli = @import("node_cli");
 const carrier = ozai.relay_tcp_carrier;
 
 pub const Options = struct {
@@ -30,7 +31,7 @@ pub fn run(init: std.process.Init, options: Options) !void {
         address = try url.socketAddr();
         host = url.hostSlice();
     } else {
-        service = try carrier.Server.init(try ozai.SocketAddr.parse(options.bind));
+        service = try carrier.Server.init(try node_cli.parseSocket(options.bind));
         address = service.?.address;
         if (address.ip == .v4 and std.mem.eql(u8, &address.ip.v4, &.{ 0, 0, 0, 0 }))
             address.ip.v4 = .{ 127, 0, 0, 1 };

@@ -1135,6 +1135,21 @@ pub const Frame = union(FrameType) {
     }
 };
 
+const PendingNewConnectionIdPayload = struct {
+    /// The sequence number to attach to this connection ID.
+    seq_num: u64,
+    /// The lowest sequence number the peer should keep.
+    retire_prior_to: u64,
+    /// Inline storage for the connection ID, at most 20 bytes (RFC 9000
+    /// §17.2); only `cid_buf[0..cid_len]` is the ID.
+    cid_buf: [20]u8,
+    /// Caller-enforced length, 1..20; `write` slices the inline buffer.
+    cid_len: u8,
+    /// The token a reset for this connection ID must end with, copied in
+    /// alongside the ID so the pair stays together in the queue.
+    stateless_reset_token: [16]u8,
+};
+
 /// A pending control frame to be sent in the next outgoing packet.
 /// Uses value types only (no slices) to avoid dangling references.
 ///
@@ -1215,20 +1230,7 @@ pub const PendingControlFrame = union(enum) {
         /// The application error code; as `Frame.stop_sending.error_code`.
         error_code: u64,
     },
-    new_connection_id: struct {
-        /// The sequence number to attach to this connection ID.
-        seq_num: u64,
-        /// The lowest sequence number the peer should keep.
-        retire_prior_to: u64,
-        /// Inline storage for the connection ID, at most 20 bytes (RFC 9000
-        /// §17.2); only `cid_buf[0..cid_len]` is the ID.
-        cid_buf: [20]u8,
-        /// Caller-enforced length, 1..20; `write` slices the inline buffer.
-        cid_len: u8,
-        /// The token a reset for this connection ID must end with, copied in
-        /// alongside the ID so the pair stays together in the queue.
-        stateless_reset_token: [16]u8,
-    },
+    new_connection_id: PendingNewConnectionIdPayload,
 
     /// draft-ietf-quic-ack-frequency: when the peer asked this endpoint to
     /// ACK. The fields carry the same meanings as `Frame.ack_frequency`, and
@@ -1253,7 +1255,7 @@ pub const PendingControlFrame = union(enum) {
     path_cids_blocked: @FieldType(Frame, "path_cids_blocked"),
     path_new_connection_id: struct {
         path_id: u32,
-        cid: @FieldType(PendingControlFrame, "new_connection_id"),
+        cid: PendingNewConnectionIdPayload,
     },
 
     /// Write this pending control frame directly on the wire.

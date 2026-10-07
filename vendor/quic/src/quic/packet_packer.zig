@@ -899,7 +899,9 @@ pub const PacketPacker = struct {
                     // A frame this packet cannot record, or has no room for,
                     // waits for the next one rather than going out untracked.
                     const record: ?ack_handler.SentControlFrame = switch (pcf) {
-                        .observed_address => .{ .observed_address = self.application_path_id },
+                        // Null selects legacy protection; multipath supplies
+                        // the carrying path ID, including an explicit path zero.
+                        .observed_address => .{ .observed_address = self.application_path_id orelse 0 },
                         else => ack_handler.SentControlFrame.from(pcf),
                     };
                     if (record != null and control_frame_count == control_frames.len) {

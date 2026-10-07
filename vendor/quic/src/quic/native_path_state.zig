@@ -94,9 +94,12 @@ pub const State = struct {
     }
 
     fn abandon(self: *State, id: u32) Error!void {
-        try self.checkMultipath(id);
+        if (!self.negotiated) return error.MultipathNotNegotiated;
+        // Remote abandonment of unknown or already closed paths is idempotent.
+        // Sending credit applies to opening a path, not to this notification.
+        if (id >= self.entries.len or id > self.local_max_path_id) return;
         const entry = &self.entries[id];
-        if (!entry.opened or entry.abandoned) return error.ClosedPath;
+        if (!entry.opened or entry.abandoned) return;
         entry.abandoned = true;
         entry.validated = false;
         if (self.selected == id) {
@@ -244,7 +247,7 @@ test "abandonment is permanent and never invents a validated replacement" {
         .{ .validated = .{ .id = 1, .value = true } }));
     state = try process(state, .{ .status = .{ .id = 1, .seq = 4, .value = .available } });
     try std.testing.expectEqual(@as(?u64, null), state.entries[1].status_seq);
-    try std.testing.expectError(error.ClosedPath, process(state, .{ .abandon = 1 }));
+    try std.testing.expectEqualDeep(state, try process(state, .{ .abandon = 1 }));
 }
 
 test "negotiation clamps to implemented two paths" {
@@ -253,4 +256,14 @@ test "negotiation clamps to implemented two paths" {
     });
     try std.testing.expectEqual(@as(u32, 1), state.local_max_path_id);
     try std.testing.expectEqual(@as(u32, 1), state.peer_max_path_id);
+}
+
+test "remote abandon ignores unopened duplicate and unknown paths independently of sending credit" {
+    const state = try process(.{}, .{ .negotiate = .{ .local_max = 1, .peer_max = 0 } });
+    try std.testing.expectEqualDeep(state, try process(state, .{ .abandon = 1 }));
+    const closed = try process(state, .{ .abandon = 0 });
+    try std.testing.expectEqualDeep(closed, try process(closed, .{ .abandon = 0 }));
+    const bounded = try process(.{}, .{ .negotiate = .{ .local_max = 0, .peer_max = 1 } });
+    try std.testing.expectEqualDeep(bounded, try process(bounded, .{ .abandon = 1 }));
+    try std.testing.expectEqualDeep(state, try process(state, .{ .abandon = 2 }));
 }

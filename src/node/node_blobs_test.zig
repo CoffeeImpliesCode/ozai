@@ -12,7 +12,7 @@ const outboard_mod = @import("../blobs/bao_outboard.zig");
 test "store backed node getter exports whole blob and clipped boundary ranges" {
     var data: [49189]u8 = undefined;
     for (&data, 0..) |*byte, i| byte.* = @intCast((i * 31 + @divFloor(i, 1024)) % 251);
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     const hash = try putTestBlob(tmp.dir, &data);
 
@@ -50,7 +50,7 @@ test "store backed node getter exports whole blob and clipped boundary ranges" {
 test "store backed node getter refuses corrupt incomplete and mismatched answers" {
     var data: [49189]u8 = undefined;
     for (&data, 0..) |*byte, i| byte.* = @intCast((i * 31 + @divFloor(i, 1024)) % 251);
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     const hash = try putTestBlob(tmp.dir, &data);
     var names: store.NameStorage = undefined;

@@ -361,7 +361,7 @@ const Room = struct {
 test "a committed blob is disclosed with its size and every chunk it has" {
     const b = try blob();
     defer t.allocator.free(b.data);
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     try commitBlob(tmp.dir, b.data, b.root);
 
@@ -389,7 +389,7 @@ test "a committed blob is disclosed with its size and every chunk it has" {
 test "an unheld hash is withheld, and a reply of only withheld hashes is empty" {
     const b = try blob();
     defer t.allocator.free(b.data);
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     try commitBlob(tmp.dir, b.data, b.root);
 
@@ -438,7 +438,7 @@ test "an unheld hash is withheld, and a reply of only withheld hashes is empty" 
 test "a torn pair is withheld, in both orders" {
     const b = try blob();
     defer t.allocator.free(b.data);
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
 
     var name_storage: store.NameStorage = undefined;
@@ -482,7 +482,7 @@ test "a torn pair is withheld, in both orders" {
 test "a request over the bound is refused, and writes no answer" {
     const b = try blob();
     defer t.allocator.free(b.data);
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     try commitBlob(tmp.dir, b.data, b.root);
 
@@ -529,7 +529,7 @@ test "a request over the bound is refused, and writes no answer" {
 test "two spans that abut are one deduplicated boundary list" {
     const b = try blob();
     defer t.allocator.free(b.data);
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     try commitBlob(tmp.dir, b.data, b.root);
 
@@ -570,7 +570,7 @@ test "two spans that abut are one deduplicated boundary list" {
 test "the asked chunks are resolved against the blob, not against the request" {
     const b = try blob();
     defer t.allocator.free(b.data);
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     try commitBlob(tmp.dir, b.data, b.root);
 
@@ -605,7 +605,7 @@ test "the asked chunks are resolved against the blob, not against the request" {
 test "a boundary buffer too small refuses, and writes no answer for that hash" {
     const b = try blob();
     defer t.allocator.free(b.data);
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     try commitBlob(tmp.dir, b.data, b.root);
 
@@ -639,7 +639,7 @@ test "a committed blob of no bytes is disclosed with a size of zero" {
     const root: Hash = try tree.rootHash(data);
     try t.expectEqual(@as(u64, 0), tree.chunks());
 
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     try commitBlob(tmp.dir, data, root);
 

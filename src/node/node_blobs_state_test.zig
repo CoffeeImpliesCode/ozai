@@ -89,7 +89,7 @@ test "blob state defers trailing byte rejection until the finished response is d
     const outboard = try t.allocator.alloc(u8, @intCast(bao.bytes(tree)));
     defer t.allocator.free(outboard);
     const written = try bao.encode(tree, data, outboard);
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     var names: store.NameStorage = undefined;
     const paths = store.names(&names, hash);
@@ -143,7 +143,7 @@ test "blob provider rejects oversized accumulation before FIN" {
     var fixture: Fixture = undefined;
     try fixture.init();
     defer fixture.deinit();
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     var state: blobs.State = .init(.{ .provider = .{ .dir = tmp.dir, .hash = @splat(0) } });
     defer state.deinit(t.allocator);
@@ -165,7 +165,7 @@ test "blob provider handles more than sixteen streams and prunes disconnected st
     var fixture: Fixture = undefined;
     try fixture.init();
     defer fixture.deinit();
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     var state: blobs.State = .init(.{ .provider = .{ .dir = tmp.dir, .hash = @splat(0) } });
     defer state.deinit(t.allocator);

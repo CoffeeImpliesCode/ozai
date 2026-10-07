@@ -42,7 +42,7 @@ test "pinned Store captures match Zig outboard requests provider and verified ge
     const outboard_len = try outboard_mod.encode(tree, data, &computed_outboard);
     try t.expectEqualSlices(u8, outboard, computed_outboard[0..outboard_len]);
 
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     var names: store.NameStorage = undefined;
     const paths = store.names(&names, root);

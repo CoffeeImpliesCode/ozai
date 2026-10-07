@@ -171,7 +171,7 @@ fn releaseStream(node: *Node, connection_id: ?u64, stream_id: ?u64) void {
 
 fn verifyPeer(conn: bridge.Conn, expected: ozai.NodeId) !void {
     if (!conn.entry.conn.is_server) {
-        if (conn.entry.conn.tls13_hs) |*handshake| {
+        if (conn.entry.conn.tls13_hs) |handshake| {
             const authenticated = handshake.peerNodeId() orelse return error.MissingPeerIdentity;
             if (!std.mem.eql(u8, &authenticated, &expected.toBytes()))
                 return error.PeerIdentityMismatch;

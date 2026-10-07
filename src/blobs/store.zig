@@ -233,7 +233,7 @@ test "the four names are the hash's digits and four different suffixes" {
 
 // The committed pair is reachable by name, and the partials are not.
 test "a commit is two renames, and the result opens as a pair" {
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     const data = [_]u8{ 1, 2, 3, 4, 5 };
 
@@ -263,7 +263,7 @@ test "a commit is two renames, and the result opens as a pair" {
 // first. A directory standing where the outboard belongs makes the *second*
 // open fail, which is the only way to observe that the first was released.
 test "a failed second open releases the first, and a missing data is one miss" {
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
 
     var storage: NameStorage = undefined;
@@ -289,7 +289,7 @@ test "a failed second open releases the first, and a missing data is one miss" {
 // Discarding is idempotent, which is the property that makes it safe to call
 // on a partial that was never created.
 test "discarding twice is the same as discarding once" {
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     var storage: NameStorage = undefined;
     const built = names(&storage, @splat(0x33));

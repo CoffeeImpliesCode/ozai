@@ -295,7 +295,7 @@ test "a whole blob is answered with size and Bao, and a miss with none" {
     const tree = BaoTree.init(data.len);
     const hash: store.Hash = try tree.rootHash(data);
 
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     try putBlob(tmp.dir, hash, data);
 
@@ -334,7 +334,7 @@ test "a partial range is the plan's own encoding, pairs in preorder" {
     const tree = BaoTree.init(data.len);
     const hash: store.Hash = try tree.rootHash(data);
 
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     try putBlob(tmp.dir, hash, data);
 
@@ -362,7 +362,7 @@ test "an invalid outboard parent aborts the provider response" {
     const tree = BaoTree.init(data.len);
     const hash: store.Hash = try tree.rootHash(data);
 
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     try putBlob(tmp.dir, hash, data);
 
@@ -394,7 +394,7 @@ test "a walk this store cannot take is refused, not half-answered" {
     const tree = BaoTree.init(data.len);
     const hash: store.Hash = try tree.rootHash(data);
 
-    var tmp = t.tmpDir(.{});
+    var tmp = try @import("test_scratch").tmpDir(.{});
     defer tmp.cleanup();
     try putBlob(tmp.dir, hash, data);
 
