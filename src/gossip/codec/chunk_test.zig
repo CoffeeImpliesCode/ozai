@@ -64,8 +64,7 @@ test "a budget over the payload splits it into more than one chunk" {
         offset += take;
         frames += 1;
     }
-    // Sixteen entries at five a frame is five, five, five and one.
-    try t.expectEqual(@as(usize, 4), frames);
+    try t.expectEqual(@divFloor(list.len + 4, 5), frames);
 }
 
 test "a payload exactly at the budget is one chunk" {
@@ -96,10 +95,8 @@ test "a budget too small for one entry is refused" {
 }
 
 test "a chunk never holds more entries than one IHaves value can" {
-    // Sixteen is the ceiling whatever the budget, because a chunk is one
-    // `IHaves` value. Twenty entries on a link that would take all twenty is
-    // still two frames, and the second is the four that are left.
-    var list: [20]IHave = undefined;
+    // Even an unbounded caller list is split at the frame-fitting capacity.
+    var list: [plumtree.max_ihaves_per_message + 4]IHave = undefined;
     fill(&list);
     const take = try codec.chunkLen(&list, codec.max_message_size);
     try t.expectEqual(@as(usize, plumtree.max_ihaves_per_message), take);
@@ -125,4 +122,18 @@ test "every chunk the cutter produces is a frame the codec writes and reads" {
         offset += take;
     }
     try t.expectEqual(@as(usize, list.len), offset);
+}
+
+test "a chunk at the upstream send ceiling is split even with a larger budget" {
+    var list: [plumtree.max_ihaves_per_message]IHave = undefined;
+    fill(&list);
+    // 124 minimal entries occupy 4095 bytes; one two-byte round reaches 4096.
+    list[0].round.value = 128;
+    try t.expectEqual(codec.max_message_size, try budgetFor(&list, list.len));
+    const take = try codec.chunkLen(&list, codec.max_message_size + 100);
+    try t.expectEqual(@as(usize, list.len - 1), take);
+    var frame: [room]u8 = undefined;
+    const cut = try plumtree.IHaves.init(list[0..take]);
+    const bytes = try codec.encode(.{ .gossip = .{ .i_have = cut } }, &frame);
+    try t.expectEqual(@as(u16, @intCast(take)), (try codec.decode(bytes)).gossip.i_have.count);
 }

@@ -1,33 +1,15 @@
 //! The frame: a length prefix, a message body, and the header a stream opens
 //! with.
 //!
-//! # The prefix is postcard's own
-//!
-//! A frame is a `varint(u64)` length and then that many bytes, which is what
-//! `wire/postcard.zig` writes for a length-prefixed byte string: `writeLen` is
-//! what `writeBytes` writes and `readBytes` is what reads it back. Nothing here
-//! invents a width, and the prefix is what makes a byte stream a message stream —
-//! a frame split across two reads is a frame the reader waits for rather than a
-//! message it guessed at.
-//!
-//! **Upstream's prefix is not this one, and a peer from the reference will not
-//! read these frames.** `read_lp` reads a `u32` and `write_frame` writes one
-//! (`net/util.rs:369`, `:392`), so upstream frames are a fixed four-byte
-//! big-endian length and these are a varint. The house wire format is the one
-//! `wire/postcard.zig` implements and the one `test/protocol_codec.zig` already
-//! frames with, and a second framing beside it would be two rules for the same
-//! bytes. `../codec.zig` says what closing that gap would take.
-//!
-//! # What a stream is
-//!
-//! A stream is a header frame and then message frames, all framed the same way.
-//! The topic travels once, in the header, and every payload after it is 32 bytes
-//! smaller than upstream's, which repeats it in every frame.
+//! Frames use the pinned upstream `net/util.rs` fixed four-byte big-endian
+//! length, followed by postcard bytes. A topic stream begins with one
+//! `StreamHeader`; later frames contain only the nested topic message.
 //!
 //! Nothing here allocates, reads a clock, or touches a socket: `encode` appends
 //! to a buffer the caller owns and `decode` borrows slices out of the frame it
 //! was handed, which is the borrow rule both gossip layers document.
 
+const std = @import("std");
 const broadcast = @import("broadcast.zig");
 const gossip = @import("../hyparview.zig");
 const limits = @import("limits.zig");
@@ -86,11 +68,12 @@ pub fn encodedLen(message: Message) usize {
 /// encoded from may be reused the moment this returns.
 pub fn encode(message: Message, out: []u8) Error![]const u8 {
     const body_len = encodedLen(message);
-    if (body_len > max_message_size) return error.FrameTooLarge;
-    var writer = postcard.Writer.init(out);
-    try writer.writeLen(body_len);
+    if (body_len >= max_message_size) return error.FrameTooLarge;
+    if (out.len < 4 + body_len) return error.BufferFull;
+    std.mem.writeInt(u32, out[0..4], @intCast(body_len), .big);
+    var writer = postcard.Writer.init(out[4..]);
     try encodeBody(message, &writer);
-    return writer.finish();
+    return out[0 .. 4 + writer.finish().len];
 }
 
 /// Writes a message's body: the layer tag, then the arm.
@@ -114,16 +97,12 @@ pub fn encodeBody(message: Message, writer: *postcard.Writer) Error!void {
 /// a caller reading a stream has to act on that rather than have this function
 /// guess where the next one begins.
 ///
-/// The refusals are three rules and not one symptom: a prefix longer than the
-/// bytes present is `error.BadLength` from `readBytes`, a body left over after
-/// the message has been read is `error.TrailingBytes`, and a body over the byte
-/// budget is `error.FrameTooLarge` before any of it is decoded. Every slice the
-/// returned message carries is borrowed from `frame`.
+/// A short prefix is `error.UnexpectedEnd`, a prefix claiming more bytes than
+/// present is `error.BadLength`, leftover bytes are `error.TrailingBytes`, and
+/// a body over the budget is `error.FrameTooLarge` before any decoding.
+/// Every slice in the returned message borrows from `frame`.
 pub fn decode(frame: []const u8) Error!Message {
-    var reader = postcard.Reader.init(frame);
-    const body = try reader.readBytes();
-    if (body.len > max_message_size) return error.FrameTooLarge;
-    try reader.finish();
+    const body = try readFrame(frame);
     return decodeBody(body);
 }
 
@@ -150,10 +129,10 @@ pub fn decodeBody(body: []const u8) Error!Message {
 /// reader with two framings has two things to get right. A caller sizing a
 /// buffer for it sizes it with `limits.max_header_size`.
 pub fn encodeStreamHeader(header: StreamHeader, out: []u8) Error![]const u8 {
-    var writer = postcard.Writer.init(out);
-    try writer.writeLen(StreamHeader.encoded_size);
-    try writer.writeArray(topic_id_length, &header.topic_id.bytes);
-    return writer.finish();
+    if (out.len < 4 + StreamHeader.encoded_size) return error.BufferFull;
+    std.mem.writeInt(u32, out[0..4], StreamHeader.encoded_size, .big);
+    @memcpy(out[4..][0..StreamHeader.encoded_size], &header.topic_id.bytes);
+    return out[0 .. 4 + StreamHeader.encoded_size];
 }
 
 /// Reads a stream header frame.
@@ -163,11 +142,19 @@ pub fn encodeStreamHeader(header: StreamHeader, out: []u8) Error![]const u8 {
 /// so a body of any other size is not a header. The topic id is copied out, so
 /// nothing in the result borrows from `frame`.
 pub fn decodeStreamHeader(frame: []const u8) Error!StreamHeader {
-    var reader = postcard.Reader.init(frame);
-    const body = try reader.readBytes();
-    try reader.finish();
+    const body = try readFrame(frame);
     if (body.len != StreamHeader.encoded_size) return error.BadHeaderSize;
     var bytes: [topic_id_length]u8 = undefined;
     @memcpy(&bytes, body);
     return StreamHeader.init(TopicId.fromBytes(bytes));
+}
+
+fn readFrame(frame: []const u8) Error![]const u8 {
+    if (frame.len < 4) return error.UnexpectedEnd;
+    const length = std.mem.readInt(u32, frame[0..4], .big);
+    if (length > max_message_size) return error.FrameTooLarge;
+    const body = frame[4..];
+    if (length > body.len) return error.BadLength;
+    if (length < body.len) return error.TrailingBytes;
+    return body;
 }
