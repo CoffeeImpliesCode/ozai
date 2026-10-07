@@ -13,9 +13,7 @@ const Role = enum { server, client };
 pub fn run(io: std.Io, gpa: std.mem.Allocator, config: options.Options,
     network: *topology.Topology, records: *evidence.Evidence, role: Role) !void
 {
-    try network.blockDirect();
     const label = @tagName(role);
-    const baseline = try snapshot(io, gpa, network, records, label, "initial");
     var output: [3][65536]u8 = undefined;
     var errors: [3][65536]u8 = undefined;
     var children: [3]processes.Process = undefined;
@@ -28,10 +26,12 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, config: options.Options,
     };
     // Retain actual post-transition counters before peers and namespaces are reaped.
     errdefer {
-        if (snapshot(io, gpa, network, records, label, "failure")) |_| {} else |err| {
+        if (snapshot(io, gpa, network, records, label, "failed")) |_| {} else |err| {
             std.log.err("NAT failure topology evidence failed: {s}", .{@errorName(err)});
         }
     }
+    try network.blockDirect();
+    const baseline = try snapshot(io, gpa, network, records, label, "initial");
     var duration_buffer: [16]u8 = undefined;
     const duration = try std.fmt.bufPrint(&duration_buffer, "{d}", .{config.duration_ms});
     var relay_duration_buffer: [16]u8 = undefined;
