@@ -45,6 +45,13 @@ const pkarr_live = @import("../discovery/pkarr_live.zig");
 const resolve = @import("../discovery/resolve.zig");
 const txt = @import("../discovery/txt.zig");
 const tls_client = @import("../discovery/tls_client.zig");
+const lookup_io = @import("../discovery/lookup_io.zig");
+const lookup_wire = @import("../discovery/lookup_wire.zig");
+const dial_source_walk = @import("../discovery/dial_source_walk.zig");
+const pkarr_body = @import("../discovery/pkarr_body.zig");
+const discovery_item = @import("../discovery/item.zig");
+const addr = @import("../base/addr.zig");
+const Instant = @import("../transport/dial.zig").Instant;
 
 const base_key = @import("../base/key.zig");
 
@@ -115,11 +122,9 @@ pub const Refused = struct {
     /// unsigned, so this is the only thing standing between a lookup and a
     /// forged one.
     foreign: u64 = 0,
-    /// The `TC` bit was set: the answer did not fit one datagram. The retry
-    /// RFC 1035 §4.2.2 asks for is a TCP stream, and
-    /// `discovery/host_io.streamRetry` is what would have to go out on it; a
-    /// node whose transport is a datagram socket has no stream to retry on, so
-    /// this is a refusal by name rather than a silent short answer.
+    /// The validated UDP answer requested TCP fallback, but the bounded
+    /// stream answer was itself truncated. UDP truncation alone is not a
+    /// refusal: `dns_live.Retrieval.ask` performs the real TCP retry.
     truncated: u64 = 0,
     /// The bytes were not an answer at all: a name that does not exist, an
     /// `RCODE` this decoder refuses, a name that runs past the message.
@@ -168,8 +173,7 @@ pub const Refused = struct {
 /// spelling, which is what makes a refusal countable rather than merely
 /// reportable. The shape is `node_gossip_wire.Outcome`'s and for its reason.
 pub const Outcome = enum {
-    /// The relay took the packet, or the answer carried records this node
-    /// could act on. The only arm with no counter.
+    /// The relay took the published packet. The only arm with no counter.
     accepted,
     /// See `Refused.nothing_to_publish`.
     nothing_to_publish,
@@ -298,118 +302,214 @@ pub fn publish(
     return true;
 }
 
-/// Ask the nameserver about `peer` and take whatever comes back to the node's
-/// own resolution path.
-///
-/// **The question is a real `_iroh.<z32>.<origin>` TXT question, framed by
-/// `discovery/dns_live.zig` and decoded by it.** Only the socket is injected:
-/// `Config.discovery.lookup`'s `datagram` is the seam `discovery/lookup_io.zig`
-/// was built around, and in production it is a `dns_live.Resolver`'s own
-/// `seam()`. So the transaction id really is drawn from `random` and really has
-/// to be echoed, the `QR` and `TC` bits really are checked, and the answer
-/// really is walked record by record — this is the module's path, not a
-/// stand-in for it.
-///
-/// `dns_live.Retrieval.ask` maps a datagram that never arrived onto
-/// `Answer.timeout`, so a timeout is a *different arm* here from an answer that
-/// arrived carrying nothing, and the two reach two different counters. That is
-/// the distinction `discovery/lookup_io.zig` argues for at length and the
-/// reason this function switches on the answer rather than on a bool.
-pub fn ask(self: *Node, io: std.Io, peer: NodeId, random: std.Random) void {
-    const source = self.config.discovery.lookup orelse {
-        self.discovery.refused.no_source += 1;
+/// Resolve and initiate one pinned dial for a requested identity.
+/// Static attempts and earlier lookup attempts share the deliberate one-shot latch.
+/// DNS failure never hides an explicitly enabled PKARR source.
+pub fn ask(self: *Node, io: std.Io, peer: NodeId, at: Instant, random: std.Random) void {
+    if (self.dialled.contains(peer)) return;
+    self.dialled.put(self.gpa, peer, {}) catch {
+        count(self, .out_of_memory);
         return;
-    };
-    const origin = self.config.discovery.origin;
-    if (dns.queryNameLength(origin) > self.discovery.name.len) {
-        self.discovery.refused.origin_too_long += 1;
-        return;
-    }
-    const name = dns.queryName(&self.discovery.name, peer, origin);
-    // A fresh retrieval per pass: the transaction id is drawn here and a second
-    // ask through one retrieval would ask the same question again and read the
-    // first one's late answer (`lookup_retrieval.Retrieval.ask`'s own rule).
-    var retrieval: dns_live.Retrieval = .{
-        .datagram = source.datagram,
-        .server = source.server,
-        .id = random.int(u16),
     };
     self.stats.discovery_lookups += 1;
-    const answer = retrieval.ask(self.gpa, io, .{
-        .name = name,
-        .wire = &self.discovery.question,
-        .reply = &self.discovery.reply,
-        .deadline_ms = self.config.discovery.deadline_ms,
+    var dns_answer: ?dns_live.Answer = null;
+    defer if (dns_answer) |answer| answer.deinit(self.gpa);
+    if (self.config.discovery.lookup) |source| {
+        const origin = self.config.discovery.origin;
+        if (dns.queryNameLength(origin) > self.discovery.name.len) {
+            count(self, .origin_too_long);
+        } else {
+            var retrieval: dns_live.Retrieval = .{
+                .datagram = source.datagram,
+                .server = source.server,
+                .id = random.int(u16),
+            };
+            dns_answer = retrieval.ask(self.gpa, io, .{
+                .name = dns.queryName(&self.discovery.name, peer, origin),
+                .wire = &self.discovery.question,
+                .reply = &self.discovery.reply,
+                .deadline_ms = self.config.discovery.deadline_ms,
+            }) catch |err| failed: {
+                count(self, lookupFailed(err));
+                break :failed null;
+            };
+        }
+    }
+    var sources: [2]resolve.AddressLookup = undefined;
+    var source_count: usize = 0;
+    var dns_service = dns_live.Resolver.service(.init(""), null);
+    if (dns_answer) |answer| switch (answer) {
+        .timeout => count(self, .timed_out),
+        .nothing => count(self, .nothing),
+        .records => |records| {
+            self.stats.discovery_answers += 1;
+            dns_service = dns_live.Resolver.service(records, null);
+            sources[source_count] = dns_service.lookup();
+            source_count += 1;
+        },
+    };
+    var pkarr_records: ?lookup_io.Answer = null;
+    defer if (pkarr_records) |answer| answer.deinit(self.gpa);
+    var pkarr_service: VerifiedRecords = .{ .service = dns_live.Resolver.service(.init(""), null) };
+    if (self.config.discovery.resolve_pkarr) {
+        pkarr_records = fetchPkarr(self, io, peer, random);
+        if (pkarr_records) |answer| switch (answer) {
+            .records => |records| {
+                self.stats.discovery_answers += 1;
+                pkarr_service.service = dns_live.Resolver.service(records, null);
+                sources[source_count] = pkarr_service.lookup();
+                source_count += 1;
+            },
+            .nothing => count(self, .nothing),
+            .timeout => count(self, .timed_out),
+        };
+    }
+    if (source_count == 0) {
+        if (self.config.discovery.lookup == null and !self.config.discovery.resolve_pkarr)
+            count(self, .no_source);
+        return;
+    }
+    const outcome = dial_source_walk.dialFromSources(self.gpa, sources[0..source_count], self.dialer, .{
+        .node_id = peer,
+        .local = self.socket.address,
+        .map = &self.map,
+        .select = .{ .ctx = self, .pick = selectAddress },
+        .at = at,
+        .random = random,
     }) catch |err| {
-        count(self, lookupFailed(err));
+        if (err == error.OutOfMemory) count(self, .out_of_memory);
+        self.stats.dials_refused += 1;
+        std.log.warn("node {f}: discovery dial to {f} refused: {t}", .{ self.nodeId(), peer, err });
         return;
     };
-    // The records are copied out of `alloc` by `ask`, so the answer owns them
-    // until this returns and `records` below is only a borrow of that copy.
-    defer answer.deinit(self.gpa);
-    switch (answer) {
-        // The third arm, and not an error: the clock ran out, not the world.
-        .timeout => self.discovery.refused.timed_out += 1,
-        // The name exists and nothing was published under it. Also not an
-        // error, and not the same fact.
-        .nothing => self.discovery.refused.nothing += 1,
-        .records => |records| resolveThrough(self, peer, records),
+    if (outcome.first_failure) |failure| {
+        count(self, .unreadable);
+        std.log.warn("node {f}: discovery source rank {d} refused: {t}", .{ self.nodeId(), failure.provenance.rank(), failure.reason });
+    }
+    switch (outcome.result) {
+        .cannot_resolve => count(self, .cannot_resolve),
+        .nothing => count(self, .no_item),
+        .no_address => count(self, .no_item),
+        // Initiated, not authenticated success: Node.step drives the handshake.
+        .dialed => self.stats.dials += 1,
     }
 }
 
-/// Hand the records to the resolver that already exists and take what it finds.
-///
-/// This is the node's own resolution path: `dns_live.Resolver.service` builds
-/// `discovery/dns.zig`'s `DnsAddressLookup` over the records and the items come
-/// off a `resolve.Stream` exactly as `discovery/dial_source.zig` would read
-/// them. The stream, the service and the records all die with this call, which
-/// is why nothing here keeps an address: this node has no use for a resolved
-/// peer yet, and keeping one would be a second answer list beside
-/// `Node.map`'s.
-///
-/// **A stream that ends with no item is counted apart from both `timed_out` and
-/// `nothing`.** Records arrived, the resolver ran, and it produced none: a
-/// third fact, and the one that says the records did not parse into an
-/// address.
-fn resolveThrough(
-    self: *Node,
-    peer: NodeId,
-    records: txt.RecordSet,
-) void {
-    self.stats.discovery_answers += 1;
-    var service = dns_live.Resolver.service(records, null);
-    var stream = service.lookup().resolve(self.gpa, peer) catch {
-        self.discovery.refused.out_of_memory += 1;
-        return;
-    } orelse {
-        self.discovery.refused.cannot_resolve += 1;
-        return;
+fn selectAddress(ctx: *anyopaque, endpoint: *const addr.NodeAddr) ?addr.TransportAddr {
+    const self: *Node = @ptrCast(@alignCast(ctx));
+    self.stats.discovery_items += 1;
+    self.stats.discovery_addresses += endpoint.addrs.len;
+    // The node's UDP socket can send direct IP candidates. Relay candidates
+    // require the relay carrier; do not pretend an unmapped relay is reachable.
+    for (endpoint.addrs) |candidate| switch (candidate) {
+        .ip => return candidate,
+        .relay, .custom => {},
     };
-    defer stream.deinit();
-    var items: usize = 0;
-    while (stream.next()) |event| switch (event) {
-        .item => |found| {
-            items += 1;
-            self.stats.discovery_addresses += found.endpoint.addrs.len;
-        },
-        .failed => |failure| {
-            self.discovery.refused.unreadable += 1;
-            // `Provenance` is an enum with a `rank` and no `format`, and the
-            // rank is its declaration order — `.dns` first, `.pkarr` second,
-            // `.memory_lookup` third — which is the ordering a log reader wants
-            // and the one `item_record.Provenance` publishes for it.
-            std.log.warn("node {f}: a discovery answer of rank {d} could not be read: {t}", .{
-                self.nodeId(),
-                failure.provenance.rank(),
-                failure.reason,
-            });
-        },
+    return null;
+}
+
+/// A verified PKARR packet has already supplied these records. Reuse the TXT
+/// parser and stream ownership, retaining the signed source's provenance.
+const VerifiedRecords = struct {
+    service: dns.DnsAddressLookup,
+    const vtable: resolve.AddressLookup.VTable = .{
+        .publish = resolve.AddressLookup.ignore_publish,
+        .resolve = start,
     };
-    if (items == 0) {
-        self.discovery.refused.no_item += 1;
-        return;
+
+    fn lookup(self: *VerifiedRecords) resolve.AddressLookup {
+        return .{ .ctx = self, .vtable = &vtable };
     }
-    self.stats.discovery_items += items;
+
+    fn start(ctx: *anyopaque, alloc: std.mem.Allocator, peer: NodeId) resolve.ResolveError!?resolve.Stream {
+        const self: *VerifiedRecords = @ptrCast(@alignCast(ctx));
+        var inner = (try self.service.lookup().resolve(alloc, peer)) orelse return null;
+        errdefer inner.deinit();
+        const state = try alloc.create(SignedStream);
+        state.* = .{ .inner = inner };
+        return .{ .state = state, .vtable = &SignedStream.vtable, .alloc = alloc, .status = .live };
+    }
+};
+
+const SignedStream = struct {
+    inner: resolve.Stream,
+    slot: [1]discovery_item.Item = undefined,
+    has_item: bool = false,
+    const vtable: resolve.Stream.VTable = .{
+        .next = next,
+        .finish = finish,
+        .cancel = cancel,
+        .destroy = destroy,
+    };
+
+    fn next(ctx: *anyopaque) ?resolve.Event {
+        const self: *SignedStream = @ptrCast(@alignCast(ctx));
+        var event = self.inner.next() orelse return null;
+        switch (event) {
+            .item => |*found| {
+                found.provenance = .pkarr;
+                self.slot[0] = found.*;
+                self.has_item = true;
+            },
+            .failed => |*failure| failure.provenance = .pkarr,
+        }
+        return event;
+    }
+
+    fn finish(ctx: *anyopaque) discovery_item.Resolution {
+        const self: *SignedStream = @ptrCast(@alignCast(ctx));
+        return switch (self.inner.finish()) {
+            .cannot_resolve => .cannot_resolve,
+            .resolved => .{ .resolved = if (self.has_item) &self.slot else &.{} },
+        };
+    }
+
+    fn cancel(_: *anyopaque) void {
+        // The synchronous TLS retrieval is closed before the stream starts.
+    }
+
+    fn destroy(ctx: *anyopaque, alloc: std.mem.Allocator) void {
+        const self: *SignedStream = @ptrCast(@alignCast(ctx));
+        self.inner.deinit();
+        alloc.destroy(self);
+    }
+};
+
+fn fetchPkarr(self: *Node, io: std.Io, peer: NodeId, random: std.Random) ?lookup_io.Answer {
+    const relay = self.config.discovery.relay orelse {
+        count(self, .no_source);
+        return null;
+    };
+    random.bytes(&self.discovery.entropy);
+    const now = std.Io.Clock.real.now(io);
+    var out: pkarr_live.Response = .{ .status = 0, .body = &.{}, .buffer = relay.response };
+    const answer = pkarr_live.resolve(self.gpa, io, .{
+        .base_url = relay.base_url,
+        .server = relay.server,
+        .trust = .{
+            .host = relay.certificate_host,
+            .bundle = relay.bundle,
+            .bundle_lock = relay.bundle_lock,
+            .entropy = &self.discovery.entropy,
+            .now = now,
+            .read_buffer = relay.read_buffer,
+            .write_buffer = relay.write_buffer,
+            .timeout_ms = relay.timeout_ms,
+        },
+        .read_buffer = relay.read_buffer,
+        .write_buffer = relay.write_buffer,
+        .timeout_ms = @min(relay.timeout_ms orelse self.config.discovery.deadline_ms, self.config.discovery.deadline_ms),
+    }, peer, &out) catch |err| {
+        count(self, if (err == error.OutOfMemory) .out_of_memory else .unreadable);
+        std.log.warn("node {f}: PKARR lookup for {f} refused: {t}", .{ self.nodeId(), peer, err });
+        return null;
+    };
+    var name: [pkarr_body.nameLength()]u8 = undefined;
+    var owner: [lookup_wire.max_name_length]u8 = undefined;
+    return pkarr_body.readBody(self.gpa, answer.packet.dns, peer, &name, &owner) catch |err| {
+        count(self, lookupFailed(err));
+        return null;
+    };
 }
 
 /// Which counter one refused publish moves.
@@ -432,11 +532,10 @@ fn publishFailed(err: pkarr_live.Error) Outcome {
 
 /// Which counter one refused question moves.
 ///
-/// The three the pass must keep apart are three arms: a `TC` bit is
-/// `truncated` because the retry needs a stream this node has none of, a
-/// foreign transaction or a foreign source is `foreign`, and an `RCODE` or a
-/// malformed message is `undecodable`. `error.Empty` never arrives here:
-/// `dns_live.Retrieval.ask` has already turned it into `Answer.timeout`.
+/// A truncated TCP fallback stays apart from a foreign transaction/source and
+/// an undecodable answer. UDP truncation is handled by `Retrieval.ask`, not
+/// translated into success or discarded here. An empty deadline becomes
+/// `Answer.timeout`, which remains distinct from an empty answer.
 fn lookupFailed(err: dns_live.Error) Outcome {
     return switch (err) {
         error.Truncated => .truncated,
@@ -484,4 +583,25 @@ pub fn count(self: *Node, refused: Outcome) void {
         .out_of_memory => counts.out_of_memory += 1,
         .canceled => counts.canceled += 1,
     }
+}
+
+test {
+    _ = @import("node_discovery_lookup_test.zig");
+}
+
+test "verified PKARR records keep signed provenance in the fan-in finish set" {
+    const t = std.testing;
+    const id = (try base_key.SecretKey.fromSeed(@splat(0x51))).nodeId();
+    var service: VerifiedRecords = .{
+        .service = dns_live.Resolver.service(.init("addr=127.0.0.1:4242\x00"), null),
+    };
+    var stream = (try service.lookup().resolve(t.allocator, id)).?;
+    defer stream.deinit();
+    const event = stream.next().?;
+    try t.expectEqual(discovery_item.Provenance.pkarr, event.item.provenance);
+    try t.expect(stream.next() == null);
+    const result = stream.finish().resolved;
+    try t.expectEqual(@as(usize, 1), result.len);
+    try t.expectEqual(discovery_item.Provenance.pkarr, result[0].provenance);
+    try t.expectEqual(id, result[0].endpoint.node_id);
 }

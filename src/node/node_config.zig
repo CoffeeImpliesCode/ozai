@@ -22,6 +22,7 @@ const router = @import("../router/router.zig");
 const relay_frame = @import("../relay/frame.zig");
 const relay_server = @import("../relay/server.zig");
 const node_relay_table = @import("node_relay_table.zig");
+const incoming_filter = @import("../endpoint/incoming_filter.zig");
 
 const NodeId = base_key.NodeId;
 const SecretKey = base_key.SecretKey;
@@ -162,6 +163,8 @@ pub const Config = struct {
     peers: []const Peer = &.{},
     /// The protocol to offer and to dispatch. See `max_alpns`.
     alpn: []const u8 = gossip_alpn,
+    /// Applied before connection allocation, after core token validation.
+    initial_policy: ?incoming_filter.InitialPolicy = null,
     /// Membership and broadcast. The defaults are upstream's, and a test that
     /// wants them faster overrides them here rather than the other way round.
     topic: hyparview.TopicConfig = .{},
@@ -265,6 +268,7 @@ pub const Error =
     plumtree.Error ||
     Allocator.Error ||
     error{
+        InvalidDiscoveryConfig,
         /// The `Io`'s monotonic clock reported a value `Instant` — a signed
         /// 64-bit nanosecond count — cannot hold. Unreachable on any machine
         /// this runs on, and refused rather than `@intCast`ed so a clock that

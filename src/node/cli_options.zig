@@ -35,6 +35,13 @@ pub const Options = struct {
     },
     /// Who to dial, in the order the flags named them.
     peers: std.ArrayList(Peer) = .empty,
+    /// Identities to resolve; static `--peer` addresses never enter this list.
+    lookup_peers: std.ArrayList(ozai.NodeId) = .empty,
+    /// Explicit resolver destination. No external server is selected by default.
+    dns_server: ?SocketAddr = null,
+    dns_origin: []const u8 = (node_mod.Discovery{}).origin,
+    lookup_deadline_ms: i32 = (node_mod.Discovery{}).deadline_ms,
+    lookup_interval_ms: u64 = (node_mod.Discovery{}).interval_ms,
     /// This node's identity, drawn when the caller does not supply one.
     secret: ?SecretKey = null,
     /// The protocol to offer, or null for the default: the gossip ALPN, or the
@@ -62,6 +69,11 @@ pub const Options = struct {
         \\  --listen <ip:port>     where to bind. Port 0 lets the kernel choose.
         \\  --peer <nodeid@ip:port>
         \\                          dial this peer. May be repeated.
+        \\  --lookup-peer <nodeid> resolve and dial this identity. May be repeated.
+        \\  --dns-server <ip:port> explicit DNS server; requires --lookup-peer.
+        \\  --dns-origin <origin> DNS suffix. Default: the production iroh origin.
+        \\  --lookup-deadline <ms> positive query budget, at most 2147483647.
+        \\  --lookup-interval <ms> positive refresh interval, at most 9223372036854.
         \\  --key-seed <base32>    this node's ed25519 seed, z-base-32. Drawn
         \\                          when absent; the node id is printed either
         \\                          way.
@@ -143,6 +155,41 @@ pub const Options = struct {
                 // this can only fail if the process is out of memory — which
                 // is propagated rather than dressed up as a bad argument.
                 try options.peers.append(arena, peer);
+            } else if (std.mem.eql(u8, flag, "--lookup-peer")) {
+                const id = ozai.NodeId.parseZ32(value) catch |err| {
+                    try cli_values.reject(out, flag, value, err);
+                    return .{ .rejected = err };
+                };
+                try options.lookup_peers.append(arena, id);
+            } else if (std.mem.eql(u8, flag, "--dns-server")) {
+                const server = cli_values.parseSocket(value) catch |err| {
+                    try cli_values.reject(out, flag, value, err);
+                    return .{ .rejected = err };
+                };
+                if (server.port == 0) {
+                    try cli_values.reject(out, flag, value, error.AddressNotReachable);
+                    return .{ .rejected = error.AddressNotReachable };
+                }
+                options.dns_server = server;
+            } else if (std.mem.eql(u8, flag, "--dns-origin")) {
+                options.dns_origin = cli_values.parseDnsOrigin(value) catch |err| {
+                    try cli_values.reject(out, flag, value, err);
+                    return .{ .rejected = err };
+                };
+                // Wire DNS names must be absolute; accept the usual suffix
+                // spelling without silently relying on a host search domain.
+                if (!std.mem.endsWith(u8, options.dns_origin, "."))
+                    options.dns_origin = try std.fmt.allocPrint(arena, "{s}.", .{options.dns_origin});
+            } else if (std.mem.eql(u8, flag, "--lookup-deadline")) {
+                options.lookup_deadline_ms = cli_values.parseLookupMilliseconds(i32, value, std.math.maxInt(i32)) catch |err| {
+                    try cli_values.reject(out, flag, value, err);
+                    return .{ .rejected = err };
+                };
+            } else if (std.mem.eql(u8, flag, "--lookup-interval")) {
+                options.lookup_interval_ms = cli_values.parseLookupMilliseconds(u64, value, cli_values.max_lookup_interval_ms) catch |err| {
+                    try cli_values.reject(out, flag, value, err);
+                    return .{ .rejected = err };
+                };
             } else if (std.mem.eql(u8, flag, "--key-seed")) {
                 const seed = ozai.base32.decode(
                     ozai.base32.z32,
@@ -216,6 +263,14 @@ pub const Options = struct {
         out: *std.Io.Writer,
         options: Options,
     ) std.Io.Writer.Error!?CliError {
+        if (options.lookup_peers.items.len != 0 and options.dns_server == null) {
+            try out.writeAll("ozai-node: --lookup-peer requires --dns-server\n");
+            return @as(?CliError, error.LookupNeedsServer);
+        }
+        if (options.dns_server != null and options.lookup_peers.items.len == 0) {
+            try out.writeAll("ozai-node: --dns-server requires --lookup-peer\n");
+            return @as(?CliError, error.LookupNeedsPeer);
+        }
         if (options.relay_peer) |target| {
             // `node.Role` is a union, so one process runs one half. Choosing
             // one here would drop the other without a word.
@@ -234,6 +289,10 @@ pub const Options = struct {
                     "ozai-node: --peer {f}: {t}\n",
                     .{ peer.id, error.RelayDialsNobody },
                 );
+                return @as(?CliError, error.RelayDialsNobody);
+            }
+            if (options.lookup_peers.items.len != 0) {
+                try out.writeAll("ozai-node: --lookup-peer cannot accompany a relay role\n");
                 return @as(?CliError, error.RelayDialsNobody);
             }
         }
@@ -264,3 +323,74 @@ pub const Parse = union(enum) {
     /// failure and not a node that quietly ran with defaults.
     rejected: CliError,
 };
+
+test "explicit lookup peers retain static peers and DNS settings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var secret = try ozai.SecretKey.fromSeed(.{7} ** ozai.SecretKey.seed_length);
+    defer secret.deinit();
+    var id_buffer: [ozai.NodeId.z32_length + 1]u8 = undefined;
+    const id = try std.fmt.bufPrintZ(&id_buffer, "{s}", .{secret.nodeId().toZ32()});
+    var peer_buffer: [100]u8 = undefined;
+    const peer = try std.fmt.bufPrintZ(&peer_buffer, "{s}@127.0.0.1:9000", .{id});
+    const args = [_][*:0]const u8{
+        "ozai-node", "--peer", peer,
+        "--lookup-peer", id, "--lookup-peer", id,
+        "--dns-server", "[::1]:5353", "--dns-origin", "test.invalid",
+        "--lookup-deadline", "25", "--lookup-interval", "100",
+    };
+    var out: std.Io.Writer.Allocating = .init(arena.allocator());
+    const parsed = try Options.parse(arena.allocator(), .{ .vector = &args }, &out.writer);
+    try std.testing.expect(parsed == .run);
+    const options = parsed.run;
+    try std.testing.expectEqual(@as(usize, 1), options.peers.items.len);
+    try std.testing.expectEqual(@as(u16, 9000), options.peers.items[0].addr.ip.port);
+    try std.testing.expectEqual(@as(usize, 2), options.lookup_peers.items.len);
+    try std.testing.expectEqual(@as(u16, 5353), options.dns_server.?.port);
+    try std.testing.expectEqualStrings("test.invalid.", options.dns_origin);
+    try std.testing.expectEqual(@as(i32, 25), options.lookup_deadline_ms);
+    try std.testing.expectEqual(@as(u64, 100), options.lookup_interval_ms);
+}
+
+test "lookup requires explicit peers and source and bounded positive timing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var secret = try ozai.SecretKey.fromSeed(.{7} ** ozai.SecretKey.seed_length);
+    defer secret.deinit();
+    var id_buffer: [ozai.NodeId.z32_length + 1]u8 = undefined;
+    const id = try std.fmt.bufPrintZ(&id_buffer, "{s}", .{secret.nodeId().toZ32()});
+    const Case = struct { args: []const [*:0]const u8, refusal: CliError };
+    const cases = [_]Case{
+        .{ .args = &.{ "ozai-node", "--lookup-peer", id }, .refusal = error.LookupNeedsServer },
+        .{ .args = &.{ "ozai-node", "--dns-server", "127.0.0.1:53" }, .refusal = error.LookupNeedsPeer },
+        .{ .args = &.{ "ozai-node", "--lookup-deadline", "0" }, .refusal = error.LookupTimingOutOfRange },
+        .{ .args = &.{ "ozai-node", "--lookup-deadline", "2147483648" }, .refusal = error.LookupTimingOutOfRange },
+        .{ .args = &.{ "ozai-node", "--lookup-interval", "-1" }, .refusal = error.LookupTimingOutOfRange },
+        .{ .args = &.{ "ozai-node", "--lookup-interval", "9223372036855" }, .refusal = error.LookupTimingOutOfRange },
+        .{ .args = &.{ "ozai-node", "--dns-server", "127.0.0.1:0" }, .refusal = error.AddressNotReachable },
+        .{ .args = &.{ "ozai-node", "--dns-origin", "" }, .refusal = error.InvalidDnsOrigin },
+        .{ .args = &.{ "ozai-node", "--relay", "--lookup-peer", id, "--dns-server", "127.0.0.1:53" }, .refusal = error.RelayDialsNobody },
+    };
+    for (cases) |case| {
+        var out: std.Io.Writer.Allocating = .init(arena.allocator());
+        const parsed = try Options.parse(arena.allocator(), .{ .vector = case.args }, &out.writer);
+        try std.testing.expect(parsed == .rejected);
+        try std.testing.expectEqual(case.refusal, parsed.rejected);
+    }
+}
+
+test "static peer does not enable external DNS" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var secret = try ozai.SecretKey.fromSeed(.{7} ** ozai.SecretKey.seed_length);
+    defer secret.deinit();
+    const id = secret.nodeId().toZ32();
+    var peer_buffer: [100]u8 = undefined;
+    const peer = try std.fmt.bufPrintZ(&peer_buffer, "{s}@127.0.0.1:9000", .{id});
+    const args = [_][*:0]const u8{ "ozai-node", "--peer", peer };
+    var out: std.Io.Writer.Allocating = .init(arena.allocator());
+    const parsed = try Options.parse(arena.allocator(), .{ .vector = &args }, &out.writer);
+    try std.testing.expect(parsed == .run);
+    try std.testing.expectEqual(@as(usize, 0), parsed.run.lookup_peers.items.len);
+    try std.testing.expect(parsed.run.dns_server == null);
+}

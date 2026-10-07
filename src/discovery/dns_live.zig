@@ -73,15 +73,13 @@
 //! cannot be driven twice with different runtimes. `Resolver` owns a socket, a
 //! server address and a stop latch, and those are the only three things it has.
 //!
-//! # What is not here
+//! # A truncated datagram is retried over TCP
 //!
-//! No `TC`-to-TCP retry. `lookup_answer.readHeader` refuses a truncated answer
-//! as `error.Truncated` before this file is asked anything, and
-//! `discovery/host_io.zig` already says what the retry is — RFC 1035 §4.2.2's
-//! two-octet length prefix over `transport/tcp.zig` — as a value a caller
-//! holding both owns. This file owns no stream, so it makes no retry; adding one
-//! would mean opening a second transport in a file whose subject is that one
-//! descriptor is enough.
+//! `host_io.streamRetry` makes the pure decision after source validation.
+//! `lookup_live.retryStream` owns one bounded TCP exchange to that same server,
+//! repeating the exact question and reading one complete length-prefixed reply.
+//! The original request deadline covers UDP and TCP together; a request with
+//! no UDP deadline still bounds its TCP exchange to the per-query DNS timeout.
 //!
 //! Also not here: the origin's nameserver. `Resolver` takes the server address
 //! it asks, because a resolver that picked one itself would be a resolver policy
@@ -105,6 +103,7 @@ const lookup_io = @import("lookup_io.zig");
 const query = @import("lookup_query.zig");
 const lookup_live = @import("lookup_live.zig");
 const wire = @import("lookup_wire.zig");
+const host_io = @import("host_io.zig");
 
 /// Everything one live lookup can fail with.
 ///
@@ -237,7 +236,12 @@ pub const Resolver = struct {
     /// can drive it at a fixed one. A caller that wants two questions to be
     /// distinguishable asks twice with two ids.
     pub fn begin(self: *Resolver, id: u16) Retrieval {
-        return .{ .datagram = self.seam(), .server = self.server, .id = id };
+        return .{
+            .datagram = self.seam(),
+            .server = self.server,
+            .id = id,
+            .resolver_stopped = &self.stopped,
+        };
     }
 
     /// The whole path in one call: begin under `id` and ask once.
@@ -301,6 +305,8 @@ pub const Retrieval = struct {
 
     /// Set by `stopRetrieval`, read at every seam entry and after every wait.
     stopped: std.atomic.Value(bool) = .init(false),
+    /// Resolver-wide cancellation also stops a fallback after UDP has returned.
+    resolver_stopped: ?*const std.atomic.Value(bool) = null,
 
     /// `resolve.Cancellation` over this one lookup. `fire` reaches the socket
     /// through the seam, which is what makes an abandoned resolve stop its
@@ -329,6 +335,7 @@ pub const Retrieval = struct {
         request: Request,
     ) Error!Answer {
         if (self.stopped.load(.acquire)) return error.Canceled;
+        const started = std.Io.Timestamp.now(io, .awake);
         const framed = try query.writeQuery(request.name, .{
             .id = self.id,
             .udp_payload = self.udp_payload,
@@ -349,6 +356,29 @@ pub const Retrieval = struct {
         // A reply that arrived after a stop is not an answer to deliver.
         if (self.stopped.load(.acquire)) return error.Canceled;
         if (reply.from.order(self.server) != .eq) return error.ForeignSource;
+        const retry = host_io.streamRetry(reply.bytes, self.id, self.server, framed) catch |err|
+            switch (err) {
+                error.ShortMessage, error.ForeignTransaction, error.NotAResponse => return err,
+                else => unreachable,
+            };
+        if (retry) |over_stream| {
+            const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - started.nanoseconds;
+            const timeout_ms = if (request.deadline_ms) |deadline|
+                @max(@as(i96, 0), @as(i96, deadline) -
+                    @divFloor(elapsed_ns, std.time.ns_per_ms))
+            else
+                host_io.query_timeout_ms;
+            const message = lookup_live.retryStream(alloc, io, over_stream,
+                @intCast(@min(timeout_ms, host_io.query_timeout_ms)), .{
+                    .retrieval = &self.stopped,
+                    .resolver = self.resolver_stopped,
+                }) catch |err| switch (err) {
+                    error.Empty => return .timeout,
+                    else => return err,
+                };
+            defer alloc.free(message);
+            return answer.readAnswer(alloc, message, request.name, self.id, &self.owner);
+        }
         return answer.readAnswer(alloc, reply.bytes, request.name, self.id, &self.owner);
     }
 };
@@ -631,3 +661,300 @@ test "the descriptor is this resolver's own, and a stop reaches it" {
         seam.send(seam.ctx, t.io, support.nameserver, &.{}),
     );
 }
+
+test "live retrieval repeats a truncated UDP question over TCP and returns its records" {
+    // The UDP seam supplies only TC; records must come from the real TCP peer.
+    const id = try capturedNode();
+    var name: [wire.max_name_length]u8 = undefined;
+    const asked = try capturedNameOf(id, &name);
+    var response_buffer: [reply_length]u8 = undefined;
+    const response = try support.hexBytes(&response_buffer, support.captured_answer_hex);
+    wire.put16(response, 0, 7);
+    var fixture = try TcpDnsFixture.open(response);
+    defer fixture.close();
+    var script: TruncatedDatagram = .{ .server = fixture.server };
+    var retrieval: Retrieval = .{
+        .datagram = script.seam(),
+        .server = fixture.server,
+        .id = 7,
+    };
+    const peer = try std.Thread.spawn(.{}, TcpDnsFixture.serve, .{&fixture});
+    var joined = false;
+    defer if (!joined) peer.join();
+    var question: [reply_length]u8 = undefined;
+    var udp_reply: [reply_length]u8 = undefined;
+    const result = try retrieval.ask(t.allocator, t.io, .{
+        .name = asked,
+        .wire = &question,
+        .reply = &udp_reply,
+        .deadline_ms = 1000,
+    });
+    defer result.deinit(t.allocator);
+    try t.expect(result.hasRecords());
+    try t.expectEqualStrings(support.captured_record, result.records.bytes);
+    peer.join();
+    joined = true;
+    try t.expect(!fixture.failed);
+    try t.expectEqualStrings(script.question[0..script.question_len],
+        fixture.question[0..fixture.question_len]);
+}
+
+test "TCP fallback rejects partial prefixes and partial length-prefixed answers" {
+    for ([_]usize{ 1, 2 }) |prefix_length| {
+        var fixture = try TcpDnsFixture.open("");
+        defer fixture.close();
+        fixture.declared_length = wire.header_length;
+        fixture.prefix_length = prefix_length;
+        var script: TruncatedDatagram = .{ .server = fixture.server };
+        var retrieval: Retrieval = .{
+            .datagram = script.seam(),
+            .server = fixture.server,
+            .id = 7,
+        };
+        const peer = try std.Thread.spawn(.{}, TcpDnsFixture.serve, .{&fixture});
+        defer peer.join();
+        var question: [reply_length]u8 = undefined;
+        var udp_reply: [reply_length]u8 = undefined;
+        try t.expectError(error.ShortMessage, retrieval.ask(t.allocator, t.io, .{
+            .name = "_iroh.example.",
+            .wire = &question,
+            .reply = &udp_reply,
+            .deadline_ms = 1000,
+        }));
+    }
+}
+
+test "TCP fallback timeout remains distinct from an empty DNS answer" {
+    var fixture = try TcpDnsFixture.open("");
+    defer fixture.close();
+    fixture.silent = true;
+    var script: TruncatedDatagram = .{ .server = fixture.server };
+    var retrieval: Retrieval = .{
+        .datagram = script.seam(),
+        .server = fixture.server,
+        .id = 7,
+    };
+    const peer = try std.Thread.spawn(.{}, TcpDnsFixture.serve, .{&fixture});
+    defer peer.join();
+    var question: [reply_length]u8 = undefined;
+    var udp_reply: [reply_length]u8 = undefined;
+    const result = try retrieval.ask(t.allocator, t.io, .{
+        .name = "_iroh.example.",
+        .wire = &question,
+        .reply = &udp_reply,
+        .deadline_ms = 100,
+    });
+    defer result.deinit(t.allocator);
+    try t.expectEqual(Answer.timeout, result);
+}
+
+test "TCP fallback reports a refused TCP connection rather than UDP truncation" {
+    // Keep the TCP port bound but not listening, so refusal cannot race another peer.
+    var fixture = try TcpDnsFixture.openBound("", false);
+    defer fixture.close();
+    var script: TruncatedDatagram = .{ .server = fixture.server };
+    var retrieval: Retrieval = .{
+        .datagram = script.seam(),
+        .server = fixture.server,
+        .id = 7,
+    };
+    var question: [reply_length]u8 = undefined;
+    var udp_reply: [reply_length]u8 = undefined;
+    try t.expectError(error.Refused, retrieval.ask(t.allocator, t.io, .{
+        .name = "_iroh.example.",
+        .wire = &question,
+        .reply = &udp_reply,
+        .deadline_ms = 1000,
+    }));
+}
+
+test "TCP fallback does not recursively retry a second truncated reply" {
+    var response: [wire.header_length]u8 = @splat(0);
+    wire.put16(&response, 0, 7);
+    wire.put16(&response, 2, wire.flag_response | wire.flag_truncated);
+    var fixture = try TcpDnsFixture.open(&response);
+    defer fixture.close();
+    var script: TruncatedDatagram = .{ .server = fixture.server };
+    var retrieval: Retrieval = .{
+        .datagram = script.seam(),
+        .server = fixture.server,
+        .id = 7,
+    };
+    const peer = try std.Thread.spawn(.{}, TcpDnsFixture.serve, .{&fixture});
+    defer peer.join();
+    var question: [reply_length]u8 = undefined;
+    var udp_reply: [reply_length]u8 = undefined;
+    try t.expectError(error.Truncated, retrieval.ask(t.allocator, t.io, .{
+        .name = "_iroh.example.",
+        .wire = &question,
+        .reply = &udp_reply,
+        .deadline_ms = 1000,
+    }));
+}
+
+test "cancellation stops TCP fallback while waiting for its reply" {
+    var fixture = try TcpDnsFixture.open("");
+    defer fixture.close();
+    fixture.silent = true;
+    var script: TruncatedDatagram = .{ .server = fixture.server };
+    var retrieval: Retrieval = .{
+        .datagram = script.seam(),
+        .server = fixture.server,
+        .id = 7,
+    };
+    const peer = try std.Thread.spawn(.{}, TcpDnsFixture.serve, .{&fixture});
+    defer peer.join();
+    const canceler = try std.Thread.spawn(.{}, cancelTcpLookup, .{ &retrieval, &fixture });
+    defer canceler.join();
+    var question: [reply_length]u8 = undefined;
+    var udp_reply: [reply_length]u8 = undefined;
+    try t.expectError(error.Canceled, retrieval.ask(t.allocator, t.io, .{
+        .name = "_iroh.example.",
+        .wire = &question,
+        .reply = &udp_reply,
+        .deadline_ms = 1000,
+    }));
+    try t.expect(fixture.received_query.load(.acquire));
+}
+
+fn cancelTcpLookup(retrieval: *Retrieval, fixture: *TcpDnsFixture) void {
+    for (0..1000) |_| {
+        if (fixture.received_query.load(.acquire)) break;
+        t.io.sleep(.fromMilliseconds(1), .awake) catch |err| switch (err) {
+            error.Canceled => break,
+        };
+    }
+    retrieval.cancellation().fire();
+}
+
+const TruncatedDatagram = struct {
+    server: addr.SocketAddr,
+    question: [reply_length]u8 = undefined,
+    question_len: usize = 0,
+
+    fn seam(self: *TruncatedDatagram) lookup_io.Datagram {
+        return .{ .ctx = self, .send = send, .receive = receive, .stop = stop };
+    }
+
+    fn send(ctx: *anyopaque, io: std.Io, to: addr.SocketAddr,
+        bytes: []const u8) lookup_io.SocketError!void {
+        _ = io;
+        const self: *TruncatedDatagram = @ptrCast(@alignCast(ctx));
+        if (to.order(self.server) != .eq) return error.Refused;
+        @memcpy(self.question[0..bytes.len], bytes);
+        self.question_len = bytes.len;
+    }
+
+    fn receive(ctx: *anyopaque, io: std.Io, into: []u8,
+        deadline_ms: ?i32) lookup_io.SocketError!lookup_io.Datagram.Reply {
+        _ = io;
+        _ = deadline_ms;
+        const self: *TruncatedDatagram = @ptrCast(@alignCast(ctx));
+        @memset(into[0..wire.header_length], 0);
+        wire.put16(into, 0, wire.be16(&self.question, 0));
+        wire.put16(into, 2, wire.flag_response | wire.flag_truncated);
+        return .{ .from = self.server, .bytes = into[0..wire.header_length] };
+    }
+
+    fn stop(ctx: *anyopaque) void {
+        _ = ctx;
+    }
+};
+
+const TcpDnsFixture = struct {
+    listener: std.c.fd_t,
+    server: addr.SocketAddr,
+    response: []const u8,
+    declared_length: ?u16 = null,
+    prefix_length: usize = host_io.length_prefix_bytes,
+    silent: bool = false,
+    question: [reply_length]u8 = undefined,
+    question_len: usize = 0,
+    received_query: std.atomic.Value(bool) = .init(false),
+    failed: bool = false,
+
+    fn open(response: []const u8) !TcpDnsFixture {
+        return openBound(response, true);
+    }
+
+    fn openBound(response: []const u8, listen: bool) !TcpDnsFixture {
+        const linux = std.os.linux;
+        const handle = std.c.socket(linux.AF.INET,
+            linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
+        if (handle < 0) return error.TestFixtureRefused;
+        errdefer _ = std.c.close(handle);
+        var storage: std.c.sockaddr.storage = undefined;
+        const length = @import("../transport/socket_addr.zig").writeSockaddr(
+            .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0 }, &storage);
+        if (std.c.bind(handle, @ptrCast(&storage), length) != 0) {
+            return error.TestFixtureRefused;
+        }
+        if (listen) {
+            if (std.c.listen(handle, 1) != 0) return error.TestFixtureRefused;
+        }
+        var size: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
+        if (std.c.getsockname(handle, @ptrCast(&storage), &size) != 0) {
+            return error.TestFixtureRefused;
+        }
+        return .{
+            .listener = handle,
+            .server = @import("../transport/socket_addr.zig").readSockaddr(&storage).?,
+            .response = response,
+        };
+    }
+
+    fn close(self: *TcpDnsFixture) void {
+        _ = std.c.close(self.listener);
+    }
+
+    fn ready(handle: std.c.fd_t, events: i16) !void {
+        var descriptors = [_]std.posix.pollfd{
+            .{ .fd = handle, .events = events, .revents = 0 },
+        };
+        if (try std.posix.poll(&descriptors, 1500) == 0) return error.TestFixtureTimeout;
+    }
+
+    fn take(handle: std.c.fd_t, into: []u8) !void {
+        var at: usize = 0;
+        while (at < into.len) {
+            try ready(handle, std.posix.POLL.IN);
+            const count = std.c.recv(handle, @ptrCast(into.ptr + at), into.len - at, 0);
+            if (count <= 0) return error.TestFixtureRefused;
+            at += @intCast(count);
+        }
+    }
+
+    fn serve(self: *TcpDnsFixture) void {
+        self.exchange() catch { self.failed = true; };
+    }
+
+    fn exchange(self: *TcpDnsFixture) !void {
+        try ready(self.listener, std.posix.POLL.IN);
+        const handle = std.c.accept4(self.listener, null, null,
+            std.os.linux.SOCK.NONBLOCK | std.os.linux.SOCK.CLOEXEC);
+        if (handle < 0) return error.TestFixtureRefused;
+        defer _ = std.c.close(handle);
+        var prefix: [2]u8 = undefined;
+        try take(handle, &prefix);
+        self.question_len = wire.be16(&prefix, 0);
+        if (self.question_len > self.question.len) return error.TestFixtureRefused;
+        try take(handle, self.question[0..self.question_len]);
+        self.received_query.store(true, .release);
+        if (self.silent) {
+            // No answer: wait for the client to close after timeout or cancel.
+            try ready(handle, std.posix.POLL.IN);
+            return;
+        }
+        wire.put16(&prefix, 0, self.declared_length orelse @intCast(self.response.len));
+        for ([_][]const u8{ prefix[0..self.prefix_length], self.response }) |part| {
+            // Split both framing and payload; clients cannot assume full reads.
+            for (part) |byte| {
+                try ready(handle, std.posix.POLL.OUT);
+                const one = [_]u8{byte};
+                if (std.c.send(handle, &one, 1, std.os.linux.MSG.NOSIGNAL) != 1) {
+                    return error.TestFixtureRefused;
+                }
+            }
+        }
+    }
+};

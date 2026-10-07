@@ -94,13 +94,10 @@ pub fn admit(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!boo
                 .remote = peer,
                 .local = self.socket.address,
                 .classification = base_ula.classify(peer),
-                // Unproved, and the honest value: the bridge reports no
-                // per-flow address validation, and a flow that had proved its
-                // address is the one the core's own `require_retry` already
-                // knows about. With no filter registered every attempt is
-                // accepted anyway (`incoming_filter.ask` on a null filter), so
-                // this field is read only by a caller that registers one.
-                .validation = .unvalidated,
+                .validation = if (conn.initialValidation() == .unvalidated)
+                    .unvalidated
+                else
+                    incoming_filter.proved(base_ula.classify(peer), peer),
             },
         }, at, random);
         moved = true;
@@ -198,7 +195,7 @@ pub fn runTask(self: *Node, task: *endpoint.Task, conn: Conn) bool {
             // `.negotiating` and runs a task to one of the terminal arms
             // above inside the call, so an action from any other state
             // means the loop handed over a task it had already driven.
-            .negotiate_alpn, .send_retry, .refuse, .ignore, .none => return false,
+            .negotiate_alpn, .refuse, .ignore, .none => return false,
         }
     }
 }
@@ -268,15 +265,7 @@ pub fn perform(
             std.debug.assert(self.accept.task(task.id) != null);
             return null;
         },
-        // Upstream's `incoming.retry()` (`protocol.rs:583`) has no call in
-        // this stack to reach: the vendored core decides Retry from two
-        // manager-wide fields inside the call that accepts the connection
-        // (`vendor/quic/src/quic/connection_manager.zig:606-647`), so a
-        // verdict made by application code arrives after the point at which
-        // RFC 9000 §17.2.5 permits one. `endpoint.zig` refuses every retry
-        // for that reason and maps `.send_retry` to `.refuse`, so the arm
-        // that recorded this node's half of a retry that was never sent is
-        // gone with it rather than left reading zero.
+        // Retry is only valid in the pre-allocation initial policy.
         .refuse => {
             self.stats.refusals += 1;
             return null;
