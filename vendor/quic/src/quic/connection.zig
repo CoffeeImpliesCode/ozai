@@ -10403,7 +10403,8 @@ test "recv abandon retains live replacement and receiving path through following
         conn.state = .connected;
         conn.handshake_confirmed = true;
         conn.local_params.initial_max_path_id = 1;
-        conn.peer_params = .{ .initial_max_path_id = 1 };
+        conn.peer_params = .{ .initial_max_path_id = 1, .initial_max_streams_uni = 1,
+            .initial_max_stream_data_uni = 4096, .initial_max_data = 4096 };
         conn.native_paths = try native_path.process(.{}, .{
             .negotiate = .{ .local_max = 1, .peer_max = 1 },
         });
@@ -10411,7 +10412,10 @@ test "recv abandon retains live replacement and receiving path through following
         conn.native_paths.selected = 1;
         conn.active_path_idx = 1;
         conn.paths[0] = NetworkPath.init(local, peer, true);
-        conn.paths[1] = NetworkPath.init(local, peer, true);
+        const direct_peer = address.Address.initIpv4(.{127, 0, 0, 1}, 3000);
+        conn.paths[1] = NetworkPath.init(local, direct_peer, false);
+        conn.paths[0].is_validated = true;
+        conn.paths[1].is_validated = true;
         conn.path_initialized = true;
         conn.local_cid_pool.registerInitialCid("keyguard", null, random.random());
         conn.local_cid_pool.entries[0].path_id = carrying_path;
@@ -10438,7 +10442,8 @@ test "recv abandon retains live replacement and receiving path through following
         var reader = io.fixedBufferStream(wire);
         var header = try packet.Header.parse(&reader, 8);
         try conn.recv(&header, &reader,
-            .{ .from = peer, .to = local, .datagram_size = wire.len }, 100, random.random());
+            .{ .from = if (carrying_path == 0) peer else direct_peer,
+                .to = local, .datagram_size = wire.len }, 100, random.random());
         try std.testing.expectEqual(State.connected, conn.state);
         try std.testing.expect(conn.native_paths.entries[1].abandoned);
         try std.testing.expectEqual(@as(u8, 0), conn.active_path_idx);
@@ -10454,6 +10459,44 @@ test "recv abandon retains live replacement and receiving path through following
             conn.paths[0].bytes_received);
         try std.testing.expectEqual(if (carrying_path == 1) @as(u64, wire.len) else 0,
             conn.paths[1].bytes_received);
+        try std.testing.expect(conn.paths[0].is_validated);
+        try std.testing.expect(conn.paths[1].is_validated);
+        try std.testing.expect(conn.paths[0].is_initial);
+        try std.testing.expect(!conn.paths[1].is_initial);
+        conn.streams.setMaxStreams(0, 1);
+        conn.streams.setPeerInitialMaxStreamData(0, 0, 4096);
+        conn.conn_flow_ctrl.base.send_window = 4096;
+        const stream = try conn.openUniStream();
+        const application = "application survives native path abandonment";
+        try stream.writeData(application);
+        stream.close();
+        var outgoing: [1500]u8 = undefined;
+        const length = try conn.sendAt(&outgoing, 200, random.random());
+        try std.testing.expect(length > 0);
+        try std.testing.expectEqual(@as(u8, 0), conn.send_path);
+        try std.testing.expect(conn.lastSendPeer().eql(peer));
+        try std.testing.expect(!conn.lastSendPeer().eql(direct_peer));
+        const peer_space: packet.PacketNumSpace = .{
+            .crypto_open = keys.current_open, .crypto_seal = keys.current_seal,
+        };
+        var outgoing_reader = io.fixedBufferStream(outgoing[0..length]);
+        var outgoing_header = try packet.Header.parse(&outgoing_reader, 8);
+        const plaintext = try packet.decryptForPath(&outgoing_header, &outgoing_reader, &peer_space, 0);
+        var remaining = plaintext;
+        var found_application = false;
+        while (remaining.len > 0) {
+            var consumed: usize = undefined;
+            const frame = try Frame.parseSized(remaining, &consumed);
+            try std.testing.expect(consumed > 0);
+            if (frame == .stream and frame.stream.stream_id == stream.stream_id) {
+                try std.testing.expectEqual(@as(u64, 0), frame.stream.offset);
+                try std.testing.expectEqualStrings(application, frame.stream.data);
+                try std.testing.expect(frame.stream.fin);
+                found_application = true;
+            }
+            remaining = remaining[consumed..];
+        }
+        try std.testing.expect(found_application);
     }
 }
 
@@ -10584,4 +10627,56 @@ test "native remote PATH_ABANDON unknown and duplicate closed paths never close 
     try std.testing.expectEqual(State.connected, conn.state);
     try std.testing.expect(conn.local_err == null);
     try std.testing.expectEqual(@as(u8, 0), conn.active_path_idx);
+}
+
+test "ordered CE feedback for already in-flight packet does not restart native path recovery" {
+    var random = std.Random.DefaultPrng.init(108);
+    for ([_]u1{0, 1}) |path_id| {
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        conn.local_params.initial_max_path_id = 1;
+        conn.peer_params = .{ .initial_max_path_id = 1 };
+        conn.native_paths.entries[1].opened = true;
+        const other = try conn.ensurePathTransport();
+        try configureNativeTestIngress(&conn, random.random());
+        conn.paths[1].is_initial = false;
+        conn.ecn_validator.start();
+        other.ecn_state.start();
+        other.handler.next_pn[2] = 50;
+        const first = try sendNativeTestPing(&conn, path_id, 0, random.random());
+        const second = try sendNativeTestPing(&conn, path_id, 50, random.random());
+        const handler = if (path_id == 0) &conn.pkt_handler else &other.handler;
+        try std.testing.expectEqual(@as(i64, 0),
+            handler.sent[2].sent_packets.get(first).?.time_sent);
+        try std.testing.expectEqual(@as(i64, 50),
+            handler.sent[2].sent_packets.get(second).?.time_sent);
+        const cc = if (path_id == 0) &conn.cc else &other.cc;
+        const original_window = cc.congestion_window;
+        const first_ack: Frame = .{ .path_ack_ecn = .{ .path_id = path_id, .ack = .{
+            .largest_ack = first, .ack_delay = 0, .first_ack_range = 0,
+            .ack_range_count = 0, .ack_ranges = undefined,
+            .ecn_ect0 = 0, .ecn_ect1 = 0, .ecn_ce = 1,
+        } } };
+        try recvNativeTestFrame(&conn, first_ack, path_id ^ 1, 100, random.random());
+        try std.testing.expect(cc.congestion_window < original_window);
+        try std.testing.expectEqual(@as(?i64, 100), cc.congestion_recovery_start_time);
+        try std.testing.expectEqual(@as(usize, 1), handler.sent[2].sent_packets.count());
+        const recovery_window = cc.congestion_window;
+        const recovery_start = cc.congestion_recovery_start_time;
+        const cubic_epoch = cc.epoch_start;
+        const second_ack: Frame = .{ .path_ack_ecn = .{ .path_id = path_id, .ack = .{
+            .largest_ack = second, .ack_delay = 0, .first_ack_range = 0,
+            .ack_range_count = 0, .ack_ranges = undefined,
+            .ecn_ect0 = 0, .ecn_ect1 = 0, .ecn_ce = 2,
+        } } };
+        try recvNativeTestFrame(&conn, second_ack, path_id, 200, random.random());
+        try std.testing.expectEqual(@as(usize, 0), handler.sent[2].sent_packets.count());
+        const peer_ce = if (path_id == 0) conn.peer_ecn_ce[2] else other.peer_ecn_ce;
+        const validator = if (path_id == 0) &conn.ecn_validator else &other.ecn_state;
+        try std.testing.expectEqual(@as(u64, 2), peer_ce);
+        try std.testing.expectEqual(@as(u64, 2), validator.acked_ect0_count);
+        try std.testing.expectEqual(recovery_window, cc.congestion_window);
+        try std.testing.expectEqual(recovery_start, cc.congestion_recovery_start_time);
+        try std.testing.expectEqual(cubic_epoch, cc.epoch_start);
+    }
 }
