@@ -35,12 +35,8 @@ const varintLen = limits.varintLen;
 
 /// What the obsolete `respond` field of a `Disconnect` is written as.
 ///
-/// Upstream keeps the field "in the struct to maintain wire compatibility"
-/// (`hyparview.rs:174`) and every sender writes `false` (`hyparview.rs:380`), so
-/// that is the byte a peer from the reference reads. The Zig `Disconnect` has no
-/// field for it — `hyparview/message.zig` says "When the codec lands, the byte
-/// goes in" — and this is that codec: the byte is written so the frame is the
-/// length a peer expects, and `decode` reads it and drops it.
+/// Upstream retains the obsolete field for wire compatibility and every
+/// sender writes false. State does not use it, so decode consumes the byte.
 pub const respond_byte: bool = false;
 
 /// `alive` and then the obsolete field. The two bytes are the whole message
@@ -196,9 +192,7 @@ fn readInfo(writer: *postcard.Reader) Error!PeerInfo {
 
 fn readInfoList(writer: *postcard.Reader) Error!PeerInfos {
     const count = try writer.readLen();
-    // The bound is proved here, at the slice, because nothing above this line
-    // proves it: the count is a peer's claim about how many records follow, and
-    // a claim of nine would index past the array below.
+    // A peer's vector count cannot index beyond the frame-fitting array.
     if (count > max_shuffle_nodes) return error.ShuffleNodeListTooLong;
     var items: [max_shuffle_nodes]PeerInfo = undefined;
     for (items[0..count]) |*info| {

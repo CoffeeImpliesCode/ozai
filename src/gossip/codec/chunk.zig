@@ -61,12 +61,13 @@ pub fn chunkLen(ihaves: []const IHave, budget: usize) Error!usize {
     // of this list either, and the loop below would only find that out after
     // measuring a candidate it did not have to.
     if (budget < min_chunk_size) return error.ChunkBudgetTooSmall;
+    const send_budget = @min(budget, limits.max_message_size - 1);
     var count: usize = 0;
     while (count < ihaves.len and count < max_ihaves_per_message) {
         const grown = count + 1;
         const list = try IHaves.init(ihaves[0..grown]);
         const body = frame.encodedLen(.{ .gossip = .{ .i_have = list } });
-        if (body > budget) break;
+        if (body > send_budget) break;
         count = grown;
     }
     return count;

@@ -61,10 +61,9 @@ pub const Neighbor = struct {
 
 /// "I am closing the connection." Upstream `hyparview::Disconnect`.
 ///
-/// Upstream carries a second field, `_respond`, marked obsolete and kept for
-/// wire compatibility. It is not carried here: this module has no wire codec,
-/// and a field nothing reads is a field a reader has to work out the meaning
-/// of. When the codec lands, the byte goes in.
+/// Upstream's obsolete `_respond` bool is emitted as false and consumed by
+/// the codec. State carries only `alive`, because the obsolete field has no
+/// effect on membership.
 pub const Disconnect = struct {
     /// Whether the sender is still in the swarm, in which case the receiver
     /// keeps it in its passive view rather than forgetting it.

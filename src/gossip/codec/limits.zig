@@ -45,18 +45,8 @@ pub const Error = postcard.Error || key.KeyError || gossip.Error || plumtree.Err
 /// measure: `write_frame` compares `postcard::experimental::serialized_size`
 /// against it (`net/util.rs:379`) and `read_lp` compares the length it read
 /// (`net/util.rs:384`), and neither counts the length prefix in front of the
-/// body. That prefix is postcard's, at most `max_prefix_size` bytes, so a frame
-/// this codec writes is at most `max_message_size + max_prefix_size` bytes on
-/// the wire.
-///
-/// **It is an inclusive ceiling, and upstream's two sides disagree by one
-/// frame.** Upstream writes `if len >= max_message_size { TooLarge }` and reads
-/// `if size > max_message_size { TooLarge }`, so a body of exactly the budget is
-/// refused on the way out and admitted on the way in. One number has to be
-/// chosen here and it is the reader's, because the reader's is the one a peer
-/// obeys: a frame this codec writes is then a frame upstream's read side accepts.
-/// `chunk.chunkLen` budgets against this number, so a list it cuts is a list
-/// that can be sent.
+/// body. The four-byte big-endian prefix is not part of that budget.
+/// Upstream rejects bodies `>=` this limit when sending and `>` when reading.
 pub const max_message_size: usize = 4096;
 
 /// The smallest budget a configuration may set. Upstream's
@@ -69,8 +59,8 @@ pub const max_message_size: usize = 4096;
 /// own.
 pub const min_message_size: usize = 512;
 
-/// The widest a frame's length prefix can be: a postcard `varint(u64)`.
-pub const max_prefix_size: usize = postcard.varintMax(u64);
+/// Every frame's fixed big-endian `u32` length prefix.
+pub const max_prefix_size: usize = 4;
 
 /// The widest a stream header frame can be: its prefix and its topic id.
 pub const max_header_size: usize = max_prefix_size + topic_id_length;
