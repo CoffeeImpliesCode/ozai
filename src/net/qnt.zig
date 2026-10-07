@@ -1,5 +1,8 @@
 //! Quic Number-Time: the QNT frame and its negotiation, as pure bytes over a
 //! caller's slice.
+//! This standalone Number-Time model is not Noq's native NAT traversal wire.
+//! Production uses vendor ADD_ADDRESS, REACH_ADDRESS and REMOVE_ADDRESS frames.
+//! The pinned native Rust captures do not validate this codec.
 //!
 //! QNT is the frame that accompanies QAD and is not a variant of it. Where
 //! QAD is a one-shot observation — one frame, one address, "here is where I saw
@@ -123,12 +126,9 @@
 //! every prefix; the buffer bound at every length; and the round trip and its
 //! fixed point for both families at every width.
 //!
-//! **Not pinned:** no upstream bytes exist on this node and none can be made
-//! here, so no golden vector captured from a real iroh peer exists. What
-//! closes that gap is one such test; it does not exist yet and this file does
-//! not pretend otherwise. The golden vector in the test below is *derived* —
-//! §4.1's field order composed with RFC 9000 §16 — exactly as `qad.zig` says
-//! of its own.
+//! No captured Rust golden vector validates this Number-Time codec.
+//! Its test vector is derived from the proposed field order and RFC 9000 §16.
+//! The vendor-native Noq oracle captures validate a different protocol.
 //!
 //! **Not implemented here, and said here rather than left to be assumed:** the
 //! rule that a frame whose challenge is not the one outstanding is not a reply.

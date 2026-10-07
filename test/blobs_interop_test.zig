@@ -2,6 +2,7 @@ const std = @import("std");
 const ozai = @import("ozai");
 const node_child = @import("two_process_child.zig");
 const rust_child = @import("rust_interop_child.zig");
+const progress_ns = @import("two_process_progress.zig");
 const t = std.testing;
 
 // These cases compare actual production CLI output with upstream-captured payload bytes.
@@ -144,13 +145,20 @@ fn runCase(direction: Direction, case: Case) !void {
         else => return error.NodeFailed,
     }
     const observed = rust.progress() orelse return error.NoRustProgress;
-    try t.expectEqual(@as(u64, 1), observed.up);
+    try expectProgressEqual(observed, "up", 1);
     const completed: u64 = if (direction == .node_provider) 1 else 0;
-    try t.expectEqual(completed, observed.blob_transfers_completed);
+    try expectProgressEqual(observed, "blob transfers completed", completed);
     const sent = if (direction == .rust_provider) case.response.len else case.request.len;
     const received = if (direction == .rust_provider) case.request.len else case.response.len;
-    try t.expectEqual(@as(u64, sent), observed.blob_sent_bytes);
-    try t.expectEqual(@as(u64, received), observed.blob_received_bytes);
+    try expectProgressEqual(observed, "blob sent bytes", sent);
+    try expectProgressEqual(observed, "blob received bytes", received);
+}
+
+fn expectProgressEqual(observed: progress_ns.Progress, field: []const u8, expected: u64) !void {
+    const lower: progress_ns.Need = .{ .field = field, .want = expected };
+    const upper: progress_ns.Need = .{ .field = field, .want = expected, .at_most = true };
+    try t.expect(lower.holds(observed));
+    try t.expect(upper.holds(observed));
 }
 
 fn startRust(

@@ -59,8 +59,12 @@ pub const Topology = struct {
     bob_pid: std.process.Child.Id = undefined,
     direct_open: bool = false,
 
-    pub fn init(io: std.Io, gpa: std.mem.Allocator, self: []const u8) !Topology {
-        try process.assertPrivate(io);
+    pub fn init(io: std.Io, gpa: std.mem.Allocator, self: []const u8,
+        baseline: process.Baseline) !Topology
+    {
+        try process.assertPrivate(io, baseline);
+        const keeper_argv = [_][]const u8{ self, "--keeper", "--original-netns",
+            baseline.net, "--original-userns", baseline.user };
         var topology: Topology = .{ .io = io, .gpa = gpa };
         errdefer topology.deinit();
         for (&topology.keepers) |*slot| {
@@ -68,8 +72,9 @@ pub const Topology = struct {
             keeper.* = .{};
             keeper.child.init(&keeper.out, &keeper.err);
             slot.* = keeper;
-            try keeper.child.spawnAs(io, &.{ "unshare", "--net", "--", self, "--keeper" },
-                &.{ self, "--keeper" });
+            try keeper.child.spawnAs(io, &.{ "unshare", "--net", "--", self, "--keeper",
+                "--original-netns", baseline.net, "--original-userns", baseline.user },
+                &keeper_argv);
             const start = std.Io.Timestamp.now(io, .awake);
             while (true) {
                 try keeper.child.pump(io);

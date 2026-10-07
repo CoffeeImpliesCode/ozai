@@ -237,7 +237,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     portable_test_mod.addImport("quic", quic_mod);
-    portable_test_mod.addImport("test_scratch", test_scratch_mod);
     const portable_tests = b.addTest(.{
         .name = "ozai-portable-test",
         .root_module = portable_test_mod,

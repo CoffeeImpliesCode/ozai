@@ -11,80 +11,26 @@
 //!
 //! # The seven inputs, and where each one comes from
 //!
-//! A probe round measures **this node**, from the inside, over QUIC. The gate
-//! asks about **one connection**, from the outside. Four of its seven inputs
-//! have a producer and three do not, and each of the three is named below with
-//! what would close it. A reader without this section reads a gap as a rule,
-//! and then wonders why the gap is never closed.
+//! This is a standalone generic gate model, not the native node driver.
+//! `observeReport` supplies local candidates and a mapping verdict.
+//! `observePeer` supplies remote candidates. `net/interface.zig` supplies
+//! interface snapshots when a caller provides them.
 //!
-//! ```text
-//! gate input                          | where it comes from
-//! -------------------------------------|----------------------------------
-//! local: where this node is reachable | `observeReport`
-//! the mapping verdict                  | `observeReport`
-//! remote: where the peer is reachable | `observePeer`
-//! the socket's interface addresses    | `net/interface.zig`
-//! the connection to punch on          | gap: the transport's table
-//! what the stack said about a round   | gap: no QNT in the vendored core
-//! whether a path carried traffic      | gap: no multipath layer
-//! ```
+//! Production uses `node_holepunch.prepare` to record the smallest authenticated
+//! client connection ID. The generic `Join.selectConnection` remains separate.
+//! The native driver restricts client initiation to that ID.
+//! Servers retain reciprocal address handling and do not initiate.
+//! `node_native.pass` calls vendor-native traversal and reads its state.
+//! No consumer converts terminal native state into this gate's
+//! `holepunch.Outcome`. Number-Time `qnt.zig` is not Noq NAT traversal.
 //!
-//! **The socket's interface addresses.** This one used to be the fourth gap,
-//! and it is closed: `net/interface.zig` enumerates interfaces with
-//! `getifaddrs` and hands the caller a `Snapshot`, and `net/address_change.zig`
-//! compares two reads under a policy. Its own module doc says which three
-//! gaps it does *not* close, and those are the three rows above still marked
-//! `gap`. The half of the local set no round measures is the half it now
-//! supplies.
-//!
-//! **The connection.** `holepunch.selectPunchConnection` turns a table into
-//! the one connection a round runs on, and `Join.selectConnection` is its
-//! pass-through. The table belongs to the transport — it is
-//! `transport/quic_bridge.Bridge.manager.entries`, one layer above this one
-//! (`docs/ARCHITECTURE.md`) — and nothing under `src/net/` imports
-//! `src/transport/`, which is what keeps this layer drivable with no QUIC
-//! substrate at all. `probe_run.Transport` is how the layer reaches the
-//! transport when it has to: a vtable the transport side fills, never an
-//! import, and no implementation of one for a connection table exists on the
-//! other side of it yet.
-//!
-//! The side is one field away for whoever writes that implementation:
-//! `quic_bridge.Conn.entry` is public and `conn.entry.conn.is_server`
-//! (`vendor/quic/src/quic/connection.zig:608`) is what `transport/dial.zig`
-//! and `src/node/node.zig` already read. What this layer could not do with
-//! it is narrow the table to one peer, because the table holds every
-//! connection this node has and a `Join` is one peer's.
-//!
-//! **The stack's answer.** `initiate_nat_traversal_round` is
-//! `draft-seemann-quic-nat-traversal-02`, and the vendored core has no QNT:
-//! `qnt`, `traversal` and `path_id` appear nowhere under `vendor/quic/src`,
-//! and `docs/DECISIONS/0001` gives the reason — iroh's QUIC is n0's own fork
-//! and this is endel/quic-zig. So `holepunch.Outcome` is a value the caller
-//! brings back from a call this project cannot make, `settle` is where it
-//! arrives, and `holepunch.classify` stays the only thing that reads it.
-//!
-//! **A path's status.** Nothing in this tree watches traffic per path. The
-//! core keeps `paths: [2]NetworkPath` under one `active_path_idx`
-//! (`vendor/quic/src/quic/connection.zig:626`) — an active/candidate register
-//! rather than a path set, which `DECISIONS/0001` measured and recorded — and
-//! `Conn.drain` sends every datagram at the one peer address it holds. So
-//! `observe` is handed its status and `absorb` files `unknown`, and no rule
-//! about which status follows which is written here.
-//!
-//! **The socket's interface addresses.** The half of the local set no round
-//! measures, and the one argument of `observeReport` a caller used to have to
-//! find for itself. The socket knows a single address and it is not one of
-//! these: `transport/socket.zig:885` reads it back with `getsockname`, which
-//! on a wildcard bind is `0.0.0.0` or `::` with the ephemeral port — where
-//! this node is *bound*, not where a peer may reach it, and advertising it
-//! would be worse than advertising nothing. `net/interface.zig` is what reads
-//! the addresses behind it, with one `getifaddrs` call and no netlink
-//! subscription; `net/address_change.zig` compares two reads and reports
-//! whether anything moved. What is still missing is the caller: nothing in
-//! `src/node/` reaches either module, so a live node does not yet hand this
-//! gate the local set from either source. That is a wiring gap rather than a
-//! missing input, and [`README.md`](README.md)'s reachability section counts
-//! it.
+//! Production also compares connection-wide accepted packet counters around
+//! each datagram. An accepted physical-source 1-RTT packet can record `.open`.
+//! This does not prove per-path application bytes or a selected path ID.
+//! The native core supports two lifetime path IDs and local per-path counters.
+//! No production consumer feeds those counters into this generic path table.
+//! `observe` therefore takes a caller-supplied status, and `absorb` records
+//! `unknown` until that caller supplies evidence.
 //!
 //! # The two mappings
 //!

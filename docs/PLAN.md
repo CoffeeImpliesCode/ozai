@@ -196,10 +196,14 @@ in [`DECISIONS/0001`](DECISIONS/0001-transport-substrate.md); the
 [execution record](DECISIONS/0001-transport-substrate.md#execution-record-of-2026-09-30)
 says what was built, what it cost against what was predicted, and what was not
 finished.
-The substrate is quic-zig; the price came in at roughly double what the first
-version of the record implied. The cost accepted with the decision is the loss
-of native multipath, mitigated by M7's synthetic-ULA map at the price of
-slower convergence.
+The initial quic-zig cut cost roughly double the first estimate.
+Its loss of native multipath was the historical cost accepted on 2026-09-30.
+That capability description no longer describes the patched core.
+The vendor now implements native Noq observed-address, NAT traversal and multipath wire extensions.
+`Node.step` drives native candidates and validated path selection through `node_native.pass`.
+The core retains path IDs 0 and 1 for the connection lifetime.
+The eight historical address pairs in `transport/multipath.Table` do not increase that limit.
+The generic path table, selection, revalidation and probe models remain standalone.
 
 **What is in the tree.** `vendor/quic/`, vendored from
 `endel/quic-zig@14b9dc3e5e8429d07e7ed18619c7b4f4baaa3719` — 33 `.zig` files.

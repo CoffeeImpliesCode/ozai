@@ -9584,7 +9584,7 @@ test "native path opening rejects absent multipath before touching packet state"
 }
 
 test "native MP control bytes fail closed without negotiation" {
-    const bytes = [_]u8{ 0x7e, 0x7a, 0x01 };
+    var bytes = [_]u8{ 0x7e, 0x7a, 0x01 };
     var used: usize = 0;
     const parsed = try Frame.parseSized(&bytes, &used);
     var conn = testConnection(std.testing.allocator);
@@ -9621,7 +9621,7 @@ test "native path packet numbers and source decoded ACK route independently" {
         .ack_eliciting = true, .in_flight = true,
     });
     // Noq PATH_ACK type 0x3e, path 1, PN 0, delay 0, ranges 0, first 0.
-    const bytes = [_]u8{ 0x3e, 1, 0, 0, 0, 0 };
+    var bytes = [_]u8{ 0x3e, 1, 0, 0, 0, 0 };
     const parsed = try Frame.parse(&bytes);
     try conn.processFrame(&parsed, .application, 100_000, random.random());
     try std.testing.expectEqual(@as(usize, 1), conn.pkt_handler.sent[2].sent_packets.count());
@@ -9639,6 +9639,8 @@ test "native path packet numbers and source decoded ACK route independently" {
 }
 
 test "native path CID duplicate changes and unvalidated selection are rejected" {
+    var cid_bytes: [8]u8 = "native01".*;
+    var changed_cid_bytes: [8]u8 = "native02".*;
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
     conn.is_server = false;
@@ -9648,13 +9650,13 @@ test "native path CID duplicate changes and unvalidated selection are rejected" 
     var random = std.Random.DefaultPrng.init(43);
     const cid: Frame = .{ .path_new_connection_id = .{
         .path_id = 1, .cid = .{
-            .seq_num = 0, .retire_prior_to = 0, .conn_id = "native01",
+            .seq_num = 0, .retire_prior_to = 0, .conn_id = cid_bytes[0..],
             .stateless_reset_token = .{1} ** 16,
         },
     } };
     try conn.processFrame(&cid, .application, 0, random.random());
     var changed = cid;
-    changed.path_new_connection_id.cid.conn_id = "native02";
+    changed.path_new_connection_id.cid.conn_id = changed_cid_bytes[0..];
     try std.testing.expectError(error.ProtocolViolation,
         conn.processFrame(&changed, .application, 0, random.random()));
     const local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1234);
@@ -9714,6 +9716,7 @@ test "native NAT probe offer commits only real packet and preserves primary rout
 }
 
 test "native direct validation uses authenticated path1 packets and preserves primary connection" {
+    var cid_bytes: [8]u8 = "path-one".*;
     var client = testConnection(std.testing.allocator);
     defer client.deinit();
     client.is_server = false;
@@ -9733,7 +9736,7 @@ test "native direct validation uses authenticated path1 packets and preserves pr
     var random = std.Random.DefaultPrng.init(53);
     const cid: Frame = .{ .path_new_connection_id = .{
         .path_id = 1, .cid = .{
-            .seq_num = 0, .retire_prior_to = 0, .conn_id = "path-one",
+            .seq_num = 0, .retire_prior_to = 0, .conn_id = cid_bytes[0..],
             .stateless_reset_token = .{3} ** 16,
         },
     } };
@@ -9903,6 +9906,7 @@ test "native queued challenge retry is not consumed by timeout" {
 }
 
 test "native path zero CID conflicts and current CID retirement close" {
+    var cid_bytes: [8]u8 = "samecid1".*;
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
     conn.state = .connected;
@@ -9912,7 +9916,7 @@ test "native path zero CID conflicts and current CID retirement close" {
     const other = try conn.ensurePathTransport();
     other.peer_cids.addPeerCid(0, "samecid1", .{1} ** 16);
     const cid: Frame = .{ .path_new_connection_id = .{ .path_id = 0, .cid = .{
-        .seq_num = 1, .retire_prior_to = 0, .conn_id = "samecid1",
+        .seq_num = 1, .retire_prior_to = 0, .conn_id = cid_bytes[0..],
         .stateless_reset_token = .{1} ** 16,
     } } };
     try std.testing.expectError(error.ProtocolViolation,
@@ -9999,7 +10003,7 @@ test "native IPv4 socket admits mapped candidates canonically" {
     conn.installAppKeys(keys[0], keys[1]);
     var wire: [1500]u8 = undefined;
     try std.testing.expect(try conn.sendAt(&wire, 1, random.random()) > 0);
-    try std.testing.expect(conn.lastSendPeer() == .ipv4);
+    try std.testing.expect(conn.lastSendPeer().* == .ipv4);
     try std.testing.expect(conn.pkt_handler.next_pn[2] > 0);
 }
 
@@ -10104,7 +10108,7 @@ fn nativeTestWire(
     return out[0 .. 13 + length];
 }
 
-fn configureNativeTestIngress(conn: *Connection, random: std.Random) !void {
+fn configureNativeTestIngress(conn: *Connection, peer_cid_bytes: *[8]u8, random: std.Random) !void {
     conn.handshake_confirmed = true;
     conn.state = .connected;
     const local = address.Address.initIpv4(.{127, 0, 0, 1}, 1000);
@@ -10123,7 +10127,7 @@ fn configureNativeTestIngress(conn: *Connection, random: std.Random) !void {
     conn.local_cid_pool.registerInitialCid("keyguard", null, random);
     try conn.issuePathCid(random);
     const peer_cid: Frame = .{ .path_new_connection_id = .{ .path_id = 1, .cid = .{
-        .seq_num = 0, .retire_prior_to = 0, .conn_id = "peerpath",
+        .seq_num = 0, .retire_prior_to = 0, .conn_id = peer_cid_bytes[0..],
         .stateless_reset_token = .{3} ** 16,
     } } };
     try conn.processFrame(&peer_cid, .application, 0, random);
@@ -10337,6 +10341,7 @@ test "lifted physical policy omits virtual observed report but emits configured 
 }
 
 test "native retirement ACK and ACK_ECN release only matching path credit repeatedly" {
+    var peer_cid_bytes: [8]u8 = "peerpath".*;
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
     conn.state = .connected;
@@ -10345,7 +10350,7 @@ test "native retirement ACK and ACK_ECN release only matching path credit repeat
     conn.native_paths.entries[1].opened = true;
     const other = try conn.ensurePathTransport();
     var random = std.Random.DefaultPrng.init(104);
-    try configureNativeTestIngress(&conn, random.random());
+    try configureNativeTestIngress(&conn, &peer_cid_bytes, random.random());
     other.handler.next_pn[2] = 50;
     for (0..12) |sequence| {
         const sent_at: i64 = @intCast((sequence + 1) * 1_000_000_000);
@@ -10505,6 +10510,7 @@ test "recv abandon retains live replacement and receiving path through following
 }
 
 test "PATH_ACK_ECN keeps per-path CE baselines and ignores duplicate or offpath-only feedback" {
+    var peer_cid_bytes: [8]u8 = "peerpath".*;
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
     conn.state = .connected;
@@ -10516,7 +10522,7 @@ test "PATH_ACK_ECN keeps per-path CE baselines and ignores duplicate or offpath-
     conn.ecn_validator.start();
     other.ecn_state.start();
     var random = std.Random.DefaultPrng.init(106);
-    try configureNativeTestIngress(&conn, random.random());
+    try configureNativeTestIngress(&conn, &peer_cid_bytes, random.random());
     other.handler.next_pn[2] = 50;
     const before0 = conn.cc.congestion_window;
     const before1 = other.cc.congestion_window;
@@ -10597,6 +10603,7 @@ test "PATH_ACK_ECN keeps per-path CE baselines and ignores duplicate or offpath-
 }
 
 test "native remote PATH_ABANDON unknown and duplicate closed paths never close connection" {
+    var peer_cid_bytes: [8]u8 = "peerpath".*;
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
     conn.state = .connected;
@@ -10606,7 +10613,7 @@ test "native remote PATH_ABANDON unknown and duplicate closed paths never close 
         .negotiate = .{ .local_max = 1, .peer_max = 0 },
     });
     var random = std.Random.DefaultPrng.init(107);
-    try configureNativeTestIngress(&conn, random.random());
+    try configureNativeTestIngress(&conn, &peer_cid_bytes, random.random());
     const abandon: Frame = .{ .path_abandon = .{ .path_id = 1, .error_code = 0 } };
     try recvNativeTestFrame(&conn, abandon, 0, 1, random.random());
     try std.testing.expectEqual(State.connected, conn.state);
@@ -10636,13 +10643,14 @@ test "native remote PATH_ABANDON unknown and duplicate closed paths never close 
 test "ordered CE feedback for already in-flight packet does not restart native path recovery" {
     var random = std.Random.DefaultPrng.init(108);
     for ([_]u1{0, 1}) |path_id| {
+        var peer_cid_bytes: [8]u8 = "peerpath".*;
         var conn = testConnection(std.testing.allocator);
         defer conn.deinit();
         conn.local_params.initial_max_path_id = 1;
         conn.peer_params = .{ .initial_max_path_id = 1 };
         conn.native_paths.entries[1].opened = true;
         const other = try conn.ensurePathTransport();
-        try configureNativeTestIngress(&conn, random.random());
+        try configureNativeTestIngress(&conn, &peer_cid_bytes, random.random());
         conn.paths[1].is_initial = false;
         conn.ecn_validator.start();
         other.ecn_state.start();

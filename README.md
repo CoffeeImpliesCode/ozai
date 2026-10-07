@@ -17,13 +17,16 @@ from the certificate, moves bytes both ways, and carries ECN over a real socket.
 `test/relay_wire_test.zig` and `test/two_process_test.zig` exercise relay
 forwarding, payload delivery, and independent shutdown on loopback.
 
-The full iroh matrix, mixed blob/gossip/relay protocol interop, NAT and node-level authenticated 0-RTT remain open.
-This section records a bounded RFC 7250 TLS and stream smoke.
+The full iroh matrix, mixed blob/gossip sockets, native NAT and node-level authenticated 0-RTT remain open.
+The TLS smoke below has a separate, bounded proof.
+Four additional relay routes passed with exact 34-byte application payloads and peer pins.
+They cover both carrier roles and both UDP-blocked, relay-only inner QUIC roles.
+The relay-only routes recorded one dial or one accept, with stable connection IDs.
+Fresh runs after the fixture's `Node.close` change produced no dropped-serving diagnostic.
+These results do not prove mixed Bao/gossip transfer or native NAT traversal.
 
-The gossip state machines run, and the gossip wire codec is built and tested
-(`src/gossip/codec.zig` and the six modules under `src/gossip/codec/`, with a
-fuzz target), but the node does not yet call it: a `send_message` the layer
-asks for is counted and its peer named, and nothing is encoded onto the wire.
+The node executes the gossip codec through its incoming and outgoing QUIC stream routes.
+The current call-site map below replaces the older unwired-codec claim.
 
 ### RFC 7250 live TLS and stream proof
 
@@ -295,36 +298,58 @@ only its listed routes. The full matrix remains open.
 
 ### What is built and tested but not yet reachable from a node
 
-This is the tree's largest gap and it is a wiring gap, not a correctness one.
-**165 of the 281 modules the build compiles are not reachable from
-`ozai-node`** — 153 production modules and 12 `_test.zig` files. They carry
-tests, several carry fuzz targets, and none of it can run in a live node
-because nothing in `src/node/` imports it.
+#### Historical reachability measurements
 
-The count is taken by crossing the tree module by module from
-`src/node/main.zig` and the three `src/node/` files it imports at top level,
-treating `src/root.zig` as what it is — a facade of `pub const` re-exports that
-would otherwise make every module in the tree look reachable. Only the
-re-export names the binary actually references drag a module in. Liveness is
-per module rather than per call path, so a module reached by an untaken branch
-counts as reachable and the figure above is a **lower bound** on what is
-unwired.
+The earlier module-import survey found 165 of 281 compiled modules unreachable from `ozai-node`.
+It classified 153 production modules and 12 test files as unreachable.
+The 2026-10-06 coverage survey later recorded 168 of 285 modules under `src/`.
+Both counts describe historical source snapshots, not current production call paths.
+Neither count measures whether a branch executes.
+No new reachability count replaces them here.
+Their retained dispositions are in [`docs/COVERAGE-LEDGER.md`](docs/COVERAGE-LEDGER.md).
 
-By directory, the 153 production modules are: `src/discovery/` 35,
-`src/net/` 37, `src/relay/` 23, `src/blobs/` 19, `src/node/` 9,
-`src/transport/` 7, `src/gossip/codec/` 6, `src/gossip/` 5, `src/crypto/` 4,
-`src/ticket/` 4, `src/gossip/plumtree/` 2, `src/root.zig` itself, and
-`src/router/qad_route.zig`. The largest groups are discovery, NAT traversal
-and hole punching, blobs, and the gossip codec. `TODO.md`'s *Next* list
-names parts of this — the gate inputs, the live lookup seam — but it is a
-list of what to do next, not a register of what is unwired, and it does not
-account for all 165.
+#### Current production routes and standalone models
 
-That figure was re-measured independently for the 2026-10-06 coverage gate:
-168 of the 285 modules under `src/` are unreachable from `ozai-node`, and the
-gate's per-path dispositions — including the treatment of the unwired modules,
-which are **not** counted as covered — are in
-[`docs/COVERAGE-LEDGER.md`](docs/COVERAGE-LEDGER.md).
+| Subsystem | Production call chain | Remaining admission |
+|---|---|---|
+| Gossip codec | `Node.step` → `node_gossip.receive/gossip`. Outbound: `feedGossip` → `node_gossip_wire.send` → `gossip.codec.encode` → QUIC unidirectional stream. Inbound decode feeds the node handler. | Mixed Rust/Zig gossip socket exchange is not yet verified. |
+| DNS, PKARR, TLS | `Node.step` → `node_discovery.pass` → `node_discovery_wire` → `dns_live.Retrieval.ask` or `pkarr_live`. PKARR uses `tls_client` over TCP. | Discovery is opt-in. Default configuration performs no lookup or publication. |
+| TCP | `tls_client` uses `transport/tcp`. `tcp_carrier.Client.init` connects the relay stream. | Standalone TCP tests alone do not prove these consumers. |
+| WebSocket, HTTP upgrade, relay | Outbound: `node_transport.send` → `State.sendMapped` → `Client.send` → `Session.relay`. Inbound: `takeRelay` → runtime poll/receive → carrier → WebSocket/relay decode → `Bridge.recv`. | The carrier lifetime is separate from the inner QUIC lifetime. |
+| Observed address, reporter, QAD, QNT | `node_build` passes opt-in `address_discovery_role` to bridge and dial configurations. The vendor negotiates native roles and processes observed-address frames. | No node consumer turns `Conn.observedAddress` into candidates or publications. `observed_reporter` and Number-Time `qnt.zig` remain standalone. |
+| Path selection, table, revalidation, probe | `Node.step` → `node_native.pass` → native candidate/path snapshots → `path_action.planSelect` → `multipath.applyAction` → `Conn.selectPath`. | Generic `path_table`, `path_select`, `path_revalidate`, and `path_probe` remain standalone. No production caller mirrors native counters into their table. |
+
+Discovery evidence has two separate scopes.
+The UDP truncation-to-TCP and direct TCP test passed 5/5.
+The identity-only DNS-to-QUIC test separately passed 5/5.
+Neither result proves an always-active default discovery service.
+
+Native Noq supports observed-address roles, NAT traversal frames and multipath wire frames.
+The core admits configured physical candidates and retains only path IDs 0 and 1 for the connection lifetime.
+The eight entries in `transport/multipath.Table` retain historical address pairs, not eight live transport paths.
+Pinned Rust-generated `*.bin` files prove encoder/decoder agreement, not live address learning.
+Configured `traversal.local_candidates` come from the caller.
+The Zig node has no strict X.509 QAD client or mapping-learning consumer.
+Rust's standalone QAD certificate service is a different route.
+
+The remaining standalone models include Number-Time QNT, observed-report folding, generic path policy and the generic holepunch gate.
+Native Noq NAT traversal does not use the Number-Time QNT codec.
+Native terminal state does not feed generic `holepunch.Outcome`.
+Accepted physical-source 1-RTT packet evidence does not prove per-path application bytes.
+Node ticket capture, storage, reconnect offer, early-send limits and replay policy remain unwired.
+
+The pending mixed-protocol checks use the existing opt-in targets:
+
+```sh
+"$ZIG" build test-blobs-interop test-gossip-interop -Doptimize=Debug \
+  -Diroh-peer="$CARGO_TARGET_DIR/release/ozai-iroh-peer"
+"$ZIG" build test-native-interop -- --zig-peer "$ZIG_PEER" \
+  --rust-peer "$RUST_PEER" --evidence-dir "$EVIDENCE_DIR" \
+  --qad-cert "$QAD_CERT" --qad-key "$QAD_KEY"
+```
+
+The native fixture needs private Linux namespaces and explicit absolute paths.
+These commands describe checks to run, not completed proof rows.
 
 ### Earlier records, kept as dated history
 
@@ -366,7 +391,7 @@ sections with zero lint/static findings. Native Debug and ReleaseSafe passed
 543/543 and the separate vendored core passed 467/467 in both modes. In that
 run the portable root was the 29-module, 438-test root and passed 438/438 in
 both modes. That run predates every later expansion of that root: it is
-**100 modules** as of 2026-10-06 (counted from `src/portable_test.zig`, method
+**101 modules** as of 2026-10-07 (counted from `src/portable_test.zig`, method
 under *Cross-platform tests* above), and neither its coverage nor its
 ReleaseSafe figures are recorded here.
 
@@ -579,11 +604,20 @@ node artifact built for each target. Its default matrix is
 Foreign GNU runs require compatible guest runtimes and are separate from
 that self-contained gate. `cross-test.portable.profile.sh` surveys all 108
 libc ABI targets listed by the pinned Zig 0.16 compiler. It uses
-`src/portable_test.zig`: **100 pure modules** as of 2026-10-06, counted as the
+`src/portable_test.zig`: **101 pure modules** as of 2026-10-07, counted as the
 unique non-`std` `@import` specifiers in that file, each with a matching
 `refAllDecls` and no duplicates. It does **not** claim a non-Linux node
 backend. An earlier figure of 32 modules is history and no longer describes
 the file.
+
+The portable root excludes the disk-backed `blobs/observe.zig` and
+`blobs/push.zig` suites. Their eight observe tests and seven push tests remain
+collected by the full live `src/root.zig` suite, alongside the store, provider,
+resume and node blob tests. The memory-only getter suite remains portable.
+All 38 existing disk-backed temporary-directory call sites use approved
+external host scratch; none was deleted or changed into a skipped test. This
+collection boundary does not exempt those branches from the full live gate
+or its coverage measurement.
 
 The tree as it stood before the 2026-10-03 contract cutover executed
 **543/543 on all 26 live Linux ABI targets** in one
@@ -620,7 +654,7 @@ including 32-bit, big-endian, GNU/musl ABI variants and WASI. Another
 Those failing rows remain in the survey rather than being silently dropped.
 They are toolchain-side outcomes, and the 53/37/18 split above belongs to the
 29-module, 438-test root. It is not a survey of the current source: that root
-has since grown to **100 modules** (2026-10-06), and this file records no
+has since grown to **101 modules** (2026-10-07), and this file records no
 execute, build-only or SDK-failure split across the 108 rows for it, because
 the full survey has not been rerun against it. A 463/463 Debug run for the
 intermediate 32-module expansion is recorded history and does not describe the

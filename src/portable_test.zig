@@ -168,8 +168,6 @@ test {
     std.testing.refAllDecls(net_path_revalidate);
     std.testing.refAllDecls(transport_multipath);
     const blobs_blob_claim = @import("blobs/blob_claim.zig");
-    const blobs_observe = @import("blobs/observe.zig");
-    const blobs_push = @import("blobs/push.zig");
     const discovery_resolve_fanin = @import("discovery/resolve_fanin.zig");
     const discovery_resolve_deadline = @import("discovery/resolve_deadline.zig");
     const gossip_topic_policy = @import("gossip/topic_policy.zig");
@@ -191,8 +189,6 @@ test {
     const node_ticket_cache = @import("node/ticket_cache.zig");
     const node_ticket_lifecycle = @import("node/ticket_lifecycle.zig");
     std.testing.refAllDecls(blobs_blob_claim);
-    std.testing.refAllDecls(blobs_observe);
-    std.testing.refAllDecls(blobs_push);
     std.testing.refAllDecls(discovery_resolve_fanin);
     std.testing.refAllDecls(discovery_resolve_deadline);
     std.testing.refAllDecls(gossip_topic_policy);

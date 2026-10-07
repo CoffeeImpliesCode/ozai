@@ -809,6 +809,56 @@ This proves a bounded TLS handshake and stream exchange. It does not close the
 upstream matrix or prove mixed blob/gossip/relay protocols, NAT traversal or
 0-RTT.
 
+### 10. Native Noq extension wire and lifetime limits
+
+The extension source is Noq 1.3.0 at
+`c1f411562e6078852749b8bcf1190523096a107f`.
+The vendor implements observed-address role transport parameters and frames.
+It also implements native NAT ADD_ADDRESS, REACH_ADDRESS and REMOVE_ADDRESS,
+plus native multipath transport parameters and frames.
+These are Noq wire extensions, not the standalone Number-Time `src/net/qnt.zig` protocol.
+
+`Node.Config.address_discovery_role` opts into native observed-address negotiation.
+Bridge and dial configurations pass that role to the core.
+Native candidate admission uses caller-configured physical addresses.
+No node consumer turns received observations into learned candidates or published addresses.
+The core supports only path IDs 0 and 1 for the connection lifetime.
+Retired IDs retain their slots. Eight historical project address pairs do not expand this capacity.
+
+`test/native_observed_upstream_oracle.rs`, `test/native_nat_upstream_oracle.rs`
+and `test/native_multipath_upstream_oracle.rs` capture pinned Noq private codec output.
+The actual generator captures produced 19-byte observed-address, 43-byte NAT and 24-byte multipath files.
+`src/net/native_oracle_test.zig` is the Zig fixture consumer.
+The current handover has not run that consumer against the fresh captures.
+Captured files prove encoder/decoder bytes, not live mapping learning or a successful NAT round.
+
+### 11. Retry policy before connection allocation
+
+`ConnectionManager` validates Initial tokens before its synchronous policy callback.
+The callback receives borrowed metadata, not an allocated connection.
+It must not retain CID slices or reenter the manager.
+The manager executes accept, Retry, refuse or ignore before `acceptConnection`.
+It refuses Retry for an already validated Initial.
+Router policy now reaches this real preallocation route.
+
+The live normal-stack Retry socket proof recorded one unvalidated Initial and one validated Initial.
+At the Retry response, `allocated_after_retry` was zero.
+The validated Initial then established one connection and exchanged the exact application payload.
+Wire vectors and token/address-binding regressions are separate codec evidence.
+Neither wire vectors alone nor an isolated policy callback proves that socket route.
+
+### 12. Public stream borrows and deferred reclamation
+
+`transport/bridge_conn.Stream` carries its owning `StreamsMap`.
+Public handles borrow core streams and must pin them across connection processing.
+Otherwise, callers must reacquire each handle by ID after that processing.
+`close` ends sending. It does not release the stream.
+`unpin` releases the final active borrow and calls `disposeIfSettled`.
+A settled stream enters deferred reclamation for the next disposal cycle.
+An unacknowledged FIN keeps the stream alive for retransmission.
+The existing overflow backstop preserves reclamation if the disposal queue is full.
+This prevents a settled, formerly pinned stream from remaining unreachable by garbage collection.
+
 ## Measured cost
 
 | | Predicted | Measured |

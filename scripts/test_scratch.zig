@@ -6,7 +6,7 @@ const gate_scratch = @import("gate_scratch.zig");
 // A mounted descendant, foreign entry, symlink, hard link, open descriptor or
 // mapping invalidates the private-tree deletion proof.
 const cleanup_script =
-    \\set -eu
+    \\set -euo pipefail
     \\die() { printf '%s\n' "$1" >&2; exit 1; }
     \\target=$1
     \\pid=$2
@@ -15,9 +15,21 @@ const cleanup_script =
     \\bad=$(find -P "$target" -xdev \
     \\    \( ! -uid "$uid" -o ! \( -type d -o -type f \) -o -type f -links +1 \) -print -quit)
     \\[ -z "$bad" ] || die 'foreign-owned, linked or special entry in scratch child'
-    \\mounted=$(find -P "$target" -xdev -type d -exec mountpoint -q -- {} \; -print -quit)
-    \\[ -z "$mounted" ] || die 'mounted descendant in scratch child'
-    \\[ -d "/proc/$pid/fd" ] && [ -r "/proc/$pid/maps" ] ||
+    \\find -P "$target" -xdev -print0 | (
+    \\    remaining=1048576
+    \\    while IFS= read -r -d '' candidate; do
+    \\        [ "$remaining" -gt 0 ] || die 'scratch entry bound exceeded'
+    \\        remaining=$((remaining - 1))
+    \\        if mountpoint -q -- "$candidate"; then
+    \\            die 'mounted descendant in scratch child'
+    \\        else
+    \\            status=$?
+    \\            [ "$status" = 32 ] || die 'mountpoint inspection failed'
+    \\        fi
+    \\    done
+    \\)
+    \\[ -d "/proc/$pid/fd" ] && [ -r "/proc/$pid/fd" ] && [ -x "/proc/$pid/fd" ] &&
+    \\    [ -r "/proc/$pid/maps" ] ||
     \\    die 'own process live-use proof unavailable'
     \\remaining=65536
     \\for entry in "/proc/$pid"/fd/* "/proc/$pid/cwd" "/proc/$pid/root" "/proc/$pid/exe"; do
@@ -197,9 +209,11 @@ test "test scratch writes externally without changing fixture cwd and removes it
     defer t.allocator.free(scratch);
     try t.expect(std.mem.startsWith(u8, path, scratch));
     try t.expectEqual(@as(u8, '/'), path[scratch.len]);
-    const file = try temporary.dir.createFile(t.io, "payload", .{ .exclusive = true });
-    try file.writeStreamingAll(t.io, "external test data");
-    file.close(t.io);
+    {
+        const file = try temporary.dir.createFile(t.io, "payload", .{ .exclusive = true });
+        defer file.close(t.io);
+        try file.writeStreamingAll(t.io, "external test data");
+    }
     const bytes = try temporary.dir.readFileAlloc(t.io, "payload", t.allocator, .limited(100));
     defer t.allocator.free(bytes);
     try t.expectEqualStrings("external test data", bytes);

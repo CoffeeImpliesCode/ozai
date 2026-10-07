@@ -102,27 +102,22 @@ built in this tree never offers it and a peer that negotiates it is dropped.
 Both halves are deliberate, and the codec over the protocol's bytes
 (`src/net/qad.zig`) is tested and deliberately unwired rather than forgotten.
 
-The route that would serve it exists and is uncalled:
-`src/router/qad_route.zig`'s `registerLast` is the only caller of
-`Builder.acceptInternal`, and its module doc records why nothing calls it.
-The blocker is the vendored core, not this tree's own ALPN width.
-`TlsConfig.alpn` is `[]const []const u8` and the server matcher walks every
-entry, so `max_alpns` could go to 2 with a two-element `alpn_list` in
-`src/transport/bridge_manager.zig` and `src/transport/dial_client.zig` and no
-vendor patch at all. What is missing is that `vendor/quic/` carries no
-OBSERVED_ADDRESS frame (`frame.zig`'s `FrameType` has no `0x9f81a6`/`0x9f81a7`
-arm, and `parseSized` answers `error.FrameEncodingError` for a type it cannot
-name) and no `address_discovery` transport parameter (`transport_params.zig`'s
-`ParamId` has no `0x9f81a176`, and `decode` skips unknown ids). `vendor/quic/`
-is read-only here.
+`src/router/qad_route.zig` provides an uncalled `registerLast` route.
+The reserved ALPN service is distinct from the native in-connection observed-address extension.
+The vendor now supports its transport parameter and observed-address frames.
+`node_build` passes opt-in `address_discovery_role` into bridge and dial connection configurations.
+The default role is disabled.
+`Conn.observedRoles` and `Conn.observedAddress` expose decoded native reports.
+No production node/discovery consumer turns those reports into candidates or published addresses.
+`observed_reporter` also has no node address-update consumer.
 
-So the route is not wired, and wiring it would be worse than dropping: a node
-offering `/iroh-qad/0` would negotiate it and then be unable to report a
-single observed address, which is the whole service. That is the fail-closed
-rule (`AGENTS.md` §2) deciding this, not the one-element list. Three things
-close it, and they are listed in `src/router/qad_route.zig`'s module doc: the
-two vendored-core features, a transport seam on the connection handle the
-handler is given, and `max_alpns` at 2 last.
+The Zig production route has no strict X.509 QAD client or mapping-learning consumer.
+Rust's real QAD client learns a mapping from a standalone certificate service.
+Configured `traversal.local_candidates` are caller-provided addresses, not learned mappings.
+A runtime observed-address report is different from a configured address.
+Peer identity and certificates do not prove a mapping.
+Native wire support therefore does not justify offering the separate `/iroh-qad/0` service.
+The router keeps that service reserved and unoffered.
 
 ## Invariants
 
@@ -287,18 +282,17 @@ prevents, and each belongs in a test.
   Recorded rather than matched because upstream has no rule to match — this is a
   consequence of the port's fixed-buffer writer, not a different opinion about
   how long a denial should be.
-- **The vendored core carries two paths; `ula` models three subnets.** The QUIC
-  substrate holds `paths: [2]NetworkPath` with one `active_path_idx` — an active
-  path and a candidate, which is RFC 9000 migration and nothing more, and is
-  upstream's own structure unchanged. The synthetic-ULA map offers a peer three
-  distinguishable subnets at once: any-path, one-per-relay, one-per-custom. A
-  connection handed all three is a connection the core reads as a migration, so
-  the map and the stack disagree about how many paths a peer has. This is the
-  cost `DECISIONS/0001` accepted when it took this substrate over one with
-  native multipath, now confirmed against the code rather than estimated. It
-  is a convergence cost and not a correctness one: the mapping still keeps the
-  paths from aliasing, and a peer that is given a second path before the first
-  is used loses the first.
+- **Native paths and synthetic addresses are distinct.**
+  `Node.step` calls `node_native.pass` for negotiated native NAT/multipath connections.
+  The driver installs caller-configured local candidates and reads vendor remote candidates.
+  It selects a validated physical pair through `path_action.planSelect` and `multipath.applyAction`.
+  The vendor admits only path IDs 0 and 1 for the connection lifetime, including retired IDs.
+  `transport/multipath.Table` retains eight historical address pairs, not eight live core paths.
+  Synthetic ULA addresses identify mapped transport routes, not native physical path IDs.
+  Generic `path_table`, `path_select`, `path_revalidate` and `path_probe` remain standalone policy models.
+  Their tables do not consume the native path byte counters.
+  Native PATH_ACK reports packet-number ranges.
+  PATH_ACK_ECN adds packet ECN counts, not byte counts or last-active times.
 - **`TlsConfig` and `ClientAuth` carry different peer pins.** The client-side
   field is `expect_peer_node_id`; the server-side one is `ClientAuth.expect_node_id`.
   Upstream had `skip_cert_verify` and a `ca_bundle` on `TlsConfig` and treated

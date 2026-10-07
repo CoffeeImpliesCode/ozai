@@ -62,37 +62,40 @@ what "next" means.
 
 ## Next
 
-The gate work below is reachable on this node. The largest unwired body of work
-is not on this list; it is counted once in
-[`README.md`](README.md#what-is-built-and-tested-but-not-yet-reachable-from-a-node).
+The current production call-site map is in
+[`README.md`](README.md#current-production-routes-and-standalone-models).
+Its reachability counts are history, not a current wiring inventory.
 
-- **Three of the seven gate inputs, not four.** `src/net/holepunch_run.zig`
-  takes seven. Three have a producer there: the local set and the
-  varies-by-destination verdict from `observeReport`, and the peer's candidate
-  addresses from `observePeer`. `src/net/interface.zig` closed a fourth — "the
-  socket's interface addresses", which `holepunch_run.zig`'s own table used to
-  call a gap — by enumerating interfaces with `getifaddrs` and comparing two
-  reads. **Three remain open**: the connection to punch on, what the QUIC
-  stack said about a round (`qnt` is not in the vendored core), and whether a
-  path carried traffic (there is no multipath layer). Each needs a producer or
-  an explicit admission that it is out of scope.
-- **The retry token's hook lives in `vendor/quic/`.** A retry token has nowhere
-  to go, so the action was removed rather than left unperformable:
-  `Action.send_token` does not exist, and the router's `send_retry` verdict —
-  still produced, still reachable — now resolves to `.refuse`, which is what
-  upstream does when `incoming.retry()` returns an error
-  (`protocol.rs:583-586`). What is missing is in the vendored core: no hook
-  runs before `acceptConnection`, so a peer that asks for a Retry is refused
-  rather than answered. Closing that is a vendor patch and needs a
-  `VENDORED.md` entry.
-- **No production driver performs a live lookup.** `lookup_live.zig` proves the
-  seam against real sockets and the only callers of its `Datagram` are its own
-  tests; `src/node/` never reaches for it, and every `net/probe_run.Transport`
-  in the tree is a test fake for the same reason. A node today dials the peers
-  its command line names. What a caller does with a live `Datagram` — merge the
-  answers into the fan-in, or feed them to a probe run — is the missing half,
-  and it needs a decision rather than a seam, because after it the answers come
-  from the network instead of from a parameter.
+- **Issue #16: production inputs and standalone gate are distinct.**
+  `node_holepunch.prepare` selects the smallest authenticated client connection ID.
+  `node_native.pass` restricts client initiation to that recorded ID.
+  Server reciprocal address handling remains eligible. Servers do not initiate.
+  The actual negotiated two-client regression passed within a 7/7 focused run.
+  It covers both table orders and reciprocal server advertisements.
+  Removing the five-line client gate made that run fail on nonselected initiation.
+  The generic `Join.selectConnection` and attempt planner remain standalone.
+  `node_native.pass` calls native `addTraversalAddress` and `initiateTraversal`.
+  The vendor sends Noq REACH_ADDRESS frames and exposes native traversal state.
+  Native terminal state does not feed generic `holepunch.Outcome`.
+  Number-Time `qnt.zig` is a different, standalone protocol.
+  `prepare`/`received` compare the same connection's `total_packets_received` around each datagram.
+  Only accepted 1-RTT short-header traffic from a physical IP records `.open`.
+  Synthetic relay sources do not qualify.
+  This proves accepted source traffic, not application bytes or a selected path ID.
+  Native per-path byte counters do not feed the generic path table or gate.
+- **Retry now has a preallocation route.**
+  The manager handles Retry before it allocates a connection.
+  Router policy reaches that route instead of substituting refusal.
+  A real normal-stack socket exchange recorded one unvalidated and one validated Initial.
+  At the Retry response, `allocated_after_retry` was zero.
+  The validated Initial then established one connection and exchanged exact application bytes.
+  The vendor patch record separates this result from wire-vector evidence.
+- **Discovery has opt-in production consumers.**
+  `Node.step` calls `node_discovery.pass`, which performs configured DNS and PKARR work.
+  DNS truncation-to-TCP and direct TCP passed a separate 5/5 test.
+  Identity-only DNS-to-QUIC separately passed 5/5.
+  Default configuration performs no lookup or publication.
+  The generic probe transport and observed-report models do not establish native mapping learning.
 
 - **Allocation-fault coverage debt: two existing map seams.**
   `transport/addr_map.zig` lacks fail-N coverage for `insert`'s reverse-map
@@ -125,8 +128,10 @@ is not on this list; it is counted once in
   repository: its runner is a git submodule outside the published package.
   This node has `tshark`, but lacks `docker` and
   `quic-network-simulator`. The matrix still needs a node with that toolchain.
-  Mixed blob/gossip/relay protocol interoperability, NAT and node-level 0-RTT
-  also remain open.
+  Four additional relay role routes passed with exact application bytes and peer pins.
+  Mixed Bao/gossip socket exchange and the fresh native NAT run remain unverified.
+  Captured Rust Bao, gossip and Noq codec files do not close those live proof gaps.
+  Node-level 0-RTT also remains open.
 - **Willow and docs** stay out of scope, as the plan says.
 
 ## Standing constraints

@@ -44,6 +44,21 @@ pub fn main(init: std.process.Init) !void {
     defer node.deinit();
     var engine = std.Random.DefaultPrng.init(0x70696e6e6564);
     const random = engine.random();
+    // Keep the operation's result until its stream pins have been released and the node
+    // has closed. A close failure takes precedence over the operation's result.
+    const result = runNode(init, node, options, expected, random);
+    const close_ns = std.Io.Clock.awake.now(init.io).nanoseconds;
+    try node.close(init.io, @intCast(close_ns), random);
+    return result;
+}
+
+fn runNode(
+    init: std.process.Init,
+    node: *Node,
+    options: Options,
+    expected: ozai.NodeId,
+    random: std.Random,
+) !void {
     const start = std.Io.Clock.awake.now(init.io);
     const start_ns = start.nanoseconds;
     try node.start(@intCast(start_ns), random);
@@ -95,9 +110,9 @@ pub fn main(init: std.process.Init) !void {
                     if (options.client) {
                         var opened = try bridge.Stream.open(conn);
                         try opened.pin();
+                        stream_id = opened.id();
                         try opened.write(options.message);
                         opened.close();
-                        stream_id = opened.id();
                     } else {
                         for (0..64) |index| {
                             var inbound = conn.incomingStream(index) orelse break;
