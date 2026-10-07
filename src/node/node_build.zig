@@ -331,7 +331,7 @@ pub fn start(self: *Node, at: Instant, random: std.Random) Error!void {
     for (self.config.discovery.peer_ids) |peer| {
         var duplicate = false;
         for (ids[0..count]) |known| {
-            if (known.eql(peer)) duplicate = true;
+            if (known.order(peer) == .eq) duplicate = true;
         }
         if (!duplicate) {
             ids[count] = peer;
