@@ -102,8 +102,21 @@ is not on this list; it is counted once in
 
 ## Open, and not yet closable here
 
-- **0-RTT.** `session_ticket` and `ticket_key` carry it and the certificate
-  patch did not discharge it. `0001` records it as open.
+- **Issue #8: core resumption works. Node-level authenticated 0-RTT remains open.**
+  The core issues and accepts tickets under a stable `TicketKey`.
+  It checks the PSK binder and retains fresh client certificate authentication
+  on resumed connections. The selected core probe passed 6/6 tests, including
+  the root test, in Debug and ReleaseSafe on 2026-10-07 at baseline `d853694c`.
+  This is not a Node smoke or a full production 0-RTT feature.
+  Bridge/Dialer omit resumption configuration. Node lacks a stable server key,
+  ticket capture/store/offer, and a reconnect path.
+  Ticket borrows must outlive the connection, including its handshake.
+  Concurrent connections need separate stable copies or an equivalent lifetime guarantee.
+  Resumption asserts the remembered server identity without a
+  fresh server certificate proof. Early application send limits and replay
+  policy remain unwired. Pure store and policy modules do not close these gaps.
+  [Transport decision item 1](docs/DECISIONS/0001-transport-substrate.md#still-open-after-m8)
+  records the commands, proof boundary, and key-rotation fallback limitation.
 - **Interop.** The opt-in process/socket smoke now proves a TLS handshake and
   application-stream exchange with strict `noq` 1.3.0 and stock iroh 1.3.0.
   It covers four client/server routes and passes in Debug and ReleaseSafe.

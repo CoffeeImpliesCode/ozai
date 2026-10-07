@@ -894,59 +894,86 @@ of those paths a way for `realtimeSeconds` to come back through.
 
 ### Still open after M8
 
-Items are kept after they close, each marked where it stands. Item 3 was
-closed after M8 and is marked below. Item 4 was added on 2026-09-30, when a
-measurement turned item 1 from "untidy" into a trap; item 1's reason was
-corrected in the same pass and its conclusion was not.
+Items remain after they close, each marked with its current status.
+Item 3 closed after M8. The 2026-09-30 probe added item 4.
+The issue #8 answer below corrects item 1 and records the core repair for item 4.
 
-**1. 0-RTT, and the verifier identity. Open.** The M8 requirement was to keep
-the client's session ticket and the server's sealing key stable across config
-construction. The old `TlsConfig.session_ticket` and `TlsConfig.ticket_key`
-fields are now the `.client` and `.server` cases of `TlsConfig.resumption`;
-each role has one value to retain. That cutover does not acquire a resumed
-client's authenticated identity. *Closes when* one acquisition path exists that
-resumption does not skip, and a test resumes with a stable server key and
-enforces the client pin on the second connection. Until then, treat
-**authenticated client-identity early data** as unimplemented, not the
-standalone unauthenticated PSK/0-RTT path.
+**1. Issue #8: core resumption works. Node-level authenticated 0-RTT remains open.**
+The old `TlsConfig.session_ticket` and `TlsConfig.ticket_key` inputs now use
+the `.client` and `.server` cases of `TlsConfig.resumption`.
+The server issues NewSessionTicket and accepts its sealed ticket under a
+stable `TicketKey`. The client captures the ticket and offers its PSK on a
+second handshake. Ticket acceptance checks the sealed identity and PSK binder.
+Server completion also requires the configured client identity policy.
+Source: `vendor/quic/src/quic/tls13.zig`, `resumableTicket` at `:1890`,
+`serverSendTicket` at `:3331`, and `tryProcessPsk` at `:3447-3614`.
+Fresh client-authentication routing is at `:3098-3121`.
+These locations describe this baseline, not a stable API line number.
 
-**Amended 2026-09-30: the reason this item gave was the wrong one.** It read
-`ClientAuth`'s doc at `tls13.zig:253-259` — "Session tickets are neither issued
-nor accepted while a policy is in force" — as why a pinned client identity and
-resumption are mutually exclusive here. That sentence points at the ticket
-format, and the ticket format is not the obstacle. A ticket carries no client
-identity. The layout cited here was a `[64]u8` plaintext; those sizes and line
-numbers were the 2026-09-30 measurement, not the current format. The current
-`serverSendTicket` writes `psk(32) || creation_time(8) || quic_version(4) ||
-alpn_len(1) || alpn`, with an ALPN of at most 32 bytes and a 16-byte tag:
-77 plaintext bytes and 93 sealed bytes at most. The ALPN capacity changed in
-the contract cutover so a negotiated protocol is recorded whole. None of these
-fields carries a client identity, so the structural obstacle below remains;
-it is not resolved by that format change.
+**Correction of the earlier client-authentication claim.**
+The fork retains CertificateRequest and fresh client Certificate/CertificateVerify
+on a PSK handshake when `ClientAuth` requires them.
+`serverProcessClientCertificate` remains the client identity acquisition path.
+The server compares the client pin and requires proof of private-key possession.
+Pinned client authentication and resumption are not mutually exclusive here.
+The PSK replaces the server's Certificate/CertificateVerify, not the required
+client proof. This is the fork's recorded interop deviation, not a claim that
+an independent TLS implementation accepts this exchange.
+See [vendored change 6](../../vendor/quic/VENDORED.md#6-a-pinned-client-identity-and-a-resumable-session-ticket).
 
-The block is structural: **TLS 1.3 has one client-identity acquisition path, and
-resumption skips it.** `serverProcessClientCertificate` (`:2066`) is the only
-place a server learns who the client is. It lifts the SPKI (`:2083`), compares
-`auth.expect_node_id` (`:2084-2086`), and is the only writer of `peer_cert`
-anywhere in the tree (`:2088`) and the only server-side writer of
-`peer_node_id` (`:2089` — the client writes the same field at `:1477`, for the
-server's certificate).
-Reaching it needs a CertificateRequest, and
-`serverBuildEncryptedExtensions` (`:1912`) decides whether to send one by
-testing `using_psk` (`:1934`) **before** it tests `client_auth` (`:1936`). A
-resumed connection therefore never triggers the CertificateRequest, never runs
-that function, and ends the handshake holding no client identity at all. In
-this tree a pinned client identity and resumption are mutually exclusive, and
-an iroh peer wants both.
+**Core proof, 2026-10-07, baseline `d853694c`.**
+Main ran the pinned Zig 0.16.0 compiler against `vendor/quic/src/test_all.zig`.
+The selected probe passed 6/6 tests in Debug and 6/6 in ReleaseSafe.
+Each count includes the root test and five behavior tests.
+The compiler was
+`/tmp/scratch/ozai-rpk-toolchain/zig-x86_64-linux-0.16.0/zig`.
+The command scope was the following, once per mode:
 
-It is also not residue of the chain walk M8 deleted. `ClientAuth` (`:260`) is
-`expect_node_id` (`:264`) plus a two-valued `Mode` (`:267-272`), and the
-judgement is `liftEd25519Spki` (`:188`) over a fixed 44 bytes
-(`ed25519_spki_len`, `:144`). There is no X.509 in it and none on the path.
-The guard is live code over a live policy.
+```sh
+"$ZIG" test -lc vendor/quic/src/test_all.zig -O Debug \
+  --test-filter 'loopback PSK resumption' \
+  --test-filter 'a pinned client resumes' \
+  --test-filter 'another version' \
+  --test-filter 'protocol is not the one this connection selects'
+# Repeat with -O ReleaseSafe.
+```
 
-Removing the guard is a trap rather than a chore, and item 4 is the
-measurement.
+`$ZIG` names the pinned compiler above. Parent job records are `bg45` and `bg51`.
+The tests prove ticket issuance/capture followed by a second PSK handshake
+and a fresh client certificate pin on that handshake.
+They also prove server refusal of a cross-version ticket and client
+preflight omission of a ticket from another version.
+A ticket with a different selected ALPN resumes PSK but cannot authorize 0-RTT.
+The version full-fallback and ALPN resume-without-early-data warnings are expected.
+These counts cover only this core probe, not the integrated gate or a Node smoke.
+
+**Missing Node pieces.**
+Bridge/Dialer TLS configuration omits `.resumption`.
+Node does not retain a server `TicketKey` or capture, store, and offer client tickets.
+It has no ticket-backed reconnect path.
+The pure `session_store`, `resumption`, `early_data`, `resumption_acceptance`,
+and `replay_window` modules do not perform those runtime actions.
+TLS borrows the ticket through the handshake.
+The current `Connection` API requires it to outlive the connection
+(`vendor/quic/src/quic/connection.zig:1491-1493,5449-5450`).
+Store slots can change, so concurrent connections need separate stable ticket
+copies or an equivalent lifetime guarantee.
+
+Resumption asserts the remembered server identity without fresh server
+Certificate/CertificateVerify proof. The fresh client pin test does not prove
+fresh server authentication on PSK.
+Node also lacks early application send-budget enforcement and replay-policy wiring.
+Thus core resumability does not close Node-level authenticated 0-RTT.
+This answer does not implement that production feature.
+
+**Limits unchanged.**
+The ticket holds a PSK, creation time, QUIC version, and selected ALPN, not a client identity.
+Do not use a ticket as client proof of private-key possession.
+The existing vendored record also identifies a key-rotation fallback defect:
+a client that offers a ticket the server declines cannot complete full fallback.
+Its rotated-key test records refusal, not a successful full handshake.
+The selected cross-version fallback proof does not remove that distinct limitation.
+See [vendored change 6](../../vendor/quic/VENDORED.md#6-a-pinned-client-identity-and-a-resumable-session-ticket).
 
 **2. Interop, and therefore requirement 3. Open.** The matrix this record relied
 on was upstream's, run at `4988228` rather than the pinned commit, and it is
@@ -994,13 +1021,15 @@ models GSO, GRO and ECN as values and returns the values a socket would be
 asked for, without one. Those two gaps are what `TODO.md`'s *Next* now names,
 and they are invisible from a module list that otherwise looks connected.
 
-**4. Lifting item 1's guard turns a pinned server into one that authenticates
-nobody, and the repair that makes it not look broken is what does it. Open.**
+**4. Historical pinned-client resumption bypass. Closed in the core.**
+The fork now retains fresh client authentication on PSK and rejects a missing
+required identity. Item 1 records the fresh two-handshake proof from 2026-10-07.
+Node-level authenticated 0-RTT remains open for the separate runtime gaps there.
 
-A measurement, not a proposal. Taken on a throwaway copy of
-`vendor/quic/src/quic/tls13.zig` on 2026-09-30, restored byte-exact afterwards,
-with both suites green after the restore (456 vendored tests, 399 project
-tests). Nothing in the tree was changed.
+The following measurement describes the unpatched 2026-09-30 behavior, not the
+current fork. It used a throwaway copy of `vendor/quic/src/quic/tls13.zig`,
+restored byte-exact afterwards. Both suites passed after the restore:
+456 vendored tests and 399 project tests. The probe changed no retained code.
 
 **How it was measured.** Two guards of the same shape, `client_auth == null`,
 gate resumption: the accept guard at `:1795`, which is the only way into
@@ -1042,7 +1071,7 @@ that pinned a node id accepted a peer it never authenticated, and nothing on
 the wire or in either state said so. The pin is not weakened and the
 comparison is not wrong — it is on a path that did not run.
 
-**The same defect one layer up, in this repository.** The bridge reads the peer
+**The same defect one layer up, in the historical tree.** The bridge reads the peer
 identity as `conn.entry.conn.peerCertificate().?` at
 `src/transport/quic_bridge.zig:1076` and `:1115`, and `Connection.peerCertificate`
 (`vendor/quic/src/quic/connection.zig:4021`) is optional because the TLS
@@ -1059,10 +1088,10 @@ installs one (`:528`, `:537`). The first unwrap written on that path turns the
 upstream null into a panic here. Both shapes are bugs; which one arrives is
 the next reader's decision, not this record's to assume.
 
-*Closes when* item 1 closes: a resumed connection under a pinned `ClientAuth`
-either carries a verified client identity or fails the handshake, and a test
-in this tree says which. Until then, treat the two `client_auth == null`
-guards as load-bearing, and do not "fix" `:2027` before the guard above it.
+The fork subsequently repaired this defect rather than lifting the guards alone.
+It retains the client certificate exchange on PSK and requires a verified
+client identity before server completion. The historical guards and line
+numbers above are not instructions for the current implementation.
 
 **5. A peer that uses both paths concurrently is broken, and this is the
 measurement of how. Open.** Added 2026-10-01; full method and numbers in

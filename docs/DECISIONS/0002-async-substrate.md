@@ -484,6 +484,28 @@ helpers and test doubles are not a public-parameter count. The earlier
 13-match lexical survey mixed those categories and is withdrawn; it does not
 measure the published surface. The explicit-runtime rule is unchanged.
 
+### Issue #8: resumption evidence, 2026-10-07
+
+Core resumption does not require a different async substrate.
+Main's pinned Zig 0.16.0 core probe passed 6/6 tests in Debug and
+6/6 in ReleaseSafe at baseline `d853694c`, including the root test.
+Five behavior tests cover ticket issuance/capture, second-handshake PSK,
+fresh client pin enforcement, version gates, and selected-ALPN early-data rejection.
+This is not a Node smoke or an integrated gate count.
+
+Bridge/Dialer omit resumption configuration. Node lacks key retention,
+ticket capture/store/offer, and a reconnect path.
+Ticket borrows must outlive the connection, including its handshake.
+Concurrent connections need separate stable copies or an equivalent lifetime guarantee.
+PSK asserts the remembered server identity without fresh server certificate proof.
+Early application send limits and replay policy also remain unwired.
+Pure store and policy modules do not close Node-level authenticated 0-RTT.
+The runtime stays at the edges and the layering decision is unchanged.
+
+See [transport decision item 1](0001-transport-substrate.md#still-open-after-m8)
+for the commands, core proof boundary, client-authentication correction, and
+existing key-rotation fallback limitation.
+
 ### The trigger to reopen it again
 
 In the direction chosen — towards a runtime that owns readiness — reopen on any
