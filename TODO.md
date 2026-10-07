@@ -104,15 +104,16 @@ is not on this list; it is counted once in
 
 - **0-RTT.** `session_ticket` and `ticket_key` carry it and the certificate
   patch did not discharge it. `0001` records it as open.
-- **Interop.** The requirement that this stack talks to more than one
-  implementation is undischarged, and there are two independent blockers.
-  Upstream's matrix is not reproducible from this repository — its runner is
-  a submodule outside the published package — so it has to be
-  re-established against this fork. And it cannot be run on this node at
-  all: `docker` and `quic-network-simulator` are both absent (`podman`
-  too), while `tshark` is present. So the matrix needs a node that has the
-  toolchain, and until one does, nothing here has spoken to an
-  implementation that is not its own test suite.
+- **Interop.** The opt-in process/socket smoke now proves a TLS handshake and
+  application-stream exchange with strict `noq` 1.3.0 and stock iroh 1.3.0.
+  It covers four client/server routes and passes in Debug and ReleaseSafe.
+  `README.md` records the command and the proof boundary.
+  The full upstream matrix remains open and is still not reproducible from this
+  repository: its runner is a git submodule outside the published package.
+  This node has `tshark`, but lacks `docker` and
+  `quic-network-simulator`. The matrix still needs a node with that toolchain.
+  Mixed blob/gossip/relay protocol interoperability, NAT and node-level 0-RTT
+  also remain open.
 - **Willow and docs** stay out of scope, as the plan says.
 
 ## Standing constraints

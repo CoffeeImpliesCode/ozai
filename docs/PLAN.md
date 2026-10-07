@@ -262,11 +262,14 @@ no nonce at all.
 - **0-RTT.** `session_ticket` and `ticket_key` must be stable across every
   client-config construction or resumption silently stops matching. The
   certificate patch did not discharge it and M8 did not touch it.
-- **Interop, and with it requirement 3.** The matrix `DECISIONS/0001` leaned on
-  was upstream's, run at a different commit, and is not reproducible from this
-  repository — upstream's runner is a git submodule outside the published
-  package. M8 did not re-run it, so requirement 3 is re-established against
-  this fork or not at all.
+- **Interop, and with it requirement 3.** The upstream matrix remains the
+  evidence needed to close this requirement. It ran at a different commit, and
+  its runner is a git submodule outside the published package. M8 did not
+  re-run it. A separate current process/socket smoke passes four routes between
+  the Zig stack and strict `noq` 1.3.0 or stock iroh 1.3.0. It exchanges
+  17-byte application payloads in both directions in Debug and ReleaseSafe.
+  That smoke does not run the matrix or close requirement 3. See `README.md`
+  for its commands and scope.
 
 **One divergence to know before touching TLS.** `Tls13Handshake.step` takes
 `now_s`, and it is a second on the **caller's** clock, not the epoch. The

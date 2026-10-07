@@ -742,6 +742,73 @@ reader auditing this file should not have to look twice for either half.
   is a published prefix: a duplicate node list, which is the price of not
   dropping the peer.
 
+### 9. RFC 7250 raw-key certificate-type deviation
+
+The vendored core has no X.509 parser or certificate fallback. Its only peer
+identity format is the 44-byte Ed25519 DER `SubjectPublicKeyInfo` containing a
+32-byte node id. The RFC 7250 extension patch makes that format explicit in
+TLS 1.3, in both certificate directions.
+
+**ClientHello offers.** In `src/quic/tls13.zig`, extension type 19 is
+`client_certificate_type` and type 20 is `server_certificate_type`. The
+ClientHello writes each extension with the normal `type:u16, length:u16`
+header. Each `extension_data` is the one-byte vector length and one-byte type
+`[1, 2]` (`:3975-3976`). The parser requires both offers once (`:2843-2932`).
+It rejects an empty or malformed vector, repeated values, and an offer without
+raw-public-key type 2. Unique extra values are tolerated only when type 2 is
+also present. The server still selects type 2.
+
+**EncryptedExtensions selections.** The server writes type 19 and type 20 with
+one-byte `extension_data` `[2]` (`:4227-4228`). The client requires each
+selection to contain exactly that byte (`:3763-3797`). Missing extensions,
+malformed selections, duplicate extensions and non-2 selections fail closed.
+TLS 1.3 `CertificateRequest` does not carry these certificate-type extensions.
+
+This is a raw-public-key-only negotiation, not an X.509 fallback. Missing
+offers fail with `MissingExtension`. Malformed vector lengths fail with
+`DecodeError`. Duplicate offer values or extensions fail with
+`IllegalParameter`. An offer without type 2 fails with `HandshakeFailure`.
+Selections must be exactly one byte with value 2. The parser may ignore other
+unique offered types, but it never selects them.
+
+**SNI capacity suffix.** `buildClientHello` writes into one fixed 4096-byte
+buffer. A large SNI and QUIC transport-parameter extension can leave too
+little room for the mandatory six-byte `psk_key_exchange_modes` extension.
+Before writing it, `buildClientHello` calls `extFits(buf.len, pos, 2)`
+(`tls13.zig:4027`). This reserves its four-byte header and two-byte payload.
+The `RFC 7250 ClientHello capacity covers the mandatory suffix` regression
+returns `InternalError` when the SNI consumes that space. It accepts a name
+one byte shorter and emits an exactly 4096-byte ClientHello.
+
+No public TLS API changed. `TlsConfig` and `ClientAuth` are unchanged. The
+existing Ed25519 SPKI extraction, node-id pin checks and unconditional
+CertificateVerify checks remain in force. The strict Rust peer checks its pin
+during TLS. Stock iroh keeps its upstream verifier and resolver unchanged.
+The harness compares stock iroh's observed peer SPKI to the expected pin after
+the handshake and before application bytes.
+
+The peer manifest pins `iroh` and `noq` to 1.3.0. `Cargo.lock` fixes the
+dependency graph, and the proof uses `--locked`.
+
+With the scratch setup in `README.md`, the real-process role proof runs as:
+
+```sh
+cargo build --locked --release --manifest-path interop/iroh-peer/Cargo.toml
+"$ZIG" build test-rust-interop -Doptimize=Debug \
+  -Diroh-peer="$CARGO_TARGET_DIR/release/ozai-iroh-peer"
+"$ZIG" build test-rust-interop -Doptimize=ReleaseSafe \
+  -Diroh-peer="$CARGO_TARGET_DIR/release/ozai-iroh-peer"
+```
+
+The peer's locked Rust contract tests passed 12/12. The process suite passed
+5/5 tests over 4/4 steps in both modes. It checks the ALPN contract and four
+routes: Zig client to strict `noq`, Zig client to stock iroh, strict `noq`
+client to Zig server, and stock iroh client to Zig server. All four negotiated
+`/iroh-gossip/1` and exchanged the exact 17-byte request and response payloads.
+This proves a bounded TLS handshake and stream exchange. It does not close the
+upstream matrix or prove mixed blob/gossip/relay protocols, NAT traversal or
+0-RTT.
+
 ## Measured cost
 
 | | Predicted | Measured |
@@ -861,13 +928,15 @@ on the first-flight version during compatible negotiation. See
 `docs/DECISIONS/0004-vendored-core-contracts.md`. This is core resumption
 coverage, not a claim that ozai's node exposes 0-RTT.
 
-**2. Interop, and therefore requirement 3. Open.** The matrix this vendoring
-relied on is upstream's, and it is **not reproducible from this repository**:
-upstream's interop runner is a git submodule outside the published package. It
-was not re-run at our SHA. Requirement 3 is re-established against this fork or
-not at all — `interop/runner/matrix.sh`, with Docker, `quic-network-simulator`
-and `tshark`. Until then the honest statement is upstream's own: ten of 88 cells
-red, one open, and ours unmeasured.
+**2. Interop, and therefore requirement 3. Open.** The full matrix this
+vendoring relied on is not reproducible from this repository. Its runner is a
+git submodule outside the published package, and it has not run at our SHA.
+Section 9 records a bounded process/socket proof with strict `noq` 1.3.0 and
+stock iroh 1.3.0. The proof covers four TLS role routes and one application
+stream in each route. It does not run the matrix or discharge requirement 3.
+The matrix still needs `interop/runner/matrix.sh`, Docker,
+`quic-network-simulator` and `tshark`. The upstream tally of ten red cells out
+of 88 and one open is historical. The full matrix at our SHA remains unmeasured.
 
 ## Rules for editing this directory
 

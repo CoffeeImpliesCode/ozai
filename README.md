@@ -17,20 +17,73 @@ from the certificate, moves bytes both ways, and carries ECN over a real socket.
 `test/relay_wire_test.zig` and `test/two_process_test.zig` exercise relay
 forwarding, payload delivery, and independent shutdown on loopback.
 
-External iroh interoperability and node-level 0-RTT remain open. The gossip
-state machines run, and the gossip wire codec is built and tested
+The full iroh matrix, mixed blob/gossip/relay protocol interop, NAT and node-level authenticated 0-RTT remain open.
+This section records a bounded RFC 7250 TLS and stream smoke.
+
+The gossip state machines run, and the gossip wire codec is built and tested
 (`src/gossip/codec.zig` and the six modules under `src/gossip/codec/`, with a
 fuzz target), but the node does not yet call it: a `send_message` the layer
 asks for is counted and its peer named, and nothing is encoded onto the wire.
 
-### Current native gate record
+### RFC 7250 live TLS and stream proof
 
-Direct invocations of the pinned Zig 0.16.0 compiler on native x86-64 Linux.
-The gate entry point does not run in this environment and was not used: its
-`anyzig` shim re-downloads the pinned toolchain and fails to extract it, which
-[`0004`](docs/DECISIONS/0004-vendored-core-contracts.md) records. No global
-tool, sandbox or launcher was repaired, and nothing in the table below is a
-cross-platform, iroh-interoperability or performance result.
+The opt-in process/socket suite passed 5/5 tests over 4/4 steps in Debug and
+ReleaseSafe. One test checks the peer banner and ALPN contract. Four tests cover
+these client/server routes:
+
+- Zig client to strict `noq` 1.3.0 server
+- Zig client to stock iroh 1.3.0 server
+- strict `noq` 1.3.0 client to Zig server
+- stock iroh 1.3.0 client to Zig server
+
+All four routes negotiated `/iroh-gossip/1` and exchanged the exact 17-byte
+`ozai-to-iroh-peer` and `iroh-peer-to-ozai` payloads on one bidirectional
+stream. The direct `noq` path checks the peer pin during TLS. Stock iroh keeps
+its upstream verifier and resolver unchanged. The harness checks the observed
+raw SPKI against the expected pin after the handshake and before application
+bytes.
+
+This proof covers the TLS handshake and one application stream only. It does
+not cover the full upstream matrix, mixed blob/gossip/relay protocols, NAT or
+0-RTT.
+
+Source `~/.local/lib/host-scratch.sh` first. It selects an approved absolute
+scratch root and sets the Zig caches. Do not use `/tmp` or `/var/tmp`. Set
+`ZIG` to the direct Zig 0.16.0 executable. `Cargo.toml` pins `iroh` and `noq`
+to 1.3.0. `Cargo.lock` pins their dependency graph.
+
+```sh
+source ~/.local/lib/host-scratch.sh
+export TMPDIR="$HOST_SCRATCH_ROOT/tmp/ozai-rpk-tmp"
+export CARGO_HOME="$HOST_SCRATCH_ROOT/cache/cargo-home"
+export CARGO_TARGET_DIR="$HOST_SCRATCH_ROOT/scratch/ozai-rpk-rust-target"
+export ZIG=/absolute/path/to/zig-0.16.0/zig
+mkdir -p "$TMPDIR" "$CARGO_HOME" "$CARGO_TARGET_DIR" \
+  "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+
+cargo test --locked --release --manifest-path interop/iroh-peer/Cargo.toml
+cargo build --locked --release --manifest-path interop/iroh-peer/Cargo.toml
+"$ZIG" build test quic-test test-rust-interop -Doptimize=Debug \
+  -Diroh-peer="$CARGO_TARGET_DIR/release/ozai-iroh-peer"
+"$ZIG" build test quic-test test-rust-interop -Doptimize=ReleaseSafe \
+  -Diroh-peer="$CARGO_TARGET_DIR/release/ozai-iroh-peer"
+```
+
+Cargo tests passed 12/12, and the release build had no warnings. Combined
+Debug and ReleaseSafe runs passed 26/26 steps and 1751/1751 tests in each mode.
+The totals were 1180 package tests, 566 vendored-core tests and five interop
+tests. The opt-in `test-rust-interop` target requires `-Diroh-peer`. The normal
+`test` step does not require Rust.
+
+### Historical native gate record (before the RFC 7250 patch)
+
+These direct native x86-64 Linux invocations record an earlier snapshot.
+They predate the RFC 7250 patch and the live interop proof. Their test counts
+are not current. The gate entry point did not run here because its `anyzig`
+shim re-downloads the pinned toolchain and fails to extract it. See
+[`0004`](docs/DECISIONS/0004-vendored-core-contracts.md) for that limitation.
+No global tool, sandbox or launcher was repaired. These are not cross-platform
+or performance results.
 
 | Section | Command | Result |
 |---|---|---|
@@ -44,11 +97,11 @@ cross-platform, iroh-interoperability or performance result.
 | Static analysis | `zwanzig --threads 2` over 42 non-vendored changed files, 21 rules | exit 0; No issues found |
 | Fuzz | `zig build fuzz --fuzz=10000` | exit 0; 21/21 steps; 10/10 targets, at least 10 000 new runs each, no crash |
 
-**1159/1159 tests over 22 build steps** is the current figure, the same in both
-modes. It is **599 package tests — 562 in the main test root plus 37 across
-seven smaller integration and gate steps — and 560 in the separately built
-vendored core** (`zig build quic-test`). No step reported a leak under the
-test allocator.
+**1159/1159 tests over 22 build steps** were the counts for that earlier
+snapshot, the same in both modes. The split was **599 package tests — 562 in
+the main test root plus 37 across seven smaller integration and gate steps —
+and 560 in the separately built vendored core** (`zig build quic-test`). No
+step reported a leak under the test allocator.
 
 The lint run is **0 errors and 24 warnings**, and every warning is under
 `vendor/quic`: 16 `avoid-as` findings and 8 `suppressed-errors` findings on
@@ -92,7 +145,7 @@ consumers exercise ownership, state transitions and decoded wire values,
 not source text or counter percentages.
 
 The 18 build steps, six programs and 50 000 decoder cases per mode are
-separate counts from the native 1159/1159 suite. None is added to that suite.
+separate counts from the historical 1159/1159 native suite. None is added to it.
 
 What each program observed, the same in both modes:
 
@@ -152,9 +205,10 @@ Fetching the working directory itself returned `error.IllegalFileTypeInPackage`.
 The archive follows `build.zig.zon.paths` and excludes local environment and
 cache artifacts. No user environment file was removed to make the fetch pass.
 
-### Current coverage measurement
+### Earlier whole-tree coverage measurement (2026-10-06)
 
-One instrumented run measured this source. `zig build test quic-test
+The instrumented run below measured the earlier source snapshot. It predates
+the RFC 7250 patch. `zig build test quic-test
 -Doptimize=Debug -Dcoverage=true -Dcoverage-rt=<zig-cov-rt.o>` exited 0 at
 22/22 steps and 1159/1159 tests — 599 package tests with their matching
 `ozai-node` children, and 560 in the separately built vendored core, which ran
@@ -178,10 +232,11 @@ These are not branch or path measurements.
 
 **The 2026-10-06 gate-7 measurement and its per-path dispositions are in
 [`docs/COVERAGE-LEDGER.md`](docs/COVERAGE-LEDGER.md).** It re-ran the
-instrumented suite in Debug and ReleaseSafe over the current tree, reports
-19/19 steps and 1171/1171 tests in both, and dispositions every production line
-that is cold in both modes as test, refactor, or accepted-with-a-reason. The
-block above is the earlier record and describes an earlier tree.
+instrumented suite in Debug and ReleaseSafe over the tree measured that day.
+It reports 19/19 steps and 1171/1171 tests in both, and dispositions every
+production line that was cold in both modes as test, refactor, or
+accepted-with-a-reason. It describes that dated snapshot. The block above is
+an earlier record from a different tree.
 
 For added or replaced nonblank, non-comment lines in 74 changed Zig files,
 1 946 have positive attribution, 2 338 have zero attribution, and 1 827 have
@@ -215,9 +270,11 @@ refusal were not forced; injected socket refusals are not kernel evidence.
 
 The cross-platform survey and its toolchain limits are reported by
 `cross-test` below and by
-[`0004`](docs/DECISIONS/0004-vendored-core-contracts.md). No iroh
-interoperability, no performance number and no node-level authenticated
-0-RTT is claimed.
+[`0004`](docs/DECISIONS/0004-vendored-core-contracts.md).
+
+This coverage record does not measure iroh interoperability, performance or
+node-level authenticated 0-RTT. The separate TLS and stream smoke above proves
+only its listed routes. The full matrix remains open.
 
 ### What is built and tested but not yet reachable from a node
 
@@ -284,8 +341,8 @@ and refusals it did not force, and compile-time or fixture attribution gaps.
 CLI refusal guards were separately smoke-tested; no duplicate tests were added
 to inflate counters. Two pre-existing map allocation-fault gaps and their
 triggers are in [`TODO.md`](TODO.md). These historical lists apply only to
-their named runs. The current measurement is under
-[*Current coverage measurement*](#current-coverage-measurement).
+their named runs. The earlier whole-tree measurement is under
+[*Earlier whole-tree coverage measurement*](#earlier-whole-tree-coverage-measurement-2026-10-06).
 
 After the portability fixes, `zig-gate --no-cross --cov` passed all nine local
 sections with zero lint/static findings. Native Debug and ReleaseSafe passed

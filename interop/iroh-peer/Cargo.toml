@@ -11,15 +11,15 @@ name = "ozai-iroh-peer"
 path = "src/main.rs"
 
 [dependencies]
-# `noq` 1.3.0 is the QUIC core, pinned to the exact version `iroh` 1.3.0
-# depends on (`iroh-1.3.0/Cargo.toml:289-292`), driven directly so the TLS
-# configuration in `src/rpk.rs` can be this crate's own. `iroh` itself is here
-# for `--tls iroh`, the stock endpoint whose RFC 7250 requirement is the one
-# recorded deviation. `tls-ring` is what makes `presets::Minimal` exist
-# (`iroh-1.3.0/src/endpoint/presets.rs:59`), and it puts ring in the graph the
-# same way `noq`'s `ring` feature does, so there is one provider throughout.
-# Neither dependency is a range: an interop peer pinned to nothing is an interop
-# peer that drifts.
+# `noq` 1.3.0 is the QUIC core pinned to the exact version `iroh` 1.3.0 depends
+# on (`iroh-1.3.0/Cargo.toml:289-292`), driven directly so `src/rpk.rs` can
+# require strict raw-public-key negotiation in both roles. `iroh` itself remains
+# for `--tls iroh`, the stock endpoint used to prove mutual interop without
+# changing its upstream TLS verifier or resolver. `tls-ring` is what makes
+# `presets::Minimal` exist (`iroh-1.3.0/src/endpoint/presets.rs:59`), and it puts
+# ring in the graph the same way `noq`'s `ring` feature does, so there is one
+# provider throughout. Neither dependency is a range: an interop peer pinned to
+# nothing is an interop peer that drifts.
 iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring"] }
 noq = { version = "=1.3.0", default-features = false, features = [
     "runtime-tokio",

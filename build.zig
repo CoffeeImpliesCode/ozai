@@ -301,6 +301,47 @@ pub fn build(b: *std.Build) void {
     });
     const run_two_process_tests = b.addRunArtifact(two_process_tests);
 
+    // Rust wire interop is opt-in: the caller supplies a prebuilt peer, so the
+    // ordinary `test` step never requires Cargo or a Rust installation.
+    const rust_interop_step = b.step(
+        "test-rust-interop",
+        "Run the Rust peer interop tests (`-Diroh-peer=/absolute/binary`)",
+    );
+    if (b.option(
+        []const u8,
+        "iroh-peer",
+        "Absolute path to a prebuilt ozai-iroh-peer executable",
+    )) |peer_executable| {
+        if (!std.fs.path.isAbsolute(peer_executable)) {
+            const invalid_peer = b.addFail(
+                "-Diroh-peer must be an absolute path to a prebuilt peer executable",
+            );
+            rust_interop_step.dependOn(&invalid_peer.step);
+        } else {
+            const rust_interop_mod = b.createModule(.{
+                .root_source_file = b.path("test/rust_interop_test.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            rust_interop_mod.addImport("ozai", lib_mod);
+            rust_interop_mod.link_libc = true;
+            const peer_test_options = b.addOptions();
+            peer_test_options.addOption([]const u8, "peer_executable", peer_executable);
+            rust_interop_mod.addOptions("peer_test_options", peer_test_options);
+            const rust_interop_tests = b.addTest(.{
+                .root_module = rust_interop_mod,
+                .test_runner = .{ .path = b.path("test/expected_log_runner.zig"), .mode = .server },
+            });
+            const run_rust_interop_tests = b.addRunArtifact(rust_interop_tests);
+            rust_interop_step.dependOn(&run_rust_interop_tests.step);
+        }
+    } else {
+        const missing_peer = b.addFail(
+            "test-rust-interop requires -Diroh-peer=/absolute/binary",
+        );
+        rust_interop_step.dependOn(&missing_peer.step);
+    }
+
     // The relay reached the way a peer reaches one: by a relay URL, over a
     // real socket, against a relay that did not place it. Wired like the four
     // artifacts above and for the same reason — it opens sockets, so it needs

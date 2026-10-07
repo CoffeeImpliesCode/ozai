@@ -1,11 +1,8 @@
 //! The wire contract this peer speaks, and where each item was read from.
 //!
-//! Every constant below is transcribed from a named site in the Zig tree. A
-//! value here that the other implementation does not have is a handshake that
-//! fails for a reason neither side can see, so the sources are named rather
-//! than asserted, and `tests` below pins the two properties that are cheap to
-//! get wrong and invisible when they are wrong: the ALPN spelling and the
-//! length of the certificate.
+//! Constants here pin ALPN spellings and the raw-key SPKI shape. RFC 7250
+//! certificate-type negotiation is documented below and exercised by the
+//! vendored core and live stock iroh interop, not by copied expected bytes.
 //!
 //! # 1. The ALPNs
 //!
@@ -70,46 +67,32 @@
 //! Certificate message carrying a 44-byte DER blob — which is why the bytes
 //! below are the whole of it and no DER builder is needed.
 //!
-//! # 3. The recorded deviation: RFC 7250 certificate-type negotiation
+//! # 3. RFC 7250 raw-public-key negotiation
 //!
-//! `vendor/quic/VENDORED.md` §1 records the raw-SPKI patch and what was deleted
-//! to make it. It does **not** record RFC 7250, and the vendored TLS does not
-//! implement it:
+//! Raw public keys use the 44-byte Ed25519 SPKI above. The TLS certificate-type
+//! values are `X.509 = 0` and `RawPublicKey = 2` (RFC 7250 §3). The ClientHello
+//! offer for each of `client_certificate_type` (19) and
+//! `server_certificate_type` (20) is the one-element vector `[2]`, encoded as
+//! the two bytes `[1, 2]`; EncryptedExtensions selects the offered type with the
+//! one-byte value `[2]`. TLS 1.3 places this selection in EncryptedExtensions,
+//! not in CertificateRequest.
 //!
-//! - `buildClientHello` (`tls13.zig:3812-4053`) writes `supported_versions`,
-//!   `key_share`, `signature_algorithms`, `supported_groups`, `server_name`,
-//!   `application_layer_protocol_negotiation`,
-//!   `quic_transport_parameters`, `psk_key_exchange_modes` and `pre_shared_key`.
-//!   There is no `client_certificate_type` (19) and no `server_certificate_type`
-//!   (20).
-//! - `buildEncryptedExtensionsFromEncoded` (`:4138-4188`) writes ALPN, transport
-//!   parameters and `early_data`. Neither certificate-type extension is echoed.
-//! - `buildCertificateRequest` (`:387-404`) writes `signature_algorithms` and
-//!   nothing else.
-//! - Both extension parsers (`:2813-2900` for the ClientHello, `:3710-3740` for
-//!   EncryptedExtensions) walk unknown `etype` values and skip them, so an
-//!   arriving `certificate_type` is tolerated and ignored.
+//! Rustls 0.23.45 exposes these requirements through
+//! `ServerCertVerifier::requires_raw_public_keys`,
+//! `ResolvesClientCert::only_raw_public_keys`, and
+//! `ResolvesServerCert::only_raw_public_keys`. This peer returns `true` from
+//! each applicable trait method; no verifier or resolver silently accepts an
+//! X.509 certificate or bypasses certificate-type negotiation. The Zig TLS
+//! implementation is raw-SPKI-only, so absent extensions, X.509 selection, and
+//! malformed or duplicate extension encodings are not alternate success paths.
+//! CertificateVerify remains mandatory and is checked as Ed25519 over the
+//! presented key; both sides compare the raw 32-byte node id against the
+//! configured pin.
 //!
-//! iroh 1.3.0 requires it. Its two verifiers return `true` from
-//! `requires_raw_public_keys()` (`iroh-1.3.0/src/tls/verifier.rs:106` and
-//! `:176`) and its certificate resolver returns `true` from
-//! `only_raw_public_keys()` (`iroh-1.3.0/src/tls/resolver.rs:35` and `:52`).
-//! rustls 0.23 then:
-//!
-//! - puts `server_certificate_types = [RawPublicKey]` in the ClientHello
-//!   (`rustls-0.23.45/src/client/hs.rs:358-363`) and **fails the handshake** if
-//!   EncryptedExtensions does not answer `server_certificate_type =
-//!   RawPublicKey` (`client/hs.rs:1088-1103`, reached from `client/tls13.rs:517`);
-//! - and fails the handshake on the server side when the ClientHello does not offer
-//!   `client_certificate_types` containing `RawPublicKey`
-//!   (`server/hs.rs:274-288`), because the client verifier requires raw keys.
-//!
-//! **This is the one behaviour that does not interoperate, in both
-//! directions.** `--tls rpk` (the default) is this peer with the *requirement*
-//! removed and nothing else changed: the same `noq` 1.3.0 core, the same
-//! 44-byte SPKI, the same byte-for-byte node-id pins, the same Ed25519
-//! CertificateVerify. `--tls iroh` is stock `iroh::Endpoint` 1.3.0, kept so the
-//! refusal is observable rather than asserted.
+//! The negotiated contract is exercised by the stock live interop in
+//! `test/rust_interop_test.zig` and by the core's RFC 7250 regressions. These
+//! notes record the expected wire behavior rather than copy bytes into a
+//! second, tautological test.
 
 /// `/iroh-gossip/1`. Read from `src/node/node_config.zig:36`.
 pub const ALPN_GOSSIP: &[u8] = b"/iroh-gossip/1";

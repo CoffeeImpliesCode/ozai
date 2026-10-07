@@ -645,10 +645,11 @@ matrix is reproducible only by initialising the submodule and running
   owns `session_ticket` and `ticket_key`, the resumption design is load-bearing
   in a way the fork should not own. See
   [Still open](#still-open-after-m8).
-- **Requirement 3 has to be discharged.** It is discharged against this fork or
-  not at all, because upstream's interop runner is a git submodule outside the
-  published package. Until the matrix is run at our SHA the substrate has never
-  spoken to an implementation that is not its own test suite.
+- **Requirement 3 has to be discharged.** The full matrix remains the evidence
+  needed. Its runner is a git submodule outside the published package. A
+  bounded process/socket proof now covers four TLS role routes and one
+  application stream against strict `noq` and stock iroh 1.3.0. It does not run
+  the matrix or discharge requirement 3. See [Still open](#still-open-after-m8).
 
 ## Correction of 2026-09-30
 
@@ -950,20 +951,29 @@ measurement.
 **2. Interop, and therefore requirement 3. Open.** The matrix this record relied
 on was upstream's, run at `4988228` rather than the pinned commit, and it is
 **not reproducible from this repository**: upstream's runner is a git submodule
-outside `build.zig.zon`'s `.paths`. M8 did not re-run it. Requirement 3 is
-re-established against this fork or not at all.
+outside `build.zig.zon`'s `.paths`. M8 did not re-run it. The full matrix remains
+the evidence needed to discharge requirement 3.
 
 There is a second blocker, independent of the first, and it is about the node
-rather than the package: **the matrix cannot be run here at all.** Of the
-three tools it needs, `tshark` is present and `docker` and
-`quic-network-simulator` are both absent. So this is not a case of a runner
-that could be wired up locally; it needs a machine that has the simulator's
-toolchain.
-*Closes when* the matrix is run against this tree **on a node that has
+rather than the package: **the full matrix still cannot run here.** Of its
+three required tools, `tshark` is present and `docker` and
+`quic-network-simulator` are absent.
+
+**Bounded proof added 2026-10-07.** The opt-in real-process/socket suite passed
+5/5 tests over 4/4 steps in Debug and ReleaseSafe. It covers a banner/ALPN
+contract and four TLS role routes against strict `noq` 1.3.0 and stock iroh
+1.3.0. Each route negotiated `/iroh-gossip/1` and exchanged exact 17-byte
+request and response payloads. The stock iroh verifier and resolver stayed
+unchanged. The harness checked the observed peer SPKI against the expected pin
+after the handshake and before application bytes.
+
+This smoke does not run or replace the matrix. Mixed blob/gossip/relay
+protocols, NAT traversal and node-level 0-RTT remain open.
+*Closes when* the full matrix is run against this tree **on a node that has
 Docker and `quic-network-simulator`** — initialise the submodule outside the
 package, run `interop/runner/matrix.sh`, and record the result against our
-SHA. Until then the honest statement is the one already in this record: ten of
-88 cells red upstream, one open, and ours unmeasured.
+SHA. The upstream record of ten red cells out of 88, one open, is historical.
+The full matrix at our SHA remains unmeasured.
 
 **3. Nothing under `src/` imports `quic`. Closed 2026-09-30, after M8.**
 `src/transport/quic_bridge.zig` closed it: it imports `quic` (`:99`), owns a

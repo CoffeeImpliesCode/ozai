@@ -8,18 +8,18 @@
 //!
 //! # Two TLS modes, and why both exist
 //!
-//! - `--tls rpk` (the default) drives **noq 1.3.0** directly with the TLS
-//!   configuration in [`rpk`]: the 44-byte Ed25519 SPKI presented in both
-//!   directions, a byte-for-byte node-id pin on each side, an Ed25519
-//!   CertificateVerify, and RFC 7250 switched off. noq 1.3.0 is the exact
-//!   version `iroh 1.3.0` pins (`iroh-1.3.0/Cargo.toml:289-292`).
-//! - `--tls iroh` drives **stock `iroh::Endpoint` 1.3.0**, whose rustls
-//!   verifiers require RFC 7250 certificate-type negotiation that the vendored
-//!   Zig core does not implement. It is here so that the refusal is something
-//!   the test observes rather than something this crate asserts.
+//! - `--tls rpk` (the default) drives **noq 1.3.0** directly with the strict
+//!   configuration in [`rpk`]: certificate types 19 and 20 negotiate raw keys,
+//!   the 44-byte Ed25519 SPKI is presented in both directions, each side checks
+//!   the peer's node-id pin, and CertificateVerify proves possession. With
+//!   `--connect`, this same configuration also exercises the client role.
+//! - `--tls iroh` drives **stock `iroh::Endpoint` 1.3.0** in either role. It
+//!   keeps iroh's verifier and resolver unchanged, checks the observed peer
+//!   SPKI against the configured pin after the handshake, then exchanges real
+//!   bidirectional-stream bytes with the Zig peer.
 //!
-//! [`contract`] holds the wire contract both modes are written against, and the
-//! record of what does not interoperate.
+//! [`contract`] holds the negotiated wire contract both modes are written
+//! against.
 //!
 //! # What it prints, and who reads it
 //!
@@ -31,8 +31,8 @@
 //!
 //! ```text
 //! node  <64 hex characters>
-//! listening  <ip>:<port>
-//! progress: dails … (the field list `two_process_progress.zig` requires)
+//! listening  <ip>:<port>    (server) or bound  <ip>:<port>    (client)
+//! progress: dials … (the field list `two_process_progress.zig` requires)
 //! stopped:  …
 //! ```
 //!
@@ -49,20 +49,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use rustls::pki_types::CertificateDer;
 
 use contract::{NODE_ID_LEN, SEED_LEN};
 
-/// The bytes this peer answers with. A constant rather than a flag's value, so
-/// the Zig side has one string to expect and there is no second place to change
-/// it.
+/// The exact payload this peer sends first.
+const QUESTION: &[u8] = b"ozai-to-iroh-peer";
+
+/// The exact payload this peer returns after validating the request.
 const ANSWER: &[u8] = b"iroh-peer-to-ozai";
 
 /// Which TLS configuration to run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tls {
-    /// The deviation-free peer: noq 1.3.0 with this crate's `rpk` module.
+    /// The strict direct noq peer.
     Rpk,
-    /// Stock iroh 1.3.0, RFC 7250 and all.
+    /// Stock iroh 1.3.0, with the upstream verifier unchanged.
     Iroh,
 }
 
@@ -71,10 +73,10 @@ struct Options {
     tls: Tls,
     bind: SocketAddr,
     seed: [u8; SEED_LEN],
-    /// The node id this peer pins its peer to. There is no "any peer" mode:
-    /// a pinless peer proves nothing about who it is talking to, and the Zig
-    /// side always pins.
+    /// The node id this peer must compare with the actual peer certificate.
     expect_peer: [u8; NODE_ID_LEN],
+    /// If present, use a direct client route to connect to this address.
+    connect: Option<SocketAddr>,
     /// How long this peer waits for the things it waits for.
     deadline: Duration,
 }
@@ -172,6 +174,7 @@ fn parse_args() -> Result<Option<Options>> {
     let mut bind: SocketAddr = "127.0.0.1:0".parse().expect("a literal address");
     let mut seed = [0x6Cu8; SEED_LEN];
     let mut expect_peer: Option<[u8; NODE_ID_LEN]> = None;
+    let mut connect: Option<SocketAddr> = None;
     let mut deadline_ms: u64 = 30_000;
 
     let mut args = std::env::args().skip(1);
@@ -196,6 +199,7 @@ fn parse_args() -> Result<Option<Options>> {
                         .context("--expect-peer is not 32 bytes of hex")?,
                 )
             }
+            "--connect" => connect = Some(value()?.parse().context("--connect is not an address")?),
             "--for" => {
                 deadline_ms = value()?
                     .parse()
@@ -204,7 +208,7 @@ fn parse_args() -> Result<Option<Options>> {
             "--help" | "-h" => {
                 println!(
                     "ozai-iroh-peer --bind <ip:port> --tls rpk|iroh --seed-hex <64 hex> \
---expect-peer <64 hex> --for <ms>"
+--expect-peer <64 hex> [--connect <ip:port>] --for <ms>"
                 );
                 return Ok(None);
             }
@@ -216,6 +220,7 @@ fn parse_args() -> Result<Option<Options>> {
         bind,
         seed,
         expect_peer: expect_peer.context("--expect-peer is required")?,
+        connect,
         deadline: Duration::from_millis(deadline_ms),
     }))
 }
@@ -231,17 +236,26 @@ async fn run(options: Options) -> Result<()> {
     );
     let node_id = rpk::node_id_of(&options.seed);
     let node_id_hex = contract::node_id_hex(&node_id);
-    match options.tls {
-        Tls::Rpk => run_noq(&options, &node_id_hex).await,
-        Tls::Iroh => run_iroh(&options, &node_id_hex).await,
+    match (options.tls, options.connect) {
+        (Tls::Rpk, None) => run_noq_server(&options, &node_id_hex).await,
+        (Tls::Rpk, Some(address)) => run_noq_client(&options, &node_id_hex, address).await,
+        (Tls::Iroh, address) => run_iroh(&options, &node_id_hex, address).await,
     }
 }
 
-/// The two banner lines, in the spelling `test/two_process_child.zig` reads:
-/// `value("listening")` for the address and `value("node")` for the identity.
+/// The server banner, with the address that the peer can dial.
 fn announce(node_id_hex: &str, bound: SocketAddr, tls: Tls) {
+    announce_with_address(node_id_hex, "listening", bound, tls);
+}
+
+/// The client banner; its socket is bound but is not listening for connections.
+fn announce_client(node_id_hex: &str, bound: SocketAddr, tls: Tls) {
+    announce_with_address(node_id_hex, "bound", bound, tls);
+}
+
+fn announce_with_address(node_id_hex: &str, address_label: &str, bound: SocketAddr, tls: Tls) {
     println!("node  {node_id_hex}");
-    println!("listening  {bound}");
+    println!("{address_label}  {bound}");
     println!("tls  {tls:?}");
     // One line per protocol, so the Zig side compares this peer's offer against
     // its own constants rather than against a Rust source file it cannot read.
@@ -252,10 +266,8 @@ fn announce(node_id_hex: &str, bound: SocketAddr, tls: Tls) {
     let _ = std::io::stdout().flush();
 }
 
-// ─── noq 1.3.0, RFC 7250 off ──────────────────────────────────────────────
-
-/// One handshake and one byte exchange, on `noq` 1.3.0.
-async fn run_noq(options: &Options, node_id_hex: &str) -> Result<()> {
+/// One server handshake and byte exchange, on `noq` 1.3.0.
+async fn run_noq_server(options: &Options, node_id_hex: &str) -> Result<()> {
     let provider = rpk::provider();
     let quic = noq::crypto::rustls::QuicServerConfig::try_from(
         rpk::server_config(&provider, &options.seed, options.expect_peer)
@@ -264,12 +276,9 @@ async fn run_noq(options: &Options, node_id_hex: &str) -> Result<()> {
     .context("the QUIC server configuration")?;
 
     let mut config = noq::ServerConfig::with_crypto(Arc::new(quic));
-    // Two streams is what this peer uses: one the peer opens and one it opens.
-    // The transport's defaults are far larger and a second peer is not
-    // something this peer has anything to say about.
+    // One bidirectional stream carries this peer's request and response.
     if let Some(transport) = Arc::get_mut(&mut config.transport) {
-        transport.max_concurrent_uni_streams(2_u8.into());
-        transport.max_concurrent_bidi_streams(2_u8.into());
+        transport.max_concurrent_bidi_streams(1_u8.into());
     }
 
     let endpoint = noq::Endpoint::server(config, options.bind).context("the server socket")?;
@@ -279,7 +288,6 @@ async fn run_noq(options: &Options, node_id_hex: &str) -> Result<()> {
     let mut counters = Counters::default();
     counters.attempts += 1;
     counters.print();
-
     let outcome = tokio::time::timeout(
         options.deadline,
         exchange_noq(&endpoint, options.expect_peer, &mut counters),
@@ -289,17 +297,14 @@ async fn run_noq(options: &Options, node_id_hex: &str) -> Result<()> {
     match outcome {
         Ok(Ok((negotiated, peer_node_id))) => {
             println!("{}", counters.report(node_id_hex, &negotiated, &peer_node_id));
-            if counters.received == 0 || counters.sent == 0 {
+            if counters.received != QUESTION.len() as u64 || counters.sent != ANSWER.len() as u64 {
                 bail!(
-                    "a handshake completed but bytes did not cross both ways: {}",
+                    "the bidirectional payload exchange was incomplete: {}",
                     counters.line()
                 );
             }
             Ok(())
         }
-        // The reason goes on the pipe as well as to stderr: the Zig side reads
-        // stdout, and a run that failed with the reason only on stderr is a run
-        // whose failure this peer did not report.
         Ok(Err(err)) => {
             println!("{}", counters.report(node_id_hex, "-", "-"));
             Err(err)
@@ -311,7 +316,57 @@ async fn run_noq(options: &Options, node_id_hex: &str) -> Result<()> {
     }
 }
 
-/// Accept one connection, read one stream, answer on a stream of this peer's own.
+/// One client handshake and byte exchange, on strict `noq` 1.3.0.
+async fn run_noq_client(
+    options: &Options,
+    node_id_hex: &str,
+    address: SocketAddr,
+) -> Result<()> {
+    let provider = rpk::provider();
+    let quic = noq::crypto::rustls::QuicClientConfig::try_from(
+        rpk::client_config(&provider, &options.seed, options.expect_peer)
+            .context("the client TLS configuration")?,
+    )
+    .context("the QUIC client configuration")?;
+    let endpoint = noq::Endpoint::client(options.bind).context("the client socket")?;
+    endpoint.set_default_client_config(noq::ClientConfig::new(Arc::new(quic)));
+    let bound = endpoint.local_addr().context("the bound client address")?;
+    announce_client(node_id_hex, bound, options.tls);
+
+    let mut counters = Counters::default();
+    counters.dials += 1;
+    counters.attempts += 1;
+    counters.print();
+    let outcome = tokio::time::timeout(
+        options.deadline,
+        exchange_noq_client(&endpoint, address, options.expect_peer, &mut counters),
+    )
+    .await;
+
+    match outcome {
+        Ok(Ok((negotiated, peer_node_id))) => {
+            println!("{}", counters.report(node_id_hex, &negotiated, &peer_node_id));
+            if counters.sent != QUESTION.len() as u64 || counters.received != ANSWER.len() as u64 {
+                bail!(
+                    "the bidirectional payload exchange was incomplete: {}",
+                    counters.line()
+                );
+            }
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            println!("{}", counters.report(node_id_hex, "-", "-"));
+            Err(err)
+        }
+        Err(_elapsed) => {
+            println!("{}", counters.report(node_id_hex, "-", "-"));
+            bail!("no connection within --for; last progress line was {}", counters.line())
+        }
+    }
+}
+
+/// Accept one connection and exchange the exact request and answer on one
+/// bidirectional stream.
 async fn exchange_noq(
     endpoint: &noq::Endpoint,
     expect_peer: [u8; NODE_ID_LEN],
@@ -324,56 +379,110 @@ async fn exchange_noq(
     counters.up += 1;
     counters.print();
 
-    // The peer proved its id inside `verify_client_cert`, which is the mirror of
-    // the Zig server's `ClientAuth.expect_node_id`. noq exposes no accessor for
-    // a peer's key — the Zig core has `peerNodeId()` and noq does not — so the
-    // id this reports is the pin that comparison was made against. Asserting
-    // that it equals what the Zig side saw on its own is the test's job.
-    let peer_node_id = contract::node_id_hex(&expect_peer);
-
-    let mut reader = connection.accept_uni().await.context("accepting a stream")?;
-    // noq's `read_to_end` takes a limit and answers with the bytes, so there is
-    // no buffer here to size wrong.
-    let received = reader.read_to_end(4096).await.context("reading")?;
+    let peer_node_id = observed_peer_node_id(connection.peer_identity(), &expect_peer)?;
+    let negotiated = noq_alpn(&connection)?;
+    let (mut writer, mut reader) = connection.accept_bi().await.context("accepting a stream")?;
+    let received = reader.read_to_end(4096).await.context("reading the request")?;
     counters.received = received.len() as u64;
     counters.print();
+    if received.as_slice() != QUESTION {
+        bail!("the client sent unexpected request bytes: {received:?}");
+    }
 
-    let mut writer = connection.open_uni().await.context("opening a stream")?;
-    writer.write_all(ANSWER).await.context("writing")?;
+    writer.write_all(ANSWER).await.context("writing the answer")?;
     writer.finish().context("finishing the stream")?;
+    if let Some(code) = writer.stopped().await.context("waiting for answer delivery")? {
+        bail!("the peer stopped the answer stream with code {code}");
+    }
     counters.sent = ANSWER.len() as u64;
     counters.print();
+    Ok((negotiated, peer_node_id))
+}
 
-    // The exchange is over. The connection is dropped here rather than awaited:
-    // noq's `closed()` answers with the peer's close *reason* rather than with a
-    // `Result`, and a peer that read a reason as a failure would report a clean
-    // shutdown as an error. What the Zig side compares is the bytes, so nothing
-    // here waits for a close in order to report it.
+/// Connect to a Zig endpoint and exchange the exact request and answer on one
+/// bidirectional stream.
+async fn exchange_noq_client(
+    endpoint: &noq::Endpoint,
+    address: SocketAddr,
+    expect_peer: [u8; NODE_ID_LEN],
+    counters: &mut Counters,
+) -> Result<(String, String)> {
+    let connecting = endpoint.connect(address, "ozai").context("starting the connection")?;
+    let connection = connecting.await.context("the handshake")?;
+    counters.established += 1;
+    counters.up += 1;
+    counters.print();
 
-    Ok((
-        String::from_utf8_lossy(&received).into_owned(),
-        peer_node_id,
-    ))
+    let peer_node_id = observed_peer_node_id(connection.peer_identity(), &expect_peer)?;
+    let negotiated = noq_alpn(&connection)?;
+    let (mut writer, mut reader) = connection.open_bi().await.context("opening a stream")?;
+    writer.write_all(QUESTION).await.context("writing the request")?;
+    writer.finish().context("finishing the request")?;
+    counters.sent = QUESTION.len() as u64;
+    counters.print();
+
+    let received = reader.read_to_end(4096).await.context("reading the answer")?;
+    counters.received = received.len() as u64;
+    counters.print();
+    if received.as_slice() != ANSWER {
+        bail!("the server sent unexpected answer bytes: {received:?}");
+    }
+    Ok((negotiated, peer_node_id))
+}
+
+/// Read the actual certificate carried by a Rustls-backed connection, then
+/// compare the observed SPKI node id with the configured pin.
+fn observed_peer_node_id(
+    identity: Option<Box<dyn std::any::Any>>,
+    expected: &[u8; NODE_ID_LEN],
+) -> Result<String> {
+    let identity = identity.context("the TLS connection exposed no peer identity")?;
+    let certificates = identity
+        .downcast_ref::<Vec<CertificateDer<'static>>>()
+        .context("the TLS connection exposed an unexpected peer identity type")?;
+    if certificates.len() != 1 {
+        bail!(
+            "the peer identity must contain exactly one raw SPKI, got {} certificates",
+            certificates.len()
+        );
+    }
+    let presented = contract::lift_node_id(certificates[0].as_ref())
+        .context("the peer identity is not the supported 44-byte Ed25519 SPKI")?;
+    if !contract::same_node_id(&presented, expected) {
+        bail!(
+            "the observed peer node id {} did not match the configured pin {}",
+            contract::node_id_hex(&presented),
+            contract::node_id_hex(expected)
+        );
+    }
+    Ok(contract::node_id_hex(&presented))
+}
+
+/// Read the negotiated ALPN from noq's Rustls handshake data.
+fn noq_alpn(connection: &noq::Connection) -> Result<String> {
+    let handshake = connection
+        .handshake_data()
+        .context("the handshake exposed no negotiated data")?;
+    let data = handshake
+        .downcast::<noq::crypto::rustls::HandshakeData>()
+        .map_err(|_| anyhow::anyhow!("the handshake exposed an unexpected data type"))?;
+    let protocol = data.protocol.context("the handshake selected no ALPN")?;
+    String::from_utf8(protocol).context("the negotiated ALPN is not UTF-8")
 }
 
 // ─── stock iroh 1.3.0 ─────────────────────────────────────────────────────
 
-/// The same exchange on `iroh::Endpoint`, with iroh's own TLS.
+/// The same exchange on stock `iroh::Endpoint`, with iroh's own TLS.
 ///
-/// This mode is here to be observed failing. Its rustls verifiers require RFC
-/// 7250 certificate-type negotiation (`iroh-1.3.0/src/tls/verifier.rs:106`,
-/// `:176`; `resolver.rs:35`, `:52`), which the vendored Zig core neither offers
-/// nor answers, so a run in this mode ends at EncryptedExtensions with rustls'
-/// `PeerIncompatible::IncorrectCertificateTypeExtension`. A run in which it
-/// succeeds is a change in iroh's TLS and would make `contract`'s record wrong.
-///
-/// iroh 1.3.0 also exposes no accessor for an accepted connection's peer node
-/// id — `remote_node_id` appears only in commented-out lines of its own tests
-/// (`iroh-1.3.0/src/endpoint.rs:2570`, `:2671`) — and its
-/// `ClientCertificateVerifier::verify_client_cert` accepts any key it is given
-/// (`verifier.rs:137-140`), so the client identity is proved but never named.
-/// Both facts are why the report below says `-` for the peer.
-async fn run_iroh(options: &Options, node_id_hex: &str) -> Result<()> {
+/// The upstream certificate verifier is left unchanged. This stock mode checks
+/// the actual peer certificate exposed by the completed connection against the
+/// configured pin before reading application bytes; the direct `noq` mode
+/// additionally enforces that pin inside its TLS verifier.
+async fn run_iroh(
+    options: &Options,
+    node_id_hex: &str,
+    connect: Option<SocketAddr>,
+) -> Result<()> {
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(iroh::SecretKey::from_bytes(&options.seed))
         .alpns(contract::ALPN_OFFERED.iter().map(|alpn| alpn.to_vec()).collect())
@@ -389,22 +498,41 @@ async fn run_iroh(options: &Options, node_id_hex: &str) -> Result<()> {
         .next()
         .copied()
         .context("the address iroh bound")?;
-    announce(node_id_hex, bound, options.tls);
+    if connect.is_some() {
+        announce_client(node_id_hex, bound, options.tls);
+    } else {
+        announce(node_id_hex, bound, options.tls);
+    }
 
     let mut counters = Counters::default();
+    if connect.is_some() {
+        counters.dials += 1;
+    }
     counters.attempts += 1;
     counters.print();
-
-    let outcome =
-        tokio::time::timeout(options.deadline, exchange_iroh(&endpoint, &mut counters)).await;
+    let outcome = tokio::time::timeout(options.deadline, async {
+        match connect {
+            Some(address) => {
+                exchange_iroh_client(&endpoint, address, options.expect_peer, &mut counters).await
+            }
+            None => exchange_iroh_server(&endpoint, options.expect_peer, &mut counters).await,
+        }
+    })
+    .await;
     match outcome {
-        Ok(Ok(negotiated)) => {
-            println!("{}", counters.report(node_id_hex, &negotiated, "-"));
+        Ok(Ok((negotiated, peer_node_id))) => {
+            println!("{}", counters.report(node_id_hex, &negotiated, &peer_node_id));
+            if counters.received != QUESTION.len() as u64 || counters.sent != ANSWER.len() as u64 {
+                bail!(
+                    "the bidirectional payload exchange was incomplete: {}",
+                    counters.line()
+                );
+            }
             Ok(())
         }
         Ok(Err(err)) => {
             println!("{}", counters.report(node_id_hex, "-", "-"));
-            Err(err).context("the iroh handshake")
+            Err(err).context("the iroh handshake or exchange")
         }
         Err(_elapsed) => {
             println!("{}", counters.report(node_id_hex, "-", "-"));
@@ -413,10 +541,11 @@ async fn run_iroh(options: &Options, node_id_hex: &str) -> Result<()> {
     }
 }
 
-async fn exchange_iroh(
+async fn exchange_iroh_server(
     endpoint: &iroh::Endpoint,
+    expect_peer: [u8; NODE_ID_LEN],
     counters: &mut Counters,
-) -> Result<String> {
+) -> Result<(String, String)> {
     let incoming = endpoint.accept().await.context("accepting a connection")?;
     let connection = incoming.await.context("the handshake")?;
     counters.accepted += 1;
@@ -424,20 +553,62 @@ async fn exchange_iroh(
     counters.up += 1;
     counters.print();
 
-    let mut reader = connection.accept_uni().await.context("accepting a stream")?;
-    let received = reader.read_to_end(4096).await.context("reading")?;
+    let peer_node_id = observed_peer_node_id(connection.peer_identity(), &expect_peer)?;
+    let negotiated = String::from_utf8(connection.alpn().to_vec())
+        .context("the negotiated ALPN is not UTF-8")?;
+    let (mut writer, mut reader) = connection.accept_bi().await.context("accepting a stream")?;
+    let received = reader.read_to_end(4096).await.context("reading the request")?;
     counters.received = received.len() as u64;
     counters.print();
+    if received.as_slice() != QUESTION {
+        bail!("the client sent unexpected request bytes: {received:?}");
+    }
 
-    let mut writer = connection.open_uni().await.context("opening a stream")?;
-    writer.write_all(ANSWER).await.context("writing")?;
+    writer.write_all(ANSWER).await.context("writing the answer")?;
     writer.finish().context("finishing the stream")?;
+    if let Some(code) = writer.stopped().await.context("waiting for answer delivery")? {
+        bail!("the peer stopped the answer stream with code {code}");
+    }
     counters.sent = ANSWER.len() as u64;
     counters.print();
+    Ok((negotiated, peer_node_id))
+}
 
-    // The same reasoning as `exchange_noq`: the exchange is over and the
-    // connection is dropped rather than awaited.
-    Ok(String::from_utf8_lossy(connection.alpn()).into_owned())
+/// Dial one explicit direct address with stock iroh and exchange both payloads.
+async fn exchange_iroh_client(
+    endpoint: &iroh::Endpoint,
+    address: SocketAddr,
+    expect_peer: [u8; NODE_ID_LEN],
+    counters: &mut Counters,
+) -> Result<(String, String)> {
+    let peer_id = iroh::EndpointId::from_bytes(&expect_peer).context("the expected peer id")?;
+    let peer_addr = iroh::EndpointAddr::new(peer_id).with_ip_addr(address);
+    let connection = endpoint
+        .connect(peer_addr, contract::ALPN_GOSSIP)
+        .await
+        .context("the handshake")?;
+    counters.established += 1;
+    counters.up += 1;
+    counters.print();
+
+    let peer_node_id = observed_peer_node_id(connection.peer_identity(), &expect_peer)?;
+    let negotiated = String::from_utf8(connection.alpn().to_vec())
+        .context("the negotiated ALPN is not UTF-8")?;
+    let (mut writer, mut reader) = connection.open_bi().await.context("opening a stream")?;
+    writer.write_all(QUESTION).await.context("writing the request")?;
+    writer.finish().context("finishing the request")?;
+    counters.sent = QUESTION.len() as u64;
+    counters.print();
+
+    // Reading the answer to FIN proves that the peer received and checked the
+    // finished request before the endpoint is dropped.
+    let received = reader.read_to_end(4096).await.context("reading the answer")?;
+    counters.received = received.len() as u64;
+    counters.print();
+    if received.as_slice() != ANSWER {
+        bail!("the server sent unexpected answer bytes: {received:?}");
+    }
+    Ok((negotiated, peer_node_id))
 }
 
 #[cfg(test)]

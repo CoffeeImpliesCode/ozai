@@ -607,3 +607,32 @@ this ledger.
   declaration with no code behind it.
 - **The portable root, the vendored core and the fuzz targets are outside
   these runs** (§1). No coverage claim is made about them here.
+
+## 8. Scoped RFC 7250 coverage follow-up
+
+Date: 2026-10-07. Source base: `6dc7986a` plus the uncommitted issue #1 RFC
+7250 patch and the SNI-capacity guard with its boundary regression. The helper
+range remained unchanged after these reports.
+
+Focused coverage ran six tests in each mode. Both modes reported 3/3 steps and
+6/6 tests. For `vendor/quic/src/quic/tls13.zig:4414-4452`, inferred source-line
+attribution was 27/27 in Debug and 25/25 in ReleaseSafe. The reports are
+`/tmp/scratch/ozai-rpk-coverage/reviewed-debug.json` and
+`/tmp/scratch/ozai-rpk-coverage/reviewed-release-safe.json`.
+
+The helper range has no cold attributed lines in either report. The new
+capacity guard at `vendor/quic/src/quic/tls13.zig:4027` has six Debug and four
+ReleaseSafe attributed hits. Its boundary regression returns `InternalError`
+for an oversized SNI and emits a 4096-byte ClientHello at the adjacent fit.
+That behavior is independent of the line counts.
+
+These are inferred attributions over instrumented blocks. They are not branch,
+path or whole-TLS coverage.
+
+**Accepted unmeasured negative guards.** The certificate send and receive
+guards require successful certificate-type negotiation. A correctly ordered
+handshake reaches those states only after both offers and selections pass.
+The core suite exercises the valid transitions. This note does not claim that
+invalid message ordering or all negative TLS paths were measured.
+
+This scoped addendum does not refresh the broader whole-tree ledger above.

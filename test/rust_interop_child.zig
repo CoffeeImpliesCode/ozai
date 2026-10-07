@@ -32,17 +32,11 @@ const ozai = @import("ozai");
 const progress_ns = @import("two_process_progress.zig");
 const peer_options = @import("peer_test_options");
 
-/// The peer binary this build emitted.
+/// The prebuilt peer binary supplied by `-Diroh-peer`.
 ///
-/// It arrives through the options module rather than a path written here, for
-/// the reason `two_process_launch.zig:22-38` gives: a path written in a test
-/// names whatever a plain `zig build` last left in `zig-out/bin`, which under
-/// `cross-test` is a host binary for a different ABI. The emitted path and its
-/// options dependency select and build that exact child.
+/// The optional interop step runs this explicit executable without making the
+/// ordinary test graph depend on Cargo or a Rust installation.
 pub const peer_executable = peer_options.peer_executable;
-
-/// No peers, for a peer that is only going to be dialled.
-const no_extras: []const []const u8 = &.{};
 
 /// What the peer is started with.
 ///
@@ -52,20 +46,19 @@ const no_extras: []const []const u8 = &.{};
 /// other is running: the Zig side knows its own from the seed it was given, and
 /// reads the peer's from the peer's banner.
 pub const Plan = struct {
-    /// `--tls`: `rpk` for the deviation-free noq peer, `iroh` for the stock
-    /// iroh endpoint. See `interop/iroh-peer/src/contract.rs`.
+    /// `--tls`: `rpk` for the strict direct noq peer, `iroh` for stock iroh.
+    /// Both configurations negotiate raw public keys.
     tls: []const u8 = "rpk",
     /// `--seed-hex`: 64 hex characters, the peer's Ed25519 seed.
     seed_hex: []const u8,
-    /// `--expect-peer`: 64 hex characters, the node id the peer must see.
+    /// `--expect-peer`: the node id this peer must compare with the raw key.
     expect_peer_hex: []const u8,
-    /// `--for`, in milliseconds. Bounds a runaway child; it is never what ends
-    /// a correct run, which is why every wait in the test is on an observed
-    /// counter instead.
+    /// Optional address of a Zig endpoint; set to make Rust initiate the QUIC
+    /// connection rather than wait as a server.
+    connect_address: ?ozai.SocketAddr = null,
+    /// `--for`, in milliseconds, bounds the child without ending a successful
+    /// exchange.
     run_ms: i64,
-    /// Flags appended as written, for a command line that is meant to be refused
-    /// and has no field above.
-    extra: []const []const u8 = no_extras,
 };
 
 /// The command line for one peer.
@@ -82,7 +75,10 @@ pub fn flags(arena: std.mem.Allocator, plan: Plan) ![]const []const u8 {
     try argv.append(arena, plan.expect_peer_hex);
     try argv.append(arena, "--for");
     try argv.append(arena, try std.fmt.allocPrint(arena, "{d}", .{plan.run_ms}));
-    try argv.appendSlice(arena, plan.extra);
+    if (plan.connect_address) |address| {
+        try argv.append(arena, "--connect");
+        try argv.append(arena, try std.fmt.allocPrint(arena, "{f}", .{address}));
+    }
     return argv.toOwnedSlice(arena);
 }
 

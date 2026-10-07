@@ -1,39 +1,32 @@
-//! TLS 1.3 over raw Ed25519 keys, with RFC 7250 switched off.
+//! TLS 1.3 over strict RFC 7250 raw Ed25519 public keys.
 //!
-//! This is `iroh-1.3.0/src/tls.rs` with one thing changed and nothing else: the
-//! two verifiers and the certificate resolver answer `false` to
-//! `requires_raw_public_keys()` and `only_raw_public_keys()` where iroh answers
-//! `true` (`iroh-1.3.0/src/tls/verifier.rs:106`, `:176`;
-//! `iroh-1.3.0/src/tls/resolver.rs:35`, `:52`). Everything else is the same
-//! shape as that file and the same shape as the Zig core's `tls13.zig`:
+//! The direct `noq` adapter uses rustls' raw-public-key verifier and resolver
+//! contracts, requiring certificate types 19 and 20 to negotiate
+//! `RawPublicKey`. It presents the same 44-byte SPKI and pins the same 32-byte
+//! node id as the Zig core:
 //!
-//! - the certificate is the 44-byte SPKI over this node's id, presented in
-//!   both directions, with no chain behind it;
-//! - the peer is pinned by comparing those 32 bytes against the id the caller
-//!   expected, which is `expect_peer_node_id` on the client and
-//!   `ClientAuth.expect_node_id` on the server in the Zig core
-//!   (`tls13.zig:1309`, `:335`);
-//! - the CertificateVerify is Ed25519 and is checked against the key the
-//!   certificate carries, which is what makes it a proof of possession rather
-//!   than a claim.
+//! - each peer presents one bare Ed25519 SPKI, with no certificate chain;
+//! - client and server verifiers compare its 32-byte key against the configured
+//!   node-id pin;
+//! - CertificateVerify remains mandatory and is checked as Ed25519 against the
+//!   presented key.
 //!
-//! What switching the flag off changes is one thing on the wire: rustls stops
-//! requiring the `client_certificate_type` (19) and `server_certificate_type`
-//! (20) extensions. The Certificate message carries the same SPKI bytes either
-//! way, because for a raw key that message holds the key and there is nothing
-//! else for it to hold. See `contract` for the full record of why iroh needs
-//! those extensions and the vendored core does not have them.
+//! TLS 1.3 selects the offered certificate type in EncryptedExtensions. There
+//! is no X.509 fallback and no extension bypass in this adapter.
 //!
-//! The two verifiers are `Debug + Send + Sync` value types holding one
+//! The verifiers are `Debug + Send + Sync` value types holding one
 //! `[u8; 32]`, so there is nothing to share and nothing to free.
 
 use std::sync::Arc;
 
-use rustls::client::danger::HandshakeSignatureValid;
-use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms, verify_tls13_signature_with_raw_key};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::ResolvesClientCert;
+use rustls::crypto::{
+    CryptoProvider, WebPkiSupportedAlgorithms, verify_tls13_signature_with_raw_key,
+};
 use rustls::pki_types::{
-    CertificateDer, InvalidSignature, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime,
-    SignatureVerificationAlgorithm, SubjectPublicKeyInfoDer, alg_id,
+    CertificateDer, InvalidSignature, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
+    SignatureVerificationAlgorithm, SubjectPublicKeyInfoDer, UnixTime, alg_id,
 };
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::sign::CertifiedKey;
@@ -129,13 +122,9 @@ fn certified_key(
     }))
 }
 
-/// Presents this peer's SPKI as a server certificate.
-///
-/// `only_raw_public_keys` stays `false`, which is the whole deviation and is what
-/// keeps rustls from putting the certificate-type extensions on the wire. The
-/// resolver is server-only because the peer is: `test/rust_interop_test.zig`
-/// dials it, so `client::ResolvesClientCert` has no caller here and is not
-/// written.
+/// Presents this peer's SPKI as a server certificate and declares that raw
+/// public keys are the only certificate type it supports.
+
 #[derive(Debug)]
 struct SpkiResolver {
     key: Arc<CertifiedKey>,
@@ -144,6 +133,36 @@ struct SpkiResolver {
 impl server::ResolvesServerCert for SpkiResolver {
     fn resolve(&self, _client_hello: server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         Some(Arc::clone(&self.key))
+    }
+
+    fn only_raw_public_keys(&self) -> bool {
+        true
+    }
+}
+
+/// Presents this peer's SPKI when a server requests client authentication.
+#[derive(Debug)]
+struct SpkiClientResolver {
+    key: Arc<CertifiedKey>,
+}
+
+impl ResolvesClientCert for SpkiClientResolver {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        sigschemes
+            .contains(&SignatureScheme::ED25519)
+            .then(|| Arc::clone(&self.key))
+    }
+
+    fn only_raw_public_keys(&self) -> bool {
+        true
+    }
+
+    fn has_certs(&self) -> bool {
+        true
     }
 }
 
@@ -222,6 +241,72 @@ impl ClientCertVerifier for PinnedClient {
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         SUPPORTED.supported_schemes()
     }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
+    }
+}
+
+/// The peer pin on the client side: the server's certificate must carry
+/// `expected`.
+#[derive(Debug)]
+struct PinnedServer {
+    expected: [u8; contract::NODE_ID_LEN],
+}
+
+impl ServerCertVerifier for PinnedServer {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        if !intermediates.is_empty() {
+            return Err(TlsError::InvalidCertificate(CertificateError::UnknownIssuer));
+        }
+        let Some(presented) = contract::lift_node_id(end_entity.as_ref()) else {
+            return Err(TlsError::InvalidCertificate(CertificateError::BadEncoding));
+        };
+        if !contract::same_node_id(&presented, &self.expected) {
+            return Err(TlsError::InvalidCertificate(CertificateError::UnknownIssuer));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Err(TlsError::PeerIncompatible(
+            rustls::PeerIncompatible::Tls12NotOffered,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        verify_tls13_signature_with_raw_key(
+            message,
+            &SubjectPublicKeyInfoDer::from(cert.as_ref()),
+            dss,
+            &SUPPORTED,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        SUPPORTED.supported_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
+    }
 }
 
 /// The one crypto provider both configurations are built with.
@@ -233,6 +318,27 @@ impl ClientCertVerifier for PinnedClient {
 /// keeps one provider in the graph, so noq-proto's and rustls' agree.
 pub fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// A client configuration that presents this peer's SPKI and pins `peer`.
+pub fn client_config(
+    provider: &Arc<CryptoProvider>,
+    seed: &[u8; contract::SEED_LEN],
+    peer: [u8; contract::NODE_ID_LEN],
+) -> Result<rustls::ClientConfig, TlsError> {
+    let resolver = SpkiClientResolver {
+        key: certified_key(provider, seed)?,
+    };
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(provider))
+        .with_protocol_versions(PROTOCOL_VERSIONS)?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedServer { expected: peer }))
+        .with_client_cert_resolver(Arc::new(resolver));
+    config.alpn_protocols = contract::ALPN_OFFERED
+        .iter()
+        .map(|alpn| alpn.to_vec())
+        .collect();
+    Ok(config)
 }
 
 /// A server configuration that presents this peer's SPKI and pins `peer`.
@@ -293,18 +399,6 @@ mod tests {
         assert_eq!(key.cert[0].as_ref().len(), contract::SPKI_LEN);
     }
 
-    /// The server configuration builds and offers no 0-RTT.
-    #[test]
-    fn the_server_configuration_builds() {
-        let provider = provider();
-        let seed = [0x51u8; contract::SEED_LEN];
-        let peer = [0x63u8; contract::NODE_ID_LEN];
-
-        let server = server_config(&provider, &seed, peer).expect("server config");
-        assert_eq!(server.max_early_data_size, 0);
-    }
-
-
     /// The server pin is the same comparison the other way.
     #[test]
     fn the_server_pin_refuses_another_node() {
@@ -326,6 +420,33 @@ mod tests {
                 .verify_client_cert(&certificate, &[], UnixTime::now())
                 .is_ok(),
             "the pinned node's own certificate must be accepted"
+        );
+    }
+
+    /// The client pin refuses another server and permits only the pinned SPKI.
+    #[test]
+    fn the_client_pin_refuses_another_node() {
+        let pinned = PinnedServer {
+            expected: [0x31u8; contract::NODE_ID_LEN],
+        };
+        let name = ServerName::try_from("ozai").expect("test server name");
+        let stranger = CertificateDer::from(
+            contract::spki(&[0x32u8; contract::NODE_ID_LEN]).to_vec(),
+        );
+        assert!(
+            pinned
+                .verify_server_cert(&stranger, &[], &name, &[], UnixTime::now())
+                .is_err(),
+            "a server certificate carrying another key must be refused"
+        );
+        let mine = CertificateDer::from(
+            contract::spki(&[0x31u8; contract::NODE_ID_LEN]).to_vec(),
+        );
+        assert!(
+            pinned
+                .verify_server_cert(&mine, &[], &name, &[], UnixTime::now())
+                .is_ok(),
+            "the pinned server's own certificate must be accepted"
         );
     }
 }

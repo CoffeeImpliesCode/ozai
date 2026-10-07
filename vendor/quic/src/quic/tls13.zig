@@ -1755,6 +1755,14 @@ pub const Tls13Handshake = struct {
     /// Client: how we sign our CertificateVerify; null sends an empty
     /// Certificate.
     client_sig_scheme: ?tls.SignatureScheme = null,
+    /// True when RawPublicKey (type 2) is the only server-certificate format
+    /// this handshake can use: after validating the peer offer on the server,
+    /// or the selection in EncryptedExtensions on the client.
+    server_certificate_type_negotiated: bool,
+    /// True when RawPublicKey (type 2) is the only client-certificate format
+    /// this handshake can use: after validating the peer offer on the server,
+    /// or the selection in EncryptedExtensions on the client.
+    client_certificate_type_negotiated: bool,
 
     /// Server: the client-auth policy in force, from the selected
     /// certificate entry or `config.client_auth`.
@@ -1967,6 +1975,8 @@ pub const Tls13Handshake = struct {
         self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
         self.certificate_requested = false;
+        self.server_certificate_type_negotiated = false;
+        self.client_certificate_type_negotiated = false;
         self.client_sig_scheme = null;
         self.client_auth = null;
         self.peer_cert = null;
@@ -2073,6 +2083,8 @@ pub const Tls13Handshake = struct {
         self.negotiated_cipher_suite = .aes_128_gcm_sha256;
         self.using_psk = false;
         self.certificate_requested = false;
+        self.server_certificate_type_negotiated = false;
+        self.client_certificate_type_negotiated = false;
         self.client_sig_scheme = null;
         self.client_auth = null;
         self.peer_cert = null;
@@ -2524,6 +2536,7 @@ pub const Tls13Handshake = struct {
         // edge does — `cdn.moq.dev` failed at this message — and refusing it
         // ends the handshake over a request we are allowed to decline.
         if (msg[0] == @intFromEnum(tls.HandshakeType.certificate_request)) {
+            if (!self.client_certificate_type_negotiated) return error.MissingExtension;
             if (self.certificate_requested) return error.UnexpectedMessage;
             const offered = parseCertificateRequest(msg[4..]) catch |err| return switch (err) {
                 error.MissingExtension => error.MissingExtension,
@@ -2537,6 +2550,7 @@ pub const Tls13Handshake = struct {
         }
 
         if (msg[0] != @intFromEnum(tls.HandshakeType.certificate)) return error.UnexpectedMessage;
+        if (!self.server_certificate_type_negotiated) return error.MissingExtension;
 
         const body = msg[4..];
         if (body.len < 4) return error.DecodeError;
@@ -2672,6 +2686,9 @@ pub const Tls13Handshake = struct {
     }
 
     fn clientSendFinished(self: *Tls13Handshake, random: std.Random) !Action {
+        if (self.certificate_requested and !self.client_certificate_type_negotiated) {
+            return error.MissingExtension;
+        }
         var pos: usize = 0;
 
         // RFC 8446 4.4.2: having been asked, the client answers with its
@@ -2802,26 +2819,36 @@ pub const Tls13Handshake = struct {
         pos += cm_len;
 
         // Extensions
-        if (pos + 2 > body.len) return error.DecodeError;
+        if (body.len - pos < 2) return error.DecodeError;
         const ext_len = readU16(body[pos..]);
         pos += 2;
+        if (ext_len != body.len - pos) return error.DecodeError;
 
         var found_key_share = false;
+        var found_client_certificate_type = false;
+        var found_server_certificate_type = false;
         var sni: ?[]const u8 = null;
         var sig_algs: ?[]const u8 = null;
         var psk_ext_offset: ?usize = null; // offset into ext_data where PSK extension starts
         var psk_ext_len: usize = 0;
         var ext_pos: usize = 0;
-        const ext_data = body[pos..][0..@min(ext_len, body.len - pos)];
-        while (ext_pos + 4 <= ext_data.len) {
+        const ext_data = body[pos..];
+        while (ext_pos < ext_data.len) {
+            if (ext_data.len - ext_pos < 4) return error.DecodeError;
             const etype = readU16(ext_data[ext_pos..]);
-            ext_pos += 2;
-            const elen = readU16(ext_data[ext_pos..]);
-            ext_pos += 2;
+            const elen = readU16(ext_data[ext_pos + 2 ..]);
+            ext_pos += 4;
+            if (elen > ext_data.len - ext_pos) return error.DecodeError;
 
-            if (ext_pos + elen > ext_data.len) break;
-
-            if (etype == @intFromEnum(tls.ExtensionType.key_share)) {
+            if (etype == extension_client_certificate_type) {
+                if (found_client_certificate_type) return error.IllegalParameter;
+                try requireRawPublicKeyCertificateTypeOffer(ext_data[ext_pos..][0..elen]);
+                found_client_certificate_type = true;
+            } else if (etype == extension_server_certificate_type) {
+                if (found_server_certificate_type) return error.IllegalParameter;
+                try requireRawPublicKeyCertificateTypeOffer(ext_data[ext_pos..][0..elen]);
+                found_server_certificate_type = true;
+            } else if (etype == @intFromEnum(tls.ExtensionType.key_share)) {
                 // client_shares_len(2) + [named_group(2) + key_len(2) + key(...)]
                 // Prefer X25519, fall back to secp256r1 (P-256)
                 if (elen >= 2) {
@@ -2900,7 +2927,11 @@ pub const Tls13Handshake = struct {
             ext_pos += elen;
         }
 
+        if (!found_client_certificate_type or !found_server_certificate_type) {
+            return error.MissingExtension;
+        }
         if (!found_key_share) return error.NoKeyShare;
+
         // The connection-wide policy, unless the entry the SNI selected names
         // one of its own. An entry that names none inherits what the
         // connection set: a statement about which certificate is served is
@@ -2941,6 +2972,10 @@ pub const Tls13Handshake = struct {
                 return error.HandshakeFailure;
         }
 
+        // Both certificate directions select RawPublicKey because neither
+        // offers an X.509 identity or a parser for one.
+        self.server_certificate_type_negotiated = true;
+        self.client_certificate_type_negotiated = true;
         // Update transcript with ClientHello
         self.transcript.update(msg);
 
@@ -3042,6 +3077,9 @@ pub const Tls13Handshake = struct {
     }
 
     fn serverBuildEncryptedExtensions(self: *Tls13Handshake) !Action {
+        if (!self.server_certificate_type_negotiated or !self.client_certificate_type_negotiated) {
+            return error.MissingExtension;
+        }
         var buf: [1024]u8 = undefined;
         // RFC 7301 §3.1: exactly the one protocol selected, never our list.
         const selected = [_][]const u8{self.selected_alpn[0..self.selected_alpn_len]};
@@ -3073,6 +3111,7 @@ pub const Tls13Handshake = struct {
     }
 
     fn serverBuildCertificateRequest(self: *Tls13Handshake) !Action {
+        if (!self.client_certificate_type_negotiated) return error.MissingExtension;
         const msg = buildCertificateRequest(&self.out_buf) catch return error.InternalError;
         self.out_len = msg.len;
         self.transcript.update(msg);
@@ -3087,6 +3126,7 @@ pub const Tls13Handshake = struct {
     }
 
     fn serverBuildCertificate(self: *Tls13Handshake) !Action {
+        if (!self.server_certificate_type_negotiated) return error.MissingExtension;
         // Built straight into out_buf: a local of the same size would be a
         // 32 KB stack duplicate of a field we already own.
         const msg = buildCertificate(&self.out_buf, self.server_cert.cert_chain_der) catch return error.InternalError;
@@ -3225,6 +3265,7 @@ pub const Tls13Handshake = struct {
     fn serverProcessClientCertificate(self: *Tls13Handshake) !Action {
         const msg = self.readHandshakeMsg() orelse return .wait_for_data;
         if (msg[0] != @intFromEnum(tls.HandshakeType.certificate)) return error.UnexpectedMessage;
+        if (!self.client_certificate_type_negotiated) return error.MissingExtension;
         const auth = self.client_auth.?;
         // One certificate or none. A client identity is a key, and a key has
         // no issuer to sit under, so a longer list is a peer offering a chain
@@ -3705,18 +3746,29 @@ pub const Tls13Handshake = struct {
     }
 
     fn parseEncryptedExtensions(self: *Tls13Handshake, body: []const u8) !void {
-        if (body.len < 2) return;
+        if (body.len < 2) return error.DecodeError;
         const ext_len = readU16(body[0..]);
+        if (ext_len != body.len - 2) return error.DecodeError;
+        const ext_data = body[2..];
         var ext_pos: usize = 0;
-        const ext_data = body[2..][0..@min(ext_len, body.len - 2)];
-        while (ext_pos + 4 <= ext_data.len) {
+        var found_client_certificate_type = false;
+        var found_server_certificate_type = false;
+        while (ext_pos < ext_data.len) {
+            if (ext_data.len - ext_pos < 4) return error.DecodeError;
             const etype = readU16(ext_data[ext_pos..]);
-            ext_pos += 2;
-            const elen = readU16(ext_data[ext_pos..]);
-            ext_pos += 2;
-            if (ext_pos + elen > ext_data.len) break;
+            const elen = readU16(ext_data[ext_pos + 2 ..]);
+            ext_pos += 4;
+            if (elen > ext_data.len - ext_pos) return error.DecodeError;
 
-            if (etype == @intFromEnum(tls.ExtensionType.quic_transport_parameters)) {
+            if (etype == extension_client_certificate_type) {
+                if (found_client_certificate_type) return error.IllegalParameter;
+                try requireRawPublicKeyCertificateTypeSelection(ext_data[ext_pos..][0..elen]);
+                found_client_certificate_type = true;
+            } else if (etype == extension_server_certificate_type) {
+                if (found_server_certificate_type) return error.IllegalParameter;
+                try requireRawPublicKeyCertificateTypeSelection(ext_data[ext_pos..][0..elen]);
+                found_server_certificate_type = true;
+            } else if (etype == @intFromEnum(tls.ExtensionType.quic_transport_parameters)) {
                 const tp_data = ext_data[ext_pos..][0..elen];
                 self.peer_transport_params = transport_params.TransportParams.decode(tp_data) catch {
                     return error.TransportParameterError;
@@ -3738,6 +3790,11 @@ pub const Tls13Handshake = struct {
             }
             ext_pos += elen;
         }
+        if (!found_client_certificate_type or !found_server_certificate_type) {
+            return error.MissingExtension;
+        }
+        self.server_certificate_type_negotiated = true;
+        self.client_certificate_type_negotiated = true;
     }
 };
 
@@ -3914,6 +3971,9 @@ fn buildClientHello(
     pos += 2;
     writeU16(buf[pos..], @intFromEnum(tls.NamedGroup.secp256r1));
     pos += 2;
+    if (pos > buf.len or buf.len - pos < 12) return error.InternalError;
+    pos = writeRawPublicKeyCertificateTypeOffer(buf, pos, extension_client_certificate_type);
+    pos = writeRawPublicKeyCertificateTypeOffer(buf, pos, extension_server_certificate_type);
 
     // SNI extension
     if (server_name) |sni| {
@@ -3964,6 +4024,7 @@ fn buildClientHello(
     // psk_key_exchange_modes extension (type=45) — always included so
     // servers know we support session tickets and can send NewSessionTicket.
     // modes_list_len(1) + mode(1)=0x01 (psk_dhe_ke)
+    if (!extFits(buf.len, pos, 2)) return error.InternalError;
     pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.psk_key_exchange_modes), 2);
     buf[pos] = 1; // modes list length
     pos += 1;
@@ -4163,6 +4224,9 @@ fn buildEncryptedExtensionsFromEncoded(
             pos += proto.len;
         }
     }
+    if (pos > buf.len or buf.len - pos < 12) return error.InternalError;
+    pos = writeRawPublicKeyCertificateTypeSelection(buf, pos, extension_client_certificate_type);
+    pos = writeRawPublicKeyCertificateTypeSelection(buf, pos, extension_server_certificate_type);
 
     // QUIC transport parameters (pre-encoded)
     pos = writeExtHeader(buf, pos, @intFromEnum(tls.ExtensionType.quic_transport_parameters), tp_encoded_data.len);
@@ -4339,6 +4403,53 @@ fn buildCertificateVerify(
 }
 
 // ─── Utility functions ───────────────────────────────────────────────
+
+/// RFC 7250 certificate-type extensions and the only format this TLS fork uses.
+const extension_client_certificate_type: u16 = 19;
+const extension_server_certificate_type: u16 = 20;
+const certificate_type_raw_public_key: u8 = 2;
+
+/// The offer is a non-empty vector of distinct values and must contain raw SPKI.
+/// Other values are ignored only after the one supported value is found.
+fn requireRawPublicKeyCertificateTypeOffer(
+    data: []const u8,
+) error{ DecodeError, IllegalParameter, HandshakeFailure }!void {
+    if (data.len < 2) return error.DecodeError;
+    const types_len = data[0];
+    if (types_len == 0 or @as(usize, types_len) + 1 != data.len) return error.DecodeError;
+
+    var seen: [32]u8 = .{0} ** 32;
+    var found_raw_public_key = false;
+    for (data[1..]) |certificate_type| {
+        const byte_index: usize = @intCast(certificate_type >> 3);
+        const bit_index: u3 = @truncate(certificate_type & 7);
+        const mask: u8 = @as(u8, 1) << bit_index;
+        if (seen[byte_index] & mask != 0) return error.IllegalParameter;
+        seen[byte_index] |= mask;
+        if (certificate_type == certificate_type_raw_public_key) found_raw_public_key = true;
+    }
+    if (!found_raw_public_key) return error.HandshakeFailure;
+}
+
+fn requireRawPublicKeyCertificateTypeSelection(
+    data: []const u8,
+) error{ DecodeError, IllegalParameter }!void {
+    if (data.len != 1) return error.DecodeError;
+    if (data[0] != certificate_type_raw_public_key) return error.IllegalParameter;
+}
+
+fn writeRawPublicKeyCertificateTypeOffer(buf: []u8, pos: usize, kind: u16) usize {
+    const data_pos = writeExtHeader(buf, pos, kind, 2);
+    buf[data_pos] = 1;
+    buf[data_pos + 1] = certificate_type_raw_public_key;
+    return data_pos + 2;
+}
+
+fn writeRawPublicKeyCertificateTypeSelection(buf: []u8, pos: usize, kind: u16) usize {
+    const data_pos = writeExtHeader(buf, pos, kind, 1);
+    buf[data_pos] = certificate_type_raw_public_key;
+    return data_pos + 1;
+}
 
 fn writeExtHeader(buf: []u8, pos: usize, ext_type: u16, ext_len: usize) usize {
     writeU16(buf[pos..], ext_type);
@@ -5103,7 +5214,13 @@ test "client answers a CertificateRequest with an empty Certificate" {
         .server_name = "localhost",
     }, .{}, entropy.random());
 
-    client.state = .client_wait_certificate;
+    client.state = .client_wait_encrypted_extensions;
+
+    var ee_buf: [512]u8 = undefined;
+    const encrypted_extensions = try buildEncryptedExtensionsFromEncoded(&ee_buf, &.{}, &.{}, false);
+    client.provideData(encrypted_extensions);
+    try std.testing.expect(try client.step(test_now_s, entropy.random()) == ._continue);
+
     client.provideData(&[_]u8{
         0x0d, 0x00, 0x00, 0x1d, // CertificateRequest, 29 bytes
         0x00, // certificate_request_context: empty
@@ -6481,6 +6598,606 @@ fn clientVerdict(hello: []const u8, random: std.Random) ?HandshakeError {
     if (client.step(test_now_s, random)) |_| {} else |err| return err;
     return null;
 }
+const test_client_certificate_type_extension: u16 = 19;
+const test_server_certificate_type_extension: u16 = 20;
+
+const TestHandshakeMessage = struct {
+    bytes: [512]u8 = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const @This()) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+/// Builds a ClientHello whose other required extensions are valid, so these
+/// cases reach certificate-type negotiation rather than an earlier parser.
+fn buildCertificateTypeTestClientHello(
+    client_offer: ?[]const u8,
+    server_offer: ?[]const u8,
+    duplicate_offer: ?u16,
+) TestHandshakeMessage {
+    var hello: TestHandshakeMessage = .{};
+    var pos: usize = 4;
+    hello.bytes[pos] = 0x03;
+    hello.bytes[pos + 1] = 0x03;
+    pos += 2;
+    @memset(hello.bytes[pos..][0..32], 0xa5);
+    pos += 32;
+    hello.bytes[pos] = 0;
+    pos += 1;
+    writeU16(hello.bytes[pos..], 2);
+    pos += 2;
+    writeU16(hello.bytes[pos..], @intFromEnum(tls.CipherSuite.AES_128_GCM_SHA256));
+    pos += 2;
+    hello.bytes[pos] = 1;
+    pos += 1;
+    hello.bytes[pos] = 0;
+    pos += 1;
+
+    const extensions_len_at = pos;
+    pos += 2;
+    const extensions_start = pos;
+
+    var key_share: [38]u8 = undefined;
+    writeU16(&key_share, 36);
+    writeU16(key_share[2..], @intFromEnum(tls.NamedGroup.x25519));
+    writeU16(key_share[4..], 32);
+    // A valid X25519 basepoint keeps accepted offers past ServerHello.
+    @memset(key_share[6..], 0);
+    key_share[6] = 9;
+    pos = writeExtHeader(
+        &hello.bytes,
+        pos,
+        @intFromEnum(tls.ExtensionType.key_share),
+        key_share.len,
+    );
+    @memcpy(hello.bytes[pos..][0..key_share.len], &key_share);
+    pos += key_share.len;
+
+    pos = writeExtHeader(
+        &hello.bytes,
+        pos,
+        @intFromEnum(tls.ExtensionType.quic_transport_parameters),
+        0,
+    );
+    const signature_algorithms = [_]u8{ 0, 2, 4, 3 };
+    pos = writeExtHeader(
+        &hello.bytes,
+        pos,
+        @intFromEnum(tls.ExtensionType.signature_algorithms),
+        signature_algorithms.len,
+    );
+    @memcpy(hello.bytes[pos..][0..signature_algorithms.len], &signature_algorithms);
+    pos += signature_algorithms.len;
+
+    if (client_offer) |offer| {
+        pos = writeExtHeader(&hello.bytes, pos, test_client_certificate_type_extension, offer.len);
+        @memcpy(hello.bytes[pos..][0..offer.len], offer);
+        pos += offer.len;
+        if (duplicate_offer == test_client_certificate_type_extension) {
+            pos = writeExtHeader(&hello.bytes, pos, test_client_certificate_type_extension, offer.len);
+            @memcpy(hello.bytes[pos..][0..offer.len], offer);
+            pos += offer.len;
+        }
+    }
+    if (server_offer) |offer| {
+        pos = writeExtHeader(&hello.bytes, pos, test_server_certificate_type_extension, offer.len);
+        @memcpy(hello.bytes[pos..][0..offer.len], offer);
+        pos += offer.len;
+        if (duplicate_offer == test_server_certificate_type_extension) {
+            pos = writeExtHeader(&hello.bytes, pos, test_server_certificate_type_extension, offer.len);
+            @memcpy(hello.bytes[pos..][0..offer.len], offer);
+            pos += offer.len;
+        }
+    }
+
+    writeU16(hello.bytes[extensions_len_at..], @intCast(pos - extensions_start));
+    hello.bytes[0] = @intFromEnum(tls.HandshakeType.client_hello);
+    const body_len = pos - 4;
+    hello.bytes[1] = @intCast(body_len >> 16);
+    hello.bytes[2] = @intCast(body_len >> 8);
+    hello.bytes[3] = @intCast(body_len);
+    hello.len = pos;
+    return hello;
+}
+
+fn buildCertificateTypeTestEncryptedExtensions(
+    server_selection: ?[]const u8,
+    client_selection: ?[]const u8,
+    duplicate_selection: ?u16,
+) TestHandshakeMessage {
+    var message: TestHandshakeMessage = .{};
+    var pos: usize = 6;
+    const extensions_start = pos;
+    pos = writeExtHeader(
+        &message.bytes,
+        pos,
+        @intFromEnum(tls.ExtensionType.quic_transport_parameters),
+        0,
+    );
+    if (server_selection) |selection| {
+        pos = writeExtHeader(
+            &message.bytes,
+            pos,
+            test_server_certificate_type_extension,
+            selection.len,
+        );
+        @memcpy(message.bytes[pos..][0..selection.len], selection);
+        pos += selection.len;
+        if (duplicate_selection == test_server_certificate_type_extension) {
+            pos = writeExtHeader(
+                &message.bytes,
+                pos,
+                test_server_certificate_type_extension,
+                selection.len,
+            );
+            @memcpy(message.bytes[pos..][0..selection.len], selection);
+            pos += selection.len;
+        }
+    }
+    if (client_selection) |selection| {
+        pos = writeExtHeader(
+            &message.bytes,
+            pos,
+            test_client_certificate_type_extension,
+            selection.len,
+        );
+        @memcpy(message.bytes[pos..][0..selection.len], selection);
+        pos += selection.len;
+        if (duplicate_selection == test_client_certificate_type_extension) {
+            pos = writeExtHeader(
+                &message.bytes,
+                pos,
+                test_client_certificate_type_extension,
+                selection.len,
+            );
+            @memcpy(message.bytes[pos..][0..selection.len], selection);
+            pos += selection.len;
+        }
+    }
+    writeU16(message.bytes[4..], @intCast(pos - extensions_start));
+    message.bytes[0] = @intFromEnum(tls.HandshakeType.encrypted_extensions);
+    const body_len = pos - 4;
+    message.bytes[1] = @intCast(body_len >> 16);
+    message.bytes[2] = @intCast(body_len >> 8);
+    message.bytes[3] = @intCast(body_len);
+    message.len = pos;
+    return message;
+}
+
+fn clientHelloExtension(hello: []const u8, extension_type: u16) ?[]const u8 {
+    if (hello.len < 4 or hello[0] != @intFromEnum(tls.HandshakeType.client_hello)) return null;
+    const body = hello[4..];
+    if (body.len < 35) return null;
+    var pos: usize = 34;
+    const session_id_len = body[pos];
+    pos += 1;
+    if (session_id_len > body.len - pos) return null;
+    pos += session_id_len;
+    if (body.len - pos < 2) return null;
+    const cipher_suites_len = readU16(body[pos..]);
+    pos += 2;
+    if (cipher_suites_len > body.len - pos) return null;
+    pos += cipher_suites_len;
+    if (pos == body.len) return null;
+    const compression_methods_len = body[pos];
+    pos += 1;
+    if (compression_methods_len > body.len - pos) return null;
+    pos += compression_methods_len;
+    if (body.len - pos < 2) return null;
+    const extensions_len = readU16(body[pos..]);
+    pos += 2;
+    if (extensions_len != body.len - pos) return null;
+    const extensions = body[pos..];
+
+    pos = 0;
+    while (pos < extensions.len) {
+        if (extensions.len - pos < 4) return null;
+        const kind = readU16(extensions[pos..]);
+        const ext_len = readU16(extensions[pos + 2 ..]);
+        pos += 4;
+        if (ext_len > extensions.len - pos) return null;
+        if (kind == extension_type) return extensions[pos..][0..ext_len];
+        pos += ext_len;
+    }
+    return null;
+}
+
+fn encryptedExtensionsExtension(message: []const u8, extension_type: u16) ?[]const u8 {
+    if (message.len < 6 or message[0] != @intFromEnum(tls.HandshakeType.encrypted_extensions)) {
+        return null;
+    }
+    const body = message[4..];
+    const extensions_len = readU16(body);
+    if (extensions_len != body.len - 2) return null;
+    const extensions = body[2..];
+    var pos: usize = 0;
+    while (pos < extensions.len) {
+        if (extensions.len - pos < 4) return null;
+        const kind = readU16(extensions[pos..]);
+        const ext_len = readU16(extensions[pos + 2 ..]);
+        pos += 4;
+        if (ext_len > extensions.len - pos) return null;
+        if (kind == extension_type) return extensions[pos..][0..ext_len];
+        pos += ext_len;
+    }
+    return null;
+}
+
+fn clientEncryptedExtensionsVerdict(extensions: []const u8, random: std.Random) ?HandshakeError {
+    var client = Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+    }, .{}, random) catch |err| return err;
+    client.state = .client_wait_encrypted_extensions;
+    client.provideData(extensions);
+    _ = client.step(test_now_s, random) catch |err| return err;
+    return null;
+}
+
+test "RFC 7250 ClientHello offers only raw public key certificate types" {
+    var entropy: Counted = .{};
+    const random = entropy.random();
+    var client = try Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{"h3"},
+    }, .{}, random);
+    const hello = switch (try client.step(test_now_s, random)) {
+        .send_data => |sd| sd.data,
+        else => return error.TestUnexpectedResult,
+    };
+
+    const expected_offer = [_]u8{ 1, 2 };
+    const client_offer = clientHelloExtension(hello, test_client_certificate_type_extension);
+    const server_offer = clientHelloExtension(hello, test_server_certificate_type_extension);
+    try std.testing.expect(client_offer != null);
+    try std.testing.expect(server_offer != null);
+    try std.testing.expectEqualSlices(u8, &expected_offer, client_offer.?);
+    try std.testing.expectEqualSlices(u8, &expected_offer, server_offer.?);
+}
+
+test "RFC 7250 server selects raw public key types in EncryptedExtensions" {
+    var entropy: Counted = .{};
+    const random = entropy.random();
+    var encrypted_extensions_buf: [64]u8 = undefined;
+    const encrypted_extensions = try buildEncryptedExtensionsFromEncoded(
+        &encrypted_extensions_buf,
+        &.{},
+        &.{},
+        false,
+    );
+    const expected_selection = [_]u8{2};
+    const client_selection = encryptedExtensionsExtension(
+        encrypted_extensions,
+        test_client_certificate_type_extension,
+    );
+    const server_selection = encryptedExtensionsExtension(
+        encrypted_extensions,
+        test_server_certificate_type_extension,
+    );
+    try std.testing.expect(client_selection != null);
+    try std.testing.expect(server_selection != null);
+    try std.testing.expectEqualSlices(u8, &expected_selection, client_selection.?);
+    try std.testing.expectEqualSlices(u8, &expected_selection, server_selection.?);
+
+    const declared_extensions_len = readU16(encrypted_extensions_buf[4..]);
+    writeU16(encrypted_extensions_buf[4..], declared_extensions_len - 1);
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.DecodeError),
+        clientEncryptedExtensionsVerdict(encrypted_extensions, random),
+    );
+}
+
+test "RFC 7250 server refuses missing, unsupported, malformed, and duplicate offers" {
+    var entropy: Counted = .{};
+    const random = entropy.random();
+    const raw_offer = [_]u8{ 1, 2 };
+    const x509_only_offer = [_]u8{ 1, 0 };
+    const unknown_only_offer = [_]u8{ 1, 99 };
+    const raw_and_unknown_offer = [_]u8{ 2, 2, 99 };
+    const malformed_offer = [_]u8{ 2, 2 };
+    const duplicate_value_offer = [_]u8{ 2, 2, 2 };
+
+    var hello = buildCertificateTypeTestClientHello(null, &raw_offer, null);
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.MissingExtension),
+        serverVerdict(hello.slice(), random),
+    );
+
+    hello = buildCertificateTypeTestClientHello(&raw_offer, null, null);
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.MissingExtension),
+        serverVerdict(hello.slice(), random),
+    );
+
+    hello = buildCertificateTypeTestClientHello(&x509_only_offer, &raw_offer, null);
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.HandshakeFailure),
+        serverVerdict(hello.slice(), random),
+    );
+    hello = buildCertificateTypeTestClientHello(&raw_offer, &x509_only_offer, null);
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.HandshakeFailure),
+        serverVerdict(hello.slice(), random),
+    );
+    hello = buildCertificateTypeTestClientHello(&unknown_only_offer, &raw_offer, null);
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.HandshakeFailure),
+        serverVerdict(hello.slice(), random),
+    );
+
+    hello = buildCertificateTypeTestClientHello(&raw_and_unknown_offer, &raw_offer, null);
+    try std.testing.expectEqual(@as(?HandshakeError, null), serverVerdict(hello.slice(), random));
+
+    hello = buildCertificateTypeTestClientHello(&malformed_offer, &raw_offer, null);
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.DecodeError),
+        serverVerdict(hello.slice(), random),
+    );
+    hello = buildCertificateTypeTestClientHello(&duplicate_value_offer, &raw_offer, null);
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.IllegalParameter),
+        serverVerdict(hello.slice(), random),
+    );
+    hello = buildCertificateTypeTestClientHello(
+        &raw_offer,
+        &raw_offer,
+        test_client_certificate_type_extension,
+    );
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.IllegalParameter),
+        serverVerdict(hello.slice(), random),
+    );
+    hello = buildCertificateTypeTestClientHello(
+        &raw_offer,
+        &raw_offer,
+        test_server_certificate_type_extension,
+    );
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.IllegalParameter),
+        serverVerdict(hello.slice(), random),
+    );
+}
+
+test "RFC 7250 client requires exactly the raw certificate type selections" {
+    var entropy: Counted = .{};
+    const random = entropy.random();
+    const raw_selection = [_]u8{2};
+    const unsupported_selection = [_]u8{0};
+    const malformed_selection = [_]u8{ 2, 2 };
+
+    var extensions = buildCertificateTypeTestEncryptedExtensions(
+        &raw_selection,
+        &raw_selection,
+        null,
+    );
+    try std.testing.expectEqual(
+        @as(?HandshakeError, null),
+        clientEncryptedExtensionsVerdict(extensions.slice(), random),
+    );
+
+    extensions = buildCertificateTypeTestEncryptedExtensions(null, &raw_selection, null);
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.MissingExtension),
+        clientEncryptedExtensionsVerdict(extensions.slice(), random),
+    );
+    extensions = buildCertificateTypeTestEncryptedExtensions(&raw_selection, null, null);
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.MissingExtension),
+        clientEncryptedExtensionsVerdict(extensions.slice(), random),
+    );
+    extensions = buildCertificateTypeTestEncryptedExtensions(
+        &unsupported_selection,
+        &raw_selection,
+        null,
+    );
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.IllegalParameter),
+        clientEncryptedExtensionsVerdict(extensions.slice(), random),
+    );
+    extensions = buildCertificateTypeTestEncryptedExtensions(
+        &malformed_selection,
+        &raw_selection,
+        null,
+    );
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.DecodeError),
+        clientEncryptedExtensionsVerdict(extensions.slice(), random),
+    );
+    extensions = buildCertificateTypeTestEncryptedExtensions(
+        &raw_selection,
+        &raw_selection,
+        test_server_certificate_type_extension,
+    );
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.IllegalParameter),
+        clientEncryptedExtensionsVerdict(extensions.slice(), random),
+    );
+    extensions = buildCertificateTypeTestEncryptedExtensions(
+        &raw_selection,
+        &raw_selection,
+        test_client_certificate_type_extension,
+    );
+    try std.testing.expectEqual(
+        @as(?HandshakeError, error.IllegalParameter),
+        clientEncryptedExtensionsVerdict(extensions.slice(), random),
+    );
+}
+
+fn expectedCertificateTypeOfferError(data: []const u8) ?HandshakeError {
+    if (data.len < 2) return error.DecodeError;
+    const types_len = data[0];
+    if (types_len == 0 or @as(usize, types_len) + 1 != data.len) return error.DecodeError;
+
+    var found_raw_public_key = false;
+    for (data[1..], 0..) |certificate_type, index| {
+        for (data[1..][0..index]) |previous| {
+            if (certificate_type == previous) return error.IllegalParameter;
+        }
+        if (certificate_type == 2) found_raw_public_key = true;
+    }
+    if (!found_raw_public_key) return error.HandshakeFailure;
+    return null;
+}
+
+fn expectedClientHelloCertificateTypeError(
+    client_offer: ?[]const u8,
+    server_offer: ?[]const u8,
+    duplicate_offer: ?u16,
+) ?HandshakeError {
+    if (client_offer) |offer| {
+        if (expectedCertificateTypeOfferError(offer)) |err| return err;
+        if (duplicate_offer == test_client_certificate_type_extension) return error.IllegalParameter;
+    }
+    if (server_offer) |offer| {
+        if (expectedCertificateTypeOfferError(offer)) |err| return err;
+        if (duplicate_offer == test_server_certificate_type_extension) return error.IllegalParameter;
+    }
+    if (client_offer == null or server_offer == null) return error.MissingExtension;
+    return null;
+}
+
+fn expectedCertificateTypeSelectionError(data: []const u8) ?HandshakeError {
+    if (data.len != 1) return error.DecodeError;
+    if (data[0] != 2) return error.IllegalParameter;
+    return null;
+}
+
+fn expectedEncryptedExtensionsCertificateTypeError(
+    server_selection: ?[]const u8,
+    client_selection: ?[]const u8,
+    duplicate_selection: ?u16,
+) ?HandshakeError {
+    if (server_selection) |selection| {
+        if (expectedCertificateTypeSelectionError(selection)) |err| return err;
+        if (duplicate_selection == test_server_certificate_type_extension) return error.IllegalParameter;
+    }
+    if (client_selection) |selection| {
+        if (expectedCertificateTypeSelectionError(selection)) |err| return err;
+        if (duplicate_selection == test_client_certificate_type_extension) return error.IllegalParameter;
+    }
+    if (server_selection == null or client_selection == null) return error.MissingExtension;
+    return null;
+}
+
+fn parseEncryptedExtensionsTestVerdict(body: []const u8) ?HandshakeError {
+    var parser: Tls13Handshake = undefined;
+    parser.config = .{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &.{},
+    };
+    parser.peer_transport_params = null;
+    parser.zero_rtt_accepted = false;
+    parser.selected_alpn_len = 0;
+    parser.server_certificate_type_negotiated = false;
+    parser.client_certificate_type_negotiated = false;
+    parser.parseEncryptedExtensions(body) catch |err| return err;
+    return null;
+}
+
+test "fuzz raw certificate type negotiation" {
+    try std.testing.fuzz(@as(void, undefined), fuzzRawCertificateTypeNegotiation, .{});
+}
+
+fn fuzzRawCertificateTypeNegotiation(_: void, smith: *std.testing.Smith) !void {
+    var client_values: [8]u8 = undefined;
+    var client_values_len: usize = @intCast(smith.slice(&client_values));
+    if (smith.boolWeighted(1, 2)) {
+        if (client_values_len == 0) client_values_len = 1;
+        client_values[0] = 2;
+    }
+    if (client_values_len > 1 and smith.boolWeighted(1, 2)) {
+        client_values[1] = client_values[0];
+    }
+    var client_offer: [9]u8 = undefined;
+    client_offer[0] = @intCast(client_values_len);
+    @memcpy(client_offer[1..][0..client_values_len], client_values[0..client_values_len]);
+    if (smith.boolWeighted(3, 1)) client_offer[0] = @intCast(client_values_len + 1);
+
+    var server_values: [8]u8 = undefined;
+    var server_values_len: usize = @intCast(smith.slice(&server_values));
+    if (smith.boolWeighted(1, 2)) {
+        if (server_values_len == 0) server_values_len = 1;
+        server_values[0] = 2;
+    }
+    if (server_values_len > 1 and smith.boolWeighted(1, 2)) {
+        server_values[1] = server_values[0];
+    }
+    var server_offer: [9]u8 = undefined;
+    server_offer[0] = @intCast(server_values_len);
+    @memcpy(server_offer[1..][0..server_values_len], server_values[0..server_values_len]);
+    if (smith.boolWeighted(3, 1)) server_offer[0] = @intCast(server_values_len + 1);
+
+    const client_offer_bytes = client_offer[0 .. client_values_len + 1];
+    const server_offer_bytes = server_offer[0 .. server_values_len + 1];
+    const offered_client: ?[]const u8 = if (smith.boolWeighted(1, 2)) null else client_offer_bytes;
+    const offered_server: ?[]const u8 = if (smith.boolWeighted(1, 2)) null else server_offer_bytes;
+    const duplicate_choice = smith.value(u8) % 3;
+    const duplicate_offer: ?u16 = switch (duplicate_choice) {
+        0 => null,
+        1 => test_client_certificate_type_extension,
+        else => test_server_certificate_type_extension,
+    };
+    const hello = buildCertificateTypeTestClientHello(
+        offered_client,
+        offered_server,
+        duplicate_offer,
+    );
+    const expected_hello_error = expectedClientHelloCertificateTypeError(
+        offered_client,
+        offered_server,
+        duplicate_offer,
+    );
+    var entropy: Counted = .{};
+    const random = entropy.random();
+    try std.testing.expectEqual(
+        expected_hello_error,
+        serverVerdict(hello.slice(), random),
+    );
+
+    var server_selection_bytes: [4]u8 = undefined;
+    var server_selection_len: usize = @intCast(smith.slice(&server_selection_bytes));
+    if (smith.boolWeighted(1, 2)) {
+        if (server_selection_len == 0) server_selection_len = 1;
+        server_selection_bytes[0] = 2;
+    }
+    var client_selection_bytes: [4]u8 = undefined;
+    var client_selection_len: usize = @intCast(smith.slice(&client_selection_bytes));
+    if (smith.boolWeighted(1, 2)) {
+        if (client_selection_len == 0) client_selection_len = 1;
+        client_selection_bytes[0] = 2;
+    }
+    const server_selection_body = server_selection_bytes[0..server_selection_len];
+    const client_selection_body = client_selection_bytes[0..client_selection_len];
+    const selected_server: ?[]const u8 =
+        if (smith.boolWeighted(1, 2)) null else server_selection_body;
+    const selected_client: ?[]const u8 =
+        if (smith.boolWeighted(1, 2)) null else client_selection_body;
+    const duplicate_selection_choice = smith.value(u8) % 3;
+    const duplicate_selection: ?u16 = switch (duplicate_selection_choice) {
+        0 => null,
+        1 => test_client_certificate_type_extension,
+        else => test_server_certificate_type_extension,
+    };
+    const extensions = buildCertificateTypeTestEncryptedExtensions(
+        selected_server,
+        selected_client,
+        duplicate_selection,
+    );
+    const expected_extensions_error = expectedEncryptedExtensionsCertificateTypeError(
+        selected_server,
+        selected_client,
+        duplicate_selection,
+    );
+    try std.testing.expectEqual(
+        expected_extensions_error,
+        parseEncryptedExtensionsTestVerdict(extensions.slice()[4..]),
+    );
+}
 
 test "a ClientHello with an invalid legacy session ID is refused" {
     var entropy: Counted = .{};
@@ -7155,6 +7872,42 @@ test "a ticket records the protocol the connection negotiated, not a prefix of i
     try std.testing.expect((try connect(&second, random)) == null);
     try std.testing.expect(second.server.using_psk);
     try std.testing.expectEqualStrings(wide_protocol, second.client.negotiatedAlpn());
+}
+
+test "RFC 7250 ClientHello capacity covers the mandatory suffix" {
+    const local_tp: transport_params.TransportParams = .{};
+    var size_entropy: Counted = .{};
+    var encoded_tp: [transport_params.encode_len_max]u8 = undefined;
+    const tp_len = try encodeTransportParams(&encoded_tp, local_tp, size_entropy.random());
+    const sni_and_tp_capacity: usize = 3873;
+    try std.testing.expect(tp_len < sni_and_tp_capacity);
+    var name: [sni_and_tp_capacity]u8 = @splat('n');
+
+    var rejected_entropy: Counted = .{};
+    const rejected_random = rejected_entropy.random();
+    var rejected = try Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{},
+        .server_name = name[0 .. sni_and_tp_capacity - tp_len],
+    }, local_tp, rejected_random);
+    try std.testing.expectEqual(tp_len, rejected.tp_encoded_len);
+    try std.testing.expectError(error.InternalError, rejected.step(test_now_s, rejected_random));
+
+    var fitting_entropy: Counted = .{};
+    const fitting_random = fitting_entropy.random();
+    var fitting = try Tls13Handshake.initClient(.{
+        .cert_chain_der = &.{},
+        .private_key_bytes = &.{},
+        .alpn = &[_][]const u8{},
+        .server_name = name[0 .. sni_and_tp_capacity - tp_len - 1],
+    }, local_tp, fitting_random);
+    try std.testing.expectEqual(tp_len, fitting.tp_encoded_len);
+    const hello = switch (try fitting.step(test_now_s, fitting_random)) {
+        .send_data => |sd| sd.data,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 4096), hello.len);
 }
 
 test "a local SNI name too long for the ClientHello is refused, not written past" {

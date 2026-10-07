@@ -16,25 +16,22 @@
 //!    transport ALPN, and against `router.qad_alpn` to say the reserved one is
 //!    absent. A contract written in two implementations and compared across is a
 //!    contract; one written in one is a comment.
-//! 2. **Each side proved the other's node id.** The Zig dialer pins the peer
-//!    (`expect_peer_node_id`, `tls13.zig:2578-2580`) and the peer pins this side
-//!    (`PinnedClient`, `interop/iroh-peer/src/rpk.rs`), so a handshake that
-//!    completes is two byte comparisons having held. The Zig side's own view is
-//!    then read back off the connection rather than taken from the pin.
-//! 3. **Application bytes crossed in both directions**, on two streams, with
-//!    each side's bytes compared, and the peer's own counters agreeing.
+//! 2. **The peer's identity is compared with its expected id.** In the
+//!    direct `rpk` server mode, rustls pins the Zig client's raw key during TLS.
+//!    Stock iroh keeps its verifier unchanged; the harness reads the accepted
+//!    raw certificate from `peer_identity()` and checks the pin before bytes
+//!    are exchanged. The reciprocal Rust-client test checks both pins too.
+//! 3. **Application bytes cross on a real bidirectional stream**, with the
+//!    Rust receive oracle and Zig response oracle comparing exact byte strings
+//!    and the peer's counters agreeing.
 //!
-//! # The one deviation, and the test that names it
+//! # The modes and the contract they exercise
 //!
-//! `interop/iroh-peer/src/contract.rs` records it: iroh 1.3.0's rustls
-//! verifiers require RFC 7250 `certificate_type` negotiation, and the vendored
-//! TLS 1.3 neither sends nor answers it. The second test below runs the peer
-//! with `--tls iroh`, i.e. stock `iroh::Endpoint` 1.3.0, and asserts that the
-//! handshake fails and that the peer says why. **The Zig side is not touched to
-//! make an unmodified upstream peer agree**: a deviation deleted to buy a green
-//! run is a deviation nobody can read any more.
-//!
-//! # Why the Zig half is in this process
+//! Both Rust TLS paths require RFC 7250 raw public keys. One uses the direct
+//! `noq` 1.3.0 configuration in `rpk.rs`; the other uses stock
+//! `iroh::Endpoint` 1.3.0 without changing its verifier. Each successful case
+//! checks the expected identity and ALPN, then exchanges a request and response.
+//! `contract.rs` records the certificate-type negotiation both sides require.
 //!
 //! `test/two_process_*` starts `ozai-node` because it is testing the program.
 //! This is testing the wire, so the Zig half is the transport this repository
@@ -47,10 +44,10 @@
 //!
 //! # Time
 //!
-//! The host clock bounds waits and nothing else. Completion is an observed
-//! counter or a compared byte string, never a sleep. The datagram round loop is
-//! bounded by `loopback_side.max_rounds` for the same reason `loopback_link.zig`'s
-//! is, and it reads no clock at all: `start` is one instant for a whole run.
+//! Each exchange owns a virtual clock seeded at `start`; each datagram round
+//! advances it by `clock_step` before driving the bridge. This lets transport
+//! timers run without coupling protocol progress to host scheduling. The host
+//! clock only bounds startup waits and never decides success.
 
 const std = @import("std");
 
@@ -85,18 +82,31 @@ const alpn: []const u8 = ozai.node.gossip_alpn;
 /// peer offers and the contract check compares against it.
 const transport_alpn: []const u8 = loopback_side.alpn;
 
-/// Where the Zig half binds, port zero so the kernel chooses.
-const loopback: SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0 };
-
-/// Where virtual time starts. One instant for a whole run, so nothing in the
-/// round loop can expire and a stall is a finding about the stack.
+/// Seed for each exchange's virtual clock.
 const start: Instant = loopback_side.start;
+
+/// How far each datagram round advances its caller-owned virtual clock.
+const clock_step: Instant = std.time.ns_per_ms;
+
+/// A run's caller-owned virtual time. Its value is never shared between tests.
+const Clock = struct {
+    now: Instant,
+
+    fn advance(self: *Clock) void {
+        self.now += clock_step;
+    }
+};
 
 /// The bytes the Zig half writes, and the bytes it expects back. Named once
 /// each: a payload written at one call site and compared at another is two
 /// places for a typo to hide in.
 const question = "ozai-to-iroh-peer";
 const answer = "iroh-peer-to-ozai";
+
+/// DER prefix for Ed25519 SubjectPublicKeyInfo, as used by the core.
+const ed25519_spki_prefix: [12]u8 = .{
+    0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00,
+};
 
 /// The Zig half's identity, fixed so a failure reproduces and so the id can be
 /// handed to the peer on its command line before the peer is running.
@@ -116,14 +126,13 @@ const budget_ms = rust_peer.budget_ms;
 
 /// How many datagram rounds this driver may spend.
 ///
-/// Far larger than `loopback_side.max_rounds`, and for the reason the loopback
-/// drivers can afford 32: their two ends are in one process, so a round hands
-/// bytes to memory. Here the far end is another process, so a round is a
-/// `sendmsg` and a `recvmsg` and the peer needs to be scheduled before its
-/// answer can exist. A round is a few syscalls and nothing blocks, so the bound
-/// is a backstop against a run that will never converge and not a timer — the
-/// clock is only ever read by `awaitState`.
+/// Each round advances virtual time by `clock_step`. The bound remains a
+/// backstop against a run that will never converge, not a wall-clock timer.
 const max_rounds = 4_000;
+
+/// How many non-blocking socket reads one round may consume before yielding
+/// the remaining queue to the next round.
+const max_receive_batches = 64;
 
 /// The Zig half of a run: its identity, its socket and bridge, the dialer, and
 /// the connection the dial handed back.
@@ -219,15 +228,24 @@ test "the peer's ALPN offer is this tree's, and the reserved one is not in it" {
 // The exchange
 // ---------------------------------------------------------------------------
 
-test "a Zig endpoint and a Rust iroh peer authenticate each other and pass bytes" {
+test "a Zig endpoint and a Rust noq peer authenticate each other and pass bytes" {
+    try authenticatedByteExchange("rpk");
+}
+
+test "a Zig endpoint and stock iroh 1.3.0 authenticate each other and pass bytes" {
+    try authenticatedByteExchange("iroh");
+}
+
+fn authenticatedByteExchange(tls: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     var secret = try SecretKey.fromSeed(zig_seed);
     defer secret.deinit();
 
-    var peer = try startPeer(arena.allocator(), secret.nodeId(), "peer", "rpk");
+    var peer = try startPeer(arena.allocator(), secret.nodeId(), "peer", tls);
     defer peer.deinit(t.io);
 
+    var clock: Clock = .{ .now = start };
     var zig = try startZig(secret);
     defer zig.deinit();
 
@@ -245,14 +263,14 @@ test "a Zig endpoint and a Rust iroh peer authenticate each other and pass bytes
         peer_id,
         zig.side.socket.address,
         &zig.side.map,
-        start,
+        clock.now,
         zig.side.random(),
     )).conn;
 
     // The handshake, as rounds. Nothing here waits for a duration: a round that
     // moved nothing and a round that moved something are the same loop, and the
     // loop ends on a state.
-    try driveUntil(t.io, peer, &zig, struct {
+    try driveUntil(t.io, peer, &zig, &clock, struct {
         fn holds(state: *const Zig) bool {
             return state.dialled.established();
         }
@@ -263,141 +281,153 @@ test "a Zig endpoint and a Rust iroh peer authenticate each other and pass bytes
     // key, compares it and drops the certificate (`tls13.zig:1463`), so this is
     // the id and there is no certificate to read back on this side at all
     // (`loopback_test.zig:197-204`).
-    const lifted = zig.dialled.entry.conn.tls13_hs.?.peerNodeId() orelse
-        return error.NoPeerIdentity;
+    const handshake = zig.dialled.entry.conn.tls13_hs orelse return error.NoPeerIdentity;
+    const lifted = handshake.peerNodeId() orelse return error.NoPeerIdentity;
     try t.expectEqualSlices(u8, &peer_id.toBytes(), &lifted);
     try t.expectEqual(@as(?[]const u8, null), zig.dialled.entry.conn.peerCertificate());
-    // The ALPN both ends settled on, from the core's own record.
     try t.expectEqualStrings(alpn, zig.dialled.entry.conn.negotiatedAlpn());
 
-    // Outbound: one stream, written once before the loop. A driver that wrote on
-    // every round would be testing its own timing rather than the path.
-    const out = try zig.dialled.entry.conn.openStream();
-    try out.send.writeData(question);
-    out.send.close();
+    // One real bidirectional stream: the Zig side sends the request and the
+    // Rust side replies on that same stream after checking the exact request.
+    var stream = try bridge_mod.Stream.open(zig.dialled);
+    try stream.write(question);
+    stream.close();
 
-    var heard: [question.len]u8 = undefined;
-    var heard_len: usize = 0;
-    var round: usize = 0;
-    while (round < max_rounds) : (round += 1) {
-        try pump(t.io, peer, &zig);
-        heard_len += zig.side.takeStream(out.stream_id, heard[heard_len..]);
-        if (heard_len == heard.len) break;
-    }
-    if (heard_len != heard.len) {
-        printPeer(t.io, peer);
-        return error.StreamStalled;
-    }
-    try t.expectEqualStrings(question, heard[0..heard_len]);
-
-    // Inbound: the peer opened a stream of its own, and `Conn.peerStream` is
-    // the accessor for a stream this end did not open. The sink is the
-    // caller's and grows, because a read has no length worth guessing
-    // (`bridge_conn.zig:278-295`).
     var reply: std.ArrayList(u8) = .empty;
     defer reply.deinit(t.allocator);
-    round = 0;
+    var round: usize = 0;
     while (round < max_rounds) : (round += 1) {
-        try pump(t.io, peer, &zig);
-        var inbound = zig.dialled.peerStream() orelse continue;
-        _ = try inbound.drain(t.allocator, &reply);
-        if (reply.items.len > 0) break;
+        try pump(t.io, peer, &zig, &clock);
+        _ = try stream.drain(t.allocator, &reply);
+        if (stream.finished()) break;
     }
-    if (!std.mem.eql(u8, reply.items, answer)) {
+    if (!stream.finished() or !std.mem.eql(u8, reply.items, answer)) {
         printPeer(t.io, peer);
         return error.NoAnswer;
     }
 
-    // And the peer agrees, from its own counters, through the harness's own
-    // gates. `received` is the Zig half's bytes and `sent` its own: a peer that
-    // had answered nothing would have read them and written none. `Need.holds`
-    // is `two_process_progress`'s; `Progress.count` is module-private, so a
-    // counter this file wants is asked for by name.
-    try awaitState(t.io, peer, struct {
+    // The peer agrees, from its own counters, that it read the request and
+    // wrote the response. The Rust handler independently checks request bytes.
+    try drivePeerUntil(t.io, peer, &zig.side, &clock, struct {
         fn holds(child: *const Process) bool {
             const seen = child.progress() orelse return false;
-            const need = progress_ns.Need{ .field = "received", .want = question.len };
-            return need.holds(seen) and
+            return (progress_ns.Need{ .field = "received", .want = question.len }).holds(seen) and
                 (progress_ns.Need{ .field = "sent", .want = answer.len }).holds(seen);
         }
-    }.holds);
+    }.holds, "peer sent and received counters");
 
-    // The report the peer wrote on the way out names the node it proved, and it
-    // is this half's id: the pin was a 32-byte comparison and this is what it
-    // compared against.
+    try drivePeerUntil(t.io, peer, &zig.side, &clock, struct {
+        fn holds(child: *const Process) bool {
+            return child.line("stopped:") != null;
+        }
+    }.holds, "peer's final report");
     const report = peer.value("stopped:") orelse
         return peer.gaveUp("exited without a final report", .{});
     try t.expect(std.mem.indexOf(u8, report, &rust_peer.hexId(secret.nodeId())) != null);
     try t.expectEqualStrings(alpn, valueAfter(report, "alpn "));
-}
-
-// A Zig endpoint and a stock iroh 1.3.0 peer, and the refusal between them.
-//
-// The peer runs `--tls iroh`, so its rustls verifiers require RFC 7250
-// `certificate_type` negotiation, which the vendored core neither offers nor
-// answers (`interop/iroh-peer/src/contract.rs` section 3). The handshake is
-// expected to fail, and the peer's own account of why is asserted: a run in
-// which it succeeded would mean iroh stopped requiring it, and this test is the
-// record that it has not.
-test "a stock iroh 1.3.0 peer is refused at the certificate-type extension" {
-    var arena: std.heap.ArenaAllocator = .init(t.allocator);
-    defer arena.deinit();
-    var secret = try SecretKey.fromSeed(zig_seed);
-    defer secret.deinit();
-
-    var peer = try startPeer(arena.allocator(), secret.nodeId(), "iroh-peer", "iroh");
-    defer peer.deinit(t.io);
-    const peer_addr = try peerAddress(t.io, peer);
-    const peer_id = try NodeId.parseHex(peer.value("node") orelse
-        return peer.gaveUp("printed a banner with no node id in it", .{}));
-
-    var zig = try startZig(secret);
-    defer zig.deinit();
-    zig.dialled = (try zig.dialer.dial(
-        // A direct route, so the address the core is told is the peer's real
-        // one and no synthetic subnet is involved (`loopback_link.zig:133-141`).
-        .{ .ip = peer_addr },
-        peer_id,
-        zig.side.socket.address,
-        &zig.side.map,
-        start,
-        zig.side.random(),
-    )).conn;
-
-    // The rounds run until one side gives up, because a handshake that fails
-    // ends on the peer's alert rather than on any state the Zig side reaches.
-    _ = try rounds(t.io, peer, &zig, struct {
-        fn holds(state: *const Zig) bool {
-            return state.dialled.established();
-        }
-    }.holds);
-
-    // No connection, from the Zig side. A handshake that reached `established`
-    // would mean the certificate-type extensions were tolerated after all.
-    try t.expect(!zig.dialled.established());
-
-    // And the peer's reason, which is the deviation named rather than inferred.
-    // `stop` first: a refusal is a failed handshake, not a peer that keeps
-    // listening, and a child left running is a process the next run collides
-    // with.
-    // The peer reports no connection of its own accord, which is the other half
-    // of the same fact: neither side came up.
-    try awaitState(t.io, peer, struct {
+    try drivePeerUntil(t.io, peer, &zig.side, &clock, struct {
         fn holds(child: *const Process) bool {
             return child.finished();
         }
-    }.holds);
+    }.holds, "peer process termination");
+    try t.expect(!(try peer.reportFailure(t.io)));
+}
+
+test "a strict direct noq client and a Zig server authenticate and pass bytes" {
+    try reciprocalClientExchange("rpk");
+}
+
+test "a stock iroh 1.3.0 client and a Zig server authenticate and pass bytes" {
+    try reciprocalClientExchange("iroh");
+}
+
+fn reciprocalClientExchange(tls: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    var zig_secret = try SecretKey.fromSeed(zig_seed);
+    defer zig_secret.deinit();
+    var rust_secret = try SecretKey.fromSeed(@splat(0x6c));
+    defer rust_secret.deinit();
+
+    var side: Side = undefined;
+    try side.init("zig-server", zig_secret, rust_secret.nodeId(), engine_seed);
+    defer side.deinit();
+    side.bridge.alpn_list[0] = alpn;
+    side.bridge.manager.tls_config.alpn = side.bridge.alpn_list[0..];
+
+    var clock: Clock = .{ .now = start };
+    const zig_id_hex = rust_peer.hexId(zig_secret.nodeId());
+    var peer = try Process.start(t.allocator, arena.allocator(), t.io, "rust-client", .{
+        .tls = tls,
+        .seed_hex = peer_seed_hex,
+        .expect_peer_hex = &zig_id_hex,
+        .run_ms = budget_ms,
+        .connect_address = side.socket.address,
+    });
+    defer peer.deinit(t.io);
+
+    try awaitNode(t.io, peer);
+    const printed = peer.value("node") orelse
+        return peer.gaveUp("printed no node identity", .{});
+    const printed_id = try NodeId.parseHex(printed);
+    const rust_node_id_bytes = rust_secret.nodeId().toBytes();
+    try t.expectEqualSlices(u8, &rust_node_id_bytes, &printed_id.toBytes());
+
+    try driveServerUntil(t.io, peer, &side, &clock, struct {
+        fn holds(server: *Side) bool {
+            const accepted = server.bridge.connectionAt(0) orelse return false;
+            return accepted.established() and accepted.peerStream() != null;
+        }
+    }.holds, "an established Rust client connection with its request stream");
+
+    const accepted = side.bridge.connectionAt(0) orelse return error.NoConnection;
+    const client_certificate = accepted.entry.conn.peerCertificate() orelse
+        return error.NoPeerCertificate;
+    try t.expectEqual(@as(usize, 44), client_certificate.len);
+    try t.expectEqualSlices(u8, &ed25519_spki_prefix, client_certificate[0..12]);
+    try t.expectEqualSlices(u8, &rust_node_id_bytes, client_certificate[12..]);
+    try t.expectEqualStrings(alpn, accepted.entry.conn.negotiatedAlpn());
+
+    var inbound = accepted.peerStream() orelse return error.NoPeerStream;
+    var request: std.ArrayList(u8) = .empty;
+    defer request.deinit(t.allocator);
+    var round: usize = 0;
+    while (round < max_rounds) : (round += 1) {
+        try pumpSide(t.io, peer, &side, &clock);
+        _ = try inbound.drain(t.allocator, &request);
+        if (inbound.finished()) break;
+    }
+    if (!inbound.finished() or !std.mem.eql(u8, request.items, question)) {
+        printPeer(t.io, peer);
+        return error.UnexpectedRequest;
+    }
+
+    try inbound.write(answer);
+    inbound.close();
+
+    try drivePeerUntil(t.io, peer, &side, &clock, struct {
+        fn holds(child: *const Process) bool {
+            const seen = child.progress() orelse return false;
+            return (progress_ns.Need{ .field = "sent", .want = question.len }).holds(seen) and
+                (progress_ns.Need{ .field = "received", .want = answer.len }).holds(seen);
+        }
+    }.holds, "peer sent and received counters");
+
+    try drivePeerUntil(t.io, peer, &side, &clock, struct {
+        fn holds(child: *const Process) bool {
+            return child.line("stopped:") != null;
+        }
+    }.holds, "peer's final report");
     const report = peer.value("stopped:") orelse
         return peer.gaveUp("exited without a final report", .{});
-    try t.expect(std.mem.indexOf(u8, report, "accepted 0") != null);
-    try t.expect(std.mem.indexOf(u8, report, "up 0") != null);
-
-    // The reason is in the alert the *Zig* side received, and the Zig core logs
-    // it rather than propagating it to this file: the run above prints
-    // `peer CONNECTION_CLOSE: error_code=0x128 ... reason=peer is incompatible:
-    // IncorrectCertificateTypeExtension` before this test's own output. Asserted
-    // here as the peer's exit being non-zero, which is what that alert causes.
-    try t.expect(try peer.reportFailure(t.io));
+    try t.expect(std.mem.indexOf(u8, report, &rust_peer.hexId(zig_secret.nodeId())) != null);
+    try t.expectEqualStrings(alpn, valueAfter(report, "alpn "));
+    try drivePeerUntil(t.io, peer, &side, &clock, struct {
+        fn holds(child: *const Process) bool {
+            return child.finished();
+        }
+    }.holds, "peer process termination");
+    try t.expect(!(try peer.reportFailure(t.io)));
 }
 
 // ---------------------------------------------------------------------------
@@ -434,9 +464,8 @@ fn startZig(secret: SecretKey) !Zig {
 
 /// Start the peer and read its banner, so the caller has both identities.
 ///
-/// `tls` is a parameter rather than a field `startZig` shares, because it is the
-/// whole difference between the two tests below and a default would hide it in
-/// the two call sites that do not pass it.
+/// `tls` selects the peer's independently configured TLS implementation. The
+/// two callers exercise strict direct `noq` and stock iroh configurations.
 fn startPeer(
     arena: std.mem.Allocator,
     zig_node_id: NodeId,
@@ -456,37 +485,45 @@ fn startPeer(
 /// One pass of `loopback_link.zig`'s `step`/`take` with the far end being a
 /// foreign process. Everything the Zig side owns is the same; what changed is
 /// that the datagrams land on the peer's socket rather than a second `Side`'s.
-fn pump(io: std.Io, peer: *Process, zig: *Zig) !void {
+fn pump(io: std.Io, peer: *Process, zig: *Zig, clock: *Clock) !void {
+    try pumpSide(io, peer, &zig.side, clock);
+}
+
+/// One round over any Zig endpoint, including one accepting the Rust dial.
+/// Advances the caller's virtual clock once, then uses that instant throughout.
+fn pumpSide(io: std.Io, peer: *Process, side: *Side, clock: *Clock) !void {
+    clock.advance();
     var index: usize = 0;
-    while (zig.side.bridge.connectionAt(index)) |conn| : (index += 1) {
-        for (try conn.drain(zig.side.egress, zig.side.out, start, zig.side.random())) |egress| {
-            _ = try zig.side.socket.send(io, egress.to, egress.send);
+    while (side.bridge.connectionAt(index)) |conn| : (index += 1) {
+        for (try conn.drain(side.egress, side.out, clock.now, side.random())) |egress| {
+            _ = try side.socket.send(io, egress.to, egress.send);
         }
     }
-    // Timers after the sends, so a connection that owes a retransmission gets
-    // the chance to produce one in this round rather than the next
-    // (`loopback_link.zig:221-225`).
     var scan: usize = 0;
-    while (zig.side.bridge.connectionAt(scan)) |conn| : (scan += 1) {
-        _ = zig.side.bridge.tick(conn, start, zig.side.random());
+    // Timers follow the sends, so a connection that owes a retransmission can
+    // produce it in this round rather than the next.
+    while (side.bridge.connectionAt(scan)) |conn| : (scan += 1) {
+        _ = side.bridge.tick(conn, clock.now, side.random());
     }
-    try take(io, zig);
+    try take(io, side, clock);
     try peer.pump(io);
 }
 
-/// Take everything queued on the Zig side's socket and hand it to its bridge.
+/// Take a bounded number of socket reads and hand each datagram to the bridge.
 ///
 /// A read is not one datagram: `UDP_GRO` may have coalesced a burst into one
 /// buffer, so the stride is what says how many packets there are and the bridge
 /// is handed them one at a time — which is what `Datagram` documents, since two
 /// packets sharing one buffer would leave the core with two replies pointing at
-/// the same bytes.
-fn take(io: std.Io, zig: *Zig) !void {
-    while (true) {
-        const got = zig.side.socket.tryReceive(
+/// the same bytes. If the read bound is reached, queued packets remain for the
+/// next round.
+fn take(io: std.Io, side: *Side, clock: *Clock) !void {
+    var batch_index: usize = 0;
+    while (batch_index < max_receive_batches) : (batch_index += 1) {
+        const got = side.socket.tryReceive(
             io,
-            zig.side.buf,
-            &zig.side.control,
+            side.buf,
+            &side.control,
         ) catch |err| switch (err) {
             // The socket is non-blocking from the moment it was created, and an
             // empty queue is a fact the loop acts on rather than a failure.
@@ -496,15 +533,15 @@ fn take(io: std.Io, zig: *Zig) !void {
         const recv = try got.toRecv();
         var position: usize = 0;
         while (position < recv.datagramCount()) : (position += 1) {
-            const ingress = try zig.side.bridge.recv(&zig.side.map, .{
+            const ingress = try side.bridge.recv(&side.map, .{
                 // The loop's bound is `recv.datagramCount()`, and
                 // `Recv.datagram` answers null only past that count.
                 // zwanzig-disable-next-line: optional-unwrap
                 .bytes = recv.datagram(position).?,
                 .from = got.from,
-                .local = zig.side.socket.address,
+                .local = side.socket.address,
                 .ecn = recv.ecn,
-            }, zig.side.scratch, start, zig.side.random());
+            }, side.scratch, clock.now, side.random());
             switch (ingress.outcome) {
                 // Nothing to do here: the connection this datagram belongs to is
                 // drained by the next round, which finds it by index.
@@ -512,7 +549,7 @@ fn take(io: std.Io, zig: *Zig) !void {
                 // A stateless reply is a send, so it goes back out of the same
                 // socket to the address the datagram came from.
                 .reply => |reply| {
-                    _ = try zig.side.socket.send(io, ingress.source.socket, reply);
+                    _ = try side.socket.send(io, ingress.source.socket, reply);
                 },
                 .dropped, .foreign => {},
             }
@@ -522,18 +559,18 @@ fn take(io: std.Io, zig: *Zig) !void {
 
 /// Round until `holds` is true of the Zig half, or `max_rounds` is spent.
 ///
-/// `max_rounds` is a backstop against a run that never converges, not a timer:
-/// nothing here reads a clock, so a stall is a finding about the stack rather
-/// than about how loaded this machine is. A gate that never held prints the
-/// peer, because the question is about a process this file cannot see into.
+/// Each round advances the caller-owned virtual clock. A gate that never held
+/// prints the peer, because the question is about a process this file cannot
+/// see into.
 fn driveUntil(
     io: std.Io,
     peer: *Process,
     zig: *Zig,
+    clock: *Clock,
     comptime gate: anytype,
     comptime what: []const u8,
 ) !void {
-    if (try rounds(io, peer, zig, gate)) return;
+    if (try rounds(io, peer, zig, clock, gate)) return;
     printPeer(io, peer);
     std.debug.print("rust_interop: the run never reached {s} in {d} rounds\n", .{
         what, max_rounds,
@@ -541,24 +578,82 @@ fn driveUntil(
     return error.RoundsExhausted;
 }
 
-/// Round until `holds` is true of the Zig half or the bound is spent, and say
-/// whether it held.
-fn rounds(io: std.Io, peer: *Process, zig: *Zig, comptime holds: anytype) !bool {
+/// Round until `holds` is true of an accepting Zig endpoint, or the bound is
+/// spent.
+fn driveServerUntil(
+    io: std.Io,
+    peer: *Process,
+    side: *Side,
+    clock: *Clock,
+    comptime holds: anytype,
+    comptime what: []const u8,
+) !void {
     var round: usize = 0;
     while (round < max_rounds) : (round += 1) {
-        try pump(io, peer, zig);
+        try pumpSide(io, peer, side, clock);
+        if (holds(side)) return;
+        if (peer.finished()) break;
+    }
+    printPeer(io, peer);
+    std.debug.print("rust_interop: the run never reached {s} in {d} rounds\n", .{
+        what, max_rounds,
+    });
+    return error.RoundsExhausted;
+}
+
+/// Keep the endpoint and peer pipes moving until a peer state is observed.
+fn drivePeerUntil(
+    io: std.Io,
+    peer: *Process,
+    side: *Side,
+    clock: *Clock,
+    comptime holds: anytype,
+    comptime what: []const u8,
+) !void {
+    var round: usize = 0;
+    while (round < max_rounds) : (round += 1) {
+        try pumpSide(io, peer, side, clock);
+        if (holds(peer)) return;
+        if (peer.finished()) break;
+    }
+    printPeer(io, peer);
+    std.debug.print("rust_interop: the peer never reached {s} in {d} rounds\n", .{
+        what, max_rounds,
+    });
+    return error.RoundsExhausted;
+}
+
+/// Wait for the peer's identity banner, as both client and server peers emit it.
+fn awaitNode(io: std.Io, peer: *Process) !void {
+    try awaitState(io, peer, struct {
+        fn holds(child: *const Process) bool {
+            return child.line("node") != null;
+        }
+    }.holds);
+}
+
+/// Round until `holds` is true of the Zig half or the bound is spent, and say
+/// whether it held.
+fn rounds(
+    io: std.Io,
+    peer: *Process,
+    zig: *Zig,
+    clock: *Clock,
+    comptime holds: anytype,
+) !bool {
+    var round: usize = 0;
+    while (round < max_rounds) : (round += 1) {
+        try pump(io, peer, zig, clock);
         if (holds(zig)) return true;
         if (peer.finished()) return holds(zig);
     }
     return false;
 }
 
-/// Pump the peer's pipes until `holds` is true of them, or `budget_ms` is spent.
+/// Wait for a peer-only startup state before a Zig transport is active.
 ///
-/// A peer cannot wait for a state, so it reports one and this is the half that
-/// decides what a missing state means. Only the host clock is read, and only to
-/// bound the wait: the loop pumps both pipes and re-reads them, so a peer that
-/// reports early is noticed early.
+/// Once an exchange is active, callers use `drivePeerUntil` to keep sockets
+/// moving while they observe peer progress.
 fn awaitState(io: std.Io, peer: *Process, comptime holds: anytype) !void {
     const deadline = try nowMs() + budget_ms;
     while (try nowMs() < deadline) {
@@ -570,14 +665,15 @@ fn awaitState(io: std.Io, peer: *Process, comptime holds: anytype) !void {
     try peer.pump(io);
     if (holds(peer)) return;
     printPeer(io, peer);
-    std.debug.panic("rust_interop: the peer never reached the state waited for", .{});
+    return error.PeerStateTimeout;
 }
 
-/// Wait for the peer's banner: the node id and the address it bound.
+/// The first progress line follows the complete ALPN offer list.
 fn awaitBanner(io: std.Io, peer: *Process) !void {
     try awaitState(io, peer, struct {
         fn holds(child: *const Process) bool {
-            return child.line("listening") != null and child.line("node") != null;
+            return child.line("listening") != null and
+                child.line("node") != null and child.progress() != null;
         }
     }.holds);
 }
@@ -614,7 +710,9 @@ fn valueAfter(line: []const u8, label: []const u8) []const u8 {
 
 /// Print both of the peer's pipes, and its last progress line.
 fn printPeer(io: std.Io, peer: *Process) void {
-    peer.pump(io) catch {};
+    peer.pump(io) catch |err| {
+        std.debug.print("rust_interop: diagnostic read failed: {s}\n", .{@errorName(err)});
+    };
     std.debug.print("rust_interop: the peer {s} wrote\n", .{peer.name});
     std.debug.print("  stdout:\n{s}\n", .{peer.out.items});
     std.debug.print("  stderr:\n{s}\n", .{peer.err_out.items});
