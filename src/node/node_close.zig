@@ -234,8 +234,7 @@ pub fn closeConnections(self: *Node, io: std.Io, at: Instant, random: std.Random
     while (self.bridge.connectionAt(index)) |conn| : (index += 1) {
         conn.entry.conn.close(0, "", at);
         for (try conn.drain(self.egress, self.out, at, random)) |egress| {
-            self.stats.datagrams_out += egress.send.datagramCount();
-            node_transport.note(self, try self.socket.send(io, egress.to, egress.send));
+            try node_transport.send(self, io, egress.to, egress.send);
         }
     }
 }

@@ -18,16 +18,15 @@
 //!
 //! ```
 //! stream := header_frame message_frame*
-//! frame  := varint(u64) body_length ++ body
-//! header := varint(u64) 32 ++ topic_id[32]
+//! frame  := u32be body_length ++ body
+//! header := u32be 32 ++ topic_id[32]
 //! body   := varint(u32) layer ++ arm
 //! ```
 //!
-//! The prefix is postcard's own length-prefixed byte string — `writeLen` and
-//! `readBytes` in `wire/postcard.zig` — and not a width invented here. The topic
-//! travels once, in the header, exactly as upstream's `StreamHeader` does
-//! (`net/util.rs:53-55`, written at `net/util.rs:299-310`), so every payload
-//! after it is 32 bytes shorter than a frame that repeated the topic.
+//! The frame length is fixed four-byte big-endian, as pinned upstream
+//! `net/util.rs::read_lp` and `write_frame` require. Internal fields retain
+//! postcard encoding. The topic travels once in the stream header; each later
+//! body contains only the nested topic message.
 //!
 //! # The tags are upstream's declaration order, and nothing else may be
 //!
@@ -51,14 +50,9 @@
 //!
 //! # The `Disconnect` byte the Zig type does not have
 //!
-//! Upstream's `Disconnect` is `{ alive: bool, _respond: bool }`, the second field
-//! marked "obsolete … kept in the struct to maintain wire compatibility"
-//! (`hyparview.rs:168-175`) and written `false` by every sender
-//! (`hyparview.rs:380`). The Zig `Disconnect` has one field, and
-//! `hyparview/message.zig` says what follows from that: "When the codec lands,
-//! the byte goes in." It goes in — `membership.respond_byte` is what is written,
-//! and a decoder reads the byte and drops it, because a field nothing reads is a
-//! field a receiver would otherwise have to work out the meaning of.
+//! Upstream retains `_respond` for wire compatibility and always sends false.
+//! The codec writes that byte and consumes it on receive; membership state
+//! carries only `alive`, because the obsolete field has no behavior.
 //!
 //! # `IHave` batches are cut by bytes
 //!
@@ -68,69 +62,17 @@
 //! which is an upper bound rather than a size; `plumtree.zig` records the
 //! divergence and the reason, and the reason is this file.
 //!
-//! # This is not `test/protocol_codec.zig`, and it is not the same bytes
+//! # Reference evidence and bounds
 //!
-//! The harness codec in `test/protocol_codec.zig` is a second, local encoding, and
-//! its own doc says so: "they are **not** the project's wire format — they are
-//! one plausible encoding". **It is not byte-compatible with this codec**, in
-//! two places and two places only:
+//! `codec_test.zig` contains explicitly source-derived framing regressions.
+//! Actual upstream state-machine serializer vectors are generated separately
+//! by the pinned Rust `gossip-vectors` binary; these are not network captures.
+//! Live Node/Rust interoperability is a separate integration check.
 //!
-//! 1. **`DeliveryScope` is numbered the other way round.** That file declares
-//!    `scope_neighbors: u8 = 0` and `scope_swarm: u8 = 1`; upstream declares
-//!    `Swarm` first (`plumtree.rs:174`) and so does `codec/tags.zig`. Every
-//!    `Gossip` message differs in the byte after its content, and nothing else in
-//!    the broadcast layer differs.
-//! 2. **`Disconnect` is one byte shorter.** That file writes `alive` alone, so
-//!    its frame leaves the obsolete byte for a reader to trip over, and this
-//!    codec's frame read by that file decodes and drops it, because that file
-//!    never checks for a trailing byte.
-//!
-//! Everything else is the same byte for the same message: the framing (both use
-//! postcard's length prefix), the two layer tags, the six membership tags, the
-//! four broadcast tags, the two priority tags, and the field order and widths of
-//! every payload. The difference is not an accident — that file numbers its
-//! discriminants to be stable against edits in `src/gossip/`, which is the same
-//! job `codec/tags.zig`'s comptime proof does, and it had no second reason to
-//! pin them to upstream. This codec has the second reason.
-//!
-//! # Nothing here has been checked against bytes from the reference
-//!
-//! **No byte of this codec has been captured from the Rust implementation, and
-//! this file makes no interoperability claim.** Every tag, field order, the
-//! stream header and the obsolete byte are read off the sources cited above; the
-//! encodings are postcard's rules as `wire/postcard.zig` states them. That is a
-//! derivation, and `AGENTS.md` §2 is explicit that a claim of interoperability is
-//! a golden-vector test carrying bytes captured from the Rust implementation or
-//! it is an unverified claim. The byte sequences in `codec_test.zig` are
-//! *declared* vectors: they are what these declarations have to produce, asserted
-//! so that a later edit to a table cannot move them silently, and they are not
-//! evidence about upstream.
-//!
-//! Three things would close the gap, in this order:
-//!
-//! 1. **Captured vectors.** A Rust program at the commit above that builds one
-//!    message of every arm and prints `postcard::to_stdvec` of it, beside
-//!    `plumtree/blake3_vectors.zig` as `codec_vectors.zig`, each vector naming
-//!    the file and line it came from. That is the only thing that turns the tag
-//!    and field tables above from a derivation into a test, and it would also
-//!    settle the one assumption this codec cannot check for itself: that
-//!    upstream's `PeerIdentity` — `PublicKey` — postcard-encodes as 32 raw bytes,
-//!    which is what `NodeId` is and what no source in this tree proves.
-//! 2. **The frame prefix.** Upstream's is a fixed four-byte big-endian `u32`
-//!    (`net/util.rs:369`, `:392`); this one is postcard's varint, because that is
-//!    the framing `wire/postcard.zig` implements and the instruction for this
-//!    codec was to reuse it rather than add a second one. A peer from the
-//!    reference cannot read these frames whatever the vectors say, so closing
-//!    this means deciding the prefix is a wire change and not a codec detail.
-//! 3. **The one-frame budget disagreement.** Upstream writes `if len >=
-//!    max_message_size` and reads `if size > max_message_size`
-//!    (`net/util.rs:379`, `:384`), so a body of exactly the budget is refused on
-//!    the way out and admitted on the way in. `codec/limits.zig` takes the
-//!    reader's rule; a peer that wrote such a frame would be refused by upstream
-//!    and is not refused here.
-//!
-//! Until all three are done, this codec is a second implementation of the same
-//! declarations and nothing more.
+//! Sending rejects bodies at or above 4096 bytes, while receiving admits exactly
+//! 4096, matching the upstream writer/reader asymmetry. Peer and IHave vectors,
+//! owned PeerData, and cached content can hold every value fitting that receive
+//! budget. Runtime peer tables remain bounded and may still report capacity errors.
 
 const chunk = @import("codec/chunk.zig");
 const frame = @import("codec/frame.zig");

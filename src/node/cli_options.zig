@@ -1,10 +1,4 @@
-//! What the command line asked for.
-//!
-//! `Options` is the whole of the program's vocabulary: a listen address, a peer
-//! list, an identity, a protocol, a relay role and a run. `parse` turns
-//! arguments into one of three answers — a run, a `--help`, or a refusal — and
-//! `contradictions` is what refuses a line naming two things one node cannot
-//! be. The flags it accepts are named in the usage text beside them.
+//! Command-line options for authenticated application protocols and carriers.
 
 const std = @import("std");
 
@@ -17,8 +11,6 @@ const Peer = node_mod.Peer;
 const SocketAddr = ozai.SocketAddr;
 const SecretKey = ozai.SecretKey;
 const CliError = cli_values.CliError;
-const RelayPeer = cli_values.RelayPeer;
-const Send = cli_values.Send;
 
 /// How long a run lasts when `--for` does not say. A binary that ran until a
 /// signal forever could not be smoke-tested from a script, and a script that
@@ -44,15 +36,23 @@ pub const Options = struct {
     lookup_interval_ms: u64 = (node_mod.Discovery{}).interval_ms,
     /// This node's identity, drawn when the caller does not supply one.
     secret: ?SecretKey = null,
-    /// The protocol to offer, or null for the default: the gossip ALPN, or the
-    /// relay one when a relay flag below asked for a role.
+    expect_peer: ?ozai.NodeId = null,
+    /// Inner application ALPN; carrier selection never changes it.
     alpn: ?[]const u8 = null,
-    /// Whether this process serves as a relay.
-    serve: bool = false,
-    /// The relay this process is a client of, if it is one.
-    relay_peer: ?RelayPeer = null,
-    /// The one datagram to put on the relay wire, if one was asked for.
-    send: ?Send = null,
+    relay_listen: ?SocketAddr = null,
+    relay_server: ?SocketAddr = null,
+    relay_host: ?[]const u8 = null,
+    gossip_topics: std.ArrayList(ozai.gossip_hyparview.TopicId) = .empty,
+    message: ?[]const u8 = null,
+    blob_role: ?BlobRole = null,
+    blob_dir: ?[]const u8 = null,
+    blob_hash: ?cli_values.BlobHash = null,
+    blob_size: ?u64 = null,
+    blob_range: ?ozai.blobs_protocol.ChunkRange = null,
+    blob_range_explicit: bool = false,
+    blob_output: ?[]const u8 = null,
+    traversal_addresses: std.ArrayList(SocketAddr) = .empty,
+    traversal_initiate: bool = false,
 
     /// The generator's seed. Fixed by default, so two runs of the same command
     /// line present the same connection ids and a failure reproduces.
@@ -70,6 +70,7 @@ pub const Options = struct {
         \\  --peer <nodeid@ip:port>
         \\                          dial this peer. May be repeated.
         \\  --lookup-peer <nodeid> resolve and dial this identity. May be repeated.
+        \\  --expect-peer <nodeid> pin incoming authenticated connections.
         \\  --dns-server <ip:port> explicit DNS server; requires --lookup-peer.
         \\  --dns-origin <origin> DNS suffix. Default: the production iroh origin.
         \\  --lookup-deadline <ms> positive query budget, at most 2147483647.
@@ -77,22 +78,21 @@ pub const Options = struct {
         \\  --key-seed <base32>    this node's ed25519 seed, z-base-32. Drawn
         \\                          when absent; the node id is printed either
         \\                          way.
-        \\  --alpn <bytes>         the protocol to offer. Default: the gossip
-        \\                          ALPN, or the relay one when a relay flag
-        \\                          below asked for a role.
-        \\
-        \\  --relay                 serve as a relay: admit clients, and forward
-        \\                          the datagrams between them.
-        \\  --relay-peer <nodeid>@<relay-url>
-        \\                          reach this relay by URL, which is all a peer
-        \\                          holds. A host that is a name is refused:
-        \\                          nothing here resolves names.
-        \\  --send <nodeid>:<bytes>
-        \\                          put one datagram on the relay wire to this
-        \\                          peer, once the relay connection is up, and
-        \\                          offer it again while the relay says that peer
-        \\                          is not there. The gossip codec's job, done
-        \\                          here by hand.
+        \\  --alpn <bytes>         inner application protocol, independent of relay.
+        \\  --relay-listen <ip:port> serve the relay carrier (port 0 permitted).
+        \\  --relay-server <ip:port> connect to this relay carrier.
+        \\  --relay-host <host>    HTTP Host for --relay-server.
+        \\  --peer-relay <nodeid@relay-url> pinned inner peer. May be repeated.
+        \\  --topic-hex <64hex>    gossip topic. May be repeated, at most four.
+        \\  --message <bytes>     initial gossip message; requires a topic.
+        \\  --blob-role provider|getter selects /iroh-bytes/4.
+        \\  --blob-dir <directory> provider's content-addressed store.
+        \\  --blob-hash <64hex>    blob to serve or retrieve.
+        \\  --blob-size <u64>      expected getter size.
+        \\  --blob-range all|start:end end-exclusive 1024-byte chunk indexes.
+        \\  --blob-output <file>   write verified getter bytes.
+        \\  --traversal-address <ip:port> configured native candidate; at most two.
+        \\  --traversal-initiate   initiate native traversal; requires a candidate.
         \\
         \\  --seed <u64>           the generator seed. Default: fixed, so a run
         \\                          reproduces.
@@ -132,9 +132,16 @@ pub const Options = struct {
                 options.progress = true;
                 continue;
             }
-            if (std.mem.eql(u8, flag, "--relay")) {
-                options.serve = true;
+            if (std.mem.eql(u8, flag, "--traversal-initiate")) {
+                options.traversal_initiate = true;
                 continue;
+            }
+            if (std.mem.eql(u8, flag, "--relay") or
+                std.mem.eql(u8, flag, "--relay-peer") or
+                std.mem.eql(u8, flag, "--send"))
+            {
+                try out.print("ozai-node: {s} is not an option\n", .{flag});
+                return .{ .rejected = error.NotAnOption };
             }
 
             const value = it.next() orelse {
@@ -190,6 +197,11 @@ pub const Options = struct {
                     try cli_values.reject(out, flag, value, err);
                     return .{ .rejected = err };
                 };
+            } else if (std.mem.eql(u8, flag, "--expect-peer")) {
+                options.expect_peer = ozai.NodeId.parseZ32(value) catch |err| {
+                    try cli_values.reject(out, flag, value, err);
+                    return .{ .rejected = err };
+                };
             } else if (std.mem.eql(u8, flag, "--key-seed")) {
                 const seed = ozai.base32.decode(
                     ozai.base32.z32,
@@ -205,16 +217,86 @@ pub const Options = struct {
                 };
             } else if (std.mem.eql(u8, flag, "--alpn")) {
                 options.alpn = value;
-            } else if (std.mem.eql(u8, flag, "--relay-peer")) {
-                options.relay_peer = cli_values.parseRelayPeer(value) catch |err| {
+            } else if (std.mem.eql(u8, flag, "--peer-relay")) {
+                const peer = cli_values.parseRelayPeer(value) catch |err| {
                     try cli_values.reject(out, flag, value, err);
                     return .{ .rejected = err };
                 };
-            } else if (std.mem.eql(u8, flag, "--send")) {
-                options.send = cli_values.parseSend(value) catch |err| {
+                try options.peers.append(arena, peer);
+            } else if (std.mem.eql(u8, flag, "--relay-listen") or
+                std.mem.eql(u8, flag, "--relay-server") or
+                std.mem.eql(u8, flag, "--traversal-address"))
+            {
+                const address = cli_values.parseSocket(value) catch |err| {
                     try cli_values.reject(out, flag, value, err);
                     return .{ .rejected = err };
                 };
+                if (std.mem.eql(u8, flag, "--relay-listen")) {
+                    options.relay_listen = address;
+                } else {
+                    if (address.port == 0) {
+                        try cli_values.reject(out, flag, value, error.AddressNotReachable);
+                        return .{ .rejected = error.AddressNotReachable };
+                    }
+                    if (std.mem.eql(u8, flag, "--relay-server")) {
+                        options.relay_server = address;
+                    } else {
+                        if (options.traversal_addresses.items.len == 2) {
+                            try cli_values.reject(out, flag, value,
+                                error.TooManyTraversalAddresses);
+                            return .{ .rejected = error.TooManyTraversalAddresses };
+                        }
+                        try options.traversal_addresses.append(arena, address);
+                    }
+                }
+            } else if (std.mem.eql(u8, flag, "--relay-host")) {
+                if (value.len == 0 or std.mem.indexOfAny(u8, value, "\r\n") != null) {
+                    try cli_values.reject(out, flag, value, error.InvalidRelayHost);
+                    return .{ .rejected = error.InvalidRelayHost };
+                }
+                options.relay_host = value;
+            } else if (std.mem.eql(u8, flag, "--topic-hex")) {
+                if (options.gossip_topics.items.len == 4) {
+                    try cli_values.reject(out, flag, value, error.TooManyTopics);
+                    return .{ .rejected = error.TooManyTopics };
+                }
+                const topic = cli_values.parseTopic(value) catch |err| {
+                    try cli_values.reject(out, flag, value, err);
+                    return .{ .rejected = err };
+                };
+                try options.gossip_topics.append(arena, topic);
+            } else if (std.mem.eql(u8, flag, "--message")) {
+                options.message = value;
+            } else if (std.mem.eql(u8, flag, "--blob-role")) {
+                options.blob_role = std.meta.stringToEnum(BlobRole, value) orelse {
+                    try cli_values.reject(out, flag, value, error.InvalidBlobRole);
+                    return .{ .rejected = error.InvalidBlobRole };
+                };
+            } else if (std.mem.eql(u8, flag, "--blob-hash")) {
+                options.blob_hash = cli_values.parseBlobHash(value) catch |err| {
+                    try cli_values.reject(out, flag, value, err);
+                    return .{ .rejected = err };
+                };
+            } else if (std.mem.eql(u8, flag, "--blob-size")) {
+                options.blob_size = std.fmt.parseInt(u64, value, 10) catch {
+                    try cli_values.reject(out, flag, value, error.InvalidBlobSize);
+                    return .{ .rejected = error.InvalidBlobSize };
+                };
+            } else if (std.mem.eql(u8, flag, "--blob-range")) {
+                options.blob_range = cli_values.parseBlobRange(value) catch |err| {
+                    try cli_values.reject(out, flag, value, err);
+                    return .{ .rejected = err };
+                };
+                options.blob_range_explicit = true;
+            } else if (std.mem.eql(u8, flag, "--blob-dir") or
+                std.mem.eql(u8, flag, "--blob-output"))
+            {
+                if (value.len == 0) {
+                    try cli_values.reject(out, flag, value, error.EmptyPath);
+                    return .{ .rejected = error.EmptyPath };
+                }
+                if (std.mem.eql(u8, flag, "--blob-dir")) options.blob_dir = value
+                else options.blob_output = value;
             } else if (std.mem.eql(u8, flag, "--seed")) {
                 options.seed = std.fmt.parseInt(u64, value, 10) catch {
                     try cli_values.reject(out, flag, value, error.NotASeed);
@@ -232,33 +314,13 @@ pub const Options = struct {
             }
         }
         if (try contradictions(out, options)) |refusal| return .{ .rejected = refusal };
+        if (options.blob_role != null) options.alpn = ozai.blobs_protocol.alpn;
+        if (options.gossip_topics.items.len != 0) options.alpn = node_mod.gossip_alpn;
 
         return .{ .run = options };
     }
 
-    /// The refusal a command line earns by naming two things one node cannot
-    /// be, and the line saying so.
-    ///
-    /// A node runs one protocol, one half of the relay handshake, and reaches
-    /// peers one way. Each arm below is a command line that named two of them,
-    /// and each is answered on its own line because a caller's mistake is
-    /// worth naming exactly rather than resolving silently: both relay roles
-    /// at once, an ALPN beside a relay role, a peer list beside a relay role,
-    /// and a datagram on a node that is not a relay's client.
-    ///
-    /// The arms run in that order and none of them is nested inside another,
-    /// because a line that is wrong twice is refused for the first reason it
-    /// can be named rather than for whichever one an arm happens to reach last.
-    /// That is why the datagram check stands on its own rather than inside the
-    /// relay arm: a node serving a relay is refused for the datagram too, and
-    /// an arm that returned early is a flag silently carried in silence.
-    ///
-    /// **The refusal comes back as a value and not as an error.** An error
-    /// returned out of `parse` is a failure of this program, and it reaches the
-    /// caller as a stack trace; a refusal is the program's own answer and has
-    /// to arrive as something `main` can print and exit 1 over. The write is
-    /// the one thing here that really can fail, and it is the only thing this
-    /// function returns as an error.
+    /// Refusals are values; writer failures are program errors.
     fn contradictions(
         out: *std.Io.Writer,
         options: Options,
@@ -271,48 +333,46 @@ pub const Options = struct {
             try out.writeAll("ozai-node: --dns-server requires --lookup-peer\n");
             return @as(?CliError, error.LookupNeedsPeer);
         }
-        if (options.relay_peer) |target| {
-            // `node.Role` is a union, so one process runs one half. Choosing
-            // one here would drop the other without a word.
-            if (options.serve) {
-                try cli_values.reject(out, "--relay-peer", target.url, error.TwoRelayRoles);
-                return @as(?CliError, error.TwoRelayRoles);
-            }
-        }
-        if (options.serve or options.relay_peer != null) {
-            if (options.alpn) |named| {
-                try cli_values.reject(out, "--alpn", named, error.RelayChoosesTheAlpn);
-                return @as(?CliError, error.RelayChoosesTheAlpn);
-            }
-            if (options.peers.items.len != 0) {
-                for (options.peers.items) |peer| try out.print(
-                    "ozai-node: --peer {f}: {t}\n",
-                    .{ peer.id, error.RelayDialsNobody },
-                );
-                return @as(?CliError, error.RelayDialsNobody);
-            }
-            if (options.lookup_peers.items.len != 0) {
-                try out.writeAll("ozai-node: --lookup-peer cannot accompany a relay role\n");
-                return @as(?CliError, error.RelayDialsNobody);
-            }
-        }
-        // A datagram needs a relay's client, and only a client has one: the
-        // wire it goes on is the one this process holds to a relay. `--relay`
-        // is the far end of that wire rather than a peer of it, and a node
-        // with no relay flag at all is dialled at its own address and reaches
-        // nobody. Left to the loop, the second of those is a `NoRelay` out of
-        // `sendThrough` on the first pass that tried and the first is a flag
-        // that is carried in silence for the whole run — both stack traces or
-        // nothing at all for a flag that was wrong before the node was built.
-        if (options.send) |datagram| {
-            if (options.relay_peer == null) {
-                try cli_values.reject(out, "--send", datagram.bytes, error.SendNeedsARelayClient);
-                return @as(?CliError, error.SendNeedsARelayClient);
-            }
+        const refusal: ?CliError = if (options.relay_listen != null and
+            options.relay_server != null) error.TwoRelayRoles
+        else if (options.relay_server != null and options.relay_host == null)
+            error.RelayNeedsHost
+        else if (options.relay_host != null and options.relay_server == null)
+            error.RelayNeedsServer
+        else if (options.traversal_initiate and options.traversal_addresses.items.len == 0)
+            error.TraversalNeedsAddress
+        else if (options.message != null and options.gossip_topics.items.len == 0)
+            error.MessageNeedsTopic
+        else if (options.gossip_topics.items.len != 0 and options.blob_role != null)
+            error.ConflictingProtocols
+        else if (options.gossip_topics.items.len != 0 and options.alpn != null and
+            !std.mem.eql(u8, options.alpn.?, node_mod.gossip_alpn))
+            error.TopicAlpnMismatch
+        else if (options.blob_role == null and (options.blob_dir != null or
+            options.blob_hash != null or options.blob_size != null or
+            options.blob_range_explicit or options.blob_output != null)) error.BlobNeedsRole
+        else if (options.blob_role != null and options.blob_hash == null)
+            error.BlobNeedsHash
+        else if (options.blob_role == .provider and options.blob_dir == null)
+            error.BlobNeedsDirectory
+        else if (options.blob_role == .provider and (options.blob_size != null or
+            options.blob_range_explicit or options.blob_output != null))
+            error.BlobProviderGetterOptions
+        else if (options.blob_role == .getter and options.blob_dir != null)
+            error.BlobGetterDirectory
+        else if (options.blob_role != null and options.alpn != null and
+            !std.mem.eql(u8, options.alpn.?, ozai.blobs_protocol.alpn))
+            error.BlobAlpnMismatch
+        else null;
+        if (refusal) |err| {
+            try out.print("ozai-node: incompatible options: {t}\n", .{err});
+            return err;
         }
         return null;
     }
 };
+
+pub const BlobRole = enum { provider, getter };
 
 /// What the command line turned out to mean.
 pub const Parse = union(enum) {
@@ -369,7 +429,6 @@ test "lookup requires explicit peers and source and bounded positive timing" {
         .{ .args = &.{ "ozai-node", "--lookup-interval", "9223372036855" }, .refusal = error.LookupTimingOutOfRange },
         .{ .args = &.{ "ozai-node", "--dns-server", "127.0.0.1:0" }, .refusal = error.AddressNotReachable },
         .{ .args = &.{ "ozai-node", "--dns-origin", "" }, .refusal = error.InvalidDnsOrigin },
-        .{ .args = &.{ "ozai-node", "--relay", "--lookup-peer", id, "--dns-server", "127.0.0.1:53" }, .refusal = error.RelayDialsNobody },
     };
     for (cases) |case| {
         var out: std.Io.Writer.Allocating = .init(arena.allocator());
@@ -393,4 +452,193 @@ test "static peer does not enable external DNS" {
     try std.testing.expect(parsed == .run);
     try std.testing.expectEqual(@as(usize, 0), parsed.run.lookup_peers.items.len);
     try std.testing.expect(parsed.run.dns_server == null);
+}
+
+test "carrier and pinned relay peers leave inner application independent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var secret = try ozai.SecretKey.fromSeed(.{7} ** ozai.SecretKey.seed_length);
+    defer secret.deinit();
+    var peer_buffer: [160]u8 = undefined;
+    const peer = try std.fmt.bufPrintZ(&peer_buffer, "{s}@http://relay.invalid:8080",
+        .{secret.nodeId().toZ32()});
+    const args = [_][*:0]const u8{
+        "ozai-node", "--relay-server", "127.0.0.1:8080", "--relay-host", "relay.invalid",
+        "--peer-relay", peer, "--alpn", "app", "--traversal-address", "127.0.0.1:9000",
+        "--traversal-address", "[::1]:9001", "--traversal-initiate",
+    };
+    var out: std.Io.Writer.Allocating = .init(arena.allocator());
+    const parsed = try Options.parse(arena.allocator(), .{ .vector = &args }, &out.writer);
+    try std.testing.expect(parsed == .run);
+    try std.testing.expectEqualStrings("app", parsed.run.alpn.?);
+    try std.testing.expectEqualStrings("relay.invalid", parsed.run.relay_host.?);
+    try std.testing.expect(parsed.run.peers.items[0].addr == .relay);
+    try std.testing.expectEqualStrings("relay.invalid",
+        parsed.run.peers.items[0].addr.relay.hostSlice());
+    try std.testing.expectEqual(@as(usize, 2), parsed.run.traversal_addresses.items.len);
+    try std.testing.expect(parsed.run.traversal_initiate);
+}
+
+test "gossip topics and getter options use protocol values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const args = [_][*:0]const u8{
+        "ozai-node", "--topic-hex", "ab" ** 32, "--topic-hex", "cd" ** 32,
+        "--message", "hello", "--relay-listen", "127.0.0.1:0",
+    };
+    var out: std.Io.Writer.Allocating = .init(arena.allocator());
+    const gossip = try Options.parse(arena.allocator(), .{ .vector = &args }, &out.writer);
+    try std.testing.expect(gossip == .run);
+    try std.testing.expectEqual(@as(usize, 2), gossip.run.gossip_topics.items.len);
+    try std.testing.expectEqual(@as(u8, 0xab), gossip.run.gossip_topics.items[0].bytes[0]);
+    try std.testing.expectEqualStrings("hello", gossip.run.message.?);
+    const blob_args = [_][*:0]const u8{
+        "ozai-node", "--blob-role", "getter", "--blob-hash", "ab" ** 32,
+        "--blob-size", "40000", "--blob-range", "15:33", "--blob-output", "verified.bin",
+    };
+    const blob = try Options.parse(arena.allocator(), .{ .vector = &blob_args }, &out.writer);
+    try std.testing.expect(blob == .run);
+    try std.testing.expectEqualStrings(ozai.blobs_protocol.alpn, blob.run.alpn.?);
+    try std.testing.expectEqual(@as(u64, 15), blob.run.blob_range.?.start);
+    try std.testing.expectEqual(@as(u64, 33), blob.run.blob_range.?.end);
+    try std.testing.expectEqual(@as(u8, 0xab), blob.run.blob_hash.?[0]);
+}
+
+test "protocol contradictions invalid values and removed flags are rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Case = struct { args: []const [*:0]const u8, refusal: CliError };
+    const cases = [_]Case{
+        .{ .args = &.{ "node", "--relay" }, .refusal = error.NotAnOption },
+        .{ .args = &.{ "node", "--relay-peer", "x" }, .refusal = error.NotAnOption },
+        .{ .args = &.{ "node", "--send", "x" }, .refusal = error.NotAnOption },
+        .{ .args = &.{ "node", "--relay-server", "127.0.0.1:80" }, .refusal = error.RelayNeedsHost },
+        .{ .args = &.{ "node", "--relay-host", "local" }, .refusal = error.RelayNeedsServer },
+        .{ .args = &.{ "node", "--relay-listen", "127.0.0.1:0", "--relay-server", "127.0.0.1:80", "--relay-host", "local" }, .refusal = error.TwoRelayRoles },
+        .{ .args = &.{ "node", "--blob-role", "getter", "--blob-hash", "ab" ** 32, "--alpn", "other" }, .refusal = error.BlobAlpnMismatch },
+        .{ .args = &.{ "node", "--blob-role", "provider", "--blob-hash", "ab" ** 32 }, .refusal = error.BlobNeedsDirectory },
+        .{ .args = &.{ "node", "--blob-role", "getter" }, .refusal = error.BlobNeedsHash },
+        .{ .args = &.{ "node", "--blob-hash", "zz" ** 32 }, .refusal = error.InvalidBlobHash },
+        .{ .args = &.{ "node", "--blob-hash", "ab" }, .refusal = error.InvalidBlobHash },
+        .{ .args = &.{ "node", "--blob-range", "1:1" }, .refusal = error.InvalidBlobRange },
+        .{ .args = &.{ "node", "--blob-range", "2:1" }, .refusal = error.InvalidBlobRange },
+        .{ .args = &.{ "node", "--blob-range", "1:2:3" }, .refusal = error.InvalidBlobRange },
+        .{ .args = &.{ "node", "--blob-size", "-1" }, .refusal = error.InvalidBlobSize },
+        .{ .args = &.{ "node", "--topic-hex", "ab" }, .refusal = error.InvalidTopic },
+        .{ .args = &.{ "node", "--topic-hex", "ab" ** 32, "--topic-hex", "ab" ** 32, "--topic-hex", "ab" ** 32, "--topic-hex", "ab" ** 32, "--topic-hex", "ab" ** 32 }, .refusal = error.TooManyTopics },
+    };
+    for (cases) |case| {
+        var out: std.Io.Writer.Allocating = .init(arena.allocator());
+        const parsed = try Options.parse(arena.allocator(), .{ .vector = case.args }, &out.writer);
+        try std.testing.expect(parsed == .rejected);
+        try std.testing.expectEqual(case.refusal, parsed.rejected);
+    }
+}
+
+test "expected peer identity is explicit and curve validated" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var secret = try ozai.SecretKey.fromSeed(.{9} ** ozai.SecretKey.seed_length);
+    defer secret.deinit();
+    var buffer: [ozai.NodeId.z32_length + 1]u8 = undefined;
+    const id = try std.fmt.bufPrintZ(&buffer, "{s}", .{secret.nodeId().toZ32()});
+    const args = [_][*:0]const u8{ "node", "--expect-peer", id };
+    var out: std.Io.Writer.Allocating = .init(arena.allocator());
+    const parsed = try Options.parse(arena.allocator(), .{ .vector = &args }, &out.writer);
+    try std.testing.expect(parsed == .run);
+    try std.testing.expectEqualStrings(id, &parsed.run.expect_peer.?.toZ32());
+    const invalid_args = [_][*:0]const u8{ "node", "--expect-peer", "invalid" };
+    const invalid = try Options.parse(arena.allocator(),
+        .{ .vector = &invalid_args }, &out.writer);
+    try std.testing.expect(invalid == .rejected);
+}
+
+test "provider directory and all chunk getter range are accepted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: std.Io.Writer.Allocating = .init(arena.allocator());
+    const provider_args = [_][*:0]const u8{
+        "node", "--blob-role", "provider", "--blob-dir", "store",
+        "--blob-hash", "ab" ** 32, "--alpn", "/iroh-bytes/4",
+    };
+    const provider = try Options.parse(arena.allocator(),
+        .{ .vector = &provider_args }, &out.writer);
+    try std.testing.expect(provider == .run);
+    try std.testing.expect(provider.run.blob_role == .provider);
+    try std.testing.expectEqualStrings("store", provider.run.blob_dir.?);
+    const getter_args = [_][*:0]const u8{
+        "node", "--blob-role", "getter", "--blob-hash", "ab" ** 32,
+        "--blob-range", "all", "--blob-size", "0",
+    };
+    const getter = try Options.parse(arena.allocator(),
+        .{ .vector = &getter_args }, &out.writer);
+    try std.testing.expect(getter == .run);
+    try std.testing.expect(getter.run.blob_range == null);
+    try std.testing.expectEqual(@as(u64, 0), getter.run.blob_size.?);
+}
+
+test "role dependent options do not disappear into defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Case = struct { args: []const [*:0]const u8, refusal: CliError };
+    const cases = [_]Case{
+        .{ .args = &.{ "node", "--blob-role", "unknown" }, .refusal = error.InvalidBlobRole },
+        .{ .args = &.{ "node", "--blob-range", "all" }, .refusal = error.BlobNeedsRole },
+        .{ .args = &.{ "node", "--blob-range", "-1:2" }, .refusal = error.InvalidBlobRange },
+        .{ .args = &.{ "node", "--blob-range", "0:18446744073709551616" }, .refusal = error.InvalidBlobRange },
+        .{ .args = &.{ "node", "--blob-range", "all:2" }, .refusal = error.InvalidBlobRange },
+        .{ .args = &.{ "node", "--blob-size", "18446744073709551616" }, .refusal = error.InvalidBlobSize },
+        .{ .args = &.{ "node", "--blob-role", "provider", "--blob-dir", "store", "--blob-hash", "ab" ** 32, "--blob-range", "all" }, .refusal = error.BlobProviderGetterOptions },
+        .{ .args = &.{ "node", "--blob-role", "getter", "--blob-hash", "ab" ** 32, "--blob-dir", "store" }, .refusal = error.BlobGetterDirectory },
+        .{ .args = &.{ "node", "--message", "hello" }, .refusal = error.MessageNeedsTopic },
+        .{ .args = &.{ "node", "--relay-host", "" }, .refusal = error.InvalidRelayHost },
+        .{ .args = &.{ "node", "--relay-server", "127.0.0.1:0" }, .refusal = error.AddressNotReachable },
+        .{ .args = &.{ "node", "--traversal-address", "127.0.0.1:0" }, .refusal = error.AddressNotReachable },
+        .{ .args = &.{ "node", "--blob-output", "" }, .refusal = error.EmptyPath },
+    };
+    for (cases) |case| {
+        var out: std.Io.Writer.Allocating = .init(arena.allocator());
+        const parsed = try Options.parse(arena.allocator(),
+            .{ .vector = case.args }, &out.writer);
+        try std.testing.expect(parsed == .rejected);
+        try std.testing.expectEqual(case.refusal, parsed.rejected);
+    }
+}
+
+test "explicit gossip topics select gossip and reject competing application protocols" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: std.Io.Writer.Allocating = .init(arena.allocator());
+    const args = [_][*:0]const u8{ "node", "--topic-hex", "ab" ** 32 };
+    const parsed = try Options.parse(arena.allocator(), .{ .vector = &args }, &out.writer);
+    try std.testing.expect(parsed == .run);
+    try std.testing.expectEqualStrings(node_mod.gossip_alpn, parsed.run.alpn.?);
+    const Case = struct { args: []const [*:0]const u8, refusal: CliError };
+    const cases = [_]Case{
+        .{ .args = &.{ "node", "--topic-hex", "ab" ** 32, "--alpn", "other" }, .refusal = error.TopicAlpnMismatch },
+        .{ .args = &.{ "node", "--topic-hex", "ab" ** 32, "--blob-role", "getter", "--blob-hash", "ab" ** 32 }, .refusal = error.ConflictingProtocols },
+    };
+    for (cases) |case| {
+        const rejected = try Options.parse(arena.allocator(),
+            .{ .vector = case.args }, &out.writer);
+        try std.testing.expect(rejected == .rejected);
+        try std.testing.expectEqual(case.refusal, rejected.rejected);
+    }
+}
+
+test "native traversal requires candidates and bounds configured candidates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const Case = struct { args: []const [*:0]const u8, refusal: CliError };
+    const cases = [_]Case{
+        .{ .args = &.{ "node", "--traversal-initiate" }, .refusal = error.TraversalNeedsAddress },
+        .{ .args = &.{ "node", "--traversal-address", "127.0.0.1:1", "--traversal-address", "127.0.0.1:2", "--traversal-address", "127.0.0.1:3" }, .refusal = error.TooManyTraversalAddresses },
+    };
+    for (cases) |case| {
+        var out: std.Io.Writer.Allocating = .init(arena.allocator());
+        const parsed = try Options.parse(arena.allocator(),
+            .{ .vector = case.args }, &out.writer);
+        try std.testing.expect(parsed == .rejected);
+        try std.testing.expectEqual(case.refusal, parsed.rejected);
+    }
 }

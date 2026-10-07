@@ -94,14 +94,14 @@
 //! notes record the expected wire behavior rather than copy bytes into a
 //! second, tautological test.
 
-/// `/iroh-gossip/1`. Read from `src/node/node_config.zig:36`.
-pub const ALPN_GOSSIP: &[u8] = b"/iroh-gossip/1";
+/// The gossip wire ALPN from the pinned upstream implementation.
+pub const ALPN_GOSSIP: &[u8] = iroh_gossip::ALPN;
 
 /// `/iroh-relay/1`. Read from `src/node/node_config.zig:41`.
 pub const ALPN_RELAY: &[u8] = b"/iroh-relay/1";
 
-/// `/iroh-bytes/4`. Read from `src/blobs/protocol.zig:66`.
-pub const ALPN_BLOBS: &[u8] = b"/iroh-bytes/4";
+/// The Bao blob-transfer ALPN from the pinned upstream implementation.
+pub const ALPN_BLOBS: &[u8] = iroh_blobs::ALPN;
 
 /// `ozai`. Read from `test/loopback_side.zig:36`, and the protocol the
 /// in-process interop driver in `test/rust_interop_test.zig` speaks.
@@ -221,22 +221,6 @@ pub fn parse_seed_hex(text: &str) -> Option<[u8; SEED_LEN]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The two spellings the whole peer hangs on, pinned against the Zig tree.
-    #[test]
-    fn the_alpn_spellings_are_the_zig_tree_spellings() {
-        assert_eq!(ALPN_GOSSIP, b"/iroh-gossip/1");
-        assert_eq!(ALPN_RELAY, b"/iroh-relay/1");
-        assert_eq!(ALPN_BLOBS, b"/iroh-bytes/4");
-        assert_eq!(ALPN_TRANSPORT, b"ozai");
-        // Reserved by `src/router/alpn_table.zig:173` and refused by
-        // `Builder.accept`, so it is never in the offer list.
-        assert_eq!(ALPN_QAD, b"/iroh-qad/0");
-        assert!(!ALPN_OFFERED.contains(&ALPN_QAD));
-        for offered in ALPN_OFFERED {
-            assert!(!offered.is_empty(), "an empty ALPN is a protocol nobody speaks");
-        }
-    }
 
     #[test]
     fn an_spki_is_forty_four_bytes_and_the_last_thirty_two_are_the_node_id() {

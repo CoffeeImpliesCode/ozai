@@ -160,3 +160,29 @@ test "a received payload too long to record is refused" {
     );
     try t.expectEqual(@as(usize, 0), state.cache.count());
 }
+
+test "received frame storage may be reused after actions are consumed" {
+    const codec = @import("../codec.zig");
+    const original = [_]u8{0x42} ** 2048;
+    const id = MessageId.fromContent(&original);
+    var frame: [codec.max_message_size + codec.max_prefix_size]u8 = undefined;
+    const encoded = try codec.encode(.{ .gossip = .{ .gossip = .{
+        .id = id,
+        .content = &original,
+        .scope = .{ .swarm = Round.zero },
+    } } }, &frame);
+    var state: State = .init(try testNodeId(1), .{});
+    var out: Actions(OutEvent) = .init(t.allocator);
+    defer out.deinit();
+    try state.handle(.{ .recv_message = .{
+        .from = try testNodeId(2),
+        .message = (try codec.decode(encoded)).gossip,
+    } }, 0, &out);
+    // Immediate emitted/forwarded actions can borrow the input. Once consumed,
+    // only cache storage remains, and it must own the entire accepted content.
+    out.clear();
+    @memset(&frame, 0xa5);
+    const cached = state.cache.get(id) orelse return error.MissingCachedContent;
+    try t.expectEqualSlices(u8, &original, cached.content);
+    try t.expect(cached.validate());
+}

@@ -44,8 +44,10 @@ fn vector(name: []const u8, message: codec.Message, head: []const u8) Vector {
 /// The bytes after a frame's length prefix, read with the reader the frame's own
 /// decoder uses rather than by counting a prefix by hand.
 fn bodyOf(frame: []const u8) ![]const u8 {
-    var reader = postcard.Reader.init(frame);
-    return reader.readBytes();
+    if (frame.len < 4) return error.UnexpectedEnd;
+    const length = std.mem.readInt(u32, frame[0..4], .big);
+    if (length != frame.len - 4) return error.BadLength;
+    return frame[4..];
 }
 
 /// A frame this codec must not read back, whatever the error is.
@@ -298,25 +300,24 @@ test "an unknown tag is refused instead of skipped" {
 }
 
 test "a frame prefix that does not match the bytes present is refused" {
-    // `gossip/prune` is the smallest frame there is: a layer tag, an arm tag and
-    // a one-byte length.
+    // `gossip/prune` is the smallest frame: two tags and a four-byte length.
     var buf: [room]u8 = undefined;
     const frame = try codec.encode(.{ .gossip = .{ .prune = {} } }, &buf);
-    try t.expectEqualSlices(u8, &.{ 0x02, 0x01, 0x01 }, frame);
+    try t.expectEqualSlices(u8, &.{ 0, 0, 0, 2, 1, 1 }, frame);
     var longer: [room]u8 = undefined;
     var shorter: [room]u8 = undefined;
     @memcpy(longer[0..frame.len], frame);
     @memcpy(shorter[0..frame.len], frame);
     // One byte more than the frame carries: the buffer is short of its own
     // declaration, which is not the same as a frame that is merely cut.
-    longer[0] = 0x03;
+    longer[3] = 0x03;
     try t.expectError(error.BadLength, codec.decode(longer[0..frame.len]));
     // One byte fewer: the body is a message and the frame has a byte left over,
     // which a decoder that returned it would be handing back unread.
-    shorter[0] = 0x01;
+    shorter[3] = 0x01;
     try t.expectError(error.TrailingBytes, codec.decode(shorter[0..frame.len]));
     // A declared body of nothing at all is not a message.
-    try t.expectError(error.UnexpectedEnd, codec.decode(&[_]u8{0x00}));
+    try t.expectError(error.UnexpectedEnd, codec.decode(&[_]u8{ 0, 0, 0, 0 }));
     // A correct frame with one byte appended.
     var extended: [room]u8 = undefined;
     @memcpy(extended[0..frame.len], frame);
@@ -329,30 +330,27 @@ test "the stream header round-trips, and a body that is not a topic id is refuse
     var buf: [limits.max_header_size]u8 = undefined;
     const frame = try codec.encodeStreamHeader(codec.StreamHeader.init(topic), &buf);
     try t.expect(frame.len <= limits.max_header_size);
-    // The first byte is the length of everything behind it, and a topic id is
-    // all of that: one prefix octet plus the id, and the two cases below are
-    // this one taken apart by a byte at each end.
-    try t.expectEqual(gossip.topic_id_length, @as(usize, frame[0]));
-    try t.expectEqual(gossip.topic_id_length + 1, frame.len);
+    try t.expectEqual(gossip.topic_id_length, std.mem.readInt(u32, frame[0..4], .big));
+    try t.expectEqual(gossip.topic_id_length + 4, frame.len);
     try t.expect((try codec.decodeStreamHeader(frame)).topic_id.eql(topic));
 
     // One byte short: a header has no length of its own to trust and no second
     // field to skip to, so a body of any other size is not a header.
     var chopped: [limits.max_header_size]u8 = undefined;
     @memcpy(chopped[0..frame.len], frame);
-    chopped[0] = @intCast(frame.len - 2);
+    chopped[3] = @intCast(gossip.topic_id_length - 1);
     try t.expectError(error.BadHeaderSize, codec.decodeStreamHeader(chopped[0 .. frame.len - 1]));
     // One byte long: the body is 33 bytes and the prefix has to say so, or the
     // refusal would be about the bytes left over rather than about the size.
     const longer_len = frame.len + 1;
-    var longer: [limits.max_header_size]u8 = undefined;
+    var longer: [limits.max_header_size + 1]u8 = undefined;
     @memcpy(longer[0..frame.len], frame);
     longer[frame.len] = 0x5a;
-    longer[0] = @intCast(longer_len - 1);
+    longer[3] = @intCast(gossip.topic_id_length + 1);
     try t.expectError(error.BadHeaderSize, codec.decodeStreamHeader(longer[0..longer_len]));
 }
 
-test "a body at the byte budget is written and one byte over is refused" {
+test "upstream write rejects the exact budget while read admits it" {
     const id = plumtree.MessageId.fromContent("budget");
     const round: u16 = std.math.maxInt(u16);
     // Everything in a `Gossip` body that is not its content: the layer tag, the
@@ -378,8 +376,11 @@ test "a body at the byte budget is written and one byte over is refused" {
 
     var frame_buf: [room]u8 = undefined;
     try t.expectError(error.FrameTooLarge, codec.encode(over_budget, &frame_buf));
-    const frame = try codec.encode(at_budget, &frame_buf);
-    const decoded = (try codec.decode(frame)).gossip.gossip;
+    try t.expectError(error.FrameTooLarge, codec.encode(at_budget, &frame_buf));
+    var at_writer = postcard.Writer.init(frame_buf[4..]);
+    try codec.encodeBody(at_budget, &at_writer);
+    std.mem.writeInt(u32, frame_buf[0..4], codec.max_message_size, .big);
+    const decoded = (try codec.decode(frame_buf[0 .. 4 + at_writer.finish().len])).gossip.gossip;
     try t.expectEqual(content_len, decoded.content.len);
     try t.expectEqualSlices(u8, content[0..content_len], decoded.content);
 
@@ -393,9 +394,9 @@ test "a body at the byte budget is written and one byte over is refused" {
     const read = (try codec.decodeBody(body)).gossip.gossip;
     try t.expectEqual(content.len, read.content.len);
     var framed: [room]u8 = undefined;
-    var framed_writer = postcard.Writer.init(&framed);
-    try framed_writer.writeBytes(body);
-    try t.expectError(error.FrameTooLarge, codec.decode(framed_writer.finish()));
+    std.mem.writeInt(u32, framed[0..4], @intCast(body.len), .big);
+    @memcpy(framed[4..][0..body.len], body);
+    try t.expectError(error.FrameTooLarge, codec.decode(framed[0 .. 4 + body.len]));
 }
 
 test "a peer id that is not a canonical point is refused" {
@@ -419,7 +420,7 @@ test "a peer id that is not a canonical point is refused" {
 test "the largest peer list and the largest IHave list round-trip" {
     const peer = try testNodeId(4);
     var infos: [gossip.max_shuffle_nodes]gossip.PeerInfo = undefined;
-    for (&infos) |*info| info.* = .{ .id = peer, .data = "data" };
+    for (&infos) |*info| info.* = .{ .id = peer, .data = null };
     var ihaves: [plumtree.max_ihaves_per_message]plumtree.IHave = undefined;
     for (&ihaves, 0..) |*have, index| {
         have.* = .{
@@ -442,42 +443,143 @@ test "the largest peer list and the largest IHave list round-trip" {
     // single element of the list is read. The bodies carry a full record per
     // claimed entry, because `readLen` refuses a count the buffer cannot satisfy
     // first and the bound is the rule under test rather than that one.
-    var too_many: [1 + 1 + 1 + 9 * (NodeId.byte_length + 1)]u8 = undefined;
+    const peer_count = gossip.max_shuffle_nodes + 1;
+    var too_many: [1 + 1 + 1 + peer_count * (NodeId.byte_length + 1)]u8 = undefined;
     @memset(&too_many, 0x00);
     too_many[0] = 0x00;
     too_many[1] = 0x03;
-    too_many[2] = 0x09;
+    too_many[2] = peer_count;
     try t.expectError(error.ShuffleNodeListTooLong, codec.decodeBody(&too_many));
-    var too_many_ihaves: [1 + 1 + 1 + 17 * (plumtree.id_length + 1)]u8 = undefined;
+    const ihave_count = plumtree.max_ihaves_per_message + 1;
+    var too_many_ihaves: [1 + 1 + 1 + ihave_count * (plumtree.id_length + 1)]u8 = undefined;
     @memset(&too_many_ihaves, 0x00);
     too_many_ihaves[0] = 0x01;
     too_many_ihaves[1] = 0x03;
-    too_many_ihaves[2] = 0x11;
+    too_many_ihaves[2] = ihave_count;
     try t.expectError(error.IHaveListTooLong, codec.decodeBody(&too_many_ihaves));
 }
 
-test "the floor carries a full membership message and not a full broadcast" {
+test "maximum owned bytes match the upstream receive frame budget" {
     const data = [_]u8{0x01} ** gossip.peer_data_max;
     const join: codec.Message = .{ .swarm = .{ .join = &data } };
-    try t.expect(codec.encodedLen(join) <= codec.min_message_size);
+    try t.expectEqual(codec.max_message_size, codec.encodedLen(join));
     const broadcast: codec.Message = .{ .gossip = .{ .gossip = .{
         .id = plumtree.MessageId.fromContent("big"),
         .content = &([_]u8{0x02} ** plumtree.max_content),
-        .scope = .{ .swarm = .{ .value = 0 } },
+        .scope = .neighbors,
     } } };
-    // A `max_content` payload does not fit the floor, which is upstream's floor
-    // too, and is why upstream's default is four times it. The default has to
-    // carry one: a configuration that did not would refuse every full broadcast.
-    try t.expect(codec.encodedLen(broadcast) > codec.min_message_size);
-    try t.expect(codec.encodedLen(broadcast) <= codec.max_message_size);
+    try t.expectEqual(codec.max_message_size, codec.encodedLen(broadcast));
 }
 
 test "varintLen is the length postcard writes for the same value" {
     const values = [_]u64{ 0, 1, 126, 127, 128, 16_383, 16_384, 65_535, 1 << 21 };
-    var buf: [limits.max_prefix_size]u8 = undefined;
+    var buf: [postcard.varintMax(u64)]u8 = undefined;
     for (values) |value| {
         var writer = postcard.Writer.init(&buf);
         try writer.writeLen(@intCast(value));
         try t.expectEqual(writer.finish().len, limits.varintLen(value));
     }
+}
+
+test "pinned upstream frames use fixed four-byte big-endian lengths" {
+    // Source-derived, not captured: pinned net/util.rs read_lp/write_frame
+    // read_u32/write_u32 frame the nested topic message and StreamHeader.
+    const prune = [_]u8{ 0, 0, 0, 2, 1, 1 };
+    var out: [64]u8 = undefined;
+    try t.expectEqualSlices(u8, &prune, try codec.encode(.{ .gossip = .{ .prune = {} } }, &out));
+    try t.expectEqualSlices(u8, &prune, try codec.encode(try codec.decode(&prune), &out));
+    var header: [36]u8 = @splat(0);
+    header[3] = 32;
+    const topic = gossip.TopicId.fromBytes(@splat(0));
+    try t.expectEqualSlices(u8, &header, try codec.encodeStreamHeader(.{ .topic_id = topic }, &out));
+    try t.expect((try codec.decodeStreamHeader(&header)).topic_id.eql(topic));
+}
+
+test "frame-fitting upstream vectors and payloads exceed old local capacities" {
+    const peer = try testNodeId(5);
+    var infos: [9]gossip.PeerInfo = undefined;
+    for (&infos) |*info| info.* = .{ .id = peer, .data = null };
+    var ihaves: [17]plumtree.IHave = undefined;
+    for (&ihaves) |*have| have.* = .{
+        .id = plumtree.MessageId.fromContent("wide"),
+        .round = .{ .value = 65535 },
+    };
+    const contact = [_]u8{0x42} ** 257;
+    const content = [_]u8{0x43} ** 1025;
+    const messages = [_]codec.Message{
+        .{ .swarm = .{ .shuffle_reply = .{ .nodes = try gossip.PeerInfos.init(&infos) } } },
+        .{ .gossip = .{ .i_have = try plumtree.IHaves.init(&ihaves) } },
+        .{ .swarm = .{ .join = &contact } },
+        .{ .gossip = .{ .gossip = .{
+            .id = plumtree.MessageId.fromContent(&content),
+            .content = &content,
+            .scope = .neighbors,
+        } } },
+    };
+    var out: [room]u8 = undefined;
+    var again: [room]u8 = undefined;
+    for (messages) |message| {
+        const bytes = try codec.encode(message, &out);
+        try t.expectEqualSlices(u8, bytes, try codec.encode(try codec.decode(bytes), &again));
+    }
+    const owned_contact = try gossip.PeerData.fromBytes(&contact);
+    try t.expectEqualSlices(u8, &contact, owned_contact.slice());
+    try t.expect(content.len <= plumtree.max_content);
+}
+
+test "all ten pinned upstream state serializer variants decode and reencode exactly" {
+    // Generated by interop/iroh-peer/src/gossip_vectors.rs from actual public
+    // State OutEvent::SendMessage, not hand-built enum payloads or packet capture.
+    const fixtures = .{
+        @embedFile("fixtures/iroh-2885dd9/join.bin"),
+        @embedFile("fixtures/iroh-2885dd9/forward_join.bin"),
+        @embedFile("fixtures/iroh-2885dd9/shuffle.bin"),
+        @embedFile("fixtures/iroh-2885dd9/shuffle_reply.bin"),
+        @embedFile("fixtures/iroh-2885dd9/neighbor.bin"),
+        @embedFile("fixtures/iroh-2885dd9/disconnect.bin"),
+        @embedFile("fixtures/iroh-2885dd9/gossip.bin"),
+        @embedFile("fixtures/iroh-2885dd9/prune.bin"),
+        @embedFile("fixtures/iroh-2885dd9/graft.bin"),
+        @embedFile("fixtures/iroh-2885dd9/ihave.bin"),
+    };
+    var out: [room]u8 = undefined;
+    inline for (fixtures, 0..) |bytes, index| {
+        const decoded = try codec.decode(bytes);
+        const layer: u8 = if (index < 6) 0 else 1;
+        const arm: u8 = @intCast(if (index < 6) index else index - 6);
+        const body = try bodyOf(bytes);
+        try t.expectEqual(layer, body[0]);
+        try t.expectEqual(arm, body[1]);
+        try t.expectEqualSlices(u8, bytes, try codec.encode(decoded, &out));
+        if (index == 6) try t.expect(decoded.gossip.gossip.validate());
+    }
+    const header = @embedFile("fixtures/iroh-2885dd9/header.bin");
+    const decoded_header = try codec.decodeStreamHeader(header);
+    try t.expectEqualSlices(u8, &([_]u8{0x74} ** 32), &decoded_header.topic_id.bytes);
+    try t.expectEqualSlices(u8, header, try codec.encodeStreamHeader(decoded_header, &out));
+}
+
+test "actual upstream boundary vectors retain contact content and long vectors" {
+    const contact = try codec.decode(@embedFile("fixtures/iroh-2885dd9/peer_data_300.bin"));
+    try t.expectEqual(@as(usize, 300), contact.swarm.join.?.len);
+    const shuffle = try codec.decode(@embedFile("fixtures/iroh-2885dd9/shuffle_large.bin"));
+    try t.expect(shuffle.swarm.shuffle.nodes.count >= 9);
+    const ihave = try codec.decode(@embedFile("fixtures/iroh-2885dd9/ihave_large.bin"));
+    try t.expect(ihave.gossip.i_have.count >= 17);
+    const payload = try codec.decode(@embedFile("fixtures/iroh-2885dd9/gossip_large.bin"));
+    try t.expectEqual(@as(usize, 2048), payload.gossip.gossip.content.len);
+    try t.expect(payload.gossip.gossip.validate());
+}
+
+test "decoded PeerData is copied before receive storage is reused" {
+    const original = [_]u8{0x42} ** 300;
+    var frame: [room]u8 = undefined;
+    const encoded = try codec.encode(.{ .swarm = .{ .join = &original } }, &frame);
+    const borrowed = (try codec.decode(encoded)).swarm.join.?;
+    var contacts: @import("hyparview/peer_data.zig").PeerDataMap = .{};
+    const peer = try testNodeId(6);
+    try contacts.put(peer, borrowed);
+    @memset(&frame, 0xa5);
+    const stored = contacts.get(peer) orelse return error.MissingContactData;
+    try t.expectEqualSlices(u8, &original, stored.slice());
 }

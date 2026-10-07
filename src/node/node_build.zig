@@ -1,23 +1,12 @@
-//! Building a node, and taking it apart again.
-//!
-//! `create` is where the project's vocabulary is translated into the seams —
-//! once, and nowhere else — and it is also the only way a node exists, because
-//! the endpoint lease and the handler context are both taken from the address
-//! it returns. `deinit` is the only exit, and it gives back in the reverse
-//! order because a guard reaches into the relay table and a client slot points
-//! at a connection the core is about to free.
-//!
-//! `start` is the go-live half between the two: it dials what `Config.peers`
-//! names and feeds the gossip layer its join command. It is not part of
-//! `create` because a dial needs an instant and a generator, and `create` has
-//! a seed rather than either.
+//! Construction, explicit subscription startup, and reverse-order teardown.
 
 const std = @import("std");
 
 const node_mod = @import("node.zig");
 const node_config = @import("node_config.zig");
 const node_accept = @import("node_accept.zig");
-const node_relay_table = @import("node_relay_table.zig");
+const node_blobs = @import("node_blobs.zig");
+const node_relay_runtime = @import("node_relay_runtime.zig");
 const node_transport = @import("node_transport.zig");
 const node_gossip = @import("node_gossip.zig");
 const node_holepunch = @import("node_holepunch.zig");
@@ -52,60 +41,12 @@ const send_room = node_transport.send_room;
 const scratch_room = node_transport.scratch_room;
 const receive_room = node_transport.receive_room;
 
-/// Build a node from `config`, with `seed` as the root of every generator
-/// it draws from.
-///
-/// **`gpa` is this node's allocator for its whole life.** Every allocation
-/// made after this call — the egress list, the three scratch buffers, the
-/// relay's tables and queues, every payload a relay hands this node — is
-/// made from it, and `deinit` returns every one to it. So `gpa` has to
-/// outlive the node: a caller that frees it first has a `deinit` writing to
-/// memory it no longer owns.
-///
-/// **`config` is taken by value, so everything in it is copied, except
-/// what it points at.** The secret is copied and the copy is zeroed by
-/// `deinit`, so the caller keeps the one it passed and should zero it in
-/// its own turn; there is no move here to observe and nothing to give up.
-/// Two fields are borrowed instead, because copying either would be an
-/// allocation this constructor has no reason to make: `alpn`, which is
-/// registered with the router here and read for as long as the node lives,
-/// and `peers`, which `start` walks on a later pass. **Both must outlive
-/// the node, not merely the call.**
-///
-/// A `Peer.addr` is borrowed twice over and the second borrow outlives the
-/// first. `start` hands it to the dialer, and the dialer copies it into
-/// this node's address map — but `NodeAddr` owns only the outer list it
-/// allocates, and a `.custom` address inside it keeps pointing at the
-/// caller's own bytes (`base/addr.zig`'s `CustomAddr`). So the outer
-/// address storage belongs to `gpa` and is freed by `deinit`, while the
-/// payload inside it is the caller's and has to outlive the node.
-///
-/// **A cancelled `io` is `error.Canceled`, not `error.EntropyUnavailable`.**
-/// The two transport secrets are drawn from `io.randomSecure` here and
-/// nowhere else, so an `Io` that is cancelled while they are being drawn
-/// answers `error.Canceled` and one that has no secure entropy answers
-/// `error.EntropyUnavailable`. Nothing is left behind either way: every
-/// line below this one is under an `errdefer`, so a failed `create` frees
-/// the socket, the bridge, the dialer and every buffer it had taken.
-///
-/// `io` is used for exactly one thing: the two transport secrets
-/// `Bridge.create` was not given. It is null-drawn from `io.randomSecure`
-/// rather than from a process CSPRNG because a global generator is what
-/// `AGENTS.md` §2 forbids and an `Io` the caller handed over is not a
-/// global — and it is read here and nowhere else, because `Node` stores no
-/// `Io`.
-///
-/// That includes the relay's admission challenge: it is drawn from the
-/// `random` this node is driven with, not from `io`, because a challenge
-/// that differs between two runs of the same node is what makes a test
-/// reproducible and `Io` is not drivable. What that costs is stated where
-/// the challenge is drawn — `serveAdmit`.
-///
-/// Everything after `Bridge.create` is the configuration translation, and
-/// it happens here once rather than at the call sites that would otherwise
-/// have to know both vocabularies. `quic_bridge.zig` gives the rule: "a
-/// translation nobody can read is a translation nobody can check".
+/// All allocation uses `gpa`, which outlives the node. Configuration is copied,
+/// but application topic IDs, peer addresses, callback context, directory handles
+/// and TLS/discovery storage are borrowed for the node's lifetime.
+/// Carrier resources are independent of inner QUIC application connections.
 pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node {
+    try node_config.validate(config);
     if (config.discovery.deadline_ms <= 0 or config.discovery.interval_ms == 0 or
         config.discovery.interval_ms > @as(u64, @intCast(std.math.maxInt(i64))) /
             std.time.ns_per_ms or
@@ -131,7 +72,7 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
         .tasks = undefined,
         .accept = undefined,
         .lease = undefined,
-        .topic = undefined,
+        .gossip_topics = &.{},
         .timers = .empty,
         .named = [_]NodeId{undefined} ** named_ring,
         .named_len = 0,
@@ -145,16 +86,8 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
         .offered = .empty,
         .dialled = .empty,
         .joined = false,
-        .slots = undefined,
-        .registry = undefined,
-        .clients = &.{},
-        .packets = &.{},
-        .messages = &.{},
-        .ring = &.{},
-        .spoke = null,
-        .relay_dialled = false,
-        .relay_out = &.{},
-        .relay_scratch = &.{},
+        .blobs = node_blobs.State.init(config.blobs),
+        .relay_runtime = undefined,
         .stats = .{},
         .discovery = .{},
         .holepunch = undefined,
@@ -163,17 +96,21 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
     errdefer self.offered.deinit(gpa);
     errdefer self.dialled.deinit(gpa);
     errdefer self.timers.deinit(gpa);
+    self.relay_runtime = try node_relay_runtime.State.init(config.relay);
+    errdefer self.relay_runtime.deinit();
+    errdefer self.blobs.deinit(gpa);
 
     self.socket = try Socket.create(config.listen, .{});
     errdefer node_transport.shutdownSocket(self);
     self.bridge = try Bridge.create(gpa, io, .{
-        // Null on purpose: one pin cannot name every peer, and the pin
-        // that is enforced on this node's accepted connections is the
-        // per-dial one the dialer carries.
-        .expect_peer = null,
+        .expect_peer = config.expect_peer,
         .secret = config.secret,
         .alpn = config.alpn,
         .initial_policy = config.initial_policy,
+        .address_discovery_role = config.address_discovery_role,
+        .max_remote_nat_traversal_addresses = config.max_remote_nat_traversal_addresses,
+        .initial_max_path_id = config.initial_max_path_id,
+        .ipv6_supported = self.socket.address.ip == .v6,
     }, self.generator());
     errdefer self.bridge.destroy();
     self.holepunch = try node_holepunch.State.init(gpa, self.bridge.manager.max_connections);
@@ -181,6 +118,10 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
     self.dialer = try Dialer.create(gpa, self.bridge, .{
         .secret = config.secret,
         .alpn = config.alpn,
+        .address_discovery_role = config.address_discovery_role,
+        .max_remote_nat_traversal_addresses = config.max_remote_nat_traversal_addresses,
+        .initial_max_path_id = config.initial_max_path_id,
+        .ipv6_supported = self.socket.address.ip == .v6,
     });
     // `destroy` refuses only while a dialled connection is live, and this
     // errdefer cannot meet one: the bridge above was created with an empty
@@ -206,12 +147,6 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
     self.buf = try gpa.alloc(u8, receive_room);
     errdefer gpa.free(self.buf);
 
-    // The relay's storage, and only for a node that is one. Every failure
-    // here unwinds what it took, so the struct this leaves behind is the
-    // one `deinit` will find.
-    try node_relay_table.initRelay(self);
-    errdefer node_relay_table.freeRelay(self);
-
     // What this node advertises as its own contact data: the address it
     // is reachable at. Upstream carries opaque bytes and this is the one
     // that is true of every node in it.
@@ -228,12 +163,16 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
             .{SocketAddr.max_text_length},
         ),
     };
-    self.topic = try hyparview.TopicState.init(
-        self.bridge.nodeId(),
-        try hyparview.PeerData.fromBytes(advertised),
-        config.topic,
-        hyparview.Rng.init(seed),
-    );
+    self.gossip_topics = try gpa.alloc(hyparview.TopicState, config.gossip_topics.len);
+    errdefer gpa.free(self.gossip_topics);
+    for (self.gossip_topics) |*topic| {
+        topic.* = try hyparview.TopicState.init(
+            self.bridge.nodeId(),
+            try hyparview.PeerData.fromBytes(advertised),
+            config.topic,
+            hyparview.Rng.init(seed),
+        );
+    }
 
     // Last, because the two values below read through this struct and a
     // failure after this point would have to unwind a lease that nothing
@@ -313,6 +252,10 @@ pub fn start(self: *Node, at: Instant, random: std.Random) Error!void {
         self.stats.dials += 1;
     }
     if (self.joined) return;
+    if (self.gossip_topics.len == 0) {
+        self.joined = true;
+        return;
+    }
     // Checked before the list is built rather than left to `Peers.init`,
     // which would refuse the same length one line later with the list
     // already half filled.
@@ -338,12 +281,7 @@ pub fn start(self: *Node, at: Instant, random: std.Random) Error!void {
             count += 1;
         }
     }
-    try node_gossip.feedGossip(self, .{
-        .command = .{ .join = try hyparview.Peers.init(ids[0..count]) },
-    }, try node_gossip.gossipNow(at));
-    // Set after the feed and not before it: a latch set here is what made
-    // a refused `start` a success on the next call, over a node that had
-    // joined nothing and would never be told otherwise.
+    try node_gossip.start(self, ids[0..count], try node_gossip.gossipNow(at));
     self.joined = true;
 }
 
@@ -358,11 +296,8 @@ pub fn start(self: *Node, at: Instant, random: std.Random) Error!void {
 /// level on purpose: it is a finding, and `zig build test`'s runner fails an
 /// artifact that logged one.
 ///
-/// **It is the only exit, and it takes the node with it.** The pointer
-/// `create` returned is dead afterwards, so every `Delivered.data`, every
-/// `Peer` address the map still holds and the node's own copy of the
-/// secret all end here rather than at a second call. Nothing may outlive
-/// this call except what `create` borrowed and the caller still owns.
+/// All node-owned transfers and carrier resources end here. Borrowed configuration
+/// storage remains the caller's property.
 ///
 /// **It may not run under a `run` or a `step` that is still on the
 /// stack.** `run` closes the node on its way out precisely so that the
@@ -370,13 +305,8 @@ pub fn start(self: *Node, at: Instant, random: std.Random) Error!void {
 /// that destroys a node whose loop is still passing it frees the buffers
 /// the pass is writing into. Single-threaded, like everything else here.
 ///
-/// What it gives back, in the order it gives it: the endpoint lease, every
-/// dialled connection and the core's sweep, the relay's clients and
-/// whatever the relay handed over, the dialer, the bridge, the four heap
-/// buffers, the address map, the three bookkeeping tables, the socket, and
-/// finally the node itself. The address map's own storage goes with it; the
-/// payloads inside a `.custom` address are the caller's and are untouched,
-/// because `NodeAddr` never owned them.
+/// Client connections leave before their dialer's secret storage and the bridge.
+/// Protocol states release their resources before the remaining node storage.
 pub fn deinit(self: *Node) void {
     switch (self.lease.deinit()) {
         .closed => {},
@@ -399,12 +329,8 @@ pub fn deinit(self: *Node) void {
         if (!entry.conn.is_server) self.bridge.manager.removeConnection(entry);
     }
     self.bridge.sweep();
-    // Before the dialer's connections leave and before the bridge goes: a
-    // guard reaches into this struct's own registry and a client slot
-    // points at a connection the core is about to free. An orderly
-    // shutdown has already released every client, so this is the backstop
-    // for the node that was dropped without one.
-    node_relay_table.freeRelay(self);
+    self.blobs.deinit(self.gpa);
+    self.relay_runtime.deinit();
     // The walk above already applied `destroy`'s own test — every entry
     // with `!entry.conn.is_server` — to every entry there was, and
     // `removeConnection` swap-removes the entry it is handed
@@ -430,6 +356,7 @@ pub fn deinit(self: *Node) void {
     self.offered.deinit(self.gpa);
     self.dialled.deinit(self.gpa);
     self.timers.deinit(self.gpa);
+    self.gpa.free(self.gossip_topics);
     self.discovery.release();
     self.holepunch.deinit(self.gpa);
     node_transport.shutdownSocket(self);

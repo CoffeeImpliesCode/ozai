@@ -96,7 +96,8 @@ const Writer = frame_writer.Writer;
 pub fn encodedLen(message: Message) usize {
     const payload: usize = switch (message) {
         .server_challenge => frame_types.ServerChallenge.challenge_length,
-        .client_auth => NodeId.byte_length + Signature.byte_length,
+        .client_auth => NodeId.byte_length +
+            frame_writer.postcardVarIntLen(Signature.byte_length) + Signature.byte_length,
         .server_confirms_auth => 0,
         .server_denies_auth => |denial| frame_writer.postcardVarIntLen(denial.reason.len) +
             denial.reason.len,
@@ -161,7 +162,9 @@ pub fn encode(message: Message, version: ProtocolVersion, out: []u8) Error![]con
         .server_challenge => |challenge| try writer.write(&challenge.challenge),
         .client_auth => |auth| {
             try writer.write(&auth.node_id.toBytes());
-            try writer.write(&auth.signature.toBytes());
+            var signature = postcard.Writer.init(writer.rest());
+            signature.writeBytes(&auth.signature.toBytes()) catch return error.BufferFull;
+            writer.advance(signature.finish().len);
         },
         .server_confirms_auth => {},
         .server_denies_auth => |denial| {

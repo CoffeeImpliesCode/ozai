@@ -14,6 +14,9 @@
 //! `relay.rs:704` for the frames a client sends. Upstream strips the whitespace
 //! out of its own hexdumps before decoding them (`relay.rs:592`), so the spacing
 //! here is ours and the bytes are theirs.
+//! The native ClientAuth fixture is source-derived, not a captured hexdump:
+//! iroh-relay 1.3.0 `handshake.rs:88-96` uses `serde_bytes` for its signature,
+//! and `handshake.rs:561` writes the struct with `postcard::to_io`.
 
 const std = @import("std");
 
@@ -49,8 +52,23 @@ pub const id_hex = "197f6b23e16c8532c6abc838" ++ "facd5ea789be0c76b2920334039bfa
 /// the field modulus, so `NodeId.fromBytes` rejects it.
 pub const non_canonical_id_hex = "ff" ** 32;
 
+/// Source-derived native authentication bytes, independent of the relay encoder.
+/// iroh-base 1.3.0 `key.rs:78-87` serializes the public key as a raw array;
+/// `serde_bytes` serializes the signature as postcard length 0x40 then 64 bytes.
+/// The signature is deterministic local test data, not an upstream capture.
+pub fn nativeClientAuth() ![98]u8 {
+    var secret = try captureKey();
+    defer secret.deinit();
+    var bytes: [98]u8 = undefined;
+    bytes[0] = 0x01;
+    @memcpy(bytes[1..33], &secret.nodeId().toBytes());
+    bytes[33] = 0x40;
+    @memcpy(bytes[34..98], &secret.sign("a message no peer has sent").toBytes());
+    return bytes;
+}
+
 /// Covers the captured hexdumps and the largest authentication frame tested here:
-/// ClientAuth is 97 bytes; ServerDeniesAuth.max_frame_length is 258.
+/// ClientAuth is 98 bytes; ServerDeniesAuth.max_frame_length is 258.
 pub const scratch_len = 512;
 
 pub fn expectEqualStringsSlices(a: []const u8, b: []const u8) !void {

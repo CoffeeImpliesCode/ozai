@@ -98,8 +98,11 @@ pub fn decode(bytes: []const u8, version: ProtocolVersion) Error!Message {
         },
         .client_auth => blk: {
             const node_id = try readNodeId(payload);
+            var reader = postcard.Reader.init(payload[NodeId.byte_length..]);
+            const length = reader.readLen() catch |err| return fromPostcard(err);
+            if (length != Signature.byte_length) return error.InvalidFrame;
             const signature = Signature.fromBytes(
-                try readExact(Signature.byte_length, payload[NodeId.byte_length..]),
+                try readExact(Signature.byte_length, reader.buffer[reader.offset..]),
             );
             break :blk .{ .client_auth = .{ .node_id = node_id, .signature = signature } };
         },
@@ -202,10 +205,10 @@ fn readDatagrams(payload: []const u8, is_batch: bool) Error!Datagrams {
 
 /// The postcard string in a `ServerDeniesAuth`.
 ///
-/// The one field in a relay frame that is postcard: `handshake.rs:561` hands the
-/// whole struct to `postcard::to_io`, and a `String` is a varint length and then
-/// UTF-8. Every failure keeps the name `postcard` gave it, except trailing bytes,
-/// which mean this is not the frame it claims to be.
+/// Handshake structs are postcard values (`handshake.rs:561`); a denial's
+/// `String` is a varint length followed by UTF-8, while ClientAuth's signature
+/// uses the same prefix through `serde_bytes`. Every failure keeps the name
+/// postcard gave it, except trailing bytes, which are `InvalidFrame`.
 fn readStr(payload: []const u8) Error![]const u8 {
     var reader = postcard.Reader.init(payload);
     const reason = reader.readStr() catch |err| return fromPostcard(err);
@@ -220,9 +223,8 @@ fn fromPostcard(err: postcard.Error) Error {
         error.ValueOutOfRange => error.ValueOutOfRange,
         error.BadLength => error.BadLength,
         error.InvalidUtf8 => error.InvalidUtf8,
-        // `readStr` reads a length and a UTF-8 run and nothing else, so these are
-        // the arms that make the mapping total rather than the arms a denial can
-        // reach.
+        // The handshake readers consume lengths, bytes and UTF-8, so these
+        // arms make the mapping total rather than naming reachable failures.
         error.BufferFull,
         error.BadBool,
         error.BadOptionTag,

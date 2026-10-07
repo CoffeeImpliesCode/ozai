@@ -425,12 +425,7 @@ test "batch invariant: a segment size is there if and only if the type is a batc
 test "codec: frames 0 through 3, derived from the handshake structs" {
     // Upstream writes no hexdump for the handshake frames, so there is no captured
     // vector to copy and this test does not claim one. The bytes follow from the
-    // struct definitions and postcard's fixed-array rule, and the lines cited are
-    // the definitions themselves.
-    var secret = try vectors.captureKey();
-    defer secret.deinit();
-    const node_id = secret.nodeId();
-    const signature = secret.sign("a message no peer has sent");
+    // struct definitions, including serde field attributes, and postcard's rules.
     var out: [vectors.scratch_len]u8 = undefined;
 
     // `ServerChallenge` (`handshake.rs:77`) is a `[u8; 16]`, and postcard writes a
@@ -444,24 +439,12 @@ test "codec: frames 0 through 3, derived from the handshake structs" {
     try std_testing.expectEqual(challenge, (try decode(challenge_bytes, .v2)).server_challenge);
     try std_testing.expectError(error.InvalidFrame, decode(challenge_bytes[0..16], .v2));
 
-    // `ClientAuth` (`handshake.rs:88`) is a 32-byte key and a 64-byte signature,
-    // both fixed arrays, both inline: 96 bytes and a header.
-    const auth: ClientAuth = .{ .node_id = node_id, .signature = signature };
+    // Native ClientAuth has an inline public key and a serde_bytes signature.
+    const expected_auth = try vectors.nativeClientAuth();
+    const auth = (try decode(&expected_auth, .v2)).client_auth;
     const auth_bytes = try encode(.{ .client_auth = auth }, .v2, &out);
-    try std_testing.expectEqual(@as(usize, 97), auth_bytes.len);
-    try std_testing.expectEqualSlices(u8, &node_id.toBytes(), auth_bytes[1..33]);
-    try std_testing.expectEqualSlices(u8, &signature.toBytes(), auth_bytes[33..97]);
-    try std_testing.expectEqual(auth, (try decode(auth_bytes, .v2)).client_auth);
-    try std_testing.expectError(error.InvalidFrame, decode(auth_bytes[0..96], .v2));
-    // One byte too long is still not the frame the type names: the width is the
-    // type's own, in both directions.
-    var over: [vectors.scratch_len]u8 = undefined;
-    @memcpy(over[0..auth_bytes.len], auth_bytes);
-    over[auth_bytes.len] = 0;
-    try std_testing.expectError(
-        error.InvalidFrame,
-        decode(over[0 .. auth_bytes.len + 1], .v2),
-    );
+    try std_testing.expectEqual(@as(usize, 98), encodedLen(.{ .client_auth = auth }));
+    try vectors.expectHex(&expected_auth, auth_bytes);
 
     // `ServerConfirmsAuth` (`handshake.rs:101`) is a unit struct, so the type is
     // the whole frame.
@@ -485,6 +468,64 @@ test "codec: frames 0 through 3, derived from the handshake structs" {
         const decoded = try decode(denial, .v2);
         try std_testing.expectEqualStrings(reason, decoded.server_denies_auth.reason);
     }
+}
+
+test "golden: native ClientAuth encode matches the source-derived postcard fixture" {
+    var secret = try vectors.captureKey();
+    defer secret.deinit();
+    const auth: ClientAuth = .{
+        .node_id = secret.nodeId(),
+        .signature = secret.sign("a message no peer has sent"),
+    };
+    const expected = try vectors.nativeClientAuth();
+    var out: [98]u8 = undefined;
+    try std_testing.expectEqual(@as(usize, 98), encodedLen(.{ .client_auth = auth }));
+    try vectors.expectHex(&expected, try encode(.{ .client_auth = auth }, .v2, &out));
+    try std_testing.expectError(
+        error.BufferFull,
+        encode(.{ .client_auth = auth }, .v2, out[0..97]),
+    );
+}
+
+test "golden: native ClientAuth decode reads public key and length-prefixed signature" {
+    const expected = try vectors.nativeClientAuth();
+    const auth = (try decode(&expected, .v2)).client_auth;
+    try std_testing.expectEqualSlices(u8, expected[1..33], &auth.node_id.toBytes());
+    try std_testing.expectEqualSlices(u8, expected[34..98], &auth.signature.toBytes());
+}
+
+test "codec: native ClientAuth rejects obsolete raw signature wire and malformed lengths" {
+    const expected = try vectors.nativeClientAuth();
+    var malformed: [99]u8 = undefined;
+    @memcpy(malformed[0..33], expected[0..33]);
+    @memcpy(malformed[33..97], expected[34..98]);
+    // The obsolete 97-byte encoding has no postcard signature length.
+    if (decode(malformed[0..97], .v2)) |_| {
+        return error.ObsoleteAuthAccepted;
+    } else |_| {}
+
+    @memcpy(malformed[0..98], &expected);
+    malformed[98] = 0;
+    for ([_]u8{ 0, 1, 63, 65 }) |length| {
+        malformed[33] = length;
+        try std_testing.expectError(error.InvalidFrame, decode(&malformed, .v2));
+    }
+    malformed[33] = 0x7f;
+    try std_testing.expectError(error.BadLength, decode(&malformed, .v2));
+    malformed[33] = 0x40;
+    try std_testing.expectError(error.InvalidFrame, decode(&malformed, .v2));
+    for (1..33) |length| {
+        try std_testing.expectError(error.InvalidFrame, decode(expected[0..length], .v2));
+    }
+    // No length byte is UnexpectedEnd; a claimed 64 bytes that do not fit is BadLength.
+    try std_testing.expectError(error.UnexpectedEnd, decode(expected[0..33], .v2));
+    for (34..98) |length| {
+        try std_testing.expectError(error.BadLength, decode(expected[0..length], .v2));
+    }
+    malformed[33] = 0x80;
+    try std_testing.expectError(error.UnexpectedEnd, decode(malformed[0..34], .v2));
+    @memset(malformed[33..43], 0x80);
+    try std_testing.expectError(error.BadVarint, decode(malformed[0..43], .v2));
 }
 
 test "codec: malformed frames are named errors" {

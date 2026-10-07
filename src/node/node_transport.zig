@@ -21,6 +21,10 @@ const bridge_mod = @import("../transport/quic_bridge.zig");
 const dial_mod = @import("../transport/dial.zig");
 const socket_mod = @import("../transport/socket.zig");
 const base_key = @import("../base/key.zig");
+const base_addr = @import("../base/addr.zig");
+const base_ula = @import("../base/ula.zig");
+const addr_map = @import("../transport/addr_map.zig");
+const relay_frame = @import("../relay/frame.zig");
 
 const Node = node_mod.Node;
 const Error = node_config.Error;
@@ -112,8 +116,7 @@ pub fn deliver(
             // A stateless reply is a send, back out of the same socket to
             // the address the datagram came from.
             .reply => |reply| {
-                self.stats.datagrams_out += reply.datagramCount();
-                note(self, try self.socket.send(io, ingress.source.socket, reply));
+                try send(self, io, ingress.source.socket, reply);
             },
             .dropped, .foreign => {},
         }
@@ -126,12 +129,83 @@ pub fn drain(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!boo
     var index: usize = 0;
     while (self.bridge.connectionAt(index)) |conn| : (index += 1) {
         for (try conn.drain(self.egress, self.out, at, random)) |egress| {
-            self.stats.datagrams_out += egress.send.datagramCount();
-            note(self, try self.socket.send(io, egress.to, egress.send));
+            try send(self, io, egress.to, egress.send);
             moved = true;
         }
     }
     return moved;
+}
+
+/// Every synthetic destination is consumed by the carrier or explicitly refused.
+pub fn send(self: *Node, io: std.Io, peer: base_addr.SocketAddr, outgoing: batch.Send) Error!void {
+    if (base_ula.classify(peer) == .ip) {
+        note(self, try self.socket.send(io, peer, outgoing));
+        self.stats.datagrams_out += outgoing.datagramCount();
+        return;
+    }
+    const size: usize = outgoing.segment_size orelse outgoing.contents.len;
+    if (size == 0) return error.ZeroSegmentSize;
+    var position: usize = 0;
+    while (position < outgoing.contents.len) {
+        const end = position + @min(size, outgoing.contents.len - position);
+        const consumed = try self.relay_runtime.sendMapped(
+            &self.map, peer, outgoing.contents[position..end],
+        );
+        std.debug.assert(consumed);
+        self.stats.datagrams_out += 1;
+        if (outgoing.ecn != null) self.stats.ecn_lost += 1;
+        position = end;
+    }
+}
+
+/// Carrier-origin identity selects a canonical virtual peer, not a physical UDP source.
+pub fn takeRelay(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!bool {
+    try self.relay_runtime.poll(io);
+    var moved = false;
+    for (0..16 * relay_frame.max_packet_size) |_| {
+        const datagram = try self.relay_runtime.receive() orelse {
+            if (moved) try validateMappedPeers(self);
+            return moved;
+        };
+        const address = try self.map.get(self.gpa, .{ .any_path = datagram.source }, random);
+        const source = base_ula.socketAddrFor(.any_path, addr_map.hostBitsOf(address));
+        node_holepunch.prepare(&self.holepunch, self.bridge);
+        const ingress = try self.bridge.recv(&self.map, .{
+            .bytes = datagram.bytes,
+            .from = source,
+            .local = self.socket.address,
+            .ecn = datagram.ecn,
+        }, self.scratch, at, random);
+        node_holepunch.received(&self.holepunch, self.bridge, source, datagram.bytes);
+        self.stats.datagrams_in += 1;
+        switch (ingress.outcome) {
+            .reply => |reply| try send(self, io, ingress.source.socket, reply),
+            .processed, .dropped, .foreign => {},
+        }
+        moved = true;
+    }
+    return error.RelayIngressLimit;
+}
+
+fn validateMappedPeers(self: *Node) error{UnexpectedRelayPeer}!void {
+    var index: usize = 0;
+    while (self.bridge.connectionAt(index)) |conn| : (index += 1) {
+        if (!conn.established() or conn.closed()) continue;
+        const peer = conn.peer() orelse continue;
+        const owner = dial_mod.ownerOf(&self.map, peer) orelse continue;
+        const expected: NodeId = switch (owner) {
+            .any_path => |id| id,
+            .relay => |via| via.node,
+            .custom => continue,
+        };
+        const handshake = conn.entry.conn.tls13_hs orelse return error.UnexpectedRelayPeer;
+        const authenticated = handshake.peerNodeId() orelse return error.UnexpectedRelayPeer;
+        if (!mappedIdentityMatches(expected, authenticated)) return error.UnexpectedRelayPeer;
+    }
+}
+
+fn mappedIdentityMatches(expected: NodeId, authenticated: [32]u8) bool {
+    return std.mem.eql(u8, &expected.toBytes(), &authenticated);
 }
 
 /// Run the core's timers, and report every connection they finished.
@@ -210,4 +284,75 @@ pub fn shutdownSocket(self: *Node) void {
     if (!self.socket_open) return;
     self.socket_open = false;
     self.socket.close();
+}
+
+test "mapped egress without a relay cannot escape onto UDP" {
+    const t = std.testing;
+    const node = try Node.create(t.allocator, t.io, .{
+        .secret = try base_key.SecretKey.fromSeed(@splat(0x71)),
+    }, 71);
+    defer node.deinit();
+    const peer = (try base_key.SecretKey.fromSeed(@splat(0x72))).nodeId();
+    const address = try node.map.get(t.allocator, .{ .any_path = peer }, node.generator());
+    const target = base_ula.socketAddrFor(.any_path, addr_map.hostBitsOf(address));
+    try t.expectError(error.RelayUnavailable,
+        send(node, t.io, target, batch.Send.single("inner QUIC", null)));
+    try t.expectEqual(@as(u64, 0), node.stats.datagrams_out);
+    try node.close(t.io, 0, node.generator());
+}
+
+test "carrier sender preserves every GSO segment and short tail under authenticated origin" {
+    const t = std.testing;
+    const carrier = @import("../relay/tcp_carrier.zig");
+    var server = try carrier.Server.init(.{
+        .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0,
+    });
+    defer server.deinit();
+    const first_secret = try base_key.SecretKey.fromSeed(@splat(0x75));
+    const second_secret = try base_key.SecretKey.fromSeed(@splat(0x76));
+    const first = try Node.create(t.allocator, t.io, .{
+        .secret = first_secret,
+        .relay = .{ .client = .{
+            .address = server.address, .host = "localhost", .secret = first_secret,
+        } },
+    }, 75);
+    defer first.deinit();
+    const second = try Node.create(t.allocator, t.io, .{
+        .secret = second_secret,
+        .relay = .{ .client = .{
+            .address = server.address, .host = "localhost", .secret = second_secret,
+        } },
+    }, 76);
+    defer second.deinit();
+    const address = try first.map.get(t.allocator,
+        .{ .any_path = second.nodeId() }, first.generator());
+    const target = base_ula.socketAddrFor(.any_path, addr_map.hostBitsOf(address));
+    try send(first, t.io, target, try batch.Send.batch("abcdefgh", 3, null));
+    const expected = [_][]const u8{ "abc", "def", "gh" };
+    var received: usize = 0;
+    for (0..256) |_| {
+        try server.poll(t.io);
+        try first.relay_runtime.poll(t.io);
+        while (try first.relay_runtime.receive()) |_| {}
+        try second.relay_runtime.poll(t.io);
+        while (try second.relay_runtime.receive()) |datagram| {
+            try t.expect(received < expected.len);
+            try t.expect(datagram.source.order(first.nodeId()) == .eq);
+            try t.expectEqualSlices(u8, expected[received], datagram.bytes);
+            received += 1;
+        }
+        if (received == expected.len) break;
+    }
+    try t.expectEqual(expected.len, received);
+    try t.expectEqual(@as(u64, 3), first.stats.datagrams_out);
+    try first.close(t.io, 0, first.generator());
+    try second.close(t.io, 0, second.generator());
+}
+
+test "carrier claimed origin is not an authenticated TLS identity" {
+    const t = std.testing;
+    const expected = (try base_key.SecretKey.fromSeed(@splat(0x81))).nodeId();
+    const other = (try base_key.SecretKey.fromSeed(@splat(0x82))).nodeId();
+    try t.expect(mappedIdentityMatches(expected, expected.toBytes()));
+    try t.expect(!mappedIdentityMatches(expected, other.toBytes()));
 }
