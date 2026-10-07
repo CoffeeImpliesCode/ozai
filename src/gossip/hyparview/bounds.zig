@@ -11,17 +11,16 @@
 /// 32 bytes an application chose. Upstream `TopicId([u8; 32])`, `proto/state.rs:21`.
 pub const topic_id_length = 32;
 
-/// The largest `PeerData` a node will hold or carry. Upstream's is a
-/// `Bytes` with no bound; a bound is what "no allocator" costs, and a node
-/// address with a couple of paths on it fits.
-pub const peer_data_max = 256;
+/// The largest contact bytes fitting an upstream 4096-byte received Join:
+/// two enum tags, one Option tag, and a two-byte postcard length.
+pub const peer_data_max = 4096 - 5;
 
 /// How many peers a node remembers contact data for.
 pub const max_known_peers = 32;
 
-/// The largest `Shuffle` or `ShuffleReply` node list. The default config
-/// already fills it: three active, four passive, and ourselves.
-pub const max_shuffle_nodes = 8;
+/// The largest frame-fitting peer vector: two tags, one count, and at least
+/// 32 identity bytes plus one Option tag per record.
+pub const max_shuffle_nodes = @divFloor(4096 - 3, 33);
 
 /// The largest active view. A node keeps five by default; thirty-two is the
 /// bound at which a test can drive a swarm wider than the default without

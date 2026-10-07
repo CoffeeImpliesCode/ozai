@@ -31,8 +31,7 @@ const peer_data_max = bounds.peer_data_max;
 pub const PeerData = struct {
     /// Zeroed, and only `len` bytes of it mean anything.
     bytes: [peer_data_max]u8 = [_]u8{0} ** peer_data_max,
-    /// `u16` rather than `u8` because `peer_data_max` is 256 and a length of
-    /// 255 is a legal value, not the largest one.
+    /// `u16` holds every frame-fitting contact record.
     len: u16 = 0,
 
     pub fn fromBytes(bytes: []const u8) Error!PeerData {

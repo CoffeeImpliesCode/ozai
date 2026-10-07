@@ -170,9 +170,7 @@ fn readMessageId(writer: *postcard.Reader) Error!MessageId {
 
 fn readIHaveList(writer: *postcard.Reader) Error!IHaves {
     const count = try writer.readLen();
-    // The bound is proved here, at the slice, because nothing above this line
-    // proves it: the count is a peer's claim about how many entries follow, and
-    // a claim of seventeen would index past the array below.
+    // A peer's vector count cannot index beyond the frame-fitting array.
     if (count > max_ihaves_per_message) return error.IHaveListTooLong;
     var items: [max_ihaves_per_message]plumtree.IHave = undefined;
     for (items[0..count]) |*have| {
