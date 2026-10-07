@@ -188,9 +188,11 @@ pub const Loop = struct {
         const pending = self.pending orelse return self.hold();
         var next = self;
         next.pending = null;
-        // The endpoint's two edits to a verdict live in `decide` — the path says
-        // what a retry is worth, the flow says whether it can be given one — and
-        // what the router then owes is its own answer.
+        // This machine owns an allocated connection id. RFC Retry belongs to
+        // Bridge.Config.initial_policy, before acceptance; a late request is
+        // invalid and explicitly refused, never reported as a sent Retry.
+        if (answer == .retry) return .{ .loop = next, .action = .refuse };
+        // The remaining answers retain ordinary postaccept dispatch semantics.
         const routed = router.dispatchStep(
             self.router,
             .incoming,
@@ -198,11 +200,6 @@ pub const Loop = struct {
         );
         return switch (routed.action) {
             .negotiate_alpn => spawn(next, pending.id),
-            // A retry the endpoint cannot answer with a token is upstream's
-            // `Err` arm: `incoming.retry()` did not happen, so the attempt is
-            // refused (`protocol.rs:583-586`). The payload the router carried
-            // is dropped here because nothing this loop can do reads it back.
-            .send_retry => .{ .loop = next, .action = .refuse },
             .refuse => .{ .loop = next, .action = .refuse },
             .ignore => .{ .loop = next, .action = .ignore },
             // A verdict cannot produce anything else: in the `incoming` state
@@ -518,11 +515,8 @@ test "the filter's four answers, and what each one does to the loop" {
             .action = .{ .spawn = .{ .id = 1, .state = .negotiating } },
             .peer = .nothing,
         },
-        // A retry is a refusal, and that is the surprise worth a row of its
-        // own: the token cannot be sent, so the peer is told the connection is
-        // refused rather than left to time out. It reads the same as the
-        // reject below because it does the same thing, not because the two
-        // answers are one.
+        // This loop already owns a connection id: Retry is an invalid late
+        // decision. The pre-accept Bridge policy executes actual Retry.
         .{ .answer = .retry, .action = .refuse, .peer = .refused },
         // The one verdict a peer is told about.
         .{ .answer = .reject, .action = .refuse, .peer = .refused },
@@ -548,7 +542,7 @@ test "the filter's four answers, and what each one does to the loop" {
     }
 }
 
-test "a retry cannot be sent, so it ends in a refusal on either path" {
+test "postaccept retry is an invalid decision on either path" {
     var handler: Handler = .{};
     var entries: [2]router.Entry = undefined;
     var builder = router.Builder.init(&entries);
@@ -556,10 +550,8 @@ test "a retry cannot be sent, so it ends in a refusal on either path" {
     _ = try builder.accept("/blob", handler.handler());
     const table = builder.build();
 
-    // The direct path, and a filter that wants the address proved first. The
-    // first attempt proves nothing, so the filter asks for a token — and the
-    // core has no hook to send one with, so the attempt is refused and the peer
-    // is told.
+    // These are postaccept handles, not new Initials. A late filter request
+    // cannot be turned into a protocol Retry.
     var proving: Proving = .{};
     var tasks: [1]Task = undefined;
     var loop = Loop.init(&table, proving.filterer(), &tasks);
@@ -568,9 +560,8 @@ test "a retry cannot be sent, so it ends in a refusal on either path" {
     try t.expectEqual(router.PeerOutcome.refused, Action.peerOutcome(step.action));
     try t.expectEqual(@as(usize, 0), step.loop.live);
 
-    // The second attempt on that flow carries the token the first one was sent.
-    // What the core proved on a direct path is an address: this filter is
-    // satisfied and the connection is in.
+    // Independently supplied token provenance satisfies the postaccept filter;
+    // this machine itself neither generated nor validated a token.
     const proved_direct = withToken(direct(1));
     try t.expectEqual(Validation{ .validated = direct(1).remote }, proved_direct.validation);
     step = try offer(&loop, proved_direct);

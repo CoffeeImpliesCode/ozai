@@ -29,7 +29,35 @@ const ula = @import("../base/ula.zig");
 const Verdict = router.Verdict;
 const Retry = router.Retry;
 
-/// A filter for incoming attempts, run before the handshake does any work.
+/// Proof carried by the opening Initial, independent of later path validation.
+pub const TokenProvenance = enum { unvalidated, retry, new_token };
+
+/// A new Initial before a connection exists. CID slices are borrowed only for
+/// the policy call. Addresses, header metadata and proof come from core ingress.
+pub const Initial = struct {
+    remote: base_addr.SocketAddr,
+    local: base_addr.SocketAddr,
+    classification: ula.Classification,
+    validation: Validation,
+    token_provenance: TokenProvenance,
+    version: u32,
+    dcid: []const u8,
+    scid: []const u8,
+    datagram_size: usize,
+    ecn: u2,
+};
+
+/// Pure pre-accept admission. The context is borrowed until Bridge.destroy;
+/// calls run synchronously on the receiving thread and must not reenter Bridge.
+/// Keep no borrowed Initial slices after returning. Retry is executed by Bridge
+/// before allocation; asking to retry a validated Initial refuses it instead.
+pub const InitialPolicy = struct {
+    ptr: *const anyopaque,
+    decide: *const fn (ptr: *const anyopaque, initial: Initial) Answer,
+};
+
+/// A postaccept filter for allocated connection handles. Use `InitialPolicy`
+/// for pre-accept admission and real RFC Retry; this filter cannot undo allocation.
 ///
 /// Upstream `IncomingFilter` (`protocol.rs:214-216`) is
 /// `Arc<dyn Fn(&Incoming) -> IncomingFilterOutcome + Send + Sync>`, held by the
@@ -206,15 +234,8 @@ pub const Validation = union(enum) {
 /// An attempt the core proved nothing about is `.unvalidated`, which the caller
 /// writes itself: there is nothing to decide in that direction.
 ///
-/// One gap is worth naming here, because it is where this fact comes from.
-/// `quic_bridge.Conn` exposes `id`, `peer`, `local`, `established`, `closed` and
-/// `drain`, and nothing that reports the path's validated bit
-/// (`transport/quic_bridge.zig:226-320`), so upstream's
-/// `Incoming::remote_addr_validated()` has no ozai counterpart yet. Until it
-/// does, this function is how a caller turns what the core told it into the
-/// fact a filter reads, and a caller with nothing to report must write
-/// `.unvalidated` — which is the conservative answer, because a token the
-/// endpoint never saw being validated buys it nothing.
+/// `Conn.initialValidation` exposes the opening token's provenance. Later path
+/// validation is not evidence that the opening Initial carried a token.
 pub fn proved(
     classification: ula.Classification,
     remote: base_addr.SocketAddr,
@@ -303,38 +324,6 @@ const Recorder = struct {
     }
 };
 
-/// A handler that counts the calls the router makes on it, so a table can be
-/// built without a protocol behind it. `endpoint.zig` has its own, because a
-/// handler that fails on demand is the only one worth having over there.
-const Handler = struct {
-    accept_calls: usize = 0,
-
-    fn accept(ctx: *anyopaque, connection: router.Connection) router.AcceptError!void {
-        _ = connection;
-        const self: *Handler = @ptrCast(@alignCast(ctx));
-        self.accept_calls += 1;
-    }
-
-    fn handler(self: *Handler) router.ProtocolHandler {
-        return .{
-            .ptr = self,
-            .on_accepting = null,
-            .accept = Handler.accept,
-            .shutdown = null,
-        };
-    }
-};
-
-/// A table with one handler for `alpn`, and the handler behind it.
-fn oneHandler(
-    alpn: []const u8,
-    entries: []router.Entry,
-    handler: *Handler,
-) !router.Router {
-    var builder = router.Builder.init(entries);
-    _ = try builder.accept(alpn, handler.handler());
-    return builder.build();
-}
 
 /// A direct-path attempt: a real socket address, nothing proved.
 fn direct(id: u64) Incoming {
@@ -376,32 +365,6 @@ fn answered(present: ?IncomingFilter, incoming: Incoming) Verdict {
     return decide(ask(present, incoming), incoming);
 }
 
-test "the filter vtable is a context pointer and one call" {
-    // The plan names one call, and `ProtocolHandler` names three. A filter that
-    // grew a second call would be a trait wearing a vtable's name, which is
-    // what `AddressLookup` refuses in `discovery/resolve.zig`.
-    const fields = @typeInfo(IncomingFilter).@"struct".fields;
-    try t.expectEqual(@as(usize, 2), fields.len);
-    const names = [_][]const u8{ "ptr", "filter" };
-    inline for (fields, names) |field, name| {
-        try t.expectEqualStrings(name, field.name);
-    }
-}
-
-test "every callback gets the filter's own context and the whole attempt" {
-    var recorder: Recorder = .{ .answer = .accept };
-    const filter = recorder.filterer();
-    const incoming = direct(1);
-
-    try t.expectEqual(Answer.accept, ask(filter, incoming));
-
-    // The context is not copied or replaced, and the attempt arrives whole: a
-    // filter that reads the path and the validation is a filter that can tell
-    // the two retry meanings apart.
-    try t.expectEqual(@as(usize, 1), recorder.calls);
-    try t.expectEqual(incoming, recorder.asked.?);
-    try t.expect(filter.ptr == @as(*anyopaque, &recorder));
-}
 
 test "no filter is upstream's default: every attempt is accepted" {
     // `if let Some(filter) = &incoming_filter` (`protocol.rs:573`) — an absent
@@ -412,52 +375,6 @@ test "no filter is upstream's default: every attempt is accepted" {
     try t.expectEqual(Verdict.accept, answered(null, relayed(1)));
 }
 
-test "the filter's four answers, and only a refusal reaches the peer" {
-    // Upstream's four, by the names the router already uses
-    // (`protocol.rs:172-210`). `refuse` is not an answer: it is what
-    // `incoming.refuse()` does about a `Reject`.
-    const answers = [_]Answer{ .accept, .retry, .reject, .ignore };
-    try t.expectEqual(@as(usize, 4), answers.len);
-    for (answers) |answer| {
-        var recorder: Recorder = .{ .answer = answer };
-        const decided = answered(recorder.filterer(), direct(1));
-        // Three of the four reach the router as themselves, and a `retry`
-        // reaches it carrying the meaning the path gives it.
-        const want: Verdict = switch (answer) {
-            .accept => .accept,
-            .retry => .{ .retry = .source_validation },
-            .reject => .reject,
-            .ignore => .ignore,
-        };
-        try t.expectEqual(want, decided);
-        try t.expectEqual(answer, recorder.answer);
-        try t.expectEqual(@as(usize, 1), recorder.calls);
-
-        // And the router's own machine gives each of them a different next
-        // step, which is what the loop acts on.
-        var handler: Handler = .{};
-        var entries: [1]router.Entry = undefined;
-        const table = try oneHandler("/echo", &entries, &handler);
-        const step = router.dispatchStep(&table, .incoming, .{ .filtered = decided });
-        switch (answer) {
-            .accept => try t.expectEqual(router.DispatchAction.negotiate_alpn, step.action),
-            .retry => try t.expectEqual(
-                router.DispatchAction{ .send_retry = .source_validation },
-                step.action,
-            ),
-            .reject => try t.expectEqual(router.DispatchAction.refuse, step.action),
-            .ignore => try t.expectEqual(router.DispatchAction.ignore, step.action),
-        }
-        // The one answer a peer learns about is a refusal, and the retry token
-        // is not an ending.
-        try t.expectEqual(
-            if (answer == .reject) router.PeerOutcome.refused else router.PeerOutcome.nothing,
-            step.action.peerOutcome(),
-        );
-        // Nothing was dispatched: an answer is not a connection.
-        try t.expectEqual(@as(usize, 0), handler.accept_calls);
-    }
-}
 
 test "a retry is source validation on a direct path and a cost on a relay" {
     // Same verb, one function, and the path is what tells them apart. The

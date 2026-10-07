@@ -65,6 +65,10 @@ pub const CliError = ozai.base32.DecodeError || ozai.KeyError ||
     NotASeed,
     /// `--for` was not a millisecond count.
     NotMilliseconds,
+    LookupNeedsServer,
+    LookupNeedsPeer,
+    LookupTimingOutOfRange,
+    InvalidDnsOrigin,
     /// The monotonic clock could not be read, or read a value `Instant` cannot
     /// hold.
     NoClock,
@@ -172,4 +176,44 @@ pub fn parsePeer(text_in: []const u8) CliError!Peer {
     const at = std.mem.indexOfScalar(u8, text_in, '@') orelse return error.PeerWithoutAddress;
     const socket = parseSocket(text_in[at + 1 ..]) catch return error.PeerAddressUnreachable;
     return .{ .id = try NodeId.parseZ32(text_in[0..at]), .addr = .{ .ip = socket } };
+}
+
+/// Milliseconds bounded so conversion to monotonic nanoseconds cannot overflow.
+pub const max_lookup_interval_ms: u64 = std.math.maxInt(i64) / std.time.ns_per_ms;
+
+pub fn parseLookupMilliseconds(comptime T: type, text: []const u8, maximum: T) CliError!T {
+    const value = std.fmt.parseInt(T, text, 10) catch return error.LookupTimingOutOfRange;
+    if (value <= 0 or value > maximum) return error.LookupTimingOutOfRange;
+    return value;
+}
+
+/// A DNS origin must leave room for `_iroh.<nodeid>` in a wire name.
+pub fn parseDnsOrigin(text: []const u8) CliError![]const u8 {
+    if (text.len == 0) return error.InvalidDnsOrigin;
+    const name = if (text[text.len - 1] == '.') text[0 .. text.len - 1] else text;
+    const prefix_length = "_iroh.".len + NodeId.z32_length + 1;
+    if (name.len == 0 or name.len + prefix_length + 2 > 255) return error.InvalidDnsOrigin;
+    var labels = std.mem.splitScalar(u8, name, '.');
+    while (labels.next()) |label| {
+        if (label.len == 0 or label.len > 63) return error.InvalidDnsOrigin;
+        for (label) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_')
+                return error.InvalidDnsOrigin;
+        }
+    }
+    return text;
+}
+
+test "lookup timing accepts exact bounds and rejects nonnumeric values" {
+    try std.testing.expectEqual(@as(i32, 2147483647), try parseLookupMilliseconds(i32, "2147483647", std.math.maxInt(i32)));
+    try std.testing.expectEqual(max_lookup_interval_ms, try parseLookupMilliseconds(u64, "9223372036854", max_lookup_interval_ms));
+    try std.testing.expectError(error.LookupTimingOutOfRange, parseLookupMilliseconds(i32, "-1", std.math.maxInt(i32)));
+    try std.testing.expectError(error.LookupTimingOutOfRange, parseLookupMilliseconds(u64, "abc", max_lookup_interval_ms));
+}
+
+test "DNS origins preserve absolute spelling and reject oversized labels" {
+    try std.testing.expectEqualStrings("dns.iroh.link.", try parseDnsOrigin("dns.iroh.link."));
+    try std.testing.expectEqualStrings("test.invalid", try parseDnsOrigin("test.invalid"));
+    try std.testing.expectError(error.InvalidDnsOrigin, parseDnsOrigin("a" ** 64 ++ ".invalid"));
+    try std.testing.expectError(error.InvalidDnsOrigin, parseDnsOrigin("test..invalid"));
 }

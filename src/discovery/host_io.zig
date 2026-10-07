@@ -100,7 +100,7 @@ pub const max_cname_hops = host_answer.max_cname_hops;
 pub const readAnswer = host_answer.readAnswer;
 
 /// RFC 1035 §4.2.2: "In the case of TCP, each DNS message is prefixed with a
-/// two byte length field specifying the message length, including the two byte
+/// two byte length field specifying the message length, excluding the two byte
 /// length field." The prefix is the only thing a DNS message on a stream
 /// carries that the same message in a datagram does not, and it is why a
 /// truncated answer cannot be resumed by sending a second datagram.

@@ -132,6 +132,10 @@ pub const Config = struct {
     /// per subsystem is that module's whole subject, and a node that shared its
     /// gossip socket with a lookup would consume a datagram meant for gossip.
     lookup: ?Source = null,
+    /// Identity-only peers resolved and dialled once. No physical endpoint is required.
+    peer_ids: []const NodeId = &.{},
+    /// Resolve through the configured PKARR relay as well as the DNS source.
+    resolve_pkarr: bool = false,
     /// The origin `_iroh.<z32>` is asked under, borrowed. `preset.dns_origin_prod`
     /// and its staging twin are the two values this tree's presets name.
     origin: []const u8 = preset.dns_origin_prod,
@@ -343,14 +347,17 @@ fn lookup(self: *Node, io: std.Io, at: Instant, random: std.Random) bool {
         if (now_ms < due) return false;
     }
     self.discovery.next_lookup_ms = now_ms + self.config.discovery.interval_ms;
+    const explicit = self.config.discovery.peer_ids;
     const peers = self.config.peers;
-    if (peers.len == 0) {
+    const count = if (explicit.len != 0) explicit.len else peers.len;
+    if (count == 0) {
         node_discovery_wire.count(self, .no_peer);
         return false;
     }
-    const peer = peers[self.discovery.peer_cursor % peers.len].id;
+    const cursor = self.discovery.peer_cursor % count;
+    const peer = if (explicit.len != 0) explicit[cursor] else peers[cursor].id;
     self.discovery.peer_cursor += 1;
-    node_discovery_wire.ask(self, io, peer, random);
+    node_discovery_wire.ask(self, io, peer, at, random);
     return true;
 }
 
@@ -572,9 +579,6 @@ fn oneLookupHappened(node: *Node) bool {
     return node.stats.discovery_lookups > 0;
 }
 
-fn twoLookupsHappened(node: *Node) bool {
-    return node.stats.discovery_lookups > 1;
-}
 
 test "a lookup the node's own pass asks reaches the node's resolution path" {
     // The whole of the wiring, through `Node.step`: the pass's timer asks,
@@ -662,17 +666,7 @@ test "a lookup that timed out and one that came back empty stay two facts" {
         .id = peer_id,
         .addr = .{ .ip = loopback },
     }};
-    const node = try Node.create(t.allocator, t.io, .{
-        .secret = try SecretKey.fromSeed(@splat(0xb2)),
-        .listen = loopback,
-        .peers = &peers,
-        .discovery = .{
-            // A lookup every pass, so two passes are two questions rather than
-            // one question and a wait.
-            .interval_ms = 0,
-            .lookup = .{ .datagram = script.datagram(), .server = nameserver },
-        },
-    }, 0xbeef);
+    const node = try nodeOver(&script, &peers);
     defer node.deinit();
     var at: Instant = start_ns;
     try driveUntil(node, &at, oneLookupHappened);
@@ -684,21 +678,24 @@ test "a lookup that timed out and one that came back empty stay two facts" {
     try t.expectEqual(@as(u64, 0), node.stats.discovery_answers);
     try t.expectEqual(@as(u64, 0), node.stats.discovery_items);
 
-    // The next answer arrives and carries nothing under the name asked about.
+    // A requested peer is deliberately attempted only once, even after the
+    // lookup interval expires. A different node can observe the empty answer.
     script.mode = .nothing;
-    try driveUntil(node, &at, twoLookupsHappened);
-
-    // Two questions went out and the two answers are two different counters.
-    // `timed_out` did not move and `nothing` did, which is the whole claim: a
-    // reader of these numbers can say which of the two happened.
+    at += @as(Instant, default_lookup_interval_ms + 1) * std.time.ns_per_ms;
+    _ = try node.step(t.io, at, node.generator());
+    try t.expectEqual(@as(u32, 1), script.sends);
+    const empty = try nodeOver(&script, &peers);
+    defer empty.deinit();
+    try driveUntil(empty, &at, oneLookupHappened);
     try t.expectEqual(@as(u32, 2), script.sends);
     try t.expectEqual(@as(u64, 1), node.discovery.refused.timed_out);
-    try t.expectEqual(@as(u64, 1), node.discovery.refused.nothing);
-    try t.expectEqual(@as(u64, 0), node.stats.discovery_answers);
-    try t.expectEqual(@as(u64, 0), node.stats.discovery_items);
-    // And neither is `cannot_resolve`, which is a fourth fact this node counts
-    // on its own: the resolver was never asked.
-    try t.expectEqual(@as(u64, 0), node.discovery.refused.cannot_resolve);
+    try t.expectEqual(@as(u64, 0), node.discovery.refused.nothing);
+    try t.expectEqual(@as(u64, 0), empty.discovery.refused.timed_out);
+    try t.expectEqual(@as(u64, 1), empty.discovery.refused.nothing);
+    try t.expectEqual(@as(u64, 0), empty.stats.discovery_answers);
+    try t.expectEqual(@as(u64, 0), empty.stats.dials);
+    try t.expectEqual(@as(u64, 0), empty.discovery.refused.cannot_resolve);
+    try empty.close(t.io, at, empty.generator());
 
     try node.close(t.io, at, node.generator());
 }
@@ -736,4 +733,15 @@ test "a node with no relay and no lookup publishes nothing and asks nobody" {
     try t.expectEqual(@as(u64, 0), node.discovery.refused.no_source);
 
     try node.close(t.io, at, node.generator());
+}
+
+test "lookup configuration refuses unbounded deadlines before opening a node" {
+    try t.expectError(error.InvalidDiscoveryConfig, Node.create(t.allocator, t.io, .{
+        .secret = try SecretKey.fromSeed(@splat(0xd4)),
+        .discovery = .{ .deadline_ms = 0 },
+    }, 42));
+    try t.expectError(error.InvalidDiscoveryConfig, Node.create(t.allocator, t.io, .{
+        .secret = try SecretKey.fromSeed(@splat(0xd4)),
+        .discovery = .{ .interval_ms = 0 },
+    }, 42));
 }

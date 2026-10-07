@@ -20,6 +20,7 @@ const node_accept = @import("node_accept.zig");
 const node_relay_table = @import("node_relay_table.zig");
 const node_transport = @import("node_transport.zig");
 const node_gossip = @import("node_gossip.zig");
+const node_holepunch = @import("node_holepunch.zig");
 
 const base_key = @import("../base/key.zig");
 const base_addr = @import("../base/addr.zig");
@@ -105,6 +106,15 @@ const receive_room = node_transport.receive_room;
 /// have to know both vocabularies. `quic_bridge.zig` gives the rule: "a
 /// translation nobody can read is a translation nobody can check".
 pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node {
+    if (config.discovery.deadline_ms <= 0 or config.discovery.interval_ms == 0 or
+        config.discovery.interval_ms > @as(u64, @intCast(std.math.maxInt(i64))) /
+            std.time.ns_per_ms or
+        (config.discovery.peer_ids.len != 0 and config.discovery.lookup == null and
+            !config.discovery.resolve_pkarr) or
+        (config.discovery.resolve_pkarr and config.discovery.relay == null))
+    {
+        return error.InvalidDiscoveryConfig;
+    }
     const self = try gpa.create(Node);
     errdefer gpa.destroy(self);
     self.* = .{
@@ -147,6 +157,7 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
         .relay_scratch = &.{},
         .stats = .{},
         .discovery = .{},
+        .holepunch = undefined,
     };
     errdefer self.map.deinit(gpa);
     errdefer self.offered.deinit(gpa);
@@ -162,8 +173,11 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
         .expect_peer = null,
         .secret = config.secret,
         .alpn = config.alpn,
+        .initial_policy = config.initial_policy,
     }, self.generator());
     errdefer self.bridge.destroy();
+    self.holepunch = try node_holepunch.State.init(gpa, self.bridge.manager.max_connections);
+    errdefer self.holepunch.deinit(gpa);
     self.dialer = try Dialer.create(gpa, self.bridge, .{
         .secret = config.secret,
         .alpn = config.alpn,
@@ -302,18 +316,30 @@ pub fn start(self: *Node, at: Instant, random: std.Random) Error!void {
     // Checked before the list is built rather than left to `Peers.init`,
     // which would refuse the same length one line later with the list
     // already half filled.
-    if (self.config.peers.len > hyparview.max_bootstrap) {
+    if (self.config.peers.len + self.config.discovery.peer_ids.len > hyparview.max_bootstrap) {
         return error.BootstrapListTooLong;
     }
     // The command is fed even when no peer was named: an empty list means
     // "be ready to be asked", which is how upstream's bootstrap node starts
     // (`hyparview.Command`'s own doc).
     var ids: [hyparview.max_bootstrap]NodeId = undefined;
-    for (self.config.peers, 0..) |peer, index| {
-        ids[index] = peer.id;
+    var count: usize = 0;
+    for (self.config.peers) |peer| {
+        ids[count] = peer.id;
+        count += 1;
+    }
+    for (self.config.discovery.peer_ids) |peer| {
+        var duplicate = false;
+        for (ids[0..count]) |known| {
+            if (known.eql(peer)) duplicate = true;
+        }
+        if (!duplicate) {
+            ids[count] = peer;
+            count += 1;
+        }
     }
     try node_gossip.feedGossip(self, .{
-        .command = .{ .join = try hyparview.Peers.init(ids[0..self.config.peers.len]) },
+        .command = .{ .join = try hyparview.Peers.init(ids[0..count]) },
     }, try node_gossip.gossipNow(at));
     // Set after the feed and not before it: a latch set here is what made
     // a refused `start` a success on the next call, over a node that had
@@ -405,6 +431,7 @@ pub fn deinit(self: *Node) void {
     self.dialled.deinit(self.gpa);
     self.timers.deinit(self.gpa);
     self.discovery.release();
+    self.holepunch.deinit(self.gpa);
     node_transport.shutdownSocket(self);
     self.config.secret.deinit();
     self.gpa.destroy(self);

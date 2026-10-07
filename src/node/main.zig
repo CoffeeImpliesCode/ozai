@@ -158,12 +158,37 @@ pub fn main(init: std.process.Init) !void {
     var secret = options.secret orelse SecretKey.generate(io);
     defer secret.deinit();
 
+    // DNS owns a separate descriptor: a resolver must not consume QUIC traffic.
+    // Both the socket and its seam stay at these addresses until Node deinitializes.
+    var dns_socket: ?ozai.transport_socket.Socket = null;
+    defer if (dns_socket) |*handle| handle.close();
+    var dns_datagram: ozai.discovery_lookup_live.Datagram = undefined;
+    var discovery: node_mod.Discovery = .{
+        .peer_ids = options.lookup_peers.items,
+        .origin = options.dns_origin,
+        .deadline_ms = options.lookup_deadline_ms,
+        .interval_ms = options.lookup_interval_ms,
+    };
+    if (options.dns_server) |server| {
+        const bind: ozai.SocketAddr = .{
+            .ip = switch (server.ip) {
+                .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
+                .v6 => .{ .v6 = .{0} ** 16 },
+            },
+            .port = 0,
+        };
+        dns_socket = try ozai.transport_socket.Socket.create(bind, .{});
+        dns_datagram = .init(&dns_socket.?);
+        discovery.lookup = .{ .datagram = dns_datagram.seam(), .server = server };
+    }
+
     const node = try Node.create(init.gpa, io, .{
         .secret = secret,
         .listen = options.listen,
         .peers = options.peers.items,
         .alpn = alpn,
         .relay = .{ .role = role },
+        .discovery = discovery,
     }, options.seed);
     defer node.deinit();
 
@@ -183,6 +208,9 @@ pub fn main(init: std.process.Init) !void {
         for (options.peers.items) |peer| {
             try text.print("peer       {f} at {f}\n", .{ peer.id, peer.addr });
         }
+    }
+    for (options.lookup_peers.items) |peer| {
+        try text.print("lookup     {f} through {f}, origin {s}\n", .{ peer, options.dns_server.?, options.dns_origin });
     }
     try text.print("running    {d} ms, then a graceful close\n", .{options.run_ms});
     try text.writeAll(

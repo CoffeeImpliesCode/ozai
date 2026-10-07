@@ -60,8 +60,8 @@ pub fn retryMeaning(path: ula.Path) Retry {
 pub const Verdict = union(enum) {
     /// Carry on with the handshake. Upstream `Accept`.
     accept,
-    /// Answer with a retry token. Upstream `Retry`, with the meaning made
-    /// explicit.
+    /// Invalid after allocation: dispatch refuses it. Actual RFC Retry is
+    /// executed by the Bridge Initial policy before a connection exists.
     retry: Retry,
     /// Refuse, and say so. Upstream `Reject`: "The remote will receive a
     /// CONNECTION_REFUSED error immediately" (`protocol.rs:203-205`). The one
@@ -111,10 +111,8 @@ pub const Drop = union(enum) {
 
 /// What the peer learns from an action.
 ///
-/// The router sends two things to a peer and no more: a retry token, and a
-/// refusal. Every local ending — invariant 19's accept failure, a connection a
-/// handler dropped on purpose, an ALPN nobody registered — leaves the peer with
-/// nothing, and upstream's five warnings are all of that kind.
+/// This postaccept router can request a refusal, not a Retry packet. Local
+/// endings leave transport shutdown to the owning endpoint.
 pub const PeerOutcome = enum {
     /// No error code and no packet. The peer learns from the transport timing
     /// out, which is exactly what upstream's failed `accept` leaves behind.
@@ -128,10 +126,6 @@ pub const DispatchAction = union(enum) {
     /// Drive the handshake until the ALPN is known. Upstream
     /// `accepting.alpn().await` (`protocol.rs:644`).
     negotiate_alpn,
-    /// Answer the filter's retry verdict with a token. The payload is what the
-    /// retry is worth on this path, and it rides along because this is the last
-    /// place the two meanings are still distinguishable.
-    send_retry: Retry,
     /// Refuse. The peer is told at once.
     refuse,
     /// Send nothing. Upstream `incoming.ignore()`.
@@ -160,7 +154,6 @@ pub const DispatchAction = union(enum) {
         return switch (self) {
             .refuse => .refused,
             .negotiate_alpn,
-            .send_retry,
             .ignore,
             .await_handshake,
             .on_accepting,
@@ -200,10 +193,6 @@ pub const ConnState = union(enum) {
     /// `ProtocolHandler`'s note on what a long-lived `accept` means without a
     /// thread.
     handling: ProtocolHandler,
-    ///
-    /// The filter answered with a retry token. Terminal: the client comes back
-    /// as a new attempt carrying the token.
-    retried: Retry,
     /// The filter refused. Terminal, and the peer was told.
     refused,
     /// The filter ignored it. Terminal, and nobody was told.
@@ -268,7 +257,7 @@ pub fn dispatchStep(
         // A terminal state absorbs everything. The first ending is the ending,
         // and a later event claiming otherwise is reported by the state the
         // caller already has, not by a second verdict written over the first.
-        .retried, .refused, .ignored, .released, .dropped => .{
+        .refused, .ignored, .released, .dropped => .{
             .state = state,
             .action = .none,
         },
@@ -282,10 +271,8 @@ fn incomingStep(event: ConnEvent) DispatchStep {
     };
     return switch (verdict) {
         .accept => .{ .state = .negotiating, .action = .negotiate_alpn },
-        .retry => |retry| .{
-            .state = .{ .retried = retry },
-            .action = .{ .send_retry = retry },
-        },
+        // Connection dispatch is postaccept. A Retry cannot be issued here.
+        .retry => .{ .state = .refused, .action = .refuse },
         .reject => .{ .state = .refused, .action = .refuse },
         .ignore => .{ .state = .ignored, .action = .ignore },
     };

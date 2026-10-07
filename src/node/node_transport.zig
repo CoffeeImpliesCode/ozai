@@ -14,6 +14,7 @@ const node_mod = @import("node.zig");
 const node_config = @import("node_config.zig");
 const node_accept = @import("node_accept.zig");
 const node_gossip = @import("node_gossip.zig");
+const node_holepunch = @import("node_holepunch.zig");
 
 const batch = @import("../transport/batch.zig");
 const bridge_mod = @import("../transport/quic_bridge.zig");
@@ -96,12 +97,14 @@ pub fn deliver(
     // count still agree.
     var position: usize = 0;
     while (recv.datagram(position)) |datagram| : (position += 1) {
+        node_holepunch.prepare(&self.holepunch, self.bridge);
         const ingress = try self.bridge.recv(&self.map, .{
             .bytes = datagram,
             .from = got.from,
             .local = self.socket.address,
             .ecn = recv.ecn,
         }, self.scratch, at, random);
+        node_holepunch.received(&self.holepunch, self.bridge, got.from, datagram);
         switch (ingress.outcome) {
             // A connection this datagram made or advanced is in the core's
             // table, and `admit` and `drive` both walk that table.
@@ -173,6 +176,7 @@ pub fn expire(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!bo
         };
         try node_gossip.peerGone(self, owner, at);
     }
+    node_holepunch.prepare(&self.holepunch, self.bridge);
     return moved;
 }
 

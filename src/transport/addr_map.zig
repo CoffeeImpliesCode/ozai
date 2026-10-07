@@ -396,6 +396,76 @@ test "a candidate the reverse index holds is drawn again, not handed out twice" 
     try expectSameKey(two, map.lookup(second));
 }
 
+// Rebuild the same public state for each failure index, so a retained allocation
+// from an earlier failed attempt cannot hide a later allocation failure.
+fn sweepGetAllocationFailures(existing: []const Key) !usize {
+    const candidate_key: Key = .{ .any_path = try testNodeId(100) };
+    const candidate_addr = ula.ulaFor(.any_path, host_b);
+    var fail_index: usize = 0;
+    while (fail_index < 16) : (fail_index += 1) {
+        var refusing = t.FailingAllocator.init(t.allocator, .{});
+        const gpa = refusing.allocator();
+        var map: MappedAddrs = .init();
+        defer map.deinit(gpa);
+        var previous: [16]Ula = undefined;
+        for (existing, 0..) |path_key, index| {
+            const host: HostBits = .{ @intCast(index + 1), 0, 0, 0, 0, 0, 0, 0 };
+            var script: ScriptedBits = .{ .script = &.{host} };
+            previous[index] = try map.get(gpa, path_key, script.random());
+        }
+
+        refusing.fail_index = refusing.alloc_index + fail_index;
+        var candidate_script: ScriptedBits = .{ .script = &.{host_b} };
+        const result = map.get(gpa, candidate_key, candidate_script.random());
+        if (result) |allocated| {
+            try t.expectEqual(candidate_addr, allocated);
+        } else |err| {
+            try t.expectEqual(error.OutOfMemory, err);
+            try t.expect(map.lookup(candidate_addr) == null);
+        }
+
+        // Existing forward hits must still work while allocation is refused.
+        var unrelated_script: ScriptedBits = .{ .script = &.{host_a} };
+        for (existing, previous[0..existing.len]) |path_key, allocated| {
+            try t.expectEqual(allocated, try map.get(gpa, path_key, unrelated_script.random()));
+            try expectSameKey(path_key, map.lookup(allocated));
+        }
+
+        refusing.fail_index = std.math.maxInt(usize);
+        const recovered = try map.get(gpa, candidate_key, candidate_script.random());
+        try t.expectEqual(candidate_addr, recovered);
+        try expectSameKey(candidate_key, map.lookup(recovered));
+        try t.expectEqual(recovered, try map.get(gpa, candidate_key, unrelated_script.random()));
+        for (existing, previous[0..existing.len]) |path_key, allocated| {
+            try t.expect(!std.mem.eql(u8, &recovered, &allocated));
+            try t.expectEqual(allocated, try map.get(gpa, path_key, unrelated_script.random()));
+            try expectSameKey(path_key, map.lookup(allocated));
+        }
+        if (result) |_| return fail_index else |_| {}
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "allocation failures leave no reverse mapping and recovery allocates the same candidate" {
+    // The empty map requires both insertions to allocate: sweeping until success
+    // includes the forward failure after the reverse insertion succeeded.
+    try t.expect(try sweepGetAllocationFailures(&.{}) >= 2);
+}
+
+test "allocation failures preserve existing mappings through growth and recovery" {
+    var keys: [16]Key = undefined;
+    for (&keys, 0..) |*path_key, index| {
+        path_key.* = .{ .any_path = try testNodeId(@intCast(index + 1)) };
+    }
+    // Exercise populated maps across growth boundaries without reading or
+    // reserving either table's capacity. Every sweep continues until success.
+    var failures: usize = 0;
+    for (1..keys.len + 1) |existing_count| {
+        failures += try sweepGetAllocationFailures(keys[0..existing_count]);
+    }
+    try t.expect(failures >= 2);
+}
+
 test "an address that arrives off the wire names the key that owns it" {
     const url = try base_addr.RelayUrl.parse("https://use1-1.relay.iroh.network./");
     const path_key: Key = .{ .relay = .{ .relay = url, .node = try testNodeId(1) } };

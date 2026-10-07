@@ -110,19 +110,12 @@
 //! still refused under the name it deserves. What is gone is the datagram that
 //! was in flight when the abort landed, which is the one the abort is about.
 //!
-//! # Truncation is refused, and where the retry belongs
+//! # Truncation needs a separate stream
 //!
-//! `TC` set on the answer means the answer did not fit one datagram; RFC 1035
-//! §4.2.2 retries it over TCP behind a two-octet length prefix.
-//! `lookup_io.readHeader` refuses it as `error.Truncated` before this file is
-//! asked anything, and that refusal is the deliberate outcome: an empty
-//! answer set would read as "this node published nothing", which is a
-//! different fact. The retry is not built here and cannot be inferred from
-//! this file's silence — `transport/socket.zig` is a datagram socket with no
-//! stream, no length prefix and no half-close, and a TCP retry also wants a
-//! connection held open for it, which is a lifetime `Request` does not have.
-//! It belongs to the layer that owns a stream, and until that layer exists a
-//! truncated answer is a refusal the caller can see.
+//! The UDP seam remains a datagram seam. `dns_live.Retrieval` consumes the pure
+//! `host_io.StreamRetry` decision through `retryStream` below: one short-lived
+//! TCP connection, the identical question, and a complete length-prefixed reply.
+//! The wire decoder remains responsible for validating the returned DNS message.
 //!
 //! # `net/probe_run.zig`'s transport is not this, and why
 //!
@@ -137,12 +130,9 @@
 //!
 //! # Purity, ownership and lifetimes
 //!
-//! No clock, no global, no thread, no allocator, and no `std.Io` stored: `io`
-//! is a parameter of `Datagram.init`'s callees and of the three functions in
-//! the seam, and is never a field, for the reason
-//! `docs/DECISIONS/0002-async-substrate.md` gives. Nothing here allocates —
-//! the copy out of the read buffer is `lookup_io.readAnswer`'s, and it is the
-//! fourth of the seam's four things rather than a fifth.
+//! No global, thread, or `std.Io` stored. Datagram operations borrow their
+//! buffers; the TCP consumer borrows `io`, reads its monotonic deadline, and
+//! allocates exactly the response length advertised by the stream prefix.
 //!
 //! What the socket carries across an abort is the socket's own state and not
 //! this file's: a `stop` writes a descriptor and sets a flag, and neither one
@@ -160,6 +150,9 @@ const batch = @import("../transport/batch.zig");
 const socket = @import("../transport/socket.zig");
 const dns = @import("dns.zig");
 const lookup_io = @import("lookup_io.zig");
+const tcp = @import("../transport/tcp.zig");
+const host_io = @import("host_io.zig");
+const wire = @import("lookup_wire.zig");
 
 const SocketError = lookup_io.SocketError;
 const Reply = lookup_io.Datagram.Reply;
@@ -172,6 +165,123 @@ const Reply = lookup_io.Datagram.Reply;
 /// 150 000. It is not short enough for an abort any more, and does not have to
 /// be, because an abort has a descriptor of its own to end the wait with.
 pub const poll_slice_ms: i32 = 20;
+
+/// The stop latches borrowed during a bounded TCP fallback.
+pub const StreamStops = struct {
+    retrieval: *const std.atomic.Value(bool),
+    resolver: ?*const std.atomic.Value(bool) = null,
+
+    fn check(self: StreamStops) SocketError!void {
+        if (self.retrieval.load(.acquire)) return error.Canceled;
+        if (self.resolver) |flag| {
+            if (flag.load(.acquire)) return error.Canceled;
+        }
+    }
+};
+
+/// Repeat a TC question through the real TCP adapter.
+/// The caller frees the returned message. No partial reply escapes on any error.
+/// `timeout_ms` is the remaining query budget, capped at the per-query DNS bound.
+pub fn retryStream(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    retry: host_io.StreamRetry,
+    timeout_ms: i32,
+    stops: StreamStops,
+) lookup_io.Error![]u8 {
+    try stops.check();
+    if (timeout_ms <= 0) return error.Empty;
+    const budget: StreamBudget = .{
+        .start = std.Io.Timestamp.now(io, .awake),
+        .timeout_ms = @min(timeout_ms, @as(i32, @intCast(host_io.query_timeout_ms))),
+        .stops = stops,
+    };
+    var stream = tcp.Tcp.create(retry.server) catch return error.Refused;
+    defer stream.close();
+    // Tcp permits one connect only; a timed-out connect must not be reissued.
+    stream.connect(io, try budget.remaining(io)) catch |err| {
+        try stops.check();
+        return switch (err) {
+            error.Canceled => error.Canceled,
+            error.WouldBlock => error.Empty,
+            else => error.Refused,
+        };
+    };
+    try stops.check();
+    var prefix: [host_io.length_prefix_bytes]u8 = undefined;
+    host_io.writeLengthPrefix(&prefix, retry.query.len) catch return error.Refused;
+    try streamWrite(&stream, io, &prefix, budget);
+    try streamWrite(&stream, io, retry.query, budget);
+    try streamRead(&stream, io, &prefix, budget);
+    const length = wire.be16(&prefix, 0);
+    if (length < wire.header_length) return error.ShortMessage;
+    const message = try alloc.alloc(u8, length);
+    errdefer alloc.free(message);
+    try streamRead(&stream, io, message, budget);
+    try stops.check();
+    return message;
+}
+
+const StreamBudget = struct {
+    start: std.Io.Timestamp,
+    timeout_ms: i32,
+    stops: StreamStops,
+
+    fn remaining(self: StreamBudget, io: std.Io) SocketError!i32 {
+        try self.stops.check();
+        const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - self.start.nanoseconds;
+        const left_ns = @as(i96, self.timeout_ms) * std.time.ns_per_ms - elapsed_ns;
+        if (left_ns <= 0) return error.Empty;
+        // Round up so a positive final millisecond is not discarded.
+        return @intCast(@divFloor(left_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+    }
+};
+
+fn streamWrite(
+    stream: *tcp.Tcp,
+    io: std.Io,
+    bytes: []const u8,
+    budget: StreamBudget,
+) lookup_io.Error!void {
+    var at: usize = 0;
+    while (at < bytes.len) {
+        const left = try budget.remaining(io);
+        const count = stream.write(io, bytes[at..], @min(left, poll_slice_ms)) catch |err| {
+            try budget.stops.check();
+            switch (err) {
+                error.Canceled => return error.Canceled,
+                error.WouldBlock => continue,
+                else => return error.Refused,
+            }
+        };
+        try budget.stops.check();
+        if (count == 0) return error.Refused;
+        at += count;
+    }
+}
+
+fn streamRead(
+    stream: *tcp.Tcp,
+    io: std.Io,
+    bytes: []u8,
+    budget: StreamBudget,
+) lookup_io.Error!void {
+    var at: usize = 0;
+    while (at < bytes.len) {
+        const left = try budget.remaining(io);
+        const count = stream.read(io, bytes[at..], @min(left, poll_slice_ms)) catch |err| {
+            try budget.stops.check();
+            switch (err) {
+                error.Canceled => return error.Canceled,
+                error.WouldBlock => continue,
+                else => return error.Refused,
+            }
+        };
+        try budget.stops.check();
+        if (count == 0) return error.ShortMessage;
+        at += count;
+    }
+}
 
 /// The socket a lookup goes out on, as the two calls this file makes on it.
 ///

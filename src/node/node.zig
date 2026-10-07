@@ -237,6 +237,7 @@ const node_relay_serve = @import("node_relay_serve.zig");
 const node_relay_table = @import("node_relay_table.zig");
 const node_stats = @import("node_stats.zig");
 const node_transport = @import("node_transport.zig");
+const node_holepunch = @import("node_holepunch.zig");
 
 const NodeId = base_key.NodeId;
 const SecretKey = base_key.SecretKey;
@@ -425,6 +426,8 @@ pub const Node = struct {
     /// what the pass does; what matters here is that `step` runs it and
     /// `Stats` reads it, exactly as `gossip` above.
     discovery: node_discovery.State = .{},
+    /// Established peer connections and authenticated received-path evidence.
+    holepunch: node_holepunch.State,
 
     /// The generator, and the buffers the socket and the drain seams need.
     /// They are on the heap because the receive buffer is
@@ -443,7 +446,7 @@ pub const Node = struct {
     /// are never reused (`quic_bridge.zig:230-233`), so this only has to
     /// answer "has this one been offered", and a set is the whole question.
     offered: std.AutoHashMapUnmanaged(u64, void),
-    /// Peers `start` has dialled, whether or not the dial worked.
+    /// Static dials and identity-only lookup attempts, recorded even on failure.
     dialled: std.AutoArrayHashMapUnmanaged(NodeId, void),
     /// Whether the gossip layer has been told to join. Set once the join
     /// command has actually been fed, so a `start` that was refused feeds it

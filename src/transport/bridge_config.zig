@@ -15,6 +15,7 @@ const std = @import("std");
 const quic = @import("quic");
 const base_key = @import("../base/key.zig");
 const batch = @import("batch.zig");
+const incoming_filter = @import("../endpoint/incoming_filter.zig");
 
 const NodeId = base_key.NodeId;
 const SecretKey = base_key.SecretKey;
@@ -121,6 +122,10 @@ pub const CreateError = error{
 /// is a node id, two keys and an ALPN, and the translation to the core's
 /// spelling happens once, in `Bridge.create`.
 pub const Config = struct {
+    /// Null applies only core admission rules. A supplied pure policy runs
+    /// after token validation, before connection allocation. Borrow its context
+    /// until the bridge is destroyed; the callback must not reenter the bridge.
+    initial_policy: ?incoming_filter.InitialPolicy = null,
     /// This node's identity: the seed the presented certificate is built
     /// from, and the node id a peer compares the certificate against.
     secret: SecretKey,
