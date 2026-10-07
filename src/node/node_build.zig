@@ -6,7 +6,6 @@ const node_mod = @import("node.zig");
 const node_config = @import("node_config.zig");
 const node_accept = @import("node_accept.zig");
 const node_blobs = @import("node_blobs.zig");
-const node_relay_runtime = @import("node_relay_runtime.zig");
 const node_transport = @import("node_transport.zig");
 const node_gossip = @import("node_gossip.zig");
 const node_holepunch = @import("node_holepunch.zig");
@@ -96,7 +95,7 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
     errdefer self.offered.deinit(gpa);
     errdefer self.dialled.deinit(gpa);
     errdefer self.timers.deinit(gpa);
-    self.relay_runtime = try node_relay_runtime.State.init(config.relay);
+    try self.relay_runtime.init(config.relay);
     errdefer self.relay_runtime.deinit();
     errdefer self.blobs.deinit(gpa);
 

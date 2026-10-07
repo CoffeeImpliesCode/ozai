@@ -52,6 +52,23 @@ scratch root and sets the Zig caches. Do not use `/tmp` or `/var/tmp`. Set
 `ZIG` to the direct Zig 0.16.0 executable. `Cargo.toml` pins `iroh` and `noq`
 to 1.3.0. `Cargo.lock` pins their dependency graph.
 
+Disk-backed Zig tests use the independent `test_scratch` module, not
+`std.testing.tmpDir`. They require `HOST_SCRATCH_ROOT` and validate its ownership,
+physical approved mount and absence of symlink redirection with the same policy
+as the gate. Each test gets an exclusively created private directory under
+`$HOST_SCRATCH_ROOT/scratch/ozai-test-*`; missing or unapproved roots fail instead
+of falling back to the repository or `/tmp`. Fixture reads keep the repository
+working directory. For direct `zig test` commands, add `--dep test_scratch` before
+the consuming `-M` module and add `-Mtest_scratch=scripts/test_scratch.zig`.
+
+Before scratch cleanup, tests must close their file and directory handles and
+join or stop child processes that used the private directory. They must not
+share its path with unrelated processes. Cleanup rechecks the approved mount,
+directory identity and private parent permissions, then rejects foreign-owned
+entries, symlinks, hard links, special files, nested mounts and live descriptors
+or mappings in the test process. It never scans unrelated PIDs or sends signals. If a check
+fails, cleanup retains the directory and prints its exact path and reason.
+
 ```sh
 source ~/.local/lib/host-scratch.sh
 export TMPDIR="$HOST_SCRATCH_ROOT/tmp/ozai-rpk-tmp"

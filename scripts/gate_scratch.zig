@@ -46,7 +46,7 @@ const validate_script =
     \\printf '%s\n' "$physical_scratch"
 ;
 
-fn validatedScratch(gpa: std.mem.Allocator, io: std.Io,
+pub fn validatedScratch(gpa: std.mem.Allocator, io: std.Io,
     environment: *const std.process.Environ.Map, target: []const u8) ![]const u8
 {
     const selected = environment.get("HOST_SCRATCH_ROOT") orelse return error.MissingScratch;

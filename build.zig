@@ -16,6 +16,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const test_scratch_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/test_scratch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     // ozai is a library first. Every crate in the iroh family is consumed as a
     // dependency, so the public surface is a module importers add; the static
     // artifact exists so a plain `zig build` proves the whole tree type-checks.
@@ -54,6 +59,7 @@ pub fn build(b: *std.Build) void {
     // same core module, while consumers add "quic" explicitly when naming
     // the core's types in their own module.
     lib_mod.addImport("quic", quic_mod);
+    lib_mod.addImport("test_scratch", test_scratch_mod);
 
     // The test root is `test_all.zig`, not `lib.zig`. A root that only
     // re-exports discovers zero tests and still exits 0, which is a green step
@@ -122,6 +128,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     node_main_mod.addImport("ozai", lib_mod);
+    node_main_mod.addImport("test_scratch", test_scratch_mod);
     node_main_mod.link_libc = true;
     const node_exe = b.addExecutable(.{
         .name = "ozai-node",
@@ -143,6 +150,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     node_cli_mod.addImport("ozai", lib_mod);
+    node_cli_mod.addImport("test_scratch", test_scratch_mod);
     relay_fixture_mod.addImport("node_cli", node_cli_mod);
     const relay_fixture = b.addExecutable(.{
         .name = "ozai-relay-fixture",
@@ -207,6 +215,7 @@ pub fn build(b: *std.Build) void {
     // does not inherit the imports of the module it was split from, so the
     // import is repeated rather than reached through `lib_mod`.
     lib_test_mod.addImport("quic", quic_mod);
+    lib_test_mod.addImport("test_scratch", test_scratch_mod);
     // `src/transport/socket.zig` reaches libc for `sendmsg`, `recvmsg` and the
     // socket options. It is here, not on `lib_mod`, because Zig does not
     // analyse a function body until something calls it: while nothing called
@@ -228,6 +237,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     portable_test_mod.addImport("quic", quic_mod);
+    portable_test_mod.addImport("test_scratch", test_scratch_mod);
     const portable_tests = b.addTest(.{
         .name = "ozai-portable-test",
         .root_module = portable_test_mod,
@@ -450,6 +460,7 @@ pub fn build(b: *std.Build) void {
                     .link_libc = true,
                 });
                 mod.addImport("ozai", lib_mod);
+                mod.addImport("test_scratch", test_scratch_mod);
                 mod.addOptions("peer_test_options", peer_test_options);
                 mod.addOptions("node_test_options", node_test_options);
                 const tests = b.addTest(.{

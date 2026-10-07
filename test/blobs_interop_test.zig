@@ -82,10 +82,14 @@ fn runCase(direction: Direction, case: Case) !void {
     );
 
     var node: *node_child.Process = undefined;
+    var node_started = false;
+    defer if (node_started) node.deinit(t.io);
     var rust: *rust_child.Process = undefined;
+    var rust_started = false;
+    defer if (rust_started) rust.deinit(t.io);
     if (direction == .rust_provider) {
         rust = try startRust(allocator, &node_hex, case, null);
-        errdefer rust.deinit(t.io);
+        rust_started = true;
         try awaitRustBanner(rust);
         const address = rust.value("listening") orelse return error.NoProviderAddress;
         const peer = try std.fmt.allocPrint(allocator, "{s}@{s}", .{ rust_z32, address });
@@ -100,6 +104,7 @@ fn runCase(direction: Direction, case: Case) !void {
                 "--blob-range", case.range, "--blob-output", output,
             },
         });
+        node_started = true;
     } else {
         node = try node_child.Process.start(t.allocator, allocator, t.io, "Node blob provider", .{
             .tag = node_tag,
@@ -110,12 +115,11 @@ fn runCase(direction: Direction, case: Case) !void {
                 "--blob-hash", &hash, "--expect-peer", &rust_z32,
             },
         });
-        errdefer node.deinit(t.io);
+        node_started = true;
         try awaitNodeBanner(node);
         rust = try startRust(allocator, &node_hex, case, node.bound().?);
+        rust_started = true;
     }
-    defer node.deinit(t.io);
-    defer rust.deinit(t.io);
     errdefer {
         node.dump();
         std.debug.print("Rust stdout:\n{s}\nRust stderr:\n{s}\n", .{

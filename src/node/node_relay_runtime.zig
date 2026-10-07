@@ -43,12 +43,11 @@ pub const State = struct {
     head: usize = 0,
     count: usize = 0,
 
-    pub fn init(config: Config) Error!State {
-        var state: State = .{};
-        errdefer state.deinit();
-        if (config.serve) |address| state.server = try carrier.Server.init(address);
-        if (config.client) |client| state.client = try carrier.Client.init(client);
-        return state;
+    pub fn init(self: *State, config: Config) Error!void {
+        self.* = .{};
+        errdefer self.deinit();
+        if (config.serve) |address| self.server = try carrier.Server.init(address);
+        if (config.client) |client| self.client = try carrier.Client.init(client);
     }
 
     pub fn deinit(self: *State) void {

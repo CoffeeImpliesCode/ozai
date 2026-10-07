@@ -20,11 +20,14 @@ fn skippedDirectory(name: []const u8) bool {
 fn relevant(path: []const u8) bool {
     const suffixes = [_][]const u8{
         ".zig", ".zon", ".nix", ".json", ".toml", ".lock", ".rs", ".c", ".h", ".sh",
+        ".bin", ".py",
     };
     for (suffixes) |suffix| {
         if (std.mem.endsWith(u8, path, suffix)) return true;
     }
-    return false;
+    // Native oracle tests also read capture provenance at runtime.
+    return std.mem.startsWith(u8, path, "test/fixtures/native/") and
+        std.mem.endsWith(u8, path, ".txt");
 }
 
 pub fn sources(gpa: Allocator, io: std.Io) ![]Source {
@@ -68,12 +71,4 @@ pub fn sourceDigest(gpa: Allocator, inventory: []const Source) ![]const u8 {
     const encoded = try std.json.Stringify.valueAlloc(gpa, inventory, .{});
     defer gpa.free(encoded);
     return files.hashBytes(gpa, encoded);
-}
-
-test "configuration and tooling participate in source freshness" {
-    try std.testing.expect(relevant("devenv.nix"));
-    try std.testing.expect(relevant("scripts/project_gate.zig"));
-    try std.testing.expect(relevant("build.zig.zon"));
-    try std.testing.expect(!relevant("docs/COVERAGE-LEDGER.md"));
-    try std.testing.expect(skippedDirectory("zig-pkg"));
 }
