@@ -11,11 +11,9 @@
 //!
 //! One rule, applied at every level of the tree:
 //!
-//! - a node the request takes **whole** is answered with its bytes and no pair
-//!   of its own — the bytes hash to the value, so a pair above it would be a
-//!   second copy of the same claim;
-//! - any other node the request touches is a **parent**: it emits its 64-byte
-//!   pair and then walks its two children in order;
+//! - a wholly selected node below the persisted group line carries its data;
+//! - every touched persisted parent carries its pair, even for a whole blob;
+//! - a partially selected group descends to the requested chunks;
 //! - a child the request does not touch is a **skip**: no bytes at all. Its
 //!   value comes from the pair above it, and the item exists only so the walk's
 //!   shape is written down in one place instead of in a reader's head.
@@ -75,19 +73,9 @@ pub const Item = union(enum) {
     }
 };
 
-/// How many items a walk can hold.
-///
-/// A node is *partial* when the request meets it without taking it whole, and
-/// a partial node is the only one that emits a pair. The partial nodes are
-/// exactly the two boundary paths from the root down to the chunks holding
-/// the request's two ends, and a node's parent is partial whenever the node
-/// is, so the walk can reach `1 + 2 * max_depth` of them over the at most
-/// `max_depth + 1` levels a tree over a `u64` chunk counter has.
-///
-/// Each partial node emits its pair and then two child entries, and every
-/// partial node but the root is one of those entries, so the total is
-/// `2 * partial + 1`. That is `4 * (max_depth + 1)` items, and
-/// `Builder.push` asserts against it rather than re-deriving it.
+/// Caller-bounded storage for a proof walk. A whole-blob proof includes every
+/// group parent, so unlike a boundary-only walk it can exceed this capacity.
+/// Such plans fail closed with `overflow`, never truncate a successful proof.
 pub const max_items = 4 * (core.max_depth + 1);
 
 /// A walk over the tree, written down before any byte is read.
@@ -97,6 +85,7 @@ pub const Plan = struct {
     /// How many bytes the whole proof is. The destination must be at least
     /// this long, and a proof that ends anywhere else is not this proof.
     bytes: usize = 0,
+    overflow: bool = false,
 
     pub fn isEmpty(self: *const Plan) bool {
         return self.len == 0;
@@ -158,7 +147,10 @@ const Builder = struct {
     sel: ranges.ChunkRange,
 
     fn push(self: *Builder, tree: BaoTree, item: Item) void {
-        std.debug.assert(self.plan.len < self.plan.items.len);
+        if (self.plan.len == self.plan.items.len) {
+            self.plan.overflow = true;
+            return;
+        }
         self.plan.items[self.plan.len] = item;
         self.plan.len += 1;
         self.plan.bytes += switch (item) {
@@ -176,7 +168,8 @@ const Builder = struct {
     /// whole spans at least two chunks, because the request is counted in
     /// chunks, so it always has children to walk into.
     fn walk(self: *Builder, tree: BaoTree, node: Node) void {
-        if (node.covers(self.sel)) {
+        if (self.plan.overflow) return;
+        if (node.span <= tree_mod.chunks_per_block and node.covers(self.sel)) {
             self.push(tree, .{ .data = node });
             return;
         }
@@ -198,18 +191,13 @@ const Builder = struct {
 const t = std.testing;
 const published = @import("../gossip/plumtree/blake3_vectors.zig");
 
-// The whole blob: one item, the root's bytes, no pair at all. A proof that
-// carried a pair for the root would be carrying a copy of the claim it is
-// being checked against.
-test "a request for the whole blob is one item of data" {
-    const tree = BaoTree.init(49153);
+// Upstream always emits persisted parents, including a whole-blob request.
+test "whole multigroup proofs retain every persisted parent" {
+    const tree = BaoTree.init(49189);
     const plan = planOf(tree, .{ .start = 0, .end = tree.chunks() });
-
-    try t.expectEqual(@as(usize, 1), plan.len);
-    try t.expectEqual(plan.items[0].data.bytes(tree).end, 49153);
-    try t.expect(plan.items[0] == .data);
-    try t.expectEqual(@as(usize, 49153), plan.bytes);
-    try t.expect(tree.root().eql(plan.items[0].data));
+    try t.expectEqual(@as(usize, 7), plan.len);
+    try t.expect(plan.items[0] == .pair);
+    try t.expectEqual(@as(usize, 49189 + 3 * pair_length), plan.bytes);
 }
 
 // A request for one chunk group. The group's bytes are hashed whole and a
@@ -396,4 +384,10 @@ test "a plan stays inside its bound and inside the blob" {
             }
         }
     }
+}
+
+test "oversized whole proof plans fail closed without walking unbounded groups" {
+    const tree = BaoTree.init(std.math.maxInt(u64));
+    const plan = planOf(tree, .{ .start = 0, .end = tree.chunks() });
+    try t.expect(plan.overflow);
 }

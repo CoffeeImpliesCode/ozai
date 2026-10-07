@@ -130,6 +130,27 @@ pub const GetRequest = struct {
         return std.mem.eql(u8, &a.hash, &b.hash) and a.ranges.eql(b.ranges);
     }
 
+    /// Resolve one contiguous root-blob range, or null for collections and
+    /// disjoint selections. Provider and getter share this pure interpretation
+    /// so neither can answer or verify chunks the other did not select.
+    pub fn selectedRange(self: GetRequest, total_chunks: u64) ?ranges_mod.ChunkRange {
+        const items = self.ranges.items;
+        if (items.len != 2) return null;
+        if (items[0].delta != 0) return null;
+        if (items[1].delta != 1 or !items[1].spec.isEmpty()) return null;
+
+        var walk = items[0].spec.resolve(total_chunks);
+        const first = walk.next() orelse return null;
+        const second = walk.next() orelse return .{
+            .start = first.offset,
+            .end = first.offset + first.size,
+        };
+        // Closing a gap would transfer chunks the request explicitly omitted.
+        if (second.offset != first.offset + first.size) return null;
+        if (walk.next() != null) return null;
+        return .{ .start = first.offset, .end = second.offset + second.size };
+    }
+
     /// The wire form: 32 raw hash bytes, then a `RangeSpecSeq`. postcard does
     /// not length-prefix a fixed-size array, and a `Hash` is a newtype over
     /// `[u8; 32]`, so the hash is those 32 bytes and nothing else.
@@ -422,4 +443,26 @@ test "GetManyRequest.allRanges is upstream's FromIterator" {
     var tight: [1]range_spec.Item = undefined;
     try testing.expect(GetManyRequest.allRanges(&tight, 4).isEmpty());
     try testing.expect(GetManyRequest.allRanges(&.{}, 4).isEmpty());
+}
+
+test "single blob range resolution clips chunks and refuses disjoint or collection walks" {
+    const hash: Hash = @splat(0);
+    const whole = GetRequest.blob(hash).selectedRange(49).?;
+    try testing.expectEqual(@as(u64, 0), whole.start);
+    try testing.expectEqual(@as(u64, 49), whole.end);
+    try testing.expectEqual(null, GetRequest.all(hash).selectedRange(49));
+    const partial_items = [_]range_spec.Item{
+        .{ .delta = 0, .spec = .{ .widths = &.{ 47, 10 } } },
+        .{ .delta = 1, .spec = range_spec.RangeSpec.empty },
+    };
+    const partial: GetRequest = .{ .hash = hash, .ranges = .{ .items = &partial_items } };
+    const clipped = partial.selectedRange(49).?;
+    try testing.expectEqual(@as(u64, 47), clipped.start);
+    try testing.expectEqual(@as(u64, 49), clipped.end);
+    const gapped_items = [_]range_spec.Item{
+        .{ .delta = 0, .spec = .{ .widths = &.{ 2, 4, 3, 1 } } },
+        .{ .delta = 1, .spec = range_spec.RangeSpec.empty },
+    };
+    const gapped: GetRequest = .{ .hash = hash, .ranges = .{ .items = &gapped_items } };
+    try testing.expectEqual(null, gapped.selectedRange(49));
 }
