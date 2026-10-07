@@ -6,9 +6,13 @@
 //! walk in `state_shuffle.zig` and the arms in `state_arms.zig`. The reason a
 //! peer is told about its removal, and the `Disconnect` itself, are in
 //! `state_departure.zig`.
+//! Derived refills decline an unwritable local `Neighbor` without changing
+//! caller-owned contact or departure transitions. Explicit `sendNeighbor`
+//! requests still report `MessageTooLarge`.
 const std = @import("std");
 const key = @import("../../base/key.zig");
 const plumtree = @import("../plumtree.zig");
+const codec = @import("../codec.zig");
 const bounds = @import("bounds.zig");
 const wire = @import("message.zig");
 const node_id = @import("node_id.zig");
@@ -83,6 +87,14 @@ pub fn refillActiveFromPassive(
     {
         return;
     }
+    const priority: Priority = if (self.active_view.count() == 0) .high else .low;
+    const message: wire.SwarmMessage = .{ .neighbor = .{
+        .priority = priority,
+        .data = self.myData(),
+    } };
+    // A refill is derived work: decline it before choosing a peer or claiming
+    // a request, without rejecting the contact or departure that triggered it.
+    if (codec.encodedLen(.{ .swarm = message }) >= codec.max_message_size) return;
     // "When a node p suspects that one of the nodes present in its active
     // view has failed ..., it selects a random node q from its passive view
     // and attempts to establish a connection with q. If the connection
@@ -101,8 +113,7 @@ pub fn refillActiveFromPassive(
     }
     const node = self.passive_view.pickRandomWithout(skip_all[0..count], &self.rng) orelse
         return;
-    const priority: Priority = if (self.active_view.count() == 0) .high else .low;
-    try sendNeighbor(self, node, priority, out);
+    try sendNeighborAdmitted(self, node, message, out);
     try out.push(.{ .schedule_timer = .{
         .after = self.config.neighbor_request_timeout,
         .timer = .{ .pending_neighbor_request = node },
@@ -179,6 +190,17 @@ pub fn addActive(
     out: *Actions(SwarmOutEvent),
 ) (Error || Allocator.Error)!bool {
     if (node_id.sameNode(peer, self.me)) return false;
+    if (reply and !self.pending_neighbor_requests.contains(peer) and
+        (priority == .high or !activeIsFull(self) or self.active_view.contains(peer)))
+    {
+        const message: wire.SwarmMessage = .{ .neighbor = .{
+            .priority = priority,
+            .data = self.myData(),
+        } };
+        if (codec.encodedLen(.{ .swarm = message }) >= codec.max_message_size) {
+            return error.MessageTooLarge;
+        }
+    }
     try self.insertPeerInfo(.{ .id = peer, .data = data }, out);
     if (self.active_view.contains(peer)) {
         if (reply) try sendNeighbor(self, peer, priority, out);
@@ -217,6 +239,24 @@ pub fn sendNeighbor(
     priority: Priority,
     out: *Actions(SwarmOutEvent),
 ) (Error || Allocator.Error)!void {
+    if (self.pending_neighbor_requests.contains(peer)) return;
+    const message: wire.SwarmMessage = .{ .neighbor = .{
+        .priority = priority,
+        .data = self.myData(),
+    } };
+    if (codec.encodedLen(.{ .swarm = message }) >= codec.max_message_size) {
+        return error.MessageTooLarge;
+    }
+    try sendNeighborAdmitted(self, peer, message, out);
+}
+
+/// Commits a `Neighbor` whose actual envelope already passed write admission.
+fn sendNeighborAdmitted(
+    self: *State,
+    peer: NodeId,
+    message: wire.SwarmMessage,
+    out: *Actions(SwarmOutEvent),
+) (Error || Allocator.Error)!void {
     if (!try self.pending_neighbor_requests.insert(peer)) return;
     // The timer that clears this entry is queued by the caller after this
     // returns, so a claim left behind by a refused append is one nothing
@@ -225,6 +265,6 @@ pub fn sendNeighbor(
     errdefer std.debug.assert(self.pending_neighbor_requests.remove(peer));
     try out.push(.{ .send_message = .{
         .to = peer,
-        .message = .{ .neighbor = .{ .priority = priority, .data = self.myData() } },
+        .message = message,
     } });
 }

@@ -17,8 +17,9 @@ const node_transport = @import("node_transport.zig");
 
 const bridge_mod = @import("../transport/quic_bridge.zig");
 const endpoint = @import("../endpoint/endpoint.zig");
+const tcp_client = @import("../relay/tcp_client.zig");
 
-const Node = node_mod.Node;
+const Self = node_mod.Node;
 const Error = node_config.Error;
 const Answer = node_accept.Answer;
 const Instant = bridge_mod.Instant;
@@ -59,7 +60,7 @@ pub const max_close_steps = 8;
 /// resume above is what a later `close` picks up, so an `Io` that cancels
 /// one close does not need to cancel the next; `run` is the caller that
 /// turns either answer into a disposal before it returns.
-pub fn close(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!void {
+pub fn close(self: *Self, io: std.Io, at: Instant, random: std.Random) Error!void {
     if (self.accept.shutdown.phase == .closed) return;
     try finish(self, io, at, random);
 }
@@ -77,7 +78,7 @@ pub fn close(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!voi
 /// One phase is different: the machine emits `close_endpoint` on the event
 /// before it and never twice, so a close resumed at `closing_endpoint` is
 /// performing the action that failed rather than being told it is owed.
-pub fn finish(self: *Node, io: ?std.Io, at: ?Instant, random: std.Random) Error!void {
+pub fn finish(self: *Self, io: ?std.Io, at: ?Instant, random: std.Random) Error!void {
     var steps: usize = 0;
     while (self.accept.shutdown.phase != .closed) {
         std.debug.assert(steps < max_close_steps);
@@ -129,7 +130,9 @@ pub fn finish(self: *Node, io: ?std.Io, at: ?Instant, random: std.Random) Error!
 /// is a counter or a call into this node's own state, so an error here would
 /// be a claim this module cannot make. It panics rather than leave a
 /// half-disposed node behind a swallowed error.
-pub fn dispose(self: *Node) void {
+pub fn dispose(self: *Self) void {
+    // ZBC cannot follow null inputs through handlers; panic marks impossible shutdown failure.
+    // zbc-disable-next-line: catch-error-panic
     finish(self, null, null, self.generator()) catch |err| std.debug.panic(
         "a shutdown with no runtime and no instant failed: {t}",
         .{err},
@@ -146,7 +149,7 @@ pub fn dispose(self: *Node) void {
 /// while a handler is still shutting down is a use-after-free
 /// (`router.zig:642-650`).
 pub fn performShutdown(
-    self: *Node,
+    self: *Self,
     io: ?std.Io,
     owed: endpoint.ShutdownStep,
     at: ?Instant,
@@ -229,7 +232,7 @@ pub fn performShutdown(
 /// descriptor open**, and that is reported rather than papered over:
 /// `finish` re-performs this step on the next close, and `dispose` is the
 /// backstop behind both.
-pub fn closeConnections(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!void {
+pub fn closeConnections(self: *Self, io: std.Io, at: Instant, random: std.Random) Error!void {
     var index: usize = 0;
     while (self.bridge.connectionAt(index)) |conn| : (index += 1) {
         conn.entry.conn.close(0, "", at);
@@ -237,4 +240,85 @@ pub fn closeConnections(self: *Node, io: std.Io, at: Instant, random: std.Random
             try node_transport.send(self, io, egress.to, egress.send);
         }
     }
+    // Relay sends enqueue framed output; keep the endpoint live until every byte is written.
+    try self.relay_runtime.flush(io);
+}
+
+const CloseOutput = struct {
+    blocked: bool = true,
+    writes: usize = 0,
+    closes: usize = 0,
+
+    fn read(_: std.Io, _: *anyopaque, _: []u8) tcp_client.Error!usize {
+        return error.UnexpectedMessage;
+    }
+
+    fn write(
+        _: std.Io,
+        context: *anyopaque,
+        bytes: []const u8,
+    ) tcp_client.Error!usize {
+        const self: *CloseOutput = @ptrCast(@alignCast(context));
+        std.debug.assert(self.closes == 0);
+        self.writes += 1;
+        if (self.blocked) return error.WouldBlock;
+        return @min(bytes.len, 5);
+    }
+
+    fn close(context: *anyopaque) void {
+        const self: *CloseOutput = @ptrCast(@alignCast(context));
+        self.closes += 1;
+    }
+};
+
+test "relay close backpressure keeps endpoint live and repeated close resumes output" {
+    // The borrowed carrier outlives shutdown; blocked bytes must survive until the next close.
+    const key = @import("../base/key.zig");
+    var output: CloseOutput = .{};
+    const node = try Self.create(std.testing.allocator, std.testing.io, .{
+        .secret = try key.SecretKey.fromSeed(@splat(42)),
+    }, 4242);
+    defer node.deinit();
+    node.relay_runtime.client = .{
+        .address = node.socket.address,
+        .connection = .{
+            .stream = undefined,
+            .transport = .{
+                .context = &output,
+                .read = CloseOutput.read,
+                .write = CloseOutput.write,
+                .close = CloseOutput.close,
+            },
+        },
+        .secret = try key.SecretKey.fromSeed(@splat(43)),
+        .host_len = 0,
+        .state = .ready,
+    };
+    try node.relay_runtime.client.?.send(node.nodeId(), "final close datagram");
+    const at: Instant = 1_000 * std.time.ns_per_s;
+    try std.testing.expectError(error.WouldBlock, node.close(
+        std.testing.io,
+        at,
+        node.generator(),
+    ));
+    try std.testing.expectEqual(.closing_endpoint, node.accept.shutdown.phase);
+    try std.testing.expect(node.socket_open);
+    try std.testing.expect(!node.endpoint_closed);
+    try std.testing.expect(node.relay_runtime.client.?.connection.busy());
+    try std.testing.expectEqual(@as(usize, 0), output.closes);
+    try std.testing.expectError(error.WouldBlock, node.close(
+        std.testing.io,
+        at,
+        node.generator(),
+    ));
+    output.blocked = false;
+    try node.close(std.testing.io, at, node.generator());
+    try std.testing.expectEqual(.closed, node.accept.shutdown.phase);
+    try std.testing.expect(!node.socket_open);
+    try std.testing.expect(node.endpoint_closed);
+    try std.testing.expect(!node.relay_runtime.client.?.connection.busy());
+    try std.testing.expectEqual(@as(usize, 0), output.closes);
+    const writes = output.writes;
+    try node.close(std.testing.io, at, node.generator());
+    try std.testing.expectEqual(writes, output.writes);
 }

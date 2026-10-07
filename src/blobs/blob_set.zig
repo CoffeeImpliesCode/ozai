@@ -241,6 +241,8 @@ pub fn BlobSet(comptime hashes: usize) type {
         /// guessing which of the two facts it still holds.
         pub fn forget(self: *Self, hash: Hash) bool {
             const index = self.indexOf(hash) orelse return false;
+            // ZBC cannot infer that successful indexOf proves index < self.len.
+            // zbc-disable-next-line: index-minus-one-without-zero-guard
             self.entries[index] = self.entries[self.len - 1];
             self.len -= 1;
             return true;

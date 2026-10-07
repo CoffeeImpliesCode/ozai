@@ -63,8 +63,8 @@ pub const Outcome = enum {
     refused,
 };
 pub fn sendmsg(
-    handle: c.fd_t,
     io: std.Io,
+    handle: c.fd_t,
     bytes: []const u8,
     name: *const c.sockaddr.storage,
     name_length: socklen_t,
@@ -122,8 +122,8 @@ pub fn sendmsg(
 }
 
 pub fn recvmsg(
-    handle: c.fd_t,
     io: std.Io,
+    handle: c.fd_t,
     buffer: []u8,
     control: *ControlBuffer,
 ) ReceiveError!Received {

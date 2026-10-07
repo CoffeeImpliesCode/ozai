@@ -79,7 +79,7 @@ const Writer = struct {
     fn walk(self: *Writer, node: Node) Error!void {
         if (!node.isOutboardParent()) return;
         const children = node.children();
-        const pair = tree_mod.Pair{
+        const pair: tree_mod.Pair = .{
             .left = try self.tree.nodeCv(children.left, self.data),
             .right = try self.tree.nodeCv(children.right, self.data),
         };

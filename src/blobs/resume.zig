@@ -92,6 +92,7 @@ const core = @import("../crypto/blake3_core.zig");
 const subtree = @import("../crypto/blake3_subtree.zig");
 const tree_mod = @import("bao_tree.zig");
 const store = @import("store.zig");
+const test_scratch = @import("test_scratch");
 
 /// The tree a partial is cut for. `bao_tree.zig` owns it; this file only spells
 /// it, for the reason `store.zig` gives for spelling `Hash`.
@@ -367,7 +368,7 @@ const nothing: Checkpoint = .{ .size = 0, .at = 0, .cv = @splat(0) };
 test "a store with no partial is a fresh write and not a fault" {
     const b = try blob(49153);
     defer t.allocator.free(b.data);
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     var storage: store.NameStorage = undefined;
     const paths = store.names(&storage, b.root);
@@ -392,7 +393,7 @@ test "a store with no partial is a fresh write and not a fault" {
 test "a verified prefix is kept and cut back to the offset that was checked" {
     const b = try blob(49153);
     defer t.allocator.free(b.data);
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     var storage: store.NameStorage = undefined;
     const paths = store.names(&storage, b.root);
@@ -434,7 +435,7 @@ test "a verified prefix is kept and cut back to the offset that was checked" {
 test "a checkpoint for another size discards both halves" {
     const b = try blob(49153);
     defer t.allocator.free(b.data);
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     var storage: store.NameStorage = undefined;
     const paths = store.names(&storage, b.root);
@@ -497,7 +498,7 @@ test "an unaligned offset, a record ahead of the bytes, and a flipped byte" {
         },
     };
     for (cases) |case| {
-        var tmp = try @import("test_scratch").tmpDir(.{});
+        var tmp = try test_scratch.tmpDir(.{});
         defer tmp.cleanup();
         var storage: store.NameStorage = undefined;
         const paths = store.names(&storage, b.root);
@@ -530,13 +531,13 @@ test "an empty scratch is refused only where a prefix would be hashed" {
     defer t.allocator.free(b.data);
     var storage: store.NameStorage = undefined;
 
-    var empty = try @import("test_scratch").tmpDir(.{});
+    var empty = try test_scratch.tmpDir(.{});
     defer empty.cleanup();
     const empty_paths = store.names(&storage, b.root);
     var out = try settle(t.io, empty.dir, empty_paths, b.tree, nothing, &.{});
     out.handles.close(t.io);
 
-    var held = try @import("test_scratch").tmpDir(.{});
+    var held = try test_scratch.tmpDir(.{});
     defer held.cleanup();
     const held_paths = store.names(&storage, b.root);
     const partial = try store.createPartial(t.io, held.dir, held_paths);
@@ -566,7 +567,7 @@ test "an empty scratch is refused only where a prefix would be hashed" {
 test "a whole blob verifies and promotes without a refetch" {
     const b = try blob(whole_chunks * chunk_size);
     defer t.allocator.free(b.data);
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     var storage: store.NameStorage = undefined;
     const paths = store.names(&storage, b.root);
@@ -610,7 +611,7 @@ test "a whole blob verifies and promotes without a refetch" {
 test "a committed blob is never touched by a settle" {
     const b = try blob(49153);
     defer t.allocator.free(b.data);
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     var storage: store.NameStorage = undefined;
     const paths = store.names(&storage, b.root);

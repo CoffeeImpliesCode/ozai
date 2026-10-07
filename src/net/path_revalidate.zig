@@ -310,14 +310,15 @@ test "the window runs from the newest figure and a refresh rearms it" {
     _ = table.observe(at(1000), .open, 0);
     try t.expect(table.sample(at(1000), 20 * millis, 1_000));
     const stale_at = 1_000 + unverified_after + 1;
-    try t.expectEqual(Verdict.unverified, verdict(&table.get(at(1000)).?, stale_at));
+    const stale = table.get(at(1000)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(Verdict.unverified, verdict(&stale, stale_at));
 
     // A second measurement replaces the first, and the path is fresh again from
     // the instant of the second rather than from the instant of the first: the
     // age is read out of `rtt_at`, so revalidation is repeatable rather than a
     // one-shot countdown to a connection that can never be trusted again.
     try t.expect(table.sample(at(1000), 24 * millis, stale_at));
-    const entry = table.get(at(1000)).?;
+    const entry = table.get(at(1000)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(Verdict.fresh, verdict(&entry, stale_at));
     try t.expectEqual(Verdict.fresh, verdict(&entry, stale_at + revalidate_after));
     try t.expectEqual(Verdict.stale, verdict(&entry, stale_at + revalidate_after + 1));
@@ -339,7 +340,7 @@ test "a path carrying right now is still unverified on a dead figure" {
     // would leave it alone for ever: idleness is the only thing that retires a
     // path, and this path is not idle. This is the case the verdict exists for
     // and the case `mark` structurally cannot reach.
-    const entry = table.get(at(1000)).?;
+    const entry = table.get(at(1000)) orelse return error.TestUnexpectedResult;
     try t.expect(entry.carrying(now));
     try t.expectEqual(@as(usize, 0), table.mark(now));
     try t.expectEqual(Verdict.unverified, verdict(&entry, now));

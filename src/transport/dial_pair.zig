@@ -25,7 +25,7 @@ const SecretKey = base_key.SecretKey;
 const SocketAddr = base_addr.SocketAddr;
 const TransportAddr = base_addr.TransportAddr;
 
-const State = quic.connection.State;
+pub const State = quic.connection.State;
 
 const Bridge = quic_bridge.Bridge;
 const Conn = quic_bridge.Conn;

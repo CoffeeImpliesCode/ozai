@@ -100,7 +100,7 @@ struct Options {
     deadline: Duration,
     protocol: Protocol,
     role: Role,
-    topic: Option<iroh_gossip::TopicId>,
+    topics: Vec<iroh_gossip::TopicId>,
     message: Option<Vec<u8>>,
     blob_hash: Option<iroh_blobs::Hash>,
     blob_range: ChunkRanges,
@@ -209,7 +209,7 @@ fn parse_args() -> Result<Option<Options>> {
 fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Options>> {
     let mut protocol = Protocol::Transport;
     let mut role = None;
-    let mut topic = None;
+    let mut topics = Vec::new();
     let mut message = None;
     let mut blob_hash = None;
     let mut blob_range = ChunkRanges::all();
@@ -244,7 +244,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Option
                 "client" => Role::Client,
                 other => bail!("--role takes server or client, not {other:?}"),
             }),
-            "--topic-hex" => topic = Some(iroh_gossip::TopicId::from(
+            "--topic-hex" => topics.push(iroh_gossip::TopicId::from(
                 contract::parse_node_id_hex(&value()?).context("--topic-hex is not 32 bytes of hex")?
             )),
             "--message" => message = Some(value()?.into_bytes()),
@@ -297,7 +297,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Option
                     "ozai-iroh-peer --protocol transport|gossip|blobs|relay|relay-endpoint \
 --role server|client --bind <ip:port> --tls rpk|iroh --seed-hex <64 hex> \
 --expect-peer <64 hex> [--connect <ip:port>] --for <ms> \
-[--topic-hex <64 hex> --message <text>] [--blob-hash <hash> \
+[--topic-hex <64 hex> ... --message <text>] [--blob-hash <hash> \
 --blob-range all|start:end --blob-size <bytes>] [--relay-url <url> --relay-only] \
 [--relay-qad-bind <ip:port> --relay-qad-cert <DER path> --relay-qad-key <PKCS8 DER path>]"
                 );
@@ -339,7 +339,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Option<Option
         deadline: Duration::from_millis(deadline_ms),
         protocol,
         role,
-        topic,
+        topics,
         message,
         blob_hash,
         blob_range,
@@ -386,8 +386,14 @@ fn announce_client(node_id_hex: &str, bound: SocketAddr, tls: Tls) -> Result<()>
 }
 
 fn announce_with_address(node_id_hex: &str, address_label: &str, bound: SocketAddr, tls: Tls, alpns: &[&[u8]]) -> Result<()> {
+    announce_with_optional_address(node_id_hex, address_label, Some(bound), tls, alpns)
+}
+
+fn announce_with_optional_address(node_id_hex: &str, address_label: &str, bound: Option<SocketAddr>, tls: Tls, alpns: &[&[u8]]) -> Result<()> {
     println!("node  {node_id_hex}");
-    println!("{address_label}  {bound}");
+    if let Some(bound) = bound {
+        println!("{address_label}  {bound}");
+    }
     println!("tls  {tls:?}");
     // One line per protocol, so the Zig side compares this peer's offer against
     // its own constants rather than against a Rust source file it cannot read.
@@ -808,6 +814,35 @@ mod tests {
         for range in ["1:1", "2:1", "-1:2", "1", "all:2"] {
             assert!(options(&["--blob-range", range]).is_err());
         }
+    }
+
+    #[test]
+    fn repeated_topics_must_not_silently_overwrite_membership() {
+        let first = "11".repeat(32);
+        let second = "22".repeat(32);
+        let parsed = options(&[
+            "--protocol", "gossip", "--expect-peer", &"33".repeat(32),
+            "--topic-hex", &first, "--topic-hex", &second, "--message", "membership",
+        ]).unwrap().unwrap();
+        assert_eq!(parsed.topics, vec![
+            iroh_gossip::TopicId::from([0x11; 32]),
+            iroh_gossip::TopicId::from([0x22; 32]),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn relay_only_blob_banner_does_not_panic_without_ip_sockets() -> Result<()> {
+        let options = options(&[
+            "--protocol", "blobs", "--role", "client",
+            "--expect-peer", &contract::node_id_hex(iroh::SecretKey::from_bytes(&[9; 32]).public().as_bytes()),
+            "--relay-only", "--relay-url", "http://127.0.0.1:9", "--for", "100",
+        ])?.context("parsed options")?;
+        let node = contract::node_id_hex(iroh::SecretKey::from_bytes(&options.seed).public().as_bytes());
+        let task = tokio::spawn(async move { blobs::run(&options, &node).await });
+        let result = task.await;
+        assert!(result.is_ok(), "accepted relay-only CLI panicked before connecting: {result:?}");
+        assert!(result.unwrap().is_err(), "unreachable relay unexpectedly connected");
+        Ok(())
     }
 
     #[test]

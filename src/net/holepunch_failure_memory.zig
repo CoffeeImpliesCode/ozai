@@ -148,6 +148,8 @@ pub const Memory = struct {
         var index: usize = 0;
         while (index < self.held) : (index += 1) {
             if (self.failures[index].addr.order(addr) != .eq) continue;
+            // The loop ensures index < held; ZBC cannot connect that guard to this subtraction.
+            // zbc-disable-next-line: index-minus-one-without-zero-guard
             self.failures[index] = self.failures[self.held - 1];
             self.held -= 1;
             return;

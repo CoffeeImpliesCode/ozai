@@ -39,9 +39,20 @@ pub const Snapshot = struct {
             "progress: dials {d}, refused {d}, accepted {d}, finished {d}, up {d}, " ++
                 "attempts {d}, spawned {d}, neighbour up {d}, broadcasts received {d}, " ++
                 "blob transfers completed {d}, blob sent bytes {d}, blob received bytes {d}\n",
-            .{ self.dials, self.refused, self.accepted, self.finished, self.up,
-                self.attempts, self.spawned, self.neighbor_up, self.received,
-                self.blobs_completed, self.blob_sent_bytes, self.blob_received_bytes },
+            .{
+                self.dials,
+                self.refused,
+                self.accepted,
+                self.finished,
+                self.up,
+                self.attempts,
+                self.spawned,
+                self.neighbor_up,
+                self.received,
+                self.blobs_completed,
+                self.blob_sent_bytes,
+                self.blob_received_bytes,
+            },
         );
     }
 };

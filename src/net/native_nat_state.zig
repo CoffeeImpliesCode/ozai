@@ -10,8 +10,16 @@ pub const Side = enum { client, server };
 pub const Action = enum { open_path, address_validated };
 pub const Event = union(enum) { added: wire.SocketAddr, removed: wire.SocketAddr };
 pub const Error = error{
-    ExtensionNotNegotiated, WrongConnectionSide, TooManyAddresses, NotEnoughAddresses,
-    Closed, AddressConflict, SequenceExhausted, NoPendingProbe, ChallengeCollision, ChallengeLimit,
+    ExtensionNotNegotiated,
+    WrongConnectionSide,
+    TooManyAddresses,
+    NotEnoughAddresses,
+    Closed,
+    AddressConflict,
+    SequenceExhausted,
+    NoPendingProbe,
+    ChallengeCollision,
+    ChallengeLimit,
 };
 const Candidate = probe.Candidate;
 
@@ -27,8 +35,12 @@ pub const State = struct {
     /// local_limit is the peer's TP, remote_limit is our advertised TP.
     pub fn init(side: Side, remote_limit: u8, local_limit: u8, ipv6: bool) Error!State {
         if (remote_limit > capacity) return error.TooManyAddresses;
-        return .{ .side = side, .local_limit = @min(local_limit, capacity),
-            .remote_limit = remote_limit, .probes = .{ .ipv6 = ipv6 } };
+        return .{
+            .side = side,
+            .local_limit = @min(local_limit, capacity),
+            .remote_limit = remote_limit,
+            .probes = .{ .ipv6 = ipv6 },
+        };
     }
 
     fn negotiated(self: *const State) Error!void {
@@ -49,19 +61,38 @@ pub const State = struct {
         const address = wire.canonical(input);
         if (findAddress(&self.local, address) != null) return null;
         if (count(&self.local) >= self.local_limit) return error.TooManyAddresses;
-        if (self.next_sequence == wire.max_sequence) return error.SequenceExhausted;
+        if (self.next_sequence > wire.max_sequence) return error.SequenceExhausted;
         const sequence = self.next_sequence;
         self.next_sequence += 1;
-        self.local[empty(&self.local).?] = .{ .address = address, .sequence = sequence };
+        const index = empty(&self.local) orelse {
+            // count is below local_limit, which init clamps to capacity.
+            std.debug.assert(false);
+            unreachable;
+        };
+        self.local[index] = .{ .address = address, .sequence = sequence };
         return if (self.side == .server)
-            .{ .add = .{ .sequence = sequence, .address = address } } else null;
+            .{ .add = .{ .sequence = sequence, .address = address } }
+        else
+            null;
     }
 
     fn removeLocal(self: *State, input: wire.SocketAddr) Error!?wire.Frame {
         try self.negotiated();
         const index = findAddress(&self.local, wire.canonical(input)) orelse return null;
-        const sequence = self.local[index].?.sequence;
+        const candidate = self.local[index] orelse {
+            // findAddress returns only an occupied slot, and no mutation intervenes.
+            std.debug.assert(false);
+            unreachable;
+        };
+        const sequence = candidate.sequence;
         self.local[index] = null;
+        if (self.side == .client and count(&self.local) == 0) {
+            self.probes.cancel(self.probes.last_retry_ns);
+            for (&self.probes.remote) |*slot| if (slot.*) |*remote| {
+                remote.pending = false;
+                remote.remaining = 0;
+            };
+        }
         return if (self.side == .server) .{ .remove = sequence } else null;
     }
 
@@ -99,8 +130,14 @@ pub const State = struct {
                     }
                 };
                 if (count(&self.probes.remote) >= self.remote_limit) return error.TooManyAddresses;
-                self.probes.remote[empty(&self.probes.remote).?] = .{
-                    .address = address, .sequence = value.sequence,
+                const index = empty(&self.probes.remote) orelse {
+                    // count is below remote_limit, which init bounds by capacity.
+                    std.debug.assert(false);
+                    unreachable;
+                };
+                self.probes.remote[index] = .{
+                    .address = address,
+                    .sequence = value.sequence,
                     .remaining = if (self.probes.supported(address)) 9 else 0,
                 };
                 return .{ .added = address };
@@ -126,15 +163,24 @@ pub const State = struct {
                 }
                 if (findAddress(&self.probes.remote, address) != null) return null;
                 if (count(&self.probes.remote) >= self.remote_limit) return error.TooManyAddresses;
-                self.probes.remote[empty(&self.probes.remote).?] = .{
-                    .address = address, .remaining = 8, .pending = true,
+                const index = empty(&self.probes.remote) orelse {
+                    // count is below remote_limit, which init bounds by capacity.
+                    std.debug.assert(false);
+                    unreachable;
+                };
+                self.probes.remote[index] = .{
+                    .address = address,
+                    .remaining = 8,
+                    .pending = true,
                 };
             },
         }
         return null;
     }
 
-    fn nextProbe(self: *const State) ?wire.SocketAddr { return self.probes.nextProbe(); }
+    fn nextProbe(self: *const State) ?wire.SocketAddr {
+        return self.probes.nextProbe();
+    }
     fn markProbeSent(self: *State, address: wire.SocketAddr, token: u64) Error!void {
         try self.negotiated();
         try self.probes.markProbeSent(address, token);
@@ -231,7 +277,9 @@ fn findAddress(set: *const [capacity]?Candidate, address: wire.SocketAddr) ?usiz
 }
 fn count(set: *const [capacity]?Candidate) usize {
     var length: usize = 0;
-    for (set) |slot| if (slot != null) { length += 1; };
+    for (set) |slot| if (slot != null) {
+        length += 1;
+    };
     return length;
 }
 fn empty(set: *const [capacity]?Candidate) ?usize {
@@ -240,20 +288,26 @@ fn empty(set: *const [capacity]?Candidate) ?usize {
 }
 
 const t = std.testing;
-const example: wire.SocketAddr = .{ .ip = .{ .v4 = .{192, 0, 2, 1} }, .port = 1234 };
+const example: wire.SocketAddr = .{ .ip = .{ .v4 = .{ 192, 0, 2, 1 } }, .port = 1234 };
 
 test "negotiation role and remote limits fail closed" {
     var disabled = try State.init(.client, 0, 1, false);
     try t.expectError(error.ExtensionNotNegotiated, disabled.addLocal(example));
     var server = try State.init(.server, 1, 1, false);
     try t.expectError(error.WrongConnectionSide, server.initiate(0));
-    try t.expectError(error.WrongConnectionSide, server.receive(.{ .add = .{ .sequence = 0, .address = example } }, 0));
+    try t.expectError(
+        error.WrongConnectionSide,
+        server.receive(.{ .add = .{ .sequence = 0, .address = example } }, 0),
+    );
     const reach: wire.Frame = .{ .reach = .{ .round = 1, .address = example } };
     _ = try server.receive(reach, 0);
     _ = try server.receive(reach, 0);
     var other = example;
     other.port += 1;
-    try t.expectError(error.TooManyAddresses, server.receive(.{ .reach = .{ .round = 1, .address = other } }, 0));
+    try t.expectError(
+        error.TooManyAddresses,
+        server.receive(.{ .reach = .{ .round = 1, .address = other } }, 0),
+    );
 }
 
 test "nine probes bounded by default four second schedule" {
@@ -286,16 +340,19 @@ test "new server round cancels tokens and stale reach cannot revive it" {
     var wrong = example;
     wrong.port += 1;
     try t.expect(server.response(wrong, 456) == null);
-    try t.expectEqual(Action.address_validated, server.response(example, 456).?);
+    try t.expectEqual(
+        Action.address_validated,
+        server.response(example, 456) orelse return error.TestUnexpectedResult,
+    );
     try t.expect(server.response(example, 456) == null);
 }
 
 test "server address sequence survives remove and client conflicts fail closed" {
     var server = try State.init(.server, 2, 2, false);
-    const first = (try server.addLocal(example)).?;
-    const removed = (try server.removeLocal(example)).?;
+    const first = (try server.addLocal(example)) orelse return error.TestUnexpectedResult;
+    const removed = (try server.removeLocal(example)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(first.add.sequence, removed.remove);
-    const second = (try server.addLocal(example)).?;
+    const second = (try server.addLocal(example)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(first.add.sequence + 1, second.add.sequence);
     var client = try State.init(.client, 2, 2, false);
     _ = try client.receive(first, 0);
@@ -315,7 +372,7 @@ test "retry clock does not send early and prior retry tokens remain valid" {
     _ = try client.addLocal(example);
     _ = try client.receive(.{ .add = .{ .sequence = 1, .address = example } }, 0);
     try client.initiate(100);
-    const frame = client.reachFrame(0).?;
+    const frame = client.reachFrame(0) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(u64, 1), frame.reach.round);
     try client.markProbeSent(example, 10);
     client.retry(99, 333_000_000);
@@ -323,7 +380,10 @@ test "retry clock does not send early and prior retry tokens remain valid" {
     try t.expect(client.nextProbe() == null);
     client.retry(33_300_100, 333_000_000);
     try client.markProbeSent(example, 11);
-    try t.expectEqual(Action.open_path, client.response(example, 10).?);
+    try t.expectEqual(
+        Action.open_path,
+        client.response(example, 10) orelse return error.TestUnexpectedResult,
+    );
     try t.expect(client.response(example, 11) == null);
     try client.initiate(40_000_000);
     try client.markProbeSent(example, 12);
@@ -335,7 +395,7 @@ test "candidate family canonicalization and duplicate at local capacity" {
     var server = try State.init(.server, 1, 1, false);
     _ = try server.addLocal(example);
     var mapped = example;
-    mapped.ip = .{ .v6 = .{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 192, 0, 2, 1} };
+    mapped.ip = .{ .v6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 192, 0, 2, 1 } };
     try t.expect((try server.addLocal(mapped)) == null);
     const unsupported: wire.SocketAddr = .{ .ip = .{ .v6 = @splat(1) }, .port = 1234 };
     _ = try server.receive(.{ .reach = .{ .round = 100, .address = unsupported } }, 0);
@@ -356,12 +416,126 @@ test "challenge collisions limits and absent probe cannot overwrite tokens" {
     try t.expect(server.response(example, 1) == null);
 }
 
-test "sequence exhaustion leaves candidate and round unchanged" {
+test "server emits the final legal address sequence once before exhaustion" {
+    var server = try State.init(.server, 1, 1, false);
+    server.next_sequence = wire.max_sequence - 1;
+    var penultimate: State = undefined;
+    const first = try process(&server, .{
+        .initial_rtt_ns = 333_000_000,
+        .event = .{ .add_local = example },
+    }, &penultimate);
+    try t.expectEqual(@as(usize, 1), first.frame_count);
+    try t.expectEqual(wire.max_sequence - 1, first.frames[0].add.sequence);
+    var vacant: State = undefined;
+    const removed_first = try process(&penultimate, .{
+        .initial_rtt_ns = 333_000_000,
+        .event = .{ .remove_local = example },
+    }, &vacant);
+    try t.expectEqual(@as(usize, 1), removed_first.frame_count);
+    try t.expectEqual(first.frames[0].add.sequence, removed_first.frames[0].remove);
+    var final_candidate: State = undefined;
+    const final = try process(&vacant, .{
+        .initial_rtt_ns = 333_000_000,
+        .event = .{ .add_local = example },
+    }, &final_candidate);
+    try t.expectEqual(@as(usize, 1), final.frame_count);
+    try t.expectEqual(wire.max_sequence, final.frames[0].add.sequence);
+    try t.expectEqualDeep(example, final.frames[0].add.address);
+    try t.expectEqual(@as(usize, 1), count(&final_candidate.local));
+    var exhausted: State = undefined;
+    const removed_final = try process(&final_candidate, .{
+        .initial_rtt_ns = 333_000_000,
+        .event = .{ .remove_local = example },
+    }, &exhausted);
+    try t.expectEqual(@as(usize, 1), removed_final.frame_count);
+    try t.expectEqual(wire.max_sequence, removed_final.frames[0].remove);
+    const before = exhausted;
+    var refused: State = undefined;
+    try t.expectError(error.SequenceExhausted, process(&exhausted, .{
+        .initial_rtt_ns = 333_000_000,
+        .event = .{ .add_local = example },
+    }, &refused));
+    try t.expectEqualDeep(before, exhausted);
+    try t.expectEqualDeep(before, refused);
+}
+
+test "last local removal cancels only client probes and retains remote candidates" {
+    const Case = struct { side: Side, local_count: u8, cancels: bool };
+    const cases = [_]Case{
+        .{ .side = .client, .local_count = 1, .cancels = true },
+        .{ .side = .client, .local_count = 2, .cancels = false },
+        .{ .side = .server, .local_count = 1, .cancels = false },
+    };
+    var other = example;
+    other.port += 1;
+    for (cases) |case| {
+        var active = try State.init(case.side, 2, 2, false);
+        _ = try active.addLocal(example);
+        if (case.local_count == 2) _ = try active.addLocal(other);
+        if (case.side == .client) {
+            _ = try active.receive(.{ .add = .{ .sequence = 10, .address = example } }, 0);
+            _ = try active.receive(.{ .add = .{ .sequence = 11, .address = other } }, 0);
+            try active.initiate(100);
+        } else {
+            _ = try active.receive(.{ .reach = .{ .round = 1, .address = example } }, 100);
+            _ = try active.receive(.{ .reach = .{ .round = 1, .address = other } }, 100);
+        }
+        try active.markProbeSent(example, 77);
+        try t.expectEqualDeep(other, active.nextProbe().?);
+        var removed: State = undefined;
+        const actions = try process(&active, .{
+            .initial_rtt_ns = 333_000_000,
+            .event = .{ .remove_local = example },
+        }, &removed);
+        try t.expectEqual(@as(usize, case.local_count - 1), count(&removed.local));
+        try t.expectEqual(@as(usize, 2), count(&removed.probes.remote));
+        try t.expectEqual(@as(usize, case.local_count), count(&active.local));
+        try t.expectEqualDeep(other, active.nextProbe().?);
+        if (case.side == .server) {
+            try t.expectEqual(@as(usize, 1), actions.frame_count);
+            try t.expectEqual(@as(u64, 0), actions.frames[0].remove);
+        } else {
+            try t.expectEqual(@as(usize, 0), actions.frame_count);
+        }
+        if (case.cancels) {
+            try t.expect(actions.next_probe == null);
+            try t.expect(actions.retry_at_ns == null);
+        } else {
+            try t.expectEqualDeep(other, actions.next_probe.?);
+            try t.expect(actions.retry_at_ns != null);
+        }
+        var retried: State = undefined;
+        const retry_actions = try process(&removed, .{
+            .initial_rtt_ns = 333_000_000,
+            .event = .{ .retry = 33_300_100 },
+        }, &retried);
+        if (case.cancels) {
+            try t.expect(retry_actions.next_probe == null);
+            try t.expect(retry_actions.retry_at_ns == null);
+        } else {
+            try t.expectEqualDeep(example, retry_actions.next_probe.?);
+        }
+        var responded: State = undefined;
+        const response_actions = try process(&retried, .{
+            .initial_rtt_ns = 333_000_000,
+            .event = .{ .response = .{ .address = example, .token = 77 } },
+        }, &responded);
+        if (case.cancels) {
+            try t.expect(response_actions.validation == null);
+            try t.expect(response_actions.next_probe == null);
+        } else {
+            const validation = response_actions.validation orelse return error.TestUnexpectedResult;
+            try t.expectEqualDeep(example, validation.address);
+            const expected: Action =
+                if (case.side == .client) .open_path else .address_validated;
+            try t.expectEqual(expected, validation.kind);
+            try t.expectEqualDeep(other, response_actions.next_probe.?);
+        }
+    }
+}
+
+test "round exhaustion leaves the last legal round unchanged" {
     var client = try State.init(.client, 1, 1, false);
-    client.next_sequence = wire.max_sequence;
-    try t.expectError(error.SequenceExhausted, client.addLocal(example));
-    try t.expectEqual(@as(usize, 0), count(&client.local));
-    client.next_sequence = 0;
     _ = try client.addLocal(example);
     client.probes.round = wire.max_sequence;
     try t.expectError(error.SequenceExhausted, client.initiate(0));
@@ -395,7 +569,8 @@ test "public pure processor leaves input immutable and returns real wire and pro
     const original = try State.init(.client, 1, 1, false);
     var with_local: State = undefined;
     const added = try process(&original, .{
-        .initial_rtt_ns = 333_000_000, .event = .{ .add_local = example },
+        .initial_rtt_ns = 333_000_000,
+        .event = .{ .add_local = example },
     }, &with_local);
     try t.expectEqual(@as(usize, 0), count(&original.local));
     try t.expectEqual(@as(usize, 1), count(&with_local.local));
@@ -404,13 +579,15 @@ test "public pure processor leaves input immutable and returns real wire and pro
     const received = try process(&with_local, .{
         .initial_rtt_ns = 333_000_000,
         .event = .{ .received = .{
-            .frame = .{ .add = .{ .sequence = 0, .address = example } }, .now_ns = 0,
+            .frame = .{ .add = .{ .sequence = 0, .address = example } },
+            .now_ns = 0,
         } },
     }, &with_remote);
     try t.expectEqualDeep(example, received.event.?.added);
     var probing: State = undefined;
     const actions = try process(&with_remote, .{
-        .initial_rtt_ns = 333_000_000, .event = .{ .initiate = 100 },
+        .initial_rtt_ns = 333_000_000,
+        .event = .{ .initiate = 100 },
     }, &probing);
     try t.expect(actions.cancel_queued_reach);
     try t.expectEqual(@as(usize, 1), actions.frame_count);

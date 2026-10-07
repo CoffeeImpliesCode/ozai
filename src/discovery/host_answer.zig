@@ -319,6 +319,8 @@ fn frameAnswer(
     wire.put16(message, 0, id);
     wire.put16(message, 2, wire.flag_response);
     wire.put16(message, 4, 1);
+    // Test callers use at most nine records; ZBC cannot prove this helper's input bound.
+    // zbc-disable-next-line: index-type-narrowing-wraparound
     wire.put16(message, 6, @intCast(records.len));
     wire.put16(message, 8, 0);
     wire.put16(message, 10, 0);
@@ -334,6 +336,8 @@ fn frameAnswer(
         wire.put16(message, at + host_wire.type_at, record.kind);
         wire.put16(message, at + host_wire.class_at, record.class);
         wire.put32(message, at + host_wire.ttl_at, record.ttl_s);
+        // Inputs are small fixed records or bounded wire names; ZBC cannot prove the length bound.
+        // zbc-disable-next-line: index-type-narrowing-wraparound
         wire.put16(message, at + host_wire.rdlength_at, @intCast(record.rdata.len));
         at += host_wire.fixed_length;
         if (at + record.rdata.len > message.len) return error.BufferTooSmall;

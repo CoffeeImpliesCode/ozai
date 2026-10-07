@@ -13,8 +13,34 @@ const vendored_file_list = @import("vendored_file_list.zig");
 const examples = @import("examples.zig");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    var target = b.standardTargetOptions(.{});
+    const native_test_linker = b.option(
+        bool,
+        "native-test-linker",
+        "Use the detected host loader for matching native test targets",
+    ) orelse false;
+    const host = &b.graph.host.result;
+    // Explicit triples otherwise select the standard loader path, which is not
+    // the native loader on Nix. Opt in for local tests, not deployment artifacts.
+    if (native_test_linker and
+        target.query.os_tag != null and target.query.dynamic_linker == null and
+        target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag and
+        target.result.abi == host.abi)
+    {
+        target.query.os_tag = null;
+        target = b.resolveTargetQuery(target.query);
+    }
     const optimize = b.standardOptimizeOption(.{});
+    const coverage = b.option(
+        bool,
+        "coverage",
+        "Instrument tests and their node child",
+    ) orelse false;
+    const coverage_options = b.addOptions();
+    coverage_options.addOption(bool, "coverage", coverage);
+    // addOptions creates a new module each time, even for the same generated
+    // file. Share one identity so roots and their QUIC dependency can import it.
+    const coverage_options_mod = coverage_options.createModule();
 
     const test_scratch_mod = b.createModule(.{
         .root_source_file = b.path("scripts/test_scratch.zig"),
@@ -29,6 +55,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib_mod.addImport("coverage_options", coverage_options_mod);
 
     const lib = b.addLibrary(.{
         .linkage = .static,
@@ -55,6 +82,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    quic_mod.addImport("coverage_options", coverage_options_mod);
     // Both modules are registered consumer routes. The bridge imports the
     // same core module, while consumers add "quic" explicitly when naming
     // the core's types in their own module.
@@ -76,6 +104,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    quic_test_mod.addImport("coverage_options", coverage_options_mod);
     const quic_tests = b.addTest(.{
         .name = "ozai-quic-test",
         .root_module = quic_test_mod,
@@ -211,6 +240,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib_test_mod.addImport("coverage_options", coverage_options_mod);
     // The test root reaches `quic` through `src/root.zig`, and a fresh module
     // does not inherit the imports of the module it was split from, so the
     // import is repeated rather than reached through `lib_mod`.
@@ -236,6 +266,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    portable_test_mod.addImport("coverage_options", coverage_options_mod);
     portable_test_mod.addImport("quic", quic_mod);
     const portable_tests = b.addTest(.{
         .name = "ozai-portable-test",
@@ -532,7 +563,10 @@ pub fn build(b: *std.Build) void {
     });
     const run_coverage_policy_tests = b.addRunArtifact(coverage_policy_tests);
     const run_project_gate_tests = b.addRunArtifact(project_gate_tests);
-    const gate_policy_step = b.step("test-gate-policy", "Run strict gate and coverage policy tests");
+    const gate_policy_step = b.step(
+        "test-gate-policy",
+        "Run strict gate and coverage policy tests",
+    );
     gate_policy_step.dependOn(&run_coverage_policy_tests.step);
     gate_policy_step.dependOn(&run_project_gate_tests.step);
 
@@ -563,11 +597,6 @@ pub fn build(b: *std.Build) void {
     // it is the artifact the options module above hands them, not a second
     // copy of it — or those tests leave the CLI, signal readiness, and live
     // snapshots unmeasured.
-    const coverage = b.option(
-        bool,
-        "coverage",
-        "Instrument tests and their node child",
-    ) orelse false;
     const coverage_rt = b.option([]const u8, "coverage-rt", "Absolute path to zig-cov-rt.o");
     if (coverage) {
         const runtime_failure: ?*std.Build.Step.Fail = if (coverage_rt) |rt|
@@ -583,7 +612,11 @@ pub fn build(b: *std.Build) void {
                 artifact.step.dependOn(&failure.step);
             }
         } else {
-            const rt = coverage_rt.?;
+            // The null case creates runtime_failure above and cannot reach this branch.
+            const rt = coverage_rt orelse {
+                std.debug.assert(runtime_failure != null);
+                unreachable;
+            };
             const coverage_abi_mod = b.createModule(.{
                 .root_source_file = b.path("test/coverage_abi.zig"),
                 .target = target,
@@ -592,6 +625,9 @@ pub fn build(b: *std.Build) void {
             for (coverage_artifacts) |artifact| {
                 // LLVM emits counters through fuzz; libc flushes them at exit.
                 artifact.use_llvm = true;
+                // Section GC leaves dead runtime DWARF DIEs with zero-address
+                // ranges. Keep their code so coverage can verify all mappings.
+                artifact.link_gc_sections = false;
                 artifact.root_module.fuzz = true;
                 artifact.root_module.link_libc = true;
                 artifact.root_module.addObjectFile(.{ .cwd_relative = rt });

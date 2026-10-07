@@ -1,10 +1,12 @@
 //! Encoded action storage while authenticated bootstrap streams become writable.
 const std = @import("std");
 const codec = @import("../gossip/codec.zig");
-const NodeId = @import("../base/key.zig").NodeId;
+const key = @import("../base/key.zig");
+const NodeId = key.NodeId;
+const SecretKey = key.SecretKey;
 const capacity = 128;
 
-pub const Error = error{FrameTooLarge, BufferFull};
+pub const Error = error{ FrameTooLarge, BufferFull };
 pub const Queue = struct {
     entries: [capacity]Entry = undefined,
     len: usize = 0,
@@ -72,7 +74,8 @@ pub const Queue = struct {
         while (cursor) |earlier| {
             if (earlier == index) return false;
             const entry = &self.entries[earlier];
-            if (entry.topic_index == wanted.topic_index and entry.to.order(wanted.to) == .eq) return true;
+            if (entry.topic_index == wanted.topic_index and
+                entry.to.order(wanted.to) == .eq) return true;
             cursor = entry.next;
         }
         unreachable;
@@ -93,13 +96,14 @@ test "pending gossip copies borrowed payload and refuses bounded overflow" {
     const queue = try t.allocator.create(Queue);
     defer t.allocator.destroy(queue);
     queue.* = .{};
-    const SecretKey = @import("../base/key.zig").SecretKey;
     var secret = try SecretKey.fromSeed([_]u8{5} ** 32);
     defer secret.deinit();
     var payload = [_]u8{ 1, 2, 3 };
     const plumtree = @import("../gossip/plumtree.zig");
     const message: codec.Message = .{ .gossip = .{ .gossip = .{
-        .id = plumtree.MessageId.fromContent(&payload), .content = &payload, .scope = .neighbors,
+        .id = plumtree.MessageId.fromContent(&payload),
+        .content = &payload,
+        .scope = .neighbors,
     } } };
     try queue.push(secret.nodeId(), 0, message);
     payload[0] = 9;
@@ -118,7 +122,6 @@ test "pending gossip keeps FIFO order per peer and topic" {
     const queue = try t.allocator.create(Queue);
     defer t.allocator.destroy(queue);
     queue.* = .{};
-    const SecretKey = @import("../base/key.zig").SecretKey;
     var a = try SecretKey.fromSeed([_]u8{6} ** 32);
     defer a.deinit();
     var b = try SecretKey.fromSeed([_]u8{7} ** 32);

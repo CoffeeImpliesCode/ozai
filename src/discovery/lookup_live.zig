@@ -151,6 +151,7 @@ const socket = @import("../transport/socket.zig");
 const dns = @import("dns.zig");
 const lookup_io = @import("lookup_io.zig");
 const tcp = @import("../transport/tcp.zig");
+const tcp_execution = @import("../transport/tcp_execution.zig");
 const host_io = @import("host_io.zig");
 const wire = @import("lookup_wire.zig");
 
@@ -179,15 +180,17 @@ pub const StreamStops = struct {
     }
 };
 
-/// Repeat a TC question through the real TCP adapter.
+/// Repeat a TC question through the borrowed TCP provider.
 /// The caller frees the returned message. No partial reply escapes on any error.
 /// `timeout_ms` is the remaining query budget, capped at the per-query DNS bound.
+/// Provider callbacks and context outlive this call and all descriptor cleanup.
 pub fn retryStream(
     alloc: std.mem.Allocator,
     io: std.Io,
     retry: host_io.StreamRetry,
     timeout_ms: i32,
     stops: StreamStops,
+    execution: tcp_execution.Execution,
 ) lookup_io.Error![]u8 {
     try stops.check();
     if (timeout_ms <= 0) return error.Empty;
@@ -196,28 +199,34 @@ pub fn retryStream(
         .timeout_ms = @min(timeout_ms, @as(i32, @intCast(host_io.query_timeout_ms))),
         .stops = stops,
     };
-    var stream = tcp.Tcp.create(retry.server) catch return error.Refused;
-    defer stream.close();
-    // Tcp permits one connect only; a timed-out connect must not be reissued.
-    stream.connect(io, try budget.remaining(io)) catch |err| {
-        try stops.check();
-        return switch (err) {
-            error.Canceled => error.Canceled,
-            error.WouldBlock => error.Empty,
-            else => error.Refused,
-        };
+    var stream = tcp.Tcp.create(io, retry.server, execution) catch |err| {
+        return if (err == error.Canceled) error.Canceled else error.Refused;
     };
+    defer stream.close();
+    // Tcp retains pending handshake state, so slices never reissue the connect syscall.
+    while (true) {
+        const left = try budget.remaining(io);
+        stream.connect(io, @min(left, poll_slice_ms)) catch |err| {
+            try stops.check();
+            switch (err) {
+                error.Canceled => return error.Canceled,
+                error.WouldBlock => continue,
+                else => return error.Refused,
+            }
+        };
+        break;
+    }
     try stops.check();
     var prefix: [host_io.length_prefix_bytes]u8 = undefined;
     host_io.writeLengthPrefix(&prefix, retry.query.len) catch return error.Refused;
-    try streamWrite(&stream, io, &prefix, budget);
-    try streamWrite(&stream, io, retry.query, budget);
-    try streamRead(&stream, io, &prefix, budget);
+    try streamWrite(io, &stream, &prefix, budget);
+    try streamWrite(io, &stream, retry.query, budget);
+    try streamRead(io, &stream, &prefix, budget);
     const length = wire.be16(&prefix, 0);
     if (length < wire.header_length) return error.ShortMessage;
     const message = try alloc.alloc(u8, length);
     errdefer alloc.free(message);
-    try streamRead(&stream, io, message, budget);
+    try streamRead(io, &stream, message, budget);
     try stops.check();
     return message;
 }
@@ -238,8 +247,8 @@ const StreamBudget = struct {
 };
 
 fn streamWrite(
-    stream: *tcp.Tcp,
     io: std.Io,
+    stream: *tcp.Tcp,
     bytes: []const u8,
     budget: StreamBudget,
 ) lookup_io.Error!void {
@@ -261,8 +270,8 @@ fn streamWrite(
 }
 
 fn streamRead(
-    stream: *tcp.Tcp,
     io: std.Io,
+    stream: *tcp.Tcp,
     bytes: []u8,
     budget: StreamBudget,
 ) lookup_io.Error!void {

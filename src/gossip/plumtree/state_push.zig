@@ -9,6 +9,7 @@
 const std = @import("std");
 const key = @import("../../base/key.zig");
 const actions = @import("actions.zig");
+const codec = @import("../codec.zig");
 const claim_table = @import("claim_table.zig");
 const limits = @import("limits.zig");
 const wire = @import("message.zig");
@@ -35,10 +36,10 @@ const State = tree.State;
 
 /// Upstream `on_gossip`.
 ///
-/// The first arm is the invariant this module exists to hold: a message
-/// whose id is not the hash of its content is dropped, and dropping it
-/// does nothing at all to the sender. No `Prune`, no demotion to lazy, no
-/// record, no reply, no timer.
+/// Internal payload handler: `State.handle` must already have admitted the
+/// content length and inclusive encoded receive budget before calling this.
+/// A message whose id is not the hash of its content is dropped without sender
+/// changes: no `Prune`, demotion, record, reply, or timer.
 pub fn onGossip(
     self: *State,
     sender: NodeId,
@@ -67,9 +68,16 @@ pub fn onGossip(
                 .scope = .{ .swarm = next },
             };
             self.received_messages.put(message.id, now + self.config.message_id_retention);
-            try self.cache.put(forwarded, now + self.config.message_cache_retention);
-            try eagerPush(self, forwarded, sender, out);
-            try lazyPush(self, forwarded, sender, out);
+            // A round increment can grow its varint past the writer's limit.
+            // Receipt still resolves claims and delivers locally, but only a
+            // writable next-hop payload can back eager sends or lazy promises.
+            if (codec.encodedLen(.{ .gossip = .{ .gossip = forwarded } }) <
+                codec.max_message_size)
+            {
+                try self.cache.put(forwarded, now + self.config.message_cache_retention);
+                try eagerPush(self, forwarded, sender, out);
+                try lazyPush(self, forwarded, sender, out);
+            }
             missing.forgetGraftTimer(self, message.id);
             var claims: [max_claims]Claim = undefined;
             if (missing.takeMissing(self, message.id, &claims)) |drained| {

@@ -3,6 +3,7 @@ const addr = @import("../base/addr.zig");
 const holepunch = @import("../net/holepunch.zig");
 const run = @import("../net/holepunch_run.zig");
 const bridge_mod = @import("../transport/quic_bridge.zig");
+const bridge_conn = @import("../transport/bridge_conn.zig");
 const ula = @import("../base/ula.zig");
 
 pub const Native = struct {
@@ -10,10 +11,10 @@ pub const Native = struct {
     advertised: usize = 0,
     initiated: bool = false,
     started_at: ?bridge_mod.Instant = null,
-    round: @import("../transport/bridge_conn.zig").RoundState = .idle,
+    round: bridge_conn.RoundState = .idle,
 };
 
-const Fact = struct {
+pub const Fact = struct {
     id: u64,
     peer: addr.NodeId,
     side: holepunch.Side,
@@ -209,22 +210,25 @@ test "accepted traffic opens only the source path of the same authenticated conn
     var state = try State.init(t.allocator, 2);
     defer state.deinit(t.allocator);
     const peer = try addr.NodeId.fromBytes([_]u8{7} ** 32);
-    const source = addr.SocketAddr{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 9000 };
+    const source: addr.SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 9000 };
     state.begin();
     state.connection(.{ .id = 41, .peer = peer, .side = .client, .packets = 9 });
     state.end();
+    const join = state.get(peer) orelse return error.TestUnexpectedResult;
     state.accepted(.{ .id = 41, .peer = peer, .side = .client, .packets = 9 }, source);
-    try t.expectEqual(@as(usize, 0), state.get(peer).?.path_count);
+    try t.expectEqual(@as(usize, 0), join.path_count);
     state.accepted(.{ .id = 42, .peer = peer, .side = .client, .packets = 10 }, source);
-    try t.expectEqual(@as(usize, 0), state.get(peer).?.path_count);
+    try t.expectEqual(@as(usize, 0), join.path_count);
     const other = try addr.NodeId.fromBytes([_]u8{9} ** 32);
     state.accepted(.{ .id = 41, .peer = other, .side = .client, .packets = 10 }, source);
-    try t.expectEqual(@as(usize, 0), state.get(peer).?.path_count);
+    try t.expectEqual(@as(usize, 0), join.path_count);
     state.accepted(.{ .id = 41, .peer = peer, .side = .client, .packets = 10 }, source);
-    const join = state.get(peer).?;
     try t.expectEqual(@as(usize, 1), join.path_count);
     try t.expectEqual(std.math.Order.eq, join.paths[0].addr.ip.order(source));
-    try t.expectEqual(std.meta.Tag(holepunch.PathStatus).open, std.meta.activeTag(join.paths[0].status));
+    try t.expectEqual(
+        std.meta.Tag(holepunch.PathStatus).open,
+        std.meta.activeTag(join.paths[0].status),
+    );
 }
 
 test "live client identity selection excludes servers and forgets reaped connections" {
@@ -272,7 +276,8 @@ test "native connection latches do not move fact or peer prefixes" {
     try t.expect(state.nativeFor(41).initiated);
     try t.expect(!state.nativeFor(42).initiated);
     try t.expectEqual(@as(u64, 41), state.slots[0].before.id);
-    try t.expectEqual(@as(?usize, 41), state.get(peer).?.punch.punch);
+    const join = state.get(peer) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(?usize, 41), join.punch.punch);
 }
 
 test "synthetic relay receipt is never direct path proof" {
@@ -284,6 +289,7 @@ test "synthetic relay receipt is never direct path proof" {
     state.connection(.{ .id = 41, .peer = peer, .side = .client, .packets = 9 });
     state.end();
     const fact: Fact = .{ .id = 41, .peer = peer, .side = .client, .packets = 10 };
-    state.accepted(fact, @import("../base/ula.zig").default_fake_addr);
-    try t.expectEqual(@as(usize, 0), state.get(peer).?.path_count);
+    state.accepted(fact, ula.default_fake_addr);
+    const join = state.get(peer) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(usize, 0), join.path_count);
 }

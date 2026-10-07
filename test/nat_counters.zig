@@ -49,9 +49,13 @@ test "snapshot summary rejects missing duplicate and misplaced counters" {
 }
 
 test "snapshot summary rejects overflowing translation totals" {
-    try std.testing.expectError(error.InvalidCounterEvidence, counters(
-        "router_alice\ncounter translated { packets 18446744073709551615 bytes 0 }\n" ++
-            router_b ++ peers ++ wan_gate));
+    try std.testing.expectError(
+        error.InvalidCounterEvidence,
+        counters(
+            "router_alice\ncounter translated { packets 18446744073709551615 bytes 0 }\n" ++
+                router_b ++ peers ++ wan_gate,
+        ),
+    );
 }
 
 test "named counters reject malformed packet and byte evidence" {
@@ -67,8 +71,7 @@ test "named counters reject malformed packet and byte evidence" {
         "counter blocked_peer_udp { packets -1 bytes 0 }",
         "counter blocked_peer_udp { packets +1 bytes 0 }",
     }) |text| {
-        try std.testing.expectError(error.InvalidCounterEvidence,
-            single(text, "blocked_peer_udp"));
+        try std.testing.expectError(error.InvalidCounterEvidence, single(text, "blocked_peer_udp"));
     }
 }
 
@@ -129,7 +132,7 @@ pub fn single(text: []const u8, name: []const u8) Error!u64 {
     const start = std.mem.indexOf(u8, text, marker) orelse return error.InvalidCounterEvidence;
     if (std.mem.indexOfPos(u8, text, start + marker.len, marker) != null)
         return error.InvalidCounterEvidence;
-    const body = text[start + marker.len..];
+    const body = text[start + marker.len ..];
     const end = std.mem.indexOfScalar(u8, body, '}') orelse return error.InvalidCounterEvidence;
     var tokens = std.mem.tokenizeAny(u8, body[0..end], " \t\r\n");
     if (!std.mem.eql(u8, tokens.next() orelse return error.InvalidCounterEvidence, "packets"))

@@ -1,6 +1,6 @@
 //! Existing protocol and state-machine tests without the Linux live adapters.
 //! Importing `root.zig` here would pull socket and process tests into this scope.
-//! TCP carriers, file-backed stores and Node/Bridge orchestration stay in the live root.
+//! Live TCP drivers, file-backed stores and Node/Bridge orchestration stay in the live root.
 
 const std = @import("std");
 
@@ -24,10 +24,12 @@ const discovery_dial_source = @import("discovery/dial_source.zig");
 const relay_frame = @import("relay/frame.zig");
 const relay_client = @import("relay/client.zig");
 const relay_server = @import("relay/server.zig");
+const relay_ws_processor = @import("relay/ws_processor.zig");
 const addr_map = @import("transport/addr_map.zig");
 const transport_batch = @import("transport/batch.zig");
 const transport_quic_bridge = @import("transport/quic_bridge.zig");
 const transport_dial = @import("transport/dial.zig");
+const transport_native_path = @import("transport/native_path.zig");
 const incoming_filter = @import("endpoint/incoming_filter.zig");
 const endpoint = @import("endpoint/endpoint.zig");
 const router = @import("router/router.zig");
@@ -58,6 +60,7 @@ const native_nat = @import("net/native_nat.zig");
 const native_nat_state = @import("net/native_nat_state.zig");
 const native_nat_probe = @import("net/native_nat_probe.zig");
 const path_action = @import("net/path_action.zig");
+const node_blobs_transfer = @import("node/node_blobs_transfer.zig");
 
 test {
     std.testing.refAllDecls(@This());
@@ -106,6 +109,7 @@ test {
     std.testing.refAllDecls(relay_http_upgrade);
     std.testing.refAllDecls(relay_version_translate);
     std.testing.refAllDecls(relay_ws_frame);
+    std.testing.refAllDecls(relay_ws_processor);
     std.testing.refAllDecls(relay_ws_frame_mask);
     std.testing.refAllDecls(native_nat);
     std.testing.refAllDecls(native_nat_state);
@@ -167,6 +171,7 @@ test {
     std.testing.refAllDecls(net_blobs_route);
     std.testing.refAllDecls(net_path_revalidate);
     std.testing.refAllDecls(transport_multipath);
+    std.testing.refAllDecls(transport_native_path);
     const blobs_blob_claim = @import("blobs/blob_claim.zig");
     const discovery_resolve_fanin = @import("discovery/resolve_fanin.zig");
     const discovery_resolve_deadline = @import("discovery/resolve_deadline.zig");
@@ -209,4 +214,5 @@ test {
     std.testing.refAllDecls(node_shutdown_budget);
     std.testing.refAllDecls(node_ticket_cache);
     std.testing.refAllDecls(node_ticket_lifecycle);
+    std.testing.refAllDecls(node_blobs_transfer);
 }

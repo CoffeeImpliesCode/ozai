@@ -46,14 +46,14 @@ const Pass = struct {
 /// erased, so the production call is `Socket.sendRun` and saying it costs
 /// nothing at run time.
 pub fn sendBatch(
-    context: anytype,
     io: std.Io,
+    context: anytype,
     dest: base_addr.SocketAddr,
     payload: batch.Send,
     caps: *batch.Capability,
 ) SendError!batch.Report {
     const family = batch.Family.of(dest.ip);
-    const first = try walkRuns(context, io, dest, payload, caps.*);
+    const first = try walkRuns(io, context, dest, payload, caps.*);
     const tail = first.tail orelse return batch.report(payload, family, first.refused);
     // Found by sending, not by asking, and permanent: noq lowers the cap and
     // never raises it (`noq-udp/src/unix.rs:436-445`), because a driver that
@@ -61,7 +61,7 @@ pub fn sendBatch(
     caps.* = caps.*.withoutSegmentation();
     // Nothing behind that refusal was segmented, so the retry draws no second
     // segmentation and cannot leave a tail of its own.
-    const second = try walkRuns(context, io, dest, tail, caps.*);
+    const second = try walkRuns(io, context, dest, tail, caps.*);
 
     // `batch.report` is given the refusal no retry can undo: a codepoint either
     // pass dropped is on the wire without it, and nothing downstream can get it
@@ -86,8 +86,8 @@ pub fn sendBatch(
 /// and every run behind it is one this socket will refuse the same way — the
 /// cap is lowered by the caller, not argued with here.
 fn walkRuns(
-    context: anytype,
     io: std.Io,
+    context: anytype,
     dest: base_addr.SocketAddr,
     payload: batch.Send,
     caps: batch.Capability,

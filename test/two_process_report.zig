@@ -149,4 +149,3 @@ pub fn expectGate(gate: *const Process, term: ?std.process.Child.Term) !void {
         .{ .line = "dials:", .label = " of ", .want = 0 },
     });
 }
-

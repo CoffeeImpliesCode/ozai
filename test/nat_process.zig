@@ -17,22 +17,28 @@ pub const assertPrivate = safety.assertPrivate;
 pub const setPrivateForwarding = safety.setPrivateForwarding;
 pub const assertOwnedDir = safety.assertOwnedDir;
 
-
 test "bounded log overflow preserves captured prefix" {
     var storage: [4]u8 = undefined;
-    var log = Log{ .buffer = &storage };
+    var log: Log = .{ .buffer = &storage };
     try log.append("ab");
     try log.append("cd");
     try std.testing.expectError(error.LogOverflow, log.append("e"));
     try std.testing.expectEqualSlices(u8, "abcd", log.bytes());
 }
 
-
 const c = std.c;
 pub const log_capacity = 64 * 1024;
 pub const Error = safety.Error || error{
-    InvalidCommand, CommandOverflow, LogOverflow, PipeFailed, SignalFailed,
-    DeadlineExceeded, AlreadyStarted, NotStarted, InputOverflow, ChildFailed,
+    InvalidCommand,
+    CommandOverflow,
+    LogOverflow,
+    PipeFailed,
+    SignalFailed,
+    DeadlineExceeded,
+    AlreadyStarted,
+    NotStarted,
+    InputOverflow,
+    ChildFailed,
 } || std.process.SpawnError || std.process.Child.WaitError;
 
 pub const Log = struct {
@@ -109,12 +115,19 @@ pub const Process = struct {
         self.caller_uid = c.getuid();
         self.parent_pid = c.getpid();
         self.child = try std.process.spawn(io, .{
-            .argv = argv, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe,
+            .argv = argv,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
         });
-        self.pid = self.child.?.id.?;
-        try nonblocking(self.child.?.stdout.?.handle);
-        try nonblocking(self.child.?.stderr.?.handle);
-        try nonblocking(self.child.?.stdin.?.handle);
+        const child = if (self.child) |*value| value else return error.NotStarted;
+        self.pid = child.id orelse return error.NotStarted;
+        const stdout_pipe = child.stdout orelse return error.PipeFailed;
+        const stderr_pipe = child.stderr orelse return error.PipeFailed;
+        const stdin_pipe = child.stdin orelse return error.PipeFailed;
+        try nonblocking(stdout_pipe.handle);
+        try nonblocking(stderr_pipe.handle);
+        try nonblocking(stdin_pipe.handle);
     }
 
     pub fn pump(self: *Process, io: std.Io) Error!void {
@@ -123,8 +136,14 @@ pub const Process = struct {
         if (self.term != null) return;
         // Both streams are serviced even if one overflowed.
         var failure: ?Error = null;
-        drain(child.stdout.?.handle, &self.out) catch |err| { failure = err; };
-        drain(child.stderr.?.handle, &self.err) catch |err| { failure = err; };
+        const stdout_pipe = child.stdout orelse return error.PipeFailed;
+        const stderr_pipe = child.stderr orelse return error.PipeFailed;
+        drain(stdout_pipe.handle, &self.out) catch |err| {
+            failure = err;
+        };
+        drain(stderr_pipe.handle, &self.err) catch |err| {
+            failure = err;
+        };
         if (failure) |err| return err;
     }
 
@@ -133,13 +152,16 @@ pub const Process = struct {
         if (self.term != null) return true;
         const child = if (self.child) |*value| value else return error.NotStarted;
         var buffer: [4096]u8 = undefined;
-        const status = try procRead(self.pid.?, "status", &buffer);
+        const pid = self.pid orelse return error.NotStarted;
+        const status = try procRead(io, pid, "status", &buffer);
         const state = statusField(status, "State:") orelse return error.InvalidProc;
         if (state.len == 0) return error.InvalidProc;
         if (state[0] != 'Z' and state[0] != 'X') return false;
         // Drain before Child.wait closes pipe handles.
         var failure: ?Error = null;
-        self.pump(io) catch |err| { failure = err; };
+        self.pump(io) catch |err| {
+            failure = err;
+        };
         self.term = try child.wait(io);
         if (failure) |err| return err;
         return true;
@@ -165,8 +187,9 @@ pub const Process = struct {
                 }
             }
             if (offset == input.len) return;
-            if (std.Io.Timestamp.now(io, .awake).nanoseconds - start >= 2 * std.time.ns_per_s)
+            if (std.Io.Timestamp.now(io, .awake).nanoseconds - start >= 2 * std.time.ns_per_s) {
                 return error.DeadlineExceeded;
+            }
             std.Io.sleep(io, .fromMilliseconds(5), .awake) catch return error.PipeFailed;
         }
         return error.DeadlineExceeded;
@@ -180,17 +203,21 @@ pub const Process = struct {
             return term;
         }
         var failure: ?Error = null;
-        self.pump(io) catch |err| { failure = err; };
+        self.pump(io) catch |err| {
+            failure = err;
+        };
         if (try self.exitedIgnoringLogs(io, &failure)) return self.finishResult(failure);
-        try self.signalOwned(.TERM);
+        try self.signalOwned(io, .TERM);
         const start = std.Io.Timestamp.now(io, .awake).nanoseconds;
         var killed = false;
         for (0..501) |_| {
-            self.pump(io) catch |err| { failure = err; };
+            self.pump(io) catch |err| {
+                failure = err;
+            };
             if (try self.exitedIgnoringLogs(io, &failure)) return self.finishResult(failure);
             const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - start;
             if (!killed and elapsed >= 500 * std.time.ns_per_ms) {
-                try self.signalOwned(.KILL);
+                try self.signalOwned(io, .KILL);
                 killed = true;
             }
             if (elapsed >= 2500 * std.time.ns_per_ms) return error.DeadlineExceeded;
@@ -211,39 +238,44 @@ pub const Process = struct {
 
     fn finishResult(self: *const Process, failure: ?Error) Error!std.process.Child.Term {
         if (failure) |err| return err;
-        return self.term.?;
+        return self.term orelse return error.NotStarted;
     }
 
-    fn signalOwned(self: *Process, signal: c.SIG) Error!void {
+    fn signalOwned(self: *Process, io: std.Io, signal: c.SIG) Error!void {
         const child = self.child orelse return error.NotStarted;
-        if (child.id == null or child.id.? != self.pid.?) return error.OwnershipMismatch;
-        try excludeAncestors(self.pid.?);
-        try verifyProcOwner(self.pid.?, self.caller_uid);
+        const pid = self.pid orelse return error.NotStarted;
+        const child_pid = child.id orelse return error.OwnershipMismatch;
+        if (child_pid != pid) return error.OwnershipMismatch;
+        try excludeAncestors(io, pid);
+        try verifyProcOwner(pid, self.caller_uid);
         var status_buffer: [4096]u8 = undefined;
-        const status = try procRead(self.pid.?, "status", &status_buffer);
+        const status = try procRead(io, pid, "status", &status_buffer);
         try checkStatus(status, self.caller_uid, self.parent_pid);
         const state = statusField(status, "State:") orelse return error.InvalidProc;
         if (state.len == 0) return error.InvalidProc;
         if (state[0] == 'Z' or state[0] == 'X') return;
         var command_buffer: [8192]u8 = undefined;
-        const command = try procRead(self.pid.?, "cmdline", &command_buffer);
+        const command = try procRead(io, pid, "cmdline", &command_buffer);
         if (command.len == 0) {
-            const fresh = try procRead(self.pid.?, "status", &status_buffer);
+            const fresh = try procRead(io, pid, "status", &status_buffer);
             const fresh_state = statusField(fresh, "State:") orelse return error.InvalidProc;
-            if (fresh_state.len > 0 and (fresh_state[0] == 'Z' or fresh_state[0] == 'X'))
+            if (fresh_state.len > 0 and (fresh_state[0] == 'Z' or fresh_state[0] == 'X')) {
                 return;
+            }
         }
         const final_matches = std.mem.eql(u8, command, self.command[0..self.command_len]);
-        const wrapper_matches = std.mem.eql(u8, command,
-            self.wrapper_command[0..self.wrapper_command_len]);
+        const wrapper_matches = std.mem.eql(
+            u8,
+            command,
+            self.wrapper_command[0..self.wrapper_command_len],
+        );
         if (!final_matches and !wrapper_matches) return error.OwnershipMismatch;
         // A direct child cannot have its PID reused while we retain its unreaped handle.
-        if (c.kill(self.pid.?, signal) != 0) {
+        if (c.kill(pid, signal) != 0) {
             if (c.errno(@as(c_int, -1)) != .SRCH) return error.SignalFailed;
         }
     }
 };
-
 
 fn nonblocking(fd: c.fd_t) Error!void {
     const flags = c.fcntl(fd, std.posix.F.GETFL);
@@ -263,12 +295,11 @@ fn drain(fd: c.fd_t, log: *Log) Error!void {
             .INTR => continue,
             else => return error.PipeFailed,
         } else {
-            log.append(buffer[0..@intCast(count)]) catch |err| return err;
+            try log.append(buffer[0..@intCast(count)]);
         }
     }
     if (log.overflow) return error.LogOverflow;
 }
-
 
 test "success requires a zero natural exit and preserved logs without overflow" {
     var out: [4]u8 = undefined;

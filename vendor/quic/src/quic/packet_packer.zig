@@ -350,7 +350,9 @@ pub const PacketPacker = struct {
         const pn = pkt_handler.nextPacketNumber(.application, random);
         var pn_buf: [4]u8 = undefined;
         const pn_len = crypto_mod.encodePacketNumber(
-            pn, pkt_handler.getLargestAcked(.application), &pn_buf,
+            pn,
+            pkt_handler.getLargestAcked(.application),
+            &pn_buf,
         );
         var first_byte: u8 = packet_mod.FIXED_BIT;
         if (self.key_phase) first_byte |= packet_mod.KEY_PHASE_BIT;
@@ -364,7 +366,11 @@ pub const PacketPacker = struct {
         // Path zero's nonce is independent of whichever application path the
         // regular packer currently targets. Legacy protection is identical.
         const encrypted_len = seal.encryptPayloadForPath(
-            0, pn, buf[0..header_len], payload[0..writer.seek], buf[header_len..],
+            0,
+            pn,
+            buf[0..header_len],
+            payload[0..writer.seek],
+            buf[header_len..],
         );
         const total_len = header_len + encrypted_len;
         seal.applyHeaderProtection(buf[0..total_len], pn_offset, pn_len);
@@ -2929,7 +2935,13 @@ test "PacketPacker: application data uses selected path handler and nonce" {
         const handler = if (path_id == 0) &path0 else &path1;
         pending_frames.push(.{ .ping = {} });
         const written = try packAppOnly(
-            &packer, handler, &crypto_mgr, &streams, &pending_frames, &packet, rng.random(),
+            &packer,
+            handler,
+            &crypto_mgr,
+            &streams,
+            &pending_frames,
+            &packet,
+            rng.random(),
         );
         try testing.expect(written > 0);
         const sent = handler.sent[2].sent_packets.values();
@@ -2960,19 +2972,31 @@ test "PacketPacker: negotiated path zero emits PATH_ACK and legacy emits ACK" {
         var pending_frames = frame_mod.PendingFrameQueue{};
         var packet: [1500]u8 = undefined;
         const written = try packAppOnly(
-            &packer, &handler, &crypto_mgr, &streams, &pending_frames, &packet, rng.random(),
+            &packer,
+            &handler,
+            &crypto_mgr,
+            &streams,
+            &pending_frames,
+            &packet,
+            rng.random(),
         );
         try testing.expect(written > 0);
         const keys = try testServerKeys();
         const pn_offset = 1 + dcid.len;
         const pn_len = crypto_mod.removeHeaderProtection(
-            packet[0..written], pn_offset, keys.open.hp_key, keys.open.cipher_suite,
+            packet[0..written],
+            pn_offset,
+            keys.open.hp_key,
+            keys.open.cipher_suite,
         );
         try testing.expect(pn_len > 0);
         const header_len = pn_offset + pn_len;
         const plaintext = if (path_id) |id|
             try keys.open.decryptPayloadForPath(
-                id, 0, packet[0..header_len], packet[header_len..written],
+                id,
+                0,
+                packet[0..header_len],
+                packet[header_len..written],
             )
         else
             try keys.open.decryptPayload(0, packet[0..header_len], packet[header_len..written]);
@@ -3031,9 +3055,19 @@ test "PacketPacker: application path configuration never changes long header pro
                 pending_frames.push(.{ .ping = {} });
             }
             lengths[i] = try packer.packSinglePacket(
-                &packets[i], case.level, &handler, &crypto_mgr, &streams,
-                &pending_frames, &keys.seal, 1000, 1200, null,
-                case.zero_rtt, false, rng.random(),
+                &packets[i],
+                case.level,
+                &handler,
+                &crypto_mgr,
+                &streams,
+                &pending_frames,
+                &keys.seal,
+                1000,
+                1200,
+                null,
+                case.zero_rtt,
+                false,
+                rng.random(),
             );
             try testing.expectEqual(@as(usize, 1200), lengths[i]);
             try testing.expect(packets[i][0] & 0x80 != 0);
@@ -3059,23 +3093,41 @@ test "PacketPacker: application validation padding preserves challenge and refus
     pending_frames.push(.{ .path_challenge = challenge });
     var packet: [1500]u8 = undefined;
     try testing.expectEqual(@as(usize, 0), try packAppOnly(
-        &packer, &handler, &crypto_mgr, &streams, &pending_frames, packet[0..1199], rng.random(),
+        &packer,
+        &handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        packet[0..1199],
+        rng.random(),
     ));
     try testing.expectEqual(@as(u64, 0), handler.next_pn[2]);
     try testing.expectEqual(@as(usize, 1), pending_frames.len);
     const written = try packAppOnly(
-        &packer, &handler, &crypto_mgr, &streams, &pending_frames, &packet, rng.random(),
+        &packer,
+        &handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        &packet,
+        rng.random(),
     );
     try testing.expectEqual(@as(usize, 1200), written);
     const keys = try testServerKeys();
     const pn_offset = 1 + dcid.len;
     const pn_len = crypto_mod.removeHeaderProtection(
-        packet[0..written], pn_offset, keys.open.hp_key, keys.open.cipher_suite,
+        packet[0..written],
+        pn_offset,
+        keys.open.hp_key,
+        keys.open.cipher_suite,
     );
     try testing.expect(pn_len > 0);
     const header_len = pn_offset + pn_len;
     const plaintext = try keys.open.decryptPayloadForPath(
-        1, 0, packet[0..header_len], packet[header_len..written],
+        1,
+        0,
+        packet[0..header_len],
+        packet[header_len..written],
     );
     var frame_len: usize = undefined;
     const decoded = try Frame.parseSized(plaintext, &frame_len);
@@ -3111,19 +3163,27 @@ test "PacketPacker: off-path probes preserve pending ACK crypto streams and cont
     var packet: [1500]u8 = undefined;
     for (0..2) |pn| {
         const written = try packer.packOffPath(
-            &packet, &handler, &keys.seal,
+            &packet,
+            &handler,
+            &keys.seal,
             .{ .challenge = challenge, .response = response },
             rng.random(),
         );
         try testing.expect(written > 0 and written < 1200);
         const pn_offset = 1 + dcid.len;
         const pn_len = crypto_mod.removeHeaderProtection(
-            packet[0..written], pn_offset, receiver.open.hp_key, receiver.open.cipher_suite,
+            packet[0..written],
+            pn_offset,
+            receiver.open.hp_key,
+            receiver.open.cipher_suite,
         );
         try testing.expect(pn_len > 0);
         const header_len = pn_offset + pn_len;
         const plaintext = try receiver.open.decryptPayloadForPath(
-            0, @intCast(pn), packet[0..header_len], packet[header_len..written],
+            0,
+            @intCast(pn),
+            packet[0..header_len],
+            packet[header_len..written],
         );
         var consumed: usize = undefined;
         var offset: usize = 0;
@@ -3145,8 +3205,19 @@ test "PacketPacker: off-path probes preserve pending ACK crypto streams and cont
         try testing.expectEqual(@as(usize, 0), handler.sent[2].sent_packets.count());
     }
     const normal_written = try packer.packCoalesced(
-        &packet, &handler, &crypto_mgr, &streams, &pending_frames,
-        null, null, null, &keys.seal, 1000, null, false, rng.random(),
+        &packet,
+        &handler,
+        &crypto_mgr,
+        &streams,
+        &pending_frames,
+        null,
+        null,
+        null,
+        &keys.seal,
+        1000,
+        null,
+        false,
+        rng.random(),
     );
     try testing.expect(normal_written > 0);
     try testing.expectEqual(@as(u64, normal_written), handler.bytes_in_flight);
@@ -3163,10 +3234,18 @@ test "PacketPacker: empty and short off-path calls consume no packet number" {
     const keys = try testClientKeys();
     var packet: [64]u8 = undefined;
     try testing.expectEqual(@as(usize, 0), try packer.packOffPath(
-        &packet, &handler, &keys.seal, .{}, rng.random(),
+        &packet,
+        &handler,
+        &keys.seal,
+        .{},
+        rng.random(),
     ));
     try testing.expectEqual(@as(usize, 0), try packer.packOffPath(
-        packet[0..20], &handler, &keys.seal, .{ .challenge = .{1} ** 8 }, rng.random(),
+        packet[0..20],
+        &handler,
+        &keys.seal,
+        .{ .challenge = .{1} ** 8 },
+        rng.random(),
     ));
     try testing.expectEqual(@as(u64, 0), handler.next_pn[2]);
     try testing.expectEqual(@as(?u64, null), handler.skipped_pns[0]);

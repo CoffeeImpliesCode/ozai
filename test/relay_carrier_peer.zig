@@ -2,7 +2,8 @@
 const std = @import("std");
 const ozai = @import("ozai");
 const node_cli = @import("node_cli");
-const carrier = ozai.relay_tcp_carrier;
+const relay_client = ozai.relay_tcp_client;
+const relay_server = ozai.relay_tcp_server;
 
 pub const Options = struct {
     client: bool,
@@ -21,7 +22,7 @@ pub fn run(init: std.process.Init, options: Options) !void {
     var secret = try ozai.SecretKey.fromSeed(seed);
     defer secret.deinit();
     const expected = try ozai.NodeId.parseHex(options.expect_peer);
-    var service: ?carrier.Server = null;
+    var service: ?relay_server.Server = null;
     defer if (service) |*server| server.deinit();
     var address: ozai.SocketAddr = undefined;
     var host: []const u8 = undefined;
@@ -31,18 +32,31 @@ pub fn run(init: std.process.Init, options: Options) !void {
         address = try url.socketAddr();
         host = url.hostSlice();
     } else {
-        service = try carrier.Server.init(try node_cli.parseSocket(options.bind));
-        address = service.?.address;
+        const server = try relay_server.Server.init(
+            init.io,
+            try node_cli.parseSocket(options.bind),
+            ozai.transport_tcp_execution.Execution.native,
+        );
+        address = server.address;
+        service = server;
         if (address.ip == .v4 and std.mem.eql(u8, &address.ip.v4, &.{ 0, 0, 0, 0 }))
             address.ip.v4 = .{ 127, 0, 0, 1 };
         host = "localhost";
     }
-    var client = try carrier.Client.init(.{ .address = address, .host = host, .secret = secret });
+    var client = try relay_client.Client.init(init.io, .{
+        .address = address,
+        .host = host,
+        .secret = secret,
+        .execution = ozai.transport_tcp_execution.Execution.native,
+    });
     defer client.deinit();
     var output_buffer: [2048]u8 = undefined;
     var output = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
     if (service) |*server| {
-        try output.interface.print("relay-ready: url http://{f}/ qad disabled\n", .{server.address});
+        try output.interface.print(
+            "relay-ready: url http://{f}/ qad disabled\n",
+            .{server.address},
+        );
         try output.flush();
     }
     const start_ns = std.Io.Clock.awake.now(init.io).nanoseconds;
@@ -76,15 +90,18 @@ pub fn run(init: std.process.Init, options: Options) !void {
             }
         }
         // Keep the service alive until its receiving peer has closed after the echo.
-        if (received and (options.client or (echoed and !hasPeer(&service.?, expected)))) {
+        const peer_closed = if (service) |*server| !hasPeer(server, expected) else false;
+        if (received and (options.client or (echoed and peer_closed))) {
             var payload: [8192]u8 = undefined;
             const digits = "0123456789abcdef";
             for (options.message, 0..) |byte, index| {
                 payload[2 * index] = digits[byte >> 4];
                 payload[2 * index + 1] = digits[byte & 15];
             }
-            try output.interface.print("relay-carrier: remote_id {f} payload_hex {s}\n",
-                .{ expected, payload[0 .. options.message.len * 2] });
+            try output.interface.print(
+                "relay-carrier: remote_id {f} payload_hex {s}\n",
+                .{ expected, payload[0 .. options.message.len * 2] },
+            );
             try output.flush();
             return;
         }
@@ -93,7 +110,7 @@ pub fn run(init: std.process.Init, options: Options) !void {
     return error.DeadlineExceeded;
 }
 
-fn hasPeer(server: *const carrier.Server, expected: ozai.NodeId) bool {
+fn hasPeer(server: *const relay_server.Server, expected: ozai.NodeId) bool {
     for (&server.peers) |*slot| {
         if (slot.*) |*peer| {
             const identity = peer.identity orelse continue;

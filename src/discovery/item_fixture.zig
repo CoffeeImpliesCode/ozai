@@ -36,6 +36,8 @@ pub fn corpusIds() key.KeyError![3]addr.NodeId {
         @memset(&bytes, @intCast(seed));
         id.* = (try key.SecretKey.fromSeed(bytes)).nodeId();
     }
+    // This loop initializes all three IDs; ZBC does not prove the full array write.
+    // zbc-disable-next-line: use-undefined
     return ids;
 }
 

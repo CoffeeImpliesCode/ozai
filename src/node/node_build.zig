@@ -13,7 +13,6 @@ const node_holepunch = @import("node_holepunch.zig");
 const base_key = @import("../base/key.zig");
 const base_addr = @import("../base/addr.zig");
 const addr_map = @import("../transport/addr_map.zig");
-const node_discovery = @import("node_discovery.zig");
 const node_discovery_record = @import("node_discovery_record.zig");
 const bridge_mod = @import("../transport/quic_bridge.zig");
 const dial_mod = @import("../transport/dial.zig");
@@ -22,8 +21,7 @@ const router = @import("../router/router.zig");
 const endpoint = @import("../endpoint/endpoint.zig");
 const hyparview = @import("../gossip/hyparview.zig");
 
-const Node = node_mod.Node;
-const Allocator = node_config.Allocator;
+const Self = node_mod.Node;
 const Config = node_config.Config;
 const Error = node_config.Error;
 const NodeId = base_key.NodeId;
@@ -44,7 +42,7 @@ const receive_room = node_transport.receive_room;
 /// but application topic IDs, peer addresses, callback context, directory handles
 /// and TLS/discovery storage are borrowed for the node's lifetime.
 /// Carrier resources are independent of inner QUIC application connections.
-pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node {
+pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, seed: u64) Error!*Self {
     try node_config.validate(config);
     if (config.discovery.deadline_ms <= 0 or config.discovery.interval_ms == 0 or
         config.discovery.interval_ms > @as(u64, @intCast(std.math.maxInt(i64))) /
@@ -55,7 +53,7 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
     {
         return error.InvalidDiscoveryConfig;
     }
-    const self = try gpa.create(Node);
+    const self = try gpa.create(Self);
     errdefer gpa.destroy(self);
     self.* = .{
         .gpa = gpa,
@@ -91,11 +89,12 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
         .discovery = .{},
         .holepunch = undefined,
     };
+    errdefer wipeConfigSecrets(&self.config);
     errdefer self.map.deinit(gpa);
     errdefer self.offered.deinit(gpa);
     errdefer self.dialled.deinit(gpa);
     errdefer self.timers.deinit(gpa);
-    try self.relay_runtime.init(config.relay);
+    try self.relay_runtime.init(io, config.relay);
     errdefer self.relay_runtime.deinit();
     errdefer self.blobs.deinit(gpa);
 
@@ -217,9 +216,10 @@ pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node
 /// by leaving the loop rather than by calling it again. A caller driving
 /// `start` itself owns that choice — try once more, or close the node and
 /// throw it away.
-pub fn start(self: *Node, at: Instant, random: std.Random) Error!void {
+pub fn start(self: *Self, at: Instant, random: std.Random) Error!void {
     for (self.config.peers) |peer| {
         if (self.dialled.contains(peer.id)) continue;
+        try self.relay_runtime.admit(peer.addr);
         try self.dialled.put(self.gpa, peer.id, {});
         const reached = self.dialer.dial(
             peer.addr,
@@ -297,6 +297,7 @@ pub fn start(self: *Node, at: Instant, random: std.Random) Error!void {
 ///
 /// All node-owned transfers and carrier resources end here. Borrowed configuration
 /// storage remains the caller's property.
+/// The caller destroys the node allocation after releasing these resources.
 ///
 /// **It may not run under a `run` or a `step` that is still on the
 /// stack.** `run` closes the node on its way out precisely so that the
@@ -306,7 +307,7 @@ pub fn start(self: *Node, at: Instant, random: std.Random) Error!void {
 ///
 /// Client connections leave before their dialer's secret storage and the bridge.
 /// Protocol states release their resources before the remaining node storage.
-pub fn deinit(self: *Node) void {
+pub fn release(self: *Self) void {
     switch (self.lease.deinit()) {
         .closed => {},
         .abandoned => |phase| std.log.err(
@@ -347,18 +348,261 @@ pub fn deinit(self: *Node) void {
         ),
     };
     self.bridge.destroy();
+    // ZBC cannot infer that `egress` is terminally owned and `self` is destroyed afterward.
+    // zbc-disable-next-line: free-without-null-then-check
     self.gpa.free(self.egress);
+    // ZBC cannot infer that `out` is terminally owned and `self` is destroyed afterward.
+    // zbc-disable-next-line: free-without-null-then-check
     self.gpa.free(self.out);
+    // ZBC cannot infer that `scratch` is terminally owned and `self` is destroyed afterward.
+    // zbc-disable-next-line: free-without-null-then-check
     self.gpa.free(self.scratch);
+    // ZBC cannot infer that `buf` is terminally owned and `self` is destroyed afterward.
+    // zbc-disable-next-line: free-without-null-then-check
     self.gpa.free(self.buf);
     self.map.deinit(self.gpa);
     self.offered.deinit(self.gpa);
     self.dialled.deinit(self.gpa);
     self.timers.deinit(self.gpa);
+    // ZBC cannot see later cleanup ignore this terminal slice before `Node.deinit` destroys `self`.
+    // zbc-disable-next-line: free-without-null-then-check
     self.gpa.free(self.gossip_topics);
     self.discovery.release();
     self.holepunch.deinit(self.gpa);
     node_transport.shutdownSocket(self);
-    self.config.secret.deinit();
-    self.gpa.destroy(self);
+    wipeConfigSecrets(&self.config);
 }
+
+fn wipeConfigSecrets(config: *Config) void {
+    config.secret.deinit();
+    if (config.relay.client) |*client| client.secret.deinit();
+}
+
+// Inspect the copied key at owned-free time, before the backing allocator poisons memory.
+test "node construction rollback wipes copied secret before freeing owner" {
+    var secret = try base_key.SecretKey.fromSeed(@splat(0x5b));
+    defer secret.deinit();
+    var observer: RollbackSecretAllocator = .{};
+    try std.testing.expectError(
+        error.OutOfMemory,
+        create(observer.allocator(), std.testing.io, .{ .secret = secret }, 991),
+    );
+    try std.testing.expect(observer.refused);
+    try std.testing.expect(observer.freed);
+    try std.testing.expect(observer.secret_zero_at_free);
+    try std.testing.expectEqual(@as(u8, 0x5b), secret.toBytes()[0]);
+}
+
+const RollbackSecretAllocator = struct {
+    owner: ?[*]u8 = null,
+    refused: bool = false,
+    freed: bool = false,
+    secret_zero_at_free: bool = false,
+
+    fn allocator(self: *RollbackSecretAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = allocate,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = freeOwner,
+        } };
+    }
+
+    fn allocate(
+        context: *anyopaque,
+        length: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *RollbackSecretAllocator = @ptrCast(@alignCast(context));
+        if (self.owner != null) {
+            self.refused = true;
+            return null;
+        }
+        std.debug.assert(length == @sizeOf(Self));
+        const owner = std.testing.allocator.rawAlloc(length, alignment, return_address) orelse
+            return null;
+        self.owner = owner;
+        return owner;
+    }
+
+    fn freeOwner(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *RollbackSecretAllocator = @ptrCast(@alignCast(context));
+        std.debug.assert(memory.ptr == self.owner.?);
+        std.debug.assert(memory.len == @sizeOf(Self));
+        const owner: *Self = @ptrCast(@alignCast(memory.ptr));
+        const bytes = owner.config.secret.toBytes();
+        self.secret_zero_at_free = std.mem.allEqual(u8, &bytes, 0);
+        self.freed = true;
+        std.testing.allocator.rawFree(memory, alignment, return_address);
+    }
+};
+
+test "node deinit wipes primary and retained relay config secrets before freeing owner" {
+    // Observe the real owner before DebugAllocator can poison either copied key.
+    var secret = try base_key.SecretKey.fromSeed(@splat(0x61));
+    defer secret.deinit();
+    var relay_secret = try base_key.SecretKey.fromSeed(@splat(0x61));
+    defer relay_secret.deinit();
+    const primary_bytes = secret.toBytes();
+    const relay_bytes = relay_secret.toBytes();
+    try std.testing.expect(&secret != &relay_secret);
+    var listener = try @import("../transport/tcp_listener.zig").Listener.init(
+        std.testing.io,
+        .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0 },
+        .native,
+    );
+    defer listener.close();
+    var observer: ConfigSecretAllocator = .{};
+    const node = try Self.create(observer.allocator(), std.testing.io, .{
+        .secret = secret,
+        .relay = .{ .client = .{
+            .address = listener.local,
+            .host = "127.0.0.1",
+            .secret = relay_secret,
+            .execution = .native,
+        } },
+    }, 992);
+    var node_live = true;
+    errdefer if (node_live) node.deinit();
+    try std.testing.expectEqual(@intFromPtr(node), @intFromPtr(observer.owner.?));
+    try std.testing.expectEqualSlices(u8, &primary_bytes, &node.config.secret.toBytes());
+    try std.testing.expectEqualSlices(u8, &relay_bytes, &node.config.relay.client.?.secret.toBytes());
+    try node.close(std.testing.io, 1_000 * std.time.ns_per_s, node.generator());
+    node.deinit();
+    node_live = false;
+    try std.testing.expect(observer.freed);
+    try std.testing.expect(std.mem.allEqual(u8, &observer.primary_at_free, 0));
+    try std.testing.expect(std.mem.allEqual(u8, &observer.relay_at_free, 0));
+    try std.testing.expectEqualSlices(u8, &primary_bytes, &secret.toBytes());
+    try std.testing.expectEqualSlices(u8, &relay_bytes, &relay_secret.toBytes());
+}
+
+test "node constructor fail-N wipes primary and retained relay config secrets before freeing owner" {
+    // Sweep every allocation refusal, including failures after carrier acquisition.
+    var secret = try base_key.SecretKey.fromSeed(@splat(0x63));
+    defer secret.deinit();
+    var relay_secret = try base_key.SecretKey.fromSeed(@splat(0x63));
+    defer relay_secret.deinit();
+    const primary_bytes = secret.toBytes();
+    const relay_bytes = relay_secret.toBytes();
+    try std.testing.expect(&secret != &relay_secret);
+    var succeeded = false;
+    var owned_rollbacks: usize = 0;
+    var primary_wiped = true;
+    var relay_wiped = true;
+    for (0..128) |fail_index| {
+        var listener = try @import("../transport/tcp_listener.zig").Listener.init(
+            std.testing.io,
+            .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0 },
+            .native,
+        );
+        defer listener.close();
+        var observer: ConfigSecretAllocator = .{ .fail_index = fail_index };
+        const node = Self.create(observer.allocator(), std.testing.io, .{
+            .secret = secret,
+            .relay = .{ .client = .{
+                .address = listener.local,
+                .host = "127.0.0.1",
+                .secret = relay_secret,
+                .execution = .native,
+            } },
+        }, 993) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(observer.refused);
+            if (fail_index == 0) {
+                try std.testing.expect(observer.owner == null);
+                try std.testing.expect(!observer.freed);
+            } else {
+                try std.testing.expect(observer.freed);
+                owned_rollbacks += 1;
+                primary_wiped = primary_wiped and
+                    std.mem.allEqual(u8, &observer.primary_at_free, 0);
+                relay_wiped = relay_wiped and std.mem.allEqual(u8, &observer.relay_at_free, 0);
+            }
+            try std.testing.expectEqualSlices(u8, &primary_bytes, &secret.toBytes());
+            try std.testing.expectEqualSlices(u8, &relay_bytes, &relay_secret.toBytes());
+            continue;
+        };
+        var node_live = true;
+        errdefer if (node_live) node.deinit();
+        try std.testing.expect(!observer.refused);
+        try std.testing.expectEqual(@intFromPtr(node), @intFromPtr(observer.owner.?));
+        try node.close(std.testing.io, 1_000 * std.time.ns_per_s, node.generator());
+        node.deinit();
+        node_live = false;
+        try std.testing.expect(observer.freed);
+        try std.testing.expectEqualSlices(u8, &primary_bytes, &secret.toBytes());
+        try std.testing.expectEqualSlices(u8, &relay_bytes, &relay_secret.toBytes());
+        succeeded = true;
+        break;
+    }
+    try std.testing.expect(succeeded);
+    try std.testing.expect(owned_rollbacks > 1);
+    try std.testing.expect(primary_wiped);
+    try std.testing.expect(relay_wiped);
+}
+
+const ConfigSecretAllocator = struct {
+    owner: ?[*]u8 = null,
+    fail_index: usize = std.math.maxInt(usize),
+    allocation_index: usize = 0,
+    refused: bool = false,
+    freed: bool = false,
+    primary_at_free: [base_key.SecretKey.byte_length]u8 = undefined,
+    relay_at_free: [base_key.SecretKey.byte_length]u8 = undefined,
+
+    fn allocator(self: *ConfigSecretAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = allocate,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = free,
+        } };
+    }
+
+    fn allocate(
+        context: *anyopaque,
+        length: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *ConfigSecretAllocator = @ptrCast(@alignCast(context));
+        const index = self.allocation_index;
+        self.allocation_index += 1;
+        if (index == self.fail_index) {
+            self.refused = true;
+            return null;
+        }
+        const memory = std.testing.allocator.rawAlloc(length, alignment, return_address) orelse
+            return null;
+        if (index == 0) {
+            std.debug.assert(length == @sizeOf(Self));
+            self.owner = memory;
+        }
+        return memory;
+    }
+
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *ConfigSecretAllocator = @ptrCast(@alignCast(context));
+        if (memory.ptr == self.owner) {
+            std.debug.assert(memory.len == @sizeOf(Self));
+            std.debug.assert(!self.freed);
+            const owner: *Self = @ptrCast(@alignCast(memory.ptr));
+            self.primary_at_free = owner.config.secret.toBytes();
+            self.relay_at_free = owner.config.relay.client.?.secret.toBytes();
+            self.freed = true;
+        }
+        std.testing.allocator.rawFree(memory, alignment, return_address);
+    }
+};

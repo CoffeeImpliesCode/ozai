@@ -179,7 +179,7 @@ pub fn readCmsg(blob: []const u8) CmsgRead {
     return read;
 }
 
-const Header = struct {
+pub const Header = struct {
     length: usize,
     level: u32,
     kind: u32,

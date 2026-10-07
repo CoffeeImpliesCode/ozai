@@ -357,6 +357,10 @@ pub const Store = struct {
     /// rather than caching a slot.
     pub fn forget(self: *Store, key: Key) bool {
         const index = self.indexOf(key) orelse return false;
+        // `indexOf` returns only an index visited under `index < self.len`; this
+        // successful unwrap proves `self.len > 0`. ZBC does not carry that scan
+        // invariant through `orelse` to the subtraction below.
+        // zbc-disable-next-line: index-minus-one-without-zero-guard
         self.entries[index] = self.entries[self.len - 1];
         self.len -= 1;
         return true;
@@ -458,10 +462,17 @@ fn ticketFor(
         .lifetime = lifetime_s,
         .creation_time = created_s,
         .quic_version = version,
+        // Private test callers supply only 4- and 11-byte ALPN fixtures; both fit
+        // `ticket[512]` and `u16`. ZBC cannot propagate those caller lengths through
+        // this `[]const u8` conversion.
+        // zbc-disable-next-line: index-type-narrowing-wraparound
         .ticket_len = @intCast(alpn.len),
     };
     @memcpy(built.ticket[0..alpn.len], alpn);
     @memcpy(built.alpn[0..alpn.len], alpn);
+    // Those same 4- and 11-byte test fixtures fit `alpn[32]` and `u8`. ZBC
+    // cannot propagate their fixed caller lengths through this `[]const u8` cast.
+    // zbc-disable-next-line: index-type-narrowing-wraparound
     built.alpn_len = @intCast(alpn.len);
     return built;
 }
@@ -737,7 +748,7 @@ test "a key compares over the protocol it names and not over its padding" {
     try t.expect(!clean.matches(other_version));
 
     // A shorter name is a different protocol too, and so is a longer one.
-    const shorter = Key{
+    const shorter: Key = .{
         .peer = peer,
         .quic_version = quic_v1,
         .alpn = clean.alpn,

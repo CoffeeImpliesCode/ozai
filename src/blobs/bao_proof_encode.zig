@@ -159,7 +159,9 @@ test "whole proofs interleave persisted parents and group data" {
         if (item == .data) {
             const bytes = item.data.bytes(tree);
             try t.expectEqualSlices(
-                u8, data[@intCast(bytes.start)..@intCast(bytes.end)], out[at..][0..count],
+                u8,
+                data[@intCast(bytes.start)..@intCast(bytes.end)],
+                out[at..][0..count],
             );
         }
         at += count;
@@ -185,7 +187,7 @@ test "the pairs of a group-aligned proof are the outboard's own bytes" {
     var outboard: [3 * pair_length]u8 = @splat(0);
     const outboard_len = try outboard_mod.encode(tree, data, &outboard);
 
-    const request = ranges.ChunkRange{ .start = 32, .end = 48 };
+    const request: ranges.ChunkRange = .{ .start = 32, .end = 48 };
     const plan = plan_mod.planOf(tree, request);
     var proof: [3 * pair_length + block_size]u8 = @splat(0);
     const written = try encode(plan, tree, data, &proof);

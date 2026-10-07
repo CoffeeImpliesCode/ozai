@@ -6,8 +6,7 @@ const quic = @import("quic");
 const nat = @import("native_nat.zig");
 const Frame = quic.frame.Frame;
 const Address = quic.address.Address;
-const sequences = [_]u64{ 0, 63, 64, 16383, 16384, 1073741823, 1073741824,
-    4611686018427387903 };
+const sequences = [_]u64{ 0, 63, 64, 16383, 16384, 1073741823, 1073741824, 4611686018427387903 };
 const ipv6 = [_]u8{ 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
 
 fn capture(name: []const u8) ![]u8 {
@@ -19,7 +18,9 @@ fn capture(name: []const u8) ![]u8 {
 
 fn numberedCapture(prefix: []const u8, number: u64) ![]u8 {
     var name: [128]u8 = undefined;
-    return capture(try std.fmt.bufPrint(&name, "{s}_{d}.bin", .{ prefix, number }));
+    const filename = try std.fmt.bufPrint(&name, "{s}_{d}.bin", .{ prefix, number });
+    const bytes = try capture(filename);
+    return bytes;
 }
 
 fn goldenFrame(bytes: []u8, expected_tag: std.meta.Tag(Frame)) !Frame {
@@ -48,8 +49,10 @@ fn provenance(name: []const u8) !void {
         if (std.mem.eql(u8, key, "vcs")) revision = value;
     }
     try t.expectEqualStrings("1.3.0", version orelse return error.MissingVersion);
-    try t.expectEqualStrings("c1f411562e6078852749b8bcf1190523096a107f",
-        revision orelse return error.MissingRevision);
+    try t.expectEqualStrings(
+        "c1f411562e6078852749b8bcf1190523096a107f",
+        revision orelse return error.MissingRevision,
+    );
 }
 
 test "native observed frames match captured Noq addresses and every varint boundary" {
@@ -74,7 +77,8 @@ test "native observed frames match captured Noq addresses and every varint bound
         try t.expectEqual(@as(quic.observed_address.Role, tag), role);
         var output: [8]u8 = undefined;
         var writer = quic.io_compat.fixedBufferStream(&output);
-        try quic.packet.writeVarInt(&writer, role.transportValue().?);
+        const value = role.transportValue() orelse return error.TestUnexpectedResult;
+        try quic.packet.writeVarInt(&writer, value);
         try t.expectEqualSlices(u8, bytes, writer.buffered());
     }
 }
@@ -86,11 +90,16 @@ test "native NAT captured ADD REMOVE REACH_OUT preserve variants addresses and s
     for (addresses, 0..) |address, family| {
         for (sequences) |sequence| {
             inline for (.{ "add", "reach" }) |kind| {
-                const prefix = if (family == 0) "nat/" ++ kind ++ "_v4" else "nat/" ++ kind ++ "_v6";
+                const prefix = if (family == 0)
+                    "nat/" ++ kind ++ "_v4"
+                else
+                    "nat/" ++ kind ++ "_v6";
                 const bytes = try numberedCapture(prefix, sequence);
                 defer t.allocator.free(bytes);
                 const tag: std.meta.Tag(Frame) = if (comptime std.mem.eql(u8, kind, "add"))
-                    .add_address else .reach_address;
+                    .add_address
+                else
+                    .reach_address;
                 const frame = try goldenFrame(bytes, tag);
                 if (comptime std.mem.eql(u8, kind, "add")) {
                     try t.expectEqual(sequence, frame.add_address.sequence);
@@ -166,7 +175,10 @@ fn expectMultipath(frame: Frame, path_id: u32) !void {
     }
 }
 
-fn expectInitialPathIdentity(params: quic.transport_params.TransportParams, golden: []const u8) !void {
+fn expectInitialPathIdentity(
+    params: quic.transport_params.TransportParams,
+    golden: []const u8,
+) !void {
     var output: [2048]u8 = undefined;
     var writer = quic.io_compat.fixedBufferStream(&output);
     var random = std.Random.DefaultPrng.init(0xc1f41156);
@@ -188,10 +200,18 @@ fn expectInitialPathIdentity(params: quic.transport_params.TransportParams, gold
 test "native multipath captured ten variants and initialMaxPath TLVs match Noq" {
     try provenance("multipath/multipath_provenance.txt");
     for ([_]u32{ 0, 1 }) |path_id| {
-        inline for (.{ .path_ack, .path_ack_ecn, .path_abandon, .path_status_backup,
-            .path_status_available, .path_new_connection_id, .path_retire_connection_id,
-            .max_path_id, .paths_blocked, .path_cids_blocked }) |tag|
-        {
+        inline for (.{
+            .path_ack,
+            .path_ack_ecn,
+            .path_abandon,
+            .path_status_backup,
+            .path_status_available,
+            .path_new_connection_id,
+            .path_retire_connection_id,
+            .max_path_id,
+            .paths_blocked,
+            .path_cids_blocked,
+        }) |tag| {
             const bytes = try numberedCapture("multipath/" ++ @tagName(tag), path_id);
             defer t.allocator.free(bytes);
             try expectMultipath(try goldenFrame(bytes, tag), path_id);

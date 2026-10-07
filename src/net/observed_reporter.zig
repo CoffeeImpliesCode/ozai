@@ -314,6 +314,8 @@ const Table = struct {
             .addr = claimed,
             .latency = self.latencies[chosen],
             .relays = supporting,
+            // observe caps len at five, and support is a subset; ZBC cannot prove the bound.
+            // zbc-disable-next-line: index-type-narrowing-wraparound
             .contradicting = @intCast(self.len - supporting),
             .varies = varying.classify(),
         };
@@ -449,7 +451,7 @@ test "one relay's word is unmeasured, and two relays that agree confirm" {
     // false here would claim a symmetric NAT nobody measured, which is the
     // easy case hole punching assumes the hard one is.
     const one = fold(&.{v4Seen(a, public_v4, 10)});
-    const only = one.v4.?;
+    const only = one.v4 orelse return error.TestUnexpectedResult;
     try t.expectEqual(public_v4, only.addr);
     try t.expectEqual(millis(10), only.latency);
     try t.expectEqual(@as(u8, 1), only.relays);
@@ -464,7 +466,8 @@ test "one relay's word is unmeasured, and two relays that agree confirm" {
     try t.expectEqual(@as(?Claim, null), one.get(.v6));
 
     // Two distinct relays, both saying the same address: corroborated.
-    const agreed = fold(&.{ v4Seen(a, public_v4, 10), v4Seen(b, public_v4, 12) }).v4.?;
+    const agreed = fold(&.{ v4Seen(a, public_v4, 10), v4Seen(b, public_v4, 12) }).v4 orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(@as(u8, 2), agreed.relays);
     try t.expectEqual(@as(u8, 0), agreed.contradicting);
     try t.expectEqual(@as(?bool, false), agreed.varies);
@@ -482,7 +485,8 @@ test "two frames from one relay are one witness, not two" {
     // The same relay twice: one slot, one observation fed to `Varying`, so the
     // mapping stays unmeasured. Counting frames would classify a NAT on one
     // relay's word, which is the extension this module adds to `Varying`.
-    const only = fold(&.{ v4Seen(a, public_v4, 10), v4Seen(a, public_v4, 12) }).v4.?;
+    const only = fold(&.{ v4Seen(a, public_v4, 10), v4Seen(a, public_v4, 12) }).v4 orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(@as(u8, 1), only.relays);
     try t.expectEqual(@as(?bool, null), only.varies);
     try t.expect(only.unmeasured());
@@ -493,7 +497,8 @@ test "two frames from one relay are one witness, not two" {
     // One relay saying two different addresses is still one witness: the
     // faster frame wins the slot and the disagreement is not counted as a
     // second relay's dissent.
-    const mixed = fold(&.{ v4Seen(a, public_v4, 10), v4Seen(a, other_v4, 12) }).v4.?;
+    const mixed = fold(&.{ v4Seen(a, public_v4, 10), v4Seen(a, other_v4, 12) }).v4 orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(@as(?bool, null), mixed.varies);
     try t.expectEqual(@as(u8, 1), mixed.relays);
 }
@@ -504,7 +509,8 @@ test "a contradicting relay contests the claim and never retracts the address" {
     const b = try namedRelay(&scratch, 2);
     const c = try namedRelay(&scratch, 3);
 
-    const agreed = fold(&.{ v4Seen(a, public_v4, 10), v4Seen(b, public_v4, 12) }).v4.?;
+    const agreed = fold(&.{ v4Seen(a, public_v4, 10), v4Seen(b, public_v4, 12) }).v4 orelse
+        return error.TestUnexpectedResult;
     try t.expect(agreed.confirmed());
     try t.expectEqual(public_v4, agreed.addr);
 
@@ -516,7 +522,7 @@ test "a contradicting relay contests the claim and never retracts the address" {
         v4Seen(a, public_v4, 10),
         v4Seen(b, public_v4, 12),
         v4Seen(c, other_v4, 3),
-    }).v4.?;
+    }).v4 orelse return error.TestUnexpectedResult;
     try t.expect(contested.contested());
     try t.expect(!contested.confirmed());
     try t.expectEqual(@as(?bool, true), contested.varies);
@@ -541,7 +547,7 @@ test "a one-relay address cannot outrank a two-relay one however fast it is" {
         v4Seen(a, public_v4, 40),
         v4Seen(b, public_v4, 41),
         v4Seen(c, other_v4, 1),
-    }).v4.?;
+    }).v4 orelse return error.TestUnexpectedResult;
     try t.expectEqual(public_v4, claim.addr);
     try t.expectEqual(@as(u8, 2), claim.relays);
     try t.expectEqual(millis(40), claim.latency);
@@ -559,23 +565,26 @@ test "the claims do not depend on the order the sightings arrived in" {
         v4Seen(b, public_v4, 41),
         v4Seen(c, other_v4, 1),
     };
-    const reference = fold(&set).v4.?;
+    const reference = fold(&set).v4 orelse return error.TestUnexpectedResult;
 
     // Every element held back and re-folded is the trivial half of the claim;
     // the rotations are the half that matters, and between them they put every
     // sighting in every position. A table whose order depended on arrival would
     // not survive this, and neither would a subject chosen by first-seen.
     var rotated = [_]Sighting{ set[1], set[2], set[0] };
-    try t.expectEqual(reference.addr, fold(&rotated).v4.?.addr);
-    try t.expectEqual(reference.latency, fold(&rotated).v4.?.latency);
-    try t.expectEqual(reference.relays, fold(&rotated).v4.?.relays);
-    try t.expectEqual(reference.contradicting, fold(&rotated).v4.?.contradicting);
-    try t.expectEqual(reference.varies, fold(&rotated).v4.?.varies);
+    const first_rotation = fold(&rotated).v4 orelse return error.TestUnexpectedResult;
+    try t.expectEqual(reference.addr, first_rotation.addr);
+    try t.expectEqual(reference.latency, first_rotation.latency);
+    try t.expectEqual(reference.relays, first_rotation.relays);
+    try t.expectEqual(reference.contradicting, first_rotation.contradicting);
+    try t.expectEqual(reference.varies, first_rotation.varies);
     rotated = .{ set[2], set[0], set[1] };
-    try t.expectEqual(reference.addr, fold(&rotated).v4.?.addr);
+    const second_rotation = fold(&rotated).v4 orelse return error.TestUnexpectedResult;
+    try t.expectEqual(reference.addr, second_rotation.addr);
     rotated = .{ set[2], set[1], set[0] };
-    try t.expectEqual(reference.addr, fold(&rotated).v4.?.addr);
-    try t.expectEqual(reference.latency, fold(&rotated).v4.?.latency);
+    const reversed = fold(&rotated).v4 orelse return error.TestUnexpectedResult;
+    try t.expectEqual(reference.addr, reversed.addr);
+    try t.expectEqual(reference.latency, reversed.latency);
 }
 
 test "two addresses seen once each resolve to the same claim in either order" {
@@ -585,8 +594,10 @@ test "two addresses seen once each resolve to the same claim in either order" {
 
     // Equal latency and equal support, so only the address can settle it.
     // `SocketAddr.order` puts every v4 before every v6 and then compares bytes.
-    const forward = fold(&.{ v4Seen(a, public_v4, 10), v4Seen(b, other_v4, 10) }).v4.?;
-    const backward = fold(&.{ v4Seen(a, other_v4, 10), v4Seen(b, public_v4, 10) }).v4.?;
+    const forward = fold(&.{ v4Seen(a, public_v4, 10), v4Seen(b, other_v4, 10) }).v4 orelse
+        return error.TestUnexpectedResult;
+    const backward = fold(&.{ v4Seen(a, other_v4, 10), v4Seen(b, public_v4, 10) }).v4 orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(forward.addr, backward.addr);
     try t.expectEqual(@as(?bool, true), forward.varies);
     try t.expectEqual(@as(u8, 1), forward.relays);
@@ -604,16 +615,20 @@ test "the two families are claimed separately and independently" {
         seen(a, public_v6, 30, .v6, .v6),
         seen(b, public_v6, 31, .v6, .v6),
     });
-    try t.expectEqual(public_v4, claims.v4.?.addr);
-    try t.expectEqual(millis(10), claims.v4.?.latency);
-    try t.expectEqual(public_v6, claims.v6.?.addr);
-    try t.expectEqual(millis(30), claims.v6.?.latency);
+    const v4_claim = claims.v4 orelse return error.TestUnexpectedResult;
+    const v6_claim = claims.v6 orelse return error.TestUnexpectedResult;
+    try t.expectEqual(public_v4, v4_claim.addr);
+    try t.expectEqual(millis(10), v4_claim.latency);
+    try t.expectEqual(public_v6, v6_claim.addr);
+    try t.expectEqual(millis(30), v6_claim.latency);
     // Each is corroborated on its own relays, and the same two relays count for
     // both families because they are two probes rather than one.
-    try t.expect(claims.v4.?.confirmed());
-    try t.expect(claims.v6.?.confirmed());
-    try t.expectEqual(claims.v4.?.addr, claims.get(.v4).?.addr);
-    try t.expectEqual(claims.v6.?.addr, claims.get(.v6).?.addr);
+    try t.expect(v4_claim.confirmed());
+    try t.expect(v6_claim.confirmed());
+    const v4_lookup = claims.get(.v4) orelse return error.TestUnexpectedResult;
+    const v6_lookup = claims.get(.v6) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(v4_claim.addr, v4_lookup.addr);
+    try t.expectEqual(v6_claim.addr, v6_lookup.addr);
 }
 
 test "a mapped address is claimed as the v4 address it names, and never as v6" {
@@ -630,7 +645,8 @@ test "a mapped address is claimed as the v4 address it names, and never as v6" {
     try t.expectEqual(Family.v4, mapped.observation.ipFamily());
     try t.expect(mapped.isAddressBearing());
 
-    const claim = fold(&.{ v4Seen(a, public_v4, 10), mapped }).v4.?;
+    const claim = fold(&.{ v4Seen(a, public_v4, 10), mapped }).v4 orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(public_v4, claim.addr);
     try t.expectEqual(@as(u8, 2), claim.relays);
     try t.expect(claim.confirmed());
@@ -652,10 +668,12 @@ test "a mapped address is claimed as the v4 address it names, and never as v6" {
     const raw = seen(a, .{ .ip = .{ .v6 = mapped_v6 }, .port = 41234 }, 10, .v6, .v6);
     try t.expect(std.meta.eql(raw.observation.addr.ip, .{ .v6 = mapped_v6 }));
     const split = fold(&.{ raw, v4Seen(b, public_v4, 12) });
-    try t.expectEqual(@as(u8, 1), split.v6.?.relays);
-    try t.expectEqual(@as(u8, 1), split.v4.?.relays);
-    try t.expect(split.v6.?.unmeasured());
-    try t.expect(split.v4.?.unmeasured());
+    const v6_claim = split.v6 orelse return error.TestUnexpectedResult;
+    const v4_claim = split.v4 orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(u8, 1), v6_claim.relays);
+    try t.expectEqual(@as(u8, 1), v4_claim.relays);
+    try t.expect(v6_claim.unmeasured());
+    try t.expect(v4_claim.unmeasured());
 }
 
 test "a sighting past the bound is dropped and nothing fails" {
@@ -669,7 +687,7 @@ test "a sighting past the bound is dropped and nothing fails" {
     // this is corroborated. Five relays is `max_observers` and enough; a sixth
     // is dropped rather than refused, because a lost witness costs a weaker
     // claim and never a wrong one.
-    const within = fold(sightings[0..max_observers]).v4.?;
+    const within = fold(sightings[0..max_observers]).v4 orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(u8, max_observers), within.relays);
     try t.expect(within.confirmed());
 
@@ -677,14 +695,15 @@ test "a sighting past the bound is dropped and nothing fails" {
     // the sixth is dropped. The bound is on the table rather than on arrival,
     // and the surviving five all reported the same address, so the claim is
     // unchanged — a lost witness costs a weaker claim, never a wrong one.
-    const beyond = fold(sightings[0 .. max_observers + 1]).v4.?;
+    const beyond = fold(sightings[0 .. max_observers + 1]).v4 orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(@as(u8, max_observers), beyond.relays);
     try t.expect(beyond.confirmed());
     try t.expectEqual(public_v4, beyond.addr);
     try t.expectEqual(millis(10), beyond.latency);
 
     // A table holding three relays reports three, never five.
-    const three = fold(sightings[0..3]).v4.?;
+    const three = fold(sightings[0..3]).v4 orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(u8, 3), three.relays);
     try t.expect(three.confirmed());
     try t.expectEqual(millis(10), three.latency);

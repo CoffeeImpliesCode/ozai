@@ -17,18 +17,16 @@ from the certificate, moves bytes both ways, and carries ECN over a real socket.
 `test/relay_wire_test.zig` and `test/two_process_test.zig` exercise relay
 forwarding, payload delivery, and independent shutdown on loopback.
 
-The full iroh matrix, native NAT and node-level authenticated 0-RTT remain open.
-The TLS smoke below has a separate, bounded proof.
-Four additional relay routes passed with exact 34-byte application payloads and peer pins.
-They cover both carrier roles and both UDP-blocked, relay-only inner QUIC roles.
-The relay-only routes recorded one dial or one accept, with stable connection IDs.
-Fresh runs after the fixture's `Node.close` change produced no dropped-serving diagnostic.
-These results do not prove mixed Bao/gossip transfer or native NAT traversal.
+The full upstream iroh matrix and node-level authenticated 0-RTT remain open.
+Historical controlled-NAT receipts cover both endpoint-A roles.
+Historical relay receipts cover exact 34-byte application payloads, pinned peers and both authenticated inner-QUIC roles.
+Current source repairs require fresh consumer acceptance.
+Bao, gossip, relay and controlled NAT retain separate proof boundaries.
 
 The node executes the gossip codec through its incoming and outgoing QUIC stream routes.
 The current call-site map below replaces the older unwired-codec claim.
 
-The live `test-gossip-interop` Debug run passed 7/7.
+The historical live `test-gossip-interop` Debug run passed 7/7.
 Stock Rust and Node exercised both roles with the exact 32-byte topic, broadcast payload and application acknowledgment.
 Both wrong-pin routes rejected the peer.
 The deliberate pin rejection produced an expected `UnknownIssuer` warning.
@@ -37,7 +35,7 @@ Those captures prove enum and encoding agreement, not a captured 4,096-byte payl
 The 4,096/4,097 boundary tests use hand-built declarations.
 They test the source-derived strict write limit and inclusive read limit separately.
 
-The live `test-blobs-interop` Debug run passed 5/5 tests over 6/6 steps.
+The historical live `test-blobs-interop` Debug run passed 5/5 tests over 6/6 steps.
 Two grouped tests exercised six actual Rust/Node transfers, with each implementation as getter and provider.
 The cases cover the 49,189-byte whole blob, cross-group chunks `15:18` and partial-tail chunks `47:49`.
 The ranges returned exactly 3,072 and 1,061 bytes.
@@ -46,6 +44,181 @@ The oracle source is pinned iroh-blobs `e82cbdcbdac9a78033174aad55e3199b2cf4c0dc
 Its response captures contain 49,389, 3,656 and 1,453 bytes.
 The live checks retain exact output equality, verified completion and EOF.
 Rust provider accounting includes the one-byte GET tag that upstream reads before the request body.
+
+The Node provider passes its remaining request budget to stream drain.
+An oversized contiguous run is rejected before allocation or consumption.
+Already accepted request bytes remain intact, and the unread run remains available.
+
+### Current public consumer contracts
+
+Blob transfer decisions are pure state transitions.
+`Decoded.claimed_size` is an unauthenticated response header, not a verified length.
+`verified_size` requires a matching expected size or authenticated terminal data.
+A nonterminal proof authenticates selected bytes, not the total-size claim.
+The getter uses a finite Bao allowance and tightens it after the header.
+The claimed size can reduce that allowance. It cannot grant verification.
+Known-size allowance is the eight-byte header plus the exact Bao plan.
+Unknown-size allowance uses `4 * (max_depth + 1)` bounded items of block-plus-pair bytes.
+Empty or overflowing plans refuse instead of allocating an unbounded response.
+Missing data and provider refusal end only the affected stream.
+Other provider errors still propagate. Node serves GET only, not GetMany, Observe or Push.
+`BlobSet` and `BlobClaim` remain standalone, outside the Node transfer adapter.
+
+Node wipes its owned `config.secret` and optional `config.relay.client.secret` on release and construction rollback.
+Bridge, Dialer and relay client cleanup wipe their separate owned key copies.
+These wipes do not erase caller-held originals, borrowed keys or independent `toBytes()` copies.
+
+Gossip receive accepts actual encoded messages up to and including 4,096 bytes.
+Gossip send requires fewer than 4,096 bytes, including the actual scope, round and TTL encoding.
+Local broadcast and public receive preflight size before startup timers, output, cache or statistics change.
+Rejected input does not leave an unowned maintenance timer. A valid later input can start maintenance.
+An accepted message with an oversized derived round still permits valid delivery and tree-control work.
+It does not promise an unwritable eager, lazy or cached message.
+Refill declines an oversized derived Neighbor before random selection, pending state, output or timers.
+Valid receive, departure and timeout cleanup still completes. Direct sender requests retain `MessageTooLarge`.
+Node stream assemblies belong to a peer and survive another connection for that peer closing.
+
+Relay TCP has separate client, server, HTTP, forwarding, execution, listener, native-path and WebSocket processor modules.
+Consumers use `tcp_client.Client` and `tcp_server.Server`, not an obsolete carrier or public `Listener` shim.
+Execution contexts are borrowed and must outlive their TCP owners and concurrent stop calls.
+
+DNS TCP fallback retains one pending connection across finite cancellation slices.
+UDP and TCP share one request budget. Resolver stop remains distinguishable as `Canceled`.
+`Answer.records` owns copied TXT bytes. Each stream owns its parsed item and copied custom-address data.
+Borrowed `RecordSet.bytes` must outlive every stream. Parent answer teardown follows the synchronous stream walk.
+Retrieval cancellation is operation-local and leaves a live Resolver usable for a later query.
+Explicit global Resolver cancellation remains terminal.
+The public regression covers reuse after UDP wait, pending TCP fallback and partial TCP fallback cancellation.
+All three real native UDP follow-up queries passed in Debug and ReleaseSafe (`bg317`).
+The Node's synchronous lookup does not expose that cancellation handle.
+
+Child construction returns either a ready owner or the exact failed owner with its start error.
+A failed post-spawn capture does not imply that the child has exited.
+Cleanup deadlines and errors retain the owner and process identity.
+Callers keep that storage until cleanup proves reap, then deinitialize it.
+No signal is authorized without exact process identity through process I/O.
+Public gate and CLI boundaries expose finite explicit error sets.
+Child pump and wait errors remain typed, not unrestricted error reflection.
+
+Assembly allocation failure publishes no usable output prefix and closes the QUIC connection.
+Path abandonment is different. It requeues reliable bytes and FIN onto a surviving path and retains ACK history.
+The sequence/last-local native cancellation model remains standalone. It is not wired into Node cancellation.
+
+The Rust peer requires actual blob EOF, the final real application acknowledgment, optional IP and repeated topics.
+These source contracts do not extend historical wire receipts or establish current final acceptance.
+
+### Integration snapshot, 2026-10-08
+
+The earlier schema-2 measurements and default-gate receipts describe their captured source only.
+The current repairs invalidate those receipts for current-source acceptance.
+Fresh schema-3 capture, exact cold-tuple decisions, strict replay and the full default gate remain pending.
+No current all-source count, coverage percentage or all-seven-issues completion claim is made.
+
+Main observed these results after the repairs:
+
+| Scope | Observed result | Boundary |
+|---|---|---|
+| Vendored QUIC (`bg288`) | Debug and ReleaseSafe each passed 671/671 tests. | This is not the complete default gate. |
+| Gate policy (`bg298`) | Debug and ReleaseSafe each passed 116/116 tests. | This is not a fresh coverage capture or final replay. |
+| Pinned Rust peer (`bg293`) | 30/30 tests and the release build passed. | This does not prove every mixed Rust/Node route. |
+| Normal-root integration (`bg317`) | Debug and ReleaseSafe each passed 28/28 steps and 2538/2538 tests. Exit 0 in 257.27 seconds. | Each mode includes library 1317/1317, portable 1041/1041 and child helpers 35/35. Fresh capture, full default gate and live smokes have not run. |
+| Current consumer regressions (`bg317`) | All 38 migrated gossip cases and the three Resolver cancellation-reuse paths passed in both modes. | The same run covers owned-key rollback/release wipes, blob proof/budget/refusal, TCP rollback and WebSocket decisions, native standalone cancellation, and child identity/retained-owner cleanup. It is not a wire-interoperability receipt. |
+
+Earlier mixed-peer receipts cover pinned TLS identities, exact blob/range output, gossip broadcasts, and both relay endpoint roles.
+Those receipts remain historical after the current source repairs.
+Configured controlled-NAT receipts prove relay-to-direct behavior, not learned candidates or mixed Rust/Zig endpoint NAT.
+The full upstream matrix and Node-level authenticated 0-RTT remain open.
+Standalone models and explicit issue admissions do not receive production execution or coverage credit.
+
+The [issue checklist](TODO.md#issue-16-checklist-disposition) keeps every named requirement and its proof boundary.
+The strict workflow below describes the required current capture and replay, not an observed final pass.
+
+
+### Strict coverage snapshot workflow
+
+The default gate always runs the configured full checks before it validates retained coverage.
+It builds and tests current source without instrumentation in both Debug and ReleaseSafe.
+The test scope includes `test`, `test-portable`, `quic-test`, `invariants` and `test-gate-policy`.
+Configured format, syntax, ziglint, zlint, native ZBC, Zwanzig and cross-target checks remain required.
+Missing cross-target runners retain build-only status. They do not count as runtime passes.
+The default then performs full current-source validation of the required retained measurement.
+It does not start a new instrumented measurement.
+
+The legacy `refdecls` and `compile-all` names describe declaration checks, not separate driver sections.
+`test` runs the `src/root.zig` declaration sweep.
+`test-portable` runs the socket-free `src/portable_test.zig` sweeps.
+`quic-test` runs `vendor/quic/src/test_all.zig`, including core declaration sweeps and explicit internal/test-only imports.
+`test-gate-policy` runs the gate-module sweeps in `scripts/project_gate.zig`.
+These executed roots reconcile the Compile-all requirement in `AGENTS.md` with the driver.
+`invariants` adds vendored source-contract checks. It does not replace core runtime tests.
+No new gate abstraction or declaration-only coverage credit applies.
+
+```sh
+source ~/.local/lib/host-scratch.sh
+devenv shell -- gate
+```
+
+Use `measure` for an explicit fresh capture:
+
+```sh
+source ~/.local/lib/host-scratch.sh
+export TMPDIR="$HOST_SCRATCH_ROOT/scratch" TMP="$HOST_SCRATCH_ROOT/scratch" TEMP="$HOST_SCRATCH_ROOT/scratch"
+export ZIG_LOCAL_CACHE_DIR="$HOST_SCRATCH_ROOT/scratch/zig-local"
+export ZIG_GLOBAL_CACHE_DIR="$HOST_SCRATCH_ROOT/scratch/zig-global"
+export ZIG=/absolute/path/to/zig-0.16.0/zig
+export OZAI_COVERAGE_RT="$HOME/tools/zcov/zig-out/lib/zig-cov-rt.o"
+"$ZIG" run --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+  scripts/project_gate.zig -- measure
+```
+
+Use only the helper's approved host-local root for temporary files, caches and retained evidence.
+Do not use the repository, NFS, `/tmp` or `/var/tmp` for these files.
+`OZAI_COVERAGE_RT` is a prerequisite for `measure`. Set it to the installed runtime object if its path differs.
+Default snapshot replay does not require a fresh instrumentation runtime.
+The devenv `gate` wrapper selects the default command. Use the direct driver for `measure` and `validate`.
+
+This command builds and tests current source without instrumentation in both modes.
+It then captures fresh instrumented coverage for the same five test targets in both modes.
+Retain the resulting `measurement.json`, compiled artifacts, raw files and reports.
+Regenerate the exact cold-tuple decisions and counters in `docs/COVERAGE-LEDGER.md` for that capture.
+Use one `ozai-coverage-v2` machine fence. Both the machine ledger and Measurement use schema 3.
+The fence requires `measurement: {path, sha256}`.
+Set `path` to the exact nonempty manifest path.
+Set `sha256` to the captured file's 64-hex-character SHA-256.
+The validator checks that file hash before it trusts the manifest.
+
+Replay the selected manifest explicitly:
+
+```sh
+"$ZIG" run --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+  scripts/project_gate.zig -- validate /absolute/scratch/path/to/current/measurement.json
+```
+
+`validate <path>` requires the fence reference to match that exact path and SHA-256.
+Default validation reads the same required reference and uses the same full replay.
+Replay checks current source, compiler identity, scope, modes and all source, artifact, raw and report hashes.
+Capture binds the original absolute instrumentation-runtime object path and its SHA-256.
+Replay rehashes that retained object, independent of a fresh `OZAI_COVERAGE_RT` environment value.
+All source-inventory paths remain represented, including absent roots and test sources.
+Cold DWARF rows can outnumber mapped PCs. That difference does not indicate report corruption.
+It checks raw-file completeness, exact-PC projection, ordered report rows and all counters.
+It preserves the full positive DWARF numeric-row universe and direct-PC hit attribution.
+It compares stored `Measurement.cold_items` with every replay-generated tuple by field content.
+The identity fields are `mode`, `path`, `source_sha256`, `line` and `unit`.
+Duplicate, omitted, stale or extra cold tuples fail. Changed tuple metadata also fails.
+Ledger decisions must match the exact cold tuples. Covered or stale extra decisions do not qualify.
+Reported project-unmapped and source-unowned totals and hits must match exactly.
+Coverage documents remain bounded to 64 MiB.
+
+Missing or changed references, manifests, artifacts or decisions fail the default gate.
+Source, compiler or scope drift also fails it until a fresh capture and exact fence replace the snapshot.
+There is no advisory result, opt-out, skipped coverage check, schema fallback, tolerance or retry-to-green.
+Rust interop, relay role smokes and controlled-NAT receipts retain their separate scopes and admissions.
+They do not replace this coverage replay or acquire coverage credit from it.
+
+
+Earlier counts below describe their own snapshots, not this integration.
+[`TODO.md`](TODO.md#issue-16-checklist-disposition) maps the orchestration checklist to executable routes and explicit admissions.
 
 ### RFC 7250 live TLS and stream proof
 
@@ -58,7 +231,7 @@ these client/server routes:
 - strict `noq` 1.3.0 client to Zig server
 - stock iroh 1.3.0 client to Zig server
 
-All four routes negotiated `/iroh-gossip/1` and exchanged the exact 17-byte
+All four routes negotiated `ozai` and exchanged the exact 17-byte
 `ozai-to-iroh-peer` and `iroh-peer-to-ozai` payloads on one bidirectional
 stream. The direct `noq` path checks the peer pin during TLS. Stock iroh keeps
 its upstream verifier and resolver unchanged. The harness checks the observed
@@ -341,9 +514,9 @@ Their retained dispositions are in [`docs/COVERAGE-LEDGER.md`](docs/COVERAGE-LED
 | Subsystem | Production call chain | Remaining admission |
 |---|---|---|
 | Gossip codec | `Node.step` → `node_gossip.receive/gossip`. Outbound: `feedGossip` → `node_gossip_wire.send` → `gossip.codec.encode` → QUIC unidirectional stream. Inbound decode feeds the node handler. | Live stock Rust/Node both-role exchange and wrong-pin rejection passed in the 7/7 Debug run. |
-| DNS, PKARR, TLS | `Node.step` → `node_discovery.pass` → `node_discovery_wire` → `dns_live.Retrieval.ask` or `pkarr_live`. PKARR uses `tls_client` over TCP. | Discovery is opt-in. Default configuration performs no lookup or publication. |
-| TCP | `tls_client` uses `transport/tcp`. `tcp_carrier.Client.init` connects the relay stream. | Standalone TCP tests alone do not prove these consumers. |
-| WebSocket, HTTP upgrade, relay | Outbound: `node_transport.send` → `State.sendMapped` → `Client.send` → `Session.relay`. Inbound: `takeRelay` → runtime poll/receive → carrier → WebSocket/relay decode → `Bridge.recv`. | The carrier lifetime is separate from the inner QUIC lifetime. |
+| DNS, PKARR, TLS | `Node.step` → `node_discovery.pass` → `node_discovery_wire.ask`/`publish` → `dns_live.Retrieval.ask`, `pkarr_live.resolve` or `pkarr_live.publish`. PKARR uses `tls_client.Client.open` over TCP. | Discovery is opt-in. Defaults perform no lookup or publication. Configured Node API routes support PKARR, but the CLI does not enable its relay/resolve configuration. No Node-level PKARR network proof is recorded. Signed-provenance tests do not prove live publication. |
+| TCP | `tls_client` uses `transport/tcp`. `tcp_client.Client.init` connects the relay stream. | Standalone TCP tests alone do not prove these consumers. |
+| WebSocket, HTTP upgrade, relay | Outbound: `node_transport.send` → `State.sendMapped` → `Client.send` → `Session.relay`. Inbound: `takeRelay` → runtime poll/receive → TCP client → WebSocket/relay decode → `Bridge.recv`. | `tcp_client` and `tcp_server` use separate HTTP, forwarding, execution, listener, native-path and WebSocket processor modules. The carrier lifetime is separate from inner QUIC. No compatibility `Listener` remains. |
 | Observed address, reporter, QAD, QNT | `node_build` passes opt-in `address_discovery_role` to bridge and dial configurations. The vendor negotiates native roles and processes observed-address frames. | No node consumer turns `Conn.observedAddress` into candidates or publications. `observed_reporter` and Number-Time `qnt.zig` remain standalone. |
 | Path selection, table, revalidation, probe | `Node.step` → `node_native.pass` → native candidate/path snapshots → `path_action.planSelect` → `multipath.applyAction` → `Conn.selectPath`. | Generic `path_table`, `path_select`, `path_revalidate`, and `path_probe` remain standalone. No production caller mirrors native counters into their table. |
 
@@ -366,6 +539,26 @@ Native terminal state does not feed generic `holepunch.Outcome`.
 Accepted physical-source 1-RTT packet evidence does not prove per-path application bytes.
 Node ticket capture, storage, reconnect offer, early-send limits and replay policy remain unwired.
 
+##### Explicit standalone-subsystem admissions for issue #2
+
+Issue #2 permits a named admission instead of a production route and real-route test.
+The following modules remain standalone under that option.
+Their module tests do not prove Node execution or give production coverage credit.
+Each admission ends when a production consumer requires the named behavior.
+
+| Subsystem | Explicit admission and proof boundary |
+|---|---|
+| Blob GetMany, Observe and Push | Their codecs and local policies exist, but the Node provider accepts only EOF-framed GET. Other requests return `WrongRequest`. Whole/range GET interop does not prove these variants. |
+| BlobTicket and EndpointTicket production use | The codecs have no Node ticket caller. BlobTicket returns explicit `Loss` data for projection losses, but no production caller logs it. The planned logging route remains absent. |
+| `node/topic_table` | This standalone table does not drive Node gossip. Production gossip uses configured topics and its own connection-stream map. |
+| Peer `ticket_cache` and `ticket_lifecycle` | No Node route consumes these EndpointTicket policies. This is separate from the missing TLS resumption ticket integration. |
+| `net/interface` | The local interface reader does not supply Node traversal candidates. The native route uses caller-configured candidates. |
+| `statistics` and `statistics_report` | The subject-statistics policies have no Node consumer. Flat `node_stats` runtime counters do not exercise them. |
+| `net/ecn_feedback` | The per-path feedback policy has no Node consumer. Production socket/core ECN transport does not prove this policy. |
+| `connection_budget`, `lane_budget` and `shutdown_budget` | Node does not enforce these standalone policies. Existing connection capacity and shutdown behavior are separate runtime mechanisms. |
+| Relay access policy and KeyMaterialAuth | The tested carrier uses challenge authentication. The separate `access_policy`/`server_handshake` model and HTTP KeyMaterialAuth credential path do not drive that carrier. No broader authorization proof is claimed. |
+
+
 The mixed-protocol checks and controlled NAT acceptance use separate opt-in targets:
 
 ```sh
@@ -380,11 +573,16 @@ ORIGINAL_USERNS=$(readlink /proc/self/ns/user)
   --endpoint-a-role both --for-ms 45000
 ```
 
-The NAT fixture runs two independent `ozai-relay-fixture` Node/Noq processes behind
-separate controlled Linux NATs, with a stock Rust 1.3 relay server as the third process.
-It is not a mixed Rust/Zig endpoint NAT proof. Bao, gossip and the mixed Rust relay
-carrier checks retain their separate live evidence. Controlled NAT acceptance remains
-pending until both endpoint-A roles pass.
+The controlled NAT proof passed on 2026-10-07 in both endpoint-A roles. Two
+independent Node/Noq processes ran behind separate Linux source-NAT routers,
+with a stock Rust 1.3 relay server. Both exchanged the exact 33-byte payload
+first over authenticated relay, then over direct UDP on stable connection ID 1;
+both peer pins matched and both endpoint processes exited zero. This is not a
+mixed Rust/Zig endpoint NAT proof. Bao, gossip and mixed Rust relay carrier
+checks retain their separate live evidence.
+The historical acceptance directory is
+`/tmp/scratch/ozai-nat-final-8weQQz`.
+
 
 Set `NODE_PEER` to the absolute path of `ozai-relay-fixture`, `RUST_RELAY` to the
 absolute path of `ozai-iroh-peer`, and `EVIDENCE_DIR` to an existing caller-owned,
@@ -398,8 +596,9 @@ WAN candidate `10.77.0.2:4444`. Endpoint B binds `10.78.2.2:4444` with seed `6c`
 repeated 32 times and configured candidate `10.77.0.3:4444`.
 Both pins are derived from the same deterministic Ed25519 seed construction used
 by the Node fixture, rather than copied from another implementation's identity.
-The candidates match the routers' actual port-preserving source SNAT endpoints;
-they are configured, not learned by QAD. There is no destination NAT.
+The candidates match the routers' actual port-preserving source-SNAT endpoints;
+they are configured, not learned by QAD. No static DNAT rule is installed.
+Established conntrack state reverse-translates peer replies.
 
 By default both roles run: A server/B client, then A client/B server.
 `--endpoint-a-role server` or `client` selects one execution.
@@ -408,8 +607,32 @@ Each execution requires authenticated relay-first and direct-phase exact applica
 bytes on the same stable connection and pinned identity at each endpoint, one
 dial/accept pair, both peer exits zero, and positive physical forwarding and translated
 counters after the relay evidence opens the initially blocked UDP gate.
-The phase deadline is at most 45 seconds. Evidence preserves each process's output,
-exit status, command, topology counters and cleanup record.
+
+| Endpoint A role | Blocked packets | Direct packets | Translated packets |
+|---|---:|---:|---:|
+| server | 8 | 26 | 2 |
+| client | 8 | 19 | 2 |
+
+The rows above belong to the 2026-10-07 proof.
+The fresh 2026-10-08 current-source NAT run followed a 7/7-step ReleaseSafe fixture build.
+It exited 0 in 3.26 seconds and retained evidence at
+`/tmp/scratch/ozai-nat-current-liHnnQ`.
+Two independent Node/Noq peers used a stock Rust relay and distinct private source-NAT routers.
+Both endpoint-A roles completed authenticated relay fallback then direct traffic with stable connection ID 1 at each endpoint.
+Each checked exact 33-byte payloads and expected pins. Both peer exits were 0.
+Cleanup terminated the owned relay and reaped the namespace keepers.
+WAN candidates remained configured, not learned. This is not mixed Rust/Zig endpoint NAT proof.
+
+| Current endpoint A role | Blocked packets | Direct packets | Translated packets |
+|---|---:|---:|---:|
+| server | 7 | 19 | 2 |
+| client | 8 | 20 | 2 |
+
+
+The bridge counter records dropped probes before opening and physically forwarded
+candidate frames afterward. The translated counter records first SNAT packets
+across both routers. The phase deadline is at most 45 seconds. Evidence preserves
+each process's output, exit status, command, topology counters and cleanup record.
 This does not close the separate Zig mapping-learning or strict X.509 QAD admissions.
 
 ### Earlier records, kept as dated history
@@ -442,9 +665,10 @@ elision, fixture rows and the reporter's conditional filter can affect it.
 That run accepted unsupported-session ABI panics (0/16), kernel interruptions
 and refusals it did not force, and compile-time or fixture attribution gaps.
 CLI refusal guards were separately smoke-tested; no duplicate tests were added
-to inflate counters. Two pre-existing map allocation-fault gaps and their
-triggers are in [`TODO.md`](TODO.md). These historical lists apply only to
-their named runs. The earlier whole-tree measurement is under
+to inflate counters. That dated run recorded two map allocation-fault gaps;
+`src/transport/addr_map.zig` now sweeps reverse- and forward-insertion OOM,
+rollback and recovery. The historical coverage lists apply only to their
+named runs. The earlier whole-tree measurement is under
 [*Earlier whole-tree coverage measurement*](#earlier-whole-tree-coverage-measurement-2026-10-06).
 
 After the portability fixes, `zig-gate --no-cross --cov` passed all nine local
@@ -490,7 +714,7 @@ duplicate permanent tests were added to raise them.
 | `src/net/` | The net report fold, the NAT classifier, and the holepunch gate. |
 | `src/transport/` | The synthetic-ULA allocation, the GSO/GRO/ECN seam and its socket, the bridge to the QUIC core, and the dial path. |
 | `src/router/`, `src/endpoint/` | ALPN dispatch, the accept loop, and the incoming filter. |
-| `src/gossip/` | HyParView, PlumTree, the gossip wire codec (`codec.zig` plus `codec/`), and a deterministic in-process simulator. The codec is built and tested but the node does not call it yet. |
+| `src/gossip/` | HyParView, PlumTree, the gossip wire codec (`codec.zig` plus `codec/`), and a deterministic in-process simulator. The node encodes and decodes the codec through real QUIC stream routes. |
 | `vendor/quic/` | The sans-IO QUIC core, 33 files, pinned by commit. No socket, no clock, no global entropy, no libc. |
 
 Pinned to bytes captured from the Rust implementation at a named commit:
@@ -504,16 +728,14 @@ different kind — published upstream vectors rather than iroh's bytes, in
 `src/gossip/plumtree/blake3_vectors.zig` and
 `src/crypto/blake3_subtree_vectors.zig`.
 
-Five formats in this tree declare that **no** captured upstream bytes exist
-for them, and each says so in its own module doc rather than here: the gossip
-codec (`src/gossip/codec.zig`), QUIC address discovery (`src/net/qad.zig`),
-QUIC NAT traversal (`src/net/qnt.zig`), the WebSocket frame layer
-(`src/relay/ws_frame.zig`, whose vectors are RFC 6455's own worked examples),
-and the host-answer records (`src/discovery/host_answer.zig`, constructed
-rather than captured). Where such a module has a golden vector, the vector is
-derived from a written specification and is pinned as a *declared* table, not
-as evidence about a peer. The rule is unchanged: a claim with no captured
-bytes attached does not go in.
+Four formats retain declared rather than captured upstream-byte vectors:
+QUIC address discovery (`src/net/qad.zig`), Number-Time QUIC NAT traversal (`src/net/qnt.zig`),
+the WebSocket layer (`src/relay/ws_frame.zig`) and host-answer records (`src/discovery/host_answer.zig`).
+WebSocket vectors use RFC 6455 examples. Host-answer records are local constructions.
+These declared tables are not evidence about an upstream peer.
+Gossip now has pinned upstream serializer/state-machine outputs at `iroh-gossip` commit `2885dd9f1120e46aca5acbcd7f212e4c64e278b9`.
+The retained provenance and byte-for-byte tests are separate from live socket proofs and hand-built boundary vectors.
+They are not packet captures.
 
 Read [`docs/PLAN.md`](docs/PLAN.md) for the milestone order and the reasoning,
 and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the module tree, the
@@ -535,7 +757,7 @@ zig build             # static library + the node binary, both installed
 zig build test        # unit + integration tests
 zig build test-portable # socket-free protocol and state-machine tests
 zig build run-ozai-node-id
-devenv shell -- gate  # configured checks plus strict Debug/ReleaseSafe coverage
+devenv shell -- gate  # configured checks, both safety modes and strict retained coverage replay
 devenv shell -- gate-strict  # exact alias of gate
 ```
 
@@ -549,30 +771,53 @@ can wait for a connection, delivery, or departure before sending SIGTERM.
 Without `--progress`, the node prints only its banner and final report.
 The SIGINT/SIGTERM handlers are installed before the listening banner is published.
 
-Both entry points run the same project-owned, fail-closed gate. It validates
-the pinned Zig version, runs `zig-gate` with `ZBC_STRICT=1` and the project
-exclusions, then measures Debug and ReleaseSafe and validates the embedded
-coverage ledger. `gate-strict` is an exact alias, not a separate weaker or
-stronger configuration.
+Both entry points run the same project-owned, fail-closed gate.
+It validates the pinned Zig version and runs strict ZBC and all remaining configured `zig-gate` sections.
+It then builds and tests current source without instrumentation in Debug and ReleaseSafe.
+Finally, it fully replays the required current-source retained coverage snapshot.
+The schema-3 machine fence must name the exact manifest path and captured SHA-256.
+Default does not start a new instrumented measurement. `gate-strict` is an exact alias.
 
-The configured `zig-gate` sections are fmt, build, test, ast-check, ziglint,
-zlint, zbc, zwanzig and cross-test. The project measurement additionally
-builds and tests `test`, `test-portable`, `quic-test`, `invariants` and
-`test-gate-policy` in both modes. There is no separate section named
-`refdecls` or `compile-all`; declaration checks run through the registered
-`std.testing.refAllDecls` tests in the roots.
+The ZBC stage uses the declared Nix libc loader and matching libraries for the
+installed ELF. Native, line-scoped exceptions require source and tool hashes
+in `.zbc-source-exceptions.json`. A hash change invalidates the exception record.
+The gate rejects wildcard and file-wide controls. ZBC must analyze the full
+selected inventory and report no active findings. Tool errors and incomplete
+summaries fail the gate.
 
-The measurement and raw counter files stay under an owned host-scratch
-evidence root. The validator checks the current source digest, compiler,
-scope, modes and one disposition for every cold item. Coverage rows are
-inferred line hits, not branch or path coverage. To collect evidence before
-updating the ledger, use the project driver's `measure` command; the normal
-`gate` command also requires the current embedded record.
+The remaining `zig-gate` sections are fmt, build, test, ast-check, ziglint, zlint, zwanzig and cross-test.
+Default also runs current uninstrumented `test`, `test-portable`, `quic-test`, `invariants` and `test-gate-policy` in both safety modes.
+There is no separate section named `refdecls` or `compile-all`.
+Declaration checks run through the registered `std.testing.refAllDecls` tests.
+
+The retained manifest, artifacts and raw counter files stay under an owned host-scratch evidence root.
+The schema-3 ledger requires one `ozai-coverage-v2` fence with `measurement: {path, sha256}`.
+The validator checks the exact manifest path and file SHA-256 before it trusts the manifest.
+Full replay checks current source/compiler identity, scope, both modes, artifact/raw/report hashes, complete raw inputs, exact report rows and counters.
+Stored cold tuples and ledger decisions must match the replay-generated tuples exactly.
+The line denominator includes the full generated DWARF numeric-row universe, not only rows observed by instrumented PCs.
+Positive GNU-PC mappings provide hits. Other numeric rows remain cold.
+These are line hits, not branch or path coverage.
+Only the explicit `measure` command captures fresh instrumented coverage in both modes.
+After capture, regenerate the exact current fence, decisions and counters.
+The normal `gate` command always requires full retained replay and fails closed on source/compiler/evidence drift.
+See the [strict snapshot workflow](#strict-coverage-snapshot-workflow) for concrete refresh and replay commands.
+
+The raw audit merges repeated binary/PC counters and checks them against the
+report's project block totals. Known-project PCs with no source line contribute
+to project block totals, not inferred line coverage. PCs with unresolved source
+ownership remain separate and do not enter the project denominator. Both
+categories require exact per-mode counts and written ledger reasons.
+External DWARF paths do not enter the project source inventory.
+
+`zig build fuzz --fuzz=1` runs the bounded decoder targets in ReleaseSafe.
+The gossip oracle uses the production four-byte big-endian frame prefix.
+It checks semantic values, borrowed slices and canonical encode/decode behavior.
 
 `GATE_EXCLUDE` is set by the project gate to exclude `vendor/quic`,
 `.zig-cache/`, `zig-out/`, `zig-cache/`, `zig-global-cache/` and
 `zig-pkg/` from the configured source scan. The vendored core is still built
-and tested by `quic-test` in both measured modes.
+and tested by `quic-test` in Debug and ReleaseSafe on every default invocation.
 
 ### Consume as a package
 
@@ -651,7 +896,7 @@ which the rejected alternative would win.
 
 `cross-test.profile.sh` runs the full Linux socket/process suite, including the
 node artifact built for each target. Its default matrix is
-**16 little-endian musl rows plus native x86_64 GNU**, not every Linux ABI.
+**15 little-endian musl rows plus native x86_64 GNU**, not every Linux ABI.
 Foreign GNU runs require compatible guest runtimes and are separate from
 that self-contained gate. `cross-test.portable.profile.sh` surveys all 108
 libc ABI targets listed by the pinned Zig 0.16 compiler. It uses
@@ -660,6 +905,9 @@ unique non-`std` `@import` specifiers in that file, each with a matching
 `refAllDecls` and no duplicates. It does **not** claim a non-Linux node
 backend. An earlier figure of 32 modules is history and no longer describes
 the file.
+
+The default profile excludes LoongArch64 `muslf32`: pinned LLVM reports its
+`lp64f` ABI as unstandardized. Canonical `musl` and soft-float `muslsf` remain.
 
 The portable root excludes the disk-backed `blobs/observe.zig` and
 `blobs/push.zig` suites. Their eight observe tests and seven push tests remain

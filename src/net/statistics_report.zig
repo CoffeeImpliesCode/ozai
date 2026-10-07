@@ -181,6 +181,11 @@ pub const Report = struct {
     }
 };
 
+const Rank = struct {
+    subject: SocketAddr,
+    slowest: Nanos,
+};
+
 /// Read `table` as it stood at `now`.
 ///
 /// `scratch` is where each subject's window is sorted on the way past, and it
@@ -199,8 +204,8 @@ pub fn build(
     scratch: *[stats.max_samples]Nanos,
 ) Report {
     var report: Report = .{};
-    var best: ?usize = null;
-    var worst: ?usize = null;
+    var best: ?Rank = null;
+    var worst: ?Rank = null;
 
     for (table.slice(), 0..) |entry, index| {
         const summary = entry.latency.summary(scratch);
@@ -224,20 +229,21 @@ pub fn build(
         // Strict, so a tie keeps the earliest row, and the rows are in
         // `SocketAddr.order` — so the tie is broken by the lower address rather
         // than by whoever was measured first.
+        const rank: Rank = .{ .subject = entry.subject, .slowest = figure };
         if (worst) |held| {
-            if (figure > report.rows[held].slowest.?) worst = index;
+            if (figure > held.slowest) worst = rank;
         } else {
-            worst = index;
+            worst = rank;
         }
         if (best) |held| {
-            if (figure < report.rows[held].slowest.?) best = index;
+            if (figure < held.slowest) best = rank;
         } else {
-            best = index;
+            best = rank;
         }
     }
 
-    if (best) |index| report.best = report.rows[index].subject;
-    if (worst) |index| report.worst = report.rows[index].subject;
+    if (best) |held| report.best = held.subject;
+    if (worst) |held| report.worst = held.subject;
     return report;
 }
 
@@ -263,7 +269,7 @@ fn millis(n: u64) Nanos {
 fn mixedTable() !stats.Table {
     var table: stats.Table = .{};
     _ = try table.open(testSubject(1));
-    const entry = table.find(testSubject(1)).?;
+    const entry = table.find(testSubject(1)) orelse return error.TestUnexpectedResult;
     entry.attempt(null, test_now);
     entry.attempt(millis(15), test_now);
     entry.attempt(null, test_now);
@@ -294,7 +300,7 @@ test "a subject nobody measured reports no latency rather than a zero one" {
     var scratch: [stats.max_samples]Nanos = undefined;
     const report = build(&table, test_now, &scratch);
 
-    const row = report.row(testSubject(1)).?;
+    const row = report.row(testSubject(1)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(u64, 0), row.attempted);
     try t.expectEqual(@as(u64, 0), row.recorded);
     try t.expectEqual(@as(u32, 0), row.held);
@@ -348,17 +354,17 @@ test "a failed attempt is a count and never a latency" {
     var scratch: [stats.max_samples]Nanos = undefined;
     const report = build(&table, test_now, &scratch);
 
-    const row = report.row(testSubject(1)).?;
+    const row = report.row(testSubject(1)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(u64, 3), row.attempted);
     try t.expectEqual(@as(u64, 1), row.recorded);
     try t.expectEqual(@as(u64, 2), row.failed());
     try t.expectEqual(@as(u32, 1), row.held);
     try t.expectEqual(@as(u64, 0), row.dropped());
     // One measurement, so one latency. The two refusals left no sample behind.
-    try t.expectEqual(millis(15), row.fastest.?);
-    try t.expectEqual(millis(15), row.slowest.?);
-    try t.expectEqual(millis(15), row.median.?);
-    try t.expectEqual(@as(Nanos, 0), row.age.?);
+    try t.expectEqual(@as(?Nanos, millis(15)), row.fastest);
+    try t.expectEqual(@as(?Nanos, millis(15)), row.slowest);
+    try t.expectEqual(@as(?Nanos, millis(15)), row.median);
+    try t.expectEqual(@as(?Nanos, 0), row.age);
 
     var buffer: [512]u8 = undefined;
     var out = std.Io.Writer.fixed(&buffer);
@@ -373,23 +379,23 @@ test "a failed attempt is a count and never a latency" {
 test "the window size and what it discarded are reported beside the median" {
     var table: stats.Table = .{};
     _ = try table.open(testSubject(1));
-    const entry = table.find(testSubject(1)).?;
+    const entry = table.find(testSubject(1)) orelse return error.TestUnexpectedResult;
     var step: u64 = 1;
     while (step <= stats.max_samples + 3) : (step += 1) entry.attempt(millis(step), step);
 
     var scratch: [stats.max_samples]Nanos = undefined;
     const report = build(&table, test_now, &scratch);
 
-    const row = report.row(testSubject(1)).?;
+    const row = report.row(testSubject(1)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(u64, stats.max_samples + 3), row.recorded);
     try t.expectEqual(@as(u32, stats.max_samples), row.held);
     try t.expectEqual(@as(u64, 3), row.dropped());
     // The window is the sixteen most recent — 4 ms through 19 ms — so the
     // median is the lower of its two middles, and the all-time extrema are
     // the ones no overwrite took.
-    try t.expectEqual(millis(11), row.median.?);
-    try t.expectEqual(millis(1), row.fastest.?);
-    try t.expectEqual(millis(19), row.slowest.?);
+    try t.expectEqual(@as(?Nanos, millis(11)), row.median);
+    try t.expectEqual(@as(?Nanos, millis(1)), row.fastest);
+    try t.expectEqual(@as(?Nanos, millis(19)), row.slowest);
 
     var buffer: [512]u8 = undefined;
     var out = std.Io.Writer.fixed(&buffer);
@@ -405,10 +411,13 @@ test "best and worst rank on the slowest latency and break a tie by address" {
     _ = try table.open(testSubject(2));
     _ = try table.open(testSubject(3));
     _ = try table.open(testSubject(4));
-    table.find(testSubject(1)).?.attempt(millis(40), test_now);
-    table.find(testSubject(2)).?.attempt(millis(10), test_now);
-    table.find(testSubject(2)).?.attempt(millis(40), test_now);
-    table.find(testSubject(3)).?.attempt(millis(90), test_now);
+    const first = table.find(testSubject(1)) orelse return error.TestUnexpectedResult;
+    const second = table.find(testSubject(2)) orelse return error.TestUnexpectedResult;
+    const third = table.find(testSubject(3)) orelse return error.TestUnexpectedResult;
+    first.attempt(millis(40), test_now);
+    second.attempt(millis(10), test_now);
+    second.attempt(millis(40), test_now);
+    third.attempt(millis(90), test_now);
     // subject(4) is filed and never measured, so it is a row and not a rank.
 
     var scratch: [stats.max_samples]Nanos = undefined;
@@ -416,28 +425,31 @@ test "best and worst rank on the slowest latency and break a tie by address" {
 
     try t.expectEqual(@as(usize, 4), report.len);
     // 1 and 2 tie on a worst case of 40 ms and the lower address wins.
-    try t.expect(testSubject(1).order(report.best.?) == .eq);
-    try t.expect(testSubject(3).order(report.worst.?) == .eq);
+    const best = report.best orelse return error.TestUnexpectedResult;
+    const worst = report.worst orelse return error.TestUnexpectedResult;
+    try t.expect(testSubject(1).order(best) == .eq);
+    try t.expect(testSubject(3).order(worst) == .eq);
     // The unmeasured row is present and ranked nowhere: it holds no slowest
     // latency, and ranking needs one.
-    const unmeasured = report.row(testSubject(4)).?;
+    const unmeasured = report.row(testSubject(4)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(?Nanos, null), unmeasured.slowest);
-    try t.expect(testSubject(4).order(report.best.?) != .eq);
-    try t.expect(testSubject(4).order(report.worst.?) != .eq);
+    try t.expect(testSubject(4).order(best) != .eq);
+    try t.expect(testSubject(4).order(worst) != .eq);
 }
 
 test "a report is a value of the table and of the instant, not a view" {
     var table: stats.Table = .{};
     _ = try table.open(testSubject(1));
-    table.find(testSubject(1)).?.attempt(millis(10), test_now - millis(30));
+    const initial = table.find(testSubject(1)) orelse return error.TestUnexpectedResult;
+    initial.attempt(millis(10), test_now - millis(30));
     var scratch: [stats.max_samples]Nanos = undefined;
     const before = build(&table, test_now, &scratch);
-    try t.expectEqual(millis(10), before.slice()[0].slowest.?);
-    try t.expectEqual(millis(30), before.slice()[0].age.?);
+    try t.expectEqual(@as(?Nanos, millis(10)), before.slice()[0].slowest);
+    try t.expectEqual(@as(?Nanos, millis(30)), before.slice()[0].age);
 
     // Recording more moves the table and not the report, so a caller holding
     // an earlier report is holding the figures it was built with.
-    const entry = table.find(testSubject(1)).?;
+    const entry = table.find(testSubject(1)) orelse return error.TestUnexpectedResult;
     entry.attempt(millis(90), test_now);
     entry.attempt(null, test_now);
     try t.expectEqual(@as(u64, 3), entry.attempted.value);
@@ -446,21 +458,23 @@ test "a report is a value of the table and of the instant, not a view" {
     // which is the same subtraction the report below is checked against.
     try t.expectEqual(@as(u64, 1), entry.failed());
     try t.expectEqual(@as(u64, 1), before.slice()[0].attempted);
-    try t.expectEqual(millis(10), before.slice()[0].slowest.?);
-    try t.expect(testSubject(1).order(before.best.?) == .eq);
+    try t.expectEqual(@as(?Nanos, millis(10)), before.slice()[0].slowest);
+    const best = before.best orelse return error.TestUnexpectedResult;
+    try t.expect(testSubject(1).order(best) == .eq);
 
     // And the same table at the same instant reports the same figures, so the
     // scratch buffer is not an input to anything.
     const again = build(&table, test_now, &scratch);
     try t.expectEqual(@as(u64, 3), again.slice()[0].attempted);
     try t.expectEqual(@as(u64, 1), again.slice()[0].failed());
-    try t.expectEqual(millis(90), again.slice()[0].slowest.?);
+    try t.expectEqual(@as(?Nanos, millis(90)), again.slice()[0].slowest);
 }
 
 test "time is an argument, so a later report is an older age" {
     var table: stats.Table = .{};
     _ = try table.open(testSubject(1));
-    table.find(testSubject(1)).?.attempt(millis(10), test_now - millis(10));
+    const entry = table.find(testSubject(1)) orelse return error.TestUnexpectedResult;
+    entry.attempt(millis(10), test_now - millis(10));
     var scratch: [stats.max_samples]Nanos = undefined;
 
     const later = build(&table, test_now, &scratch);
@@ -470,9 +484,11 @@ test "time is an argument, so a later report is an older age" {
     // One measurement, three instants: the latencies are the same three times
     // and only the age moves, which is what "pure over its inputs" means for a
     // report whose caller owns the clock.
-    try t.expectEqual(millis(10), later.slice()[0].age.?);
-    try t.expectEqual(@as(Nanos, 0), earlier.slice()[0].age.?);
-    try t.expectEqual(millis(110), future.slice()[0].age.?);
+    try t.expectEqual(@as(?Nanos, millis(10)), later.slice()[0].age);
+    try t.expectEqual(@as(?Nanos, 0), earlier.slice()[0].age);
+    try t.expectEqual(@as(?Nanos, millis(110)), future.slice()[0].age);
     try t.expectEqual(later.slice()[0].recorded, earlier.slice()[0].recorded);
-    try t.expectEqual(later.slice()[0].median.?, earlier.slice()[0].median.?);
+    const later_median = later.slice()[0].median orelse return error.TestUnexpectedResult;
+    const earlier_median = earlier.slice()[0].median orelse return error.TestUnexpectedResult;
+    try t.expectEqual(later_median, earlier_median);
 }

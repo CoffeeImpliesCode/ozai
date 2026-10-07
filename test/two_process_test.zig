@@ -68,6 +68,9 @@ const launch = @import("two_process_launch.zig");
 const progress_ns = @import("two_process_progress.zig");
 const report_ns = @import("two_process_report.zig");
 const roster_ns = @import("two_process_roster.zig");
+const child_cleanup = @import("child_cleanup.zig");
+const child_exit_probe = @import("child_exit_probe.zig");
+const child_constructor_safety = @import("child_constructor_safety.zig");
 
 const Process = child.Process;
 const Roster = roster_ns.Roster;
@@ -125,7 +128,7 @@ test "two node processes meet on a socket and both wind down in order" {
     var roster: Roster = .{};
     defer roster.deinit(t.allocator);
 
-    const listener = try startNode(&roster, t.allocator, arena.allocator(), t.io, "listener", .{
+    const listener = try startNode(t.io, t.allocator, arena.allocator(), &roster, "listener", .{
         .tag = 0x51,
         .run_ms = watchdog_ms,
         .seed = 0x1111,
@@ -136,7 +139,7 @@ test "two node processes meet on a socket and both wind down in order" {
     }
 
     const one_peer = [_][]const u8{try launch.peer(arena.allocator(), listener)};
-    const dialer = try startNode(&roster, t.allocator, arena.allocator(), t.io, "dialer", .{
+    const dialer = try startNode(t.io, t.allocator, arena.allocator(), &roster, "dialer", .{
         .tag = 0xc1,
         .run_ms = watchdog_ms,
         .seed = 0x2222,
@@ -169,8 +172,8 @@ test "two node processes meet on a socket and both wind down in order" {
     // have between them is a pass, which is why they are not staggered — that
     // is the shape the control test below builds on purpose, and a pass in
     // between would make this the two SIGTERM tests instead.
-    try dialer.stop();
-    try listener.stop();
+    try dialer.stop(t.io);
+    try listener.stop(t.io);
     const listener_term = try roster.reap(t.io, listener, budget_ms);
     const dialer_term = try roster.reap(t.io, dialer, budget_ms);
     try report_ns.expectWoundDown(listener, listener_term);
@@ -223,13 +226,13 @@ test "two connected nodes stopped back to back wind down" {
     var roster: Roster = .{};
     defer roster.deinit(t.allocator);
 
-    const gate = try startNode(&roster, t.allocator, arena.allocator(), t.io, "gate", .{
+    const gate = try startNode(t.io, t.allocator, arena.allocator(), &roster, "gate", .{
         .tag = 0x33,
         .run_ms = watchdog_ms,
         .seed = 0x3333,
     });
     defer gate.deinit(t.io);
-    const listener = try startNode(&roster, t.allocator, arena.allocator(), t.io, "listener", .{
+    const listener = try startNode(t.io, t.allocator, arena.allocator(), &roster, "listener", .{
         .tag = 0x51,
         .run_ms = watchdog_ms,
         .seed = 0x1111,
@@ -243,7 +246,7 @@ test "two connected nodes stopped back to back wind down" {
     }
 
     const both_peers = try launch.peers(arena.allocator(), gate, listener);
-    const dialer = try startNode(&roster, t.allocator, arena.allocator(), t.io, "dialer", .{
+    const dialer = try startNode(t.io, t.allocator, arena.allocator(), &roster, "dialer", .{
         .tag = 0xc1,
         .run_ms = watchdog_ms,
         .seed = 0x2222,
@@ -262,7 +265,7 @@ test "two connected nodes stopped back to back wind down" {
     // land on nodes that have finished connecting.
     try roster.awaitWant(t.io, gate, "an arrival it had handled", arrived, budget_ms);
     try roster.awaitWant(t.io, listener, "an arrival it had handled", arrived, budget_ms);
-    try gate.stop();
+    try gate.stop(t.io);
     const gate_term = try roster.reap(t.io, gate, budget_ms);
     try report_ns.expectGate(gate, gate_term);
 
@@ -274,8 +277,8 @@ test "two connected nodes stopped back to back wind down" {
     // because the dialer's other peer is the gate — which died moments ago,
     // and whether the core had given that connection up yet is a race this
     // file has no business joining.
-    try listener.stop();
-    try dialer.stop();
+    try listener.stop(t.io);
+    try dialer.stop(t.io);
     const listener_term = try roster.reap(t.io, listener, budget_ms);
     const dialer_term = try roster.reap(t.io, dialer, budget_ms);
     try report_ns.expectWoundDown(listener, listener_term);
@@ -302,13 +305,13 @@ test "a SIGTERM to the dialling process leaves the listening one running, and it
     var roster: Roster = .{};
     defer roster.deinit(t.allocator);
 
-    const gate = try startNode(&roster, t.allocator, arena.allocator(), t.io, "gate", .{
+    const gate = try startNode(t.io, t.allocator, arena.allocator(), &roster, "gate", .{
         .tag = 0x33,
         .run_ms = watchdog_ms,
         .seed = 0x3333,
     });
     defer gate.deinit(t.io);
-    const listener = try startNode(&roster, t.allocator, arena.allocator(), t.io, "listener", .{
+    const listener = try startNode(t.io, t.allocator, arena.allocator(), &roster, "listener", .{
         .tag = 0x51,
         .run_ms = watchdog_ms,
         .seed = 0x1111,
@@ -322,7 +325,7 @@ test "a SIGTERM to the dialling process leaves the listening one running, and it
     }
 
     const both_peers = try launch.peers(arena.allocator(), gate, listener);
-    const dialer = try startNode(&roster, t.allocator, arena.allocator(), t.io, "dialer", .{
+    const dialer = try startNode(t.io, t.allocator, arena.allocator(), &roster, "dialer", .{
         .tag = 0xc1,
         .run_ms = watchdog_ms,
         .seed = 0x2222,
@@ -339,11 +342,11 @@ test "a SIGTERM to the dialling process leaves the listening one running, and it
     // stopped only once it holds a connection this test can then watch end.
     try roster.awaitWant(t.io, gate, "an arrival it had handled", arrived, budget_ms);
     try roster.awaitWant(t.io, listener, "an arrival it had handled", arrived, budget_ms);
-    try gate.stop();
+    try gate.stop(t.io);
     const gate_term = try roster.reap(t.io, gate, budget_ms);
     try report_ns.expectGate(gate, gate_term);
 
-    try dialer.stop();
+    try dialer.stop(t.io);
     const dialer_term = try roster.reap(t.io, dialer, budget_ms);
     try report_ns.expectWoundDown(dialer, dialer_term);
     try report_ns.expectCounts(dialer, &.{
@@ -373,7 +376,7 @@ test "a SIGTERM to the dialling process leaves the listening one running, and it
     // claim is unchanged and only the moment it is read at has stopped being a
     // guess.
     try roster.awaitWant(t.io, listener, "a connection it had given up", one_gave_up, budget_ms);
-    try listener.stop();
+    try listener.stop(t.io);
     const listener_term = try roster.reap(t.io, listener, budget_ms);
     try report_ns.expectWoundDown(listener, listener_term);
     try report_ns.expectCounts(listener, &.{
@@ -396,13 +399,13 @@ test "a SIGTERM to the listening process leaves the dialling one running, and it
     var roster: Roster = .{};
     defer roster.deinit(t.allocator);
 
-    const gate = try startNode(&roster, t.allocator, arena.allocator(), t.io, "gate", .{
+    const gate = try startNode(t.io, t.allocator, arena.allocator(), &roster, "gate", .{
         .tag = 0x33,
         .run_ms = watchdog_ms,
         .seed = 0x3333,
     });
     defer gate.deinit(t.io);
-    const listener = try startNode(&roster, t.allocator, arena.allocator(), t.io, "listener", .{
+    const listener = try startNode(t.io, t.allocator, arena.allocator(), &roster, "listener", .{
         .tag = 0x51,
         .run_ms = watchdog_ms,
         .seed = 0x1111,
@@ -416,7 +419,7 @@ test "a SIGTERM to the listening process leaves the dialling one running, and it
     }
 
     const both_peers = try launch.peers(arena.allocator(), gate, listener);
-    const dialer = try startNode(&roster, t.allocator, arena.allocator(), t.io, "dialer", .{
+    const dialer = try startNode(t.io, t.allocator, arena.allocator(), &roster, "dialer", .{
         .tag = 0xc1,
         .run_ms = watchdog_ms,
         .seed = 0x2222,
@@ -433,13 +436,13 @@ test "a SIGTERM to the listening process leaves the dialling one running, and it
     // connection this test then watches end.
     try roster.awaitWant(t.io, gate, "an arrival it had handled", arrived, budget_ms);
     try roster.awaitWant(t.io, listener, "an arrival it had handled", arrived, budget_ms);
-    try gate.stop();
+    try gate.stop(t.io);
     const gate_term = try roster.reap(t.io, gate, budget_ms);
     try report_ns.expectGate(gate, gate_term);
 
     // The other direction: the node that answers is the one that is stopped,
     // and the node that dialled has to be the one that notices.
-    try listener.stop();
+    try listener.stop(t.io);
     const listener_term = try roster.reap(t.io, listener, budget_ms);
     try report_ns.expectWoundDown(listener, listener_term);
     try report_ns.expectCounts(listener, &.{
@@ -464,7 +467,7 @@ test "a SIGTERM to the listening process leaves the dialling one running, and it
     // gone, so the gate's departure and the listener's are both counted, and
     // the gate that read one of them has already been reaped above.
     try roster.awaitWant(t.io, dialer, "both connections it had given up", two_gave_up, budget_ms);
-    try dialer.stop();
+    try dialer.stop(t.io);
     const dialer_term = try roster.reap(t.io, dialer, budget_ms);
     try report_ns.expectWoundDown(dialer, dialer_term);
     try report_ns.expectCounts(dialer, &.{
@@ -508,7 +511,7 @@ test "a closing node counts what its close told, and a peer left running shows i
     // that closes first is stopped once its own connection is up, so the close
     // it writes below really is a close over a live connection and not a node
     // that had nothing to tell anyone.
-    const listener = try startNode(&roster, t.allocator, arena.allocator(), t.io, "listener", .{
+    const listener = try startNode(t.io, t.allocator, arena.allocator(), &roster, "listener", .{
         .tag = 0x51,
         .run_ms = watchdog_ms,
         .seed = 0x1111,
@@ -519,7 +522,7 @@ test "a closing node counts what its close told, and a peer left running shows i
     }
 
     const one_peer = [_][]const u8{try launch.peer(arena.allocator(), listener)};
-    const dialer = try startNode(&roster, t.allocator, arena.allocator(), t.io, "dialer", .{
+    const dialer = try startNode(t.io, t.allocator, arena.allocator(), &roster, "dialer", .{
         .tag = 0xc1,
         .run_ms = watchdog_ms,
         .seed = 0x2222,
@@ -534,7 +537,7 @@ test "a closing node counts what its close told, and a peer left running shows i
     // `--for` that now establishes that.
     try roster.awaitWant(t.io, listener, "an arrival it had handled", arrived, budget_ms);
     try roster.awaitWant(t.io, dialer, "a dialled connection that was up", dialled, budget_ms);
-    try dialer.stop();
+    try dialer.stop(t.io);
     const dialer_term = try roster.reap(t.io, dialer, budget_ms);
     try report_ns.expectWoundDown(dialer, dialer_term);
     try report_ns.expectCounts(dialer, &.{
@@ -559,7 +562,7 @@ test "a closing node counts what its close told, and a peer left running shows i
     // counter at the pass where the core says it retired one, which is the
     // same claim with the guess taken out.
     try roster.awaitWant(t.io, listener, "a connection it had given up", one_gave_up, budget_ms);
-    try listener.stop();
+    try listener.stop(t.io);
     const listener_term = try roster.reap(t.io, listener, budget_ms);
     try report_ns.expectWoundDown(listener, listener_term);
     try report_ns.expectCounts(listener, &.{
@@ -582,7 +585,7 @@ test "a node that never reached a peer reports a close with nothing in it" {
     // listens, so the shutdown below is the first thing this node has ever
     // done to a connection. The watchdog is long enough that the signal is the
     // only thing in the run that can end it.
-    const alone = try startNode(&roster, t.allocator, arena.allocator(), t.io, "alone", .{
+    const alone = try startNode(t.io, t.allocator, arena.allocator(), &roster, "alone", .{
         .tag = 0x33,
         .run_ms = watchdog_ms,
         .seed = 0x3333,
@@ -591,7 +594,7 @@ test "a node that never reached a peer reports a close with nothing in it" {
     if (!try roster.await(t.io, alone, &Process.saidWhereItListens, budget_ms)) {
         return alone.gaveUp("never said where it was listening", .{});
     }
-    try alone.stop();
+    try alone.stop(t.io);
 
     const alone_term = try roster.reap(t.io, alone, budget_ms);
     try report_ns.expectWoundDown(alone, alone_term);
@@ -640,7 +643,8 @@ test "process progress parser accepts exact twelve fields and rejects obsolete o
             "neighbour up 8, broadcasts received 9, blob transfers completed 10, " ++
             "blob sent bytes 11, blob received bytes 12",
         "progress: dials 1, refused 2, accepted 3, finished 4, up 5, attempts 6, spawned 7, " ++
-            "neighbour up 8, broadcasts received 9, blob transfers completed 10, blob sent bytes 11",
+            "neighbour up 8, broadcasts received 9, " ++
+            "blob transfers completed 10, blob sent bytes 11",
         line ++ ", obsolete 13",
         line ++ ", ",
         line ++ " trailing",
@@ -648,4 +652,10 @@ test "process progress parser accepts exact twelve fields and rejects obsolete o
     for (rejected) |invalid| {
         try t.expectEqual(@as(?progress_ns.Progress, null), progress_ns.parseProgress(invalid));
     }
+}
+
+test {
+    t.refAllDecls(child_cleanup);
+    t.refAllDecls(child_exit_probe);
+    t.refAllDecls(child_constructor_safety);
 }

@@ -46,10 +46,9 @@
 //!
 //! **The bundle is the caller's, not this file's.** `std`'s
 //! `Certificate.Bundle.rescan` reads the host's trust store, which is a
-//! filesystem read of files whose path is a policy; `tls_client.rescanTrust`
-//! exposes it as an explicit named call so a caller that wants the host store
-//! asks for it, and a caller that wants a pinned bundle passes its own. Nothing
-//! here reads a file unless the caller calls that function.
+//! filesystem read of files whose path is a policy. A caller that wants the
+//! host store explicitly rescans its bundle; a caller that wants pinned trust
+//! passes its own bundle. Nothing here reads a file.
 //!
 //! **Certificate time is the caller's too.** `Options.now` is a
 //! `std.Io.Timestamp`, not a clock read, because a validity window is an input
@@ -106,13 +105,6 @@ pub const entropy_length: usize = tls.Client.Options.entropy_len;
 /// narrowing it here would discard the one thing a caller diagnosing a relay
 /// needs, which is which of them it was.
 pub const Error = tls.Client.InitError || tcp.OpenError || tcp.ConnectError;
-
-/// Everything a trust scan can fail with.
-///
-/// `Certificate.Bundle.RescanError`, which is a filesystem read's own set: this
-/// is the only function in the file that touches the disk, and it does so
-/// because the caller asked.
-pub const TrustError = Certificate.Bundle.RescanError;
 
 /// The trust material and the handshake inputs, as one value.
 ///
@@ -248,7 +240,7 @@ pub const Client = struct {
     ) Error!Client {
         std.debug.assert(options.read_buffer.len >= buffer_length);
         std.debug.assert(options.write_buffer.len >= buffer_length);
-        var stream = try tcp.Tcp.create(server);
+        var stream = try tcp.Tcp.create(io, server, .native);
         errdefer stream.close();
         try stream.connect(io, options.timeout_ms);
 
@@ -411,26 +403,6 @@ const Link = struct {
     timeout_ms: ?i32,
 };
 
-/// Rescan the host's trust store into `bundle`.
-///
-/// The one call in this file that touches the filesystem, and it is a named one
-/// so a caller that wants the host's certificate authorities asks for them by
-/// name rather than having them read as a side effect of opening a connection.
-/// A caller that wants a pinned bundle — which is what a node embedding this
-/// should usually do, so its trust does not move under it — never calls this.
-///
-/// `now` is the timestamp the rescan dates any certificate it finds by, and it
-/// is a parameter for the reason `Options.now` is: a validity window is an input
-/// to a decision rather than a fact this module discovers.
-pub fn rescanTrust(
-    bundle: *Certificate.Bundle,
-    alloc: std.mem.Allocator,
-    io: std.Io,
-    now: std.Io.Timestamp,
-) TrustError!void {
-    try bundle.rescan(alloc, io, now);
-}
-
 /// The raw socket, read into a writer's slice.
 ///
 /// `std.Io.Reader`'s `stream` entry: the reader hands over a slice it wants
@@ -480,6 +452,8 @@ fn streamOut(
     }
     // `splat` is the driver writing one byte many times, which is what a record
     // layer does for a run of zeros; the loop is what makes the count exact.
+    // std.Io.Writer's drain contract requires nonempty data; ZBC cannot see that caller guarantee.
+    // zbc-disable-next-line: index-minus-one-without-zero-guard
     const pattern = data[data.len - 1];
     var at: usize = 0;
     while (at < splat) : (at += 1) try writeAll(self, pattern);
@@ -549,10 +523,8 @@ const c = std.c;
 
 /// A connected loopback stream and the peer on the other end of it.
 ///
-/// Built with `std.c` directly and not through `transport/tcp.zig`'s surface:
-/// that module's doc says it has no listener and no accept, and a fixture that
-/// built its peer out of the module under test could not tell a forwarding bug
-/// from a working one.
+/// Built with `std.c` directly so its peer is independent of the transport
+/// owner under test.
 const Pair = struct {
     listener: c.fd_t,
     /// The accepted end, held so the connection is not torn down between the
@@ -564,7 +536,7 @@ const Pair = struct {
         const listener = try bindLoopback(0);
         errdefer _ = c.close(listener);
         if (c.listen(listener, 1) != 0) return error.TestFixtureRefused;
-        var stream = try tcp.Tcp.create(loopback(try portOf(listener)));
+        var stream = try tcp.Tcp.create(t.io, loopback(try portOf(listener)), .native);
         errdefer stream.close();
         try stream.connect(t.io, fixture_timeout_ms);
         return .{ .listener = listener, .peer = try acceptOne(listener), .stream = stream };

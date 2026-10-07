@@ -148,176 +148,234 @@ pub const Options = struct {
                 try out.print("ozai-node: {s} wants a value\n", .{flag});
                 return .{ .rejected = error.FlagWithoutValue };
             };
-            if (std.mem.eql(u8, flag, "--listen")) {
-                options.listen = cli_values.parseSocket(value) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-            } else if (std.mem.eql(u8, flag, "--peer")) {
-                const peer = cli_values.parsePeer(value) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-                // The arena is the process's and does not grow on its own, so
-                // this can only fail if the process is out of memory — which
-                // is propagated rather than dressed up as a bad argument.
-                try options.peers.append(arena, peer);
-            } else if (std.mem.eql(u8, flag, "--lookup-peer")) {
-                const id = ozai.NodeId.parseZ32(value) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-                try options.lookup_peers.append(arena, id);
-            } else if (std.mem.eql(u8, flag, "--dns-server")) {
-                const server = cli_values.parseSocket(value) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-                if (server.port == 0) {
-                    try cli_values.reject(out, flag, value, error.AddressNotReachable);
-                    return .{ .rejected = error.AddressNotReachable };
-                }
-                options.dns_server = server;
-            } else if (std.mem.eql(u8, flag, "--dns-origin")) {
-                options.dns_origin = cli_values.parseDnsOrigin(value) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-                // Wire DNS names must be absolute; accept the usual suffix
-                // spelling without silently relying on a host search domain.
-                if (!std.mem.endsWith(u8, options.dns_origin, "."))
-                    options.dns_origin = try std.fmt.allocPrint(arena, "{s}.", .{options.dns_origin});
-            } else if (std.mem.eql(u8, flag, "--lookup-deadline")) {
-                options.lookup_deadline_ms = cli_values.parseLookupMilliseconds(i32, value, std.math.maxInt(i32)) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-            } else if (std.mem.eql(u8, flag, "--lookup-interval")) {
-                options.lookup_interval_ms = cli_values.parseLookupMilliseconds(u64, value, cli_values.max_lookup_interval_ms) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-            } else if (std.mem.eql(u8, flag, "--expect-peer")) {
-                options.expect_peer = ozai.NodeId.parseZ32(value) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-            } else if (std.mem.eql(u8, flag, "--key-seed")) {
-                const seed = ozai.base32.decode(
-                    ozai.base32.z32,
-                    SecretKey.seed_length,
-                    value,
-                ) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-                options.secret = SecretKey.fromSeed(seed) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-            } else if (std.mem.eql(u8, flag, "--alpn")) {
-                options.alpn = value;
-            } else if (std.mem.eql(u8, flag, "--peer-relay")) {
-                const peer = cli_values.parseRelayPeer(value) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-                try options.peers.append(arena, peer);
-            } else if (std.mem.eql(u8, flag, "--relay-listen") or
-                std.mem.eql(u8, flag, "--relay-server") or
-                std.mem.eql(u8, flag, "--traversal-address"))
-            {
-                const address = cli_values.parseSocket(value) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-                if (std.mem.eql(u8, flag, "--relay-listen")) {
-                    options.relay_listen = address;
-                } else {
-                    if (address.port == 0) {
-                        try cli_values.reject(out, flag, value, error.AddressNotReachable);
-                        return .{ .rejected = error.AddressNotReachable };
-                    }
-                    if (std.mem.eql(u8, flag, "--relay-server")) {
-                        options.relay_server = address;
-                    } else {
-                        if (options.traversal_addresses.items.len == 2) {
-                            try cli_values.reject(out, flag, value,
-                                error.TooManyTraversalAddresses);
-                            return .{ .rejected = error.TooManyTraversalAddresses };
-                        }
-                        try options.traversal_addresses.append(arena, address);
-                    }
-                }
-            } else if (std.mem.eql(u8, flag, "--relay-host")) {
-                if (value.len == 0 or std.mem.indexOfAny(u8, value, "\r\n") != null) {
-                    try cli_values.reject(out, flag, value, error.InvalidRelayHost);
-                    return .{ .rejected = error.InvalidRelayHost };
-                }
-                options.relay_host = value;
-            } else if (std.mem.eql(u8, flag, "--topic-hex")) {
-                if (options.gossip_topics.items.len == 4) {
-                    try cli_values.reject(out, flag, value, error.TooManyTopics);
-                    return .{ .rejected = error.TooManyTopics };
-                }
-                const topic = cli_values.parseTopic(value) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-                try options.gossip_topics.append(arena, topic);
-            } else if (std.mem.eql(u8, flag, "--message")) {
-                options.message = value;
-            } else if (std.mem.eql(u8, flag, "--blob-role")) {
-                options.blob_role = std.meta.stringToEnum(BlobRole, value) orelse {
-                    try cli_values.reject(out, flag, value, error.InvalidBlobRole);
-                    return .{ .rejected = error.InvalidBlobRole };
-                };
-            } else if (std.mem.eql(u8, flag, "--blob-hash")) {
-                options.blob_hash = cli_values.parseBlobHash(value) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-            } else if (std.mem.eql(u8, flag, "--blob-size")) {
-                options.blob_size = std.fmt.parseInt(u64, value, 10) catch {
-                    try cli_values.reject(out, flag, value, error.InvalidBlobSize);
-                    return .{ .rejected = error.InvalidBlobSize };
-                };
-            } else if (std.mem.eql(u8, flag, "--blob-range")) {
-                options.blob_range = cli_values.parseBlobRange(value) catch |err| {
-                    try cli_values.reject(out, flag, value, err);
-                    return .{ .rejected = err };
-                };
-                options.blob_range_explicit = true;
-            } else if (std.mem.eql(u8, flag, "--blob-dir") or
-                std.mem.eql(u8, flag, "--blob-output"))
-            {
-                if (value.len == 0) {
-                    try cli_values.reject(out, flag, value, error.EmptyPath);
-                    return .{ .rejected = error.EmptyPath };
-                }
-                if (std.mem.eql(u8, flag, "--blob-dir")) options.blob_dir = value
-                else options.blob_output = value;
-            } else if (std.mem.eql(u8, flag, "--seed")) {
-                options.seed = std.fmt.parseInt(u64, value, 10) catch {
-                    try cli_values.reject(out, flag, value, error.NotASeed);
-                    return .{ .rejected = error.NotASeed };
-                };
-            } else if (std.mem.eql(u8, flag, "--for")) {
-                options.run_ms = std.fmt.parseInt(i64, value, 10) catch {
-                    try cli_values.reject(out, flag, value, error.NotMilliseconds);
-                    return .{ .rejected = error.NotMilliseconds };
-                };
-            } else {
-                try out.print("ozai-node: {s} is not an option\n", .{flag});
-                try out.writeAll(usage);
-                return .{ .rejected = error.NotAnOption };
-            }
+            if (try options.parseValue(arena, flag, value, out)) |refusal| return refusal;
         }
         if (try contradictions(out, options)) |refusal| return .{ .rejected = refusal };
         if (options.blob_role != null) options.alpn = ozai.blobs_protocol.alpn;
         if (options.gossip_topics.items.len != 0) options.alpn = node_mod.gossip_alpn;
 
         return .{ .run = options };
+    }
+
+    fn parseValue(
+        options: *Options,
+        arena: Allocator,
+        flag: []const u8,
+        value: []const u8,
+        out: *std.Io.Writer,
+    ) !?Parse {
+        if (std.mem.eql(u8, flag, "--listen")) {
+            options.listen = cli_values.parseSocket(value) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+        } else if (std.mem.eql(u8, flag, "--peer")) {
+            const peer = cli_values.parsePeer(value) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+            // The arena is the process's and does not grow on its own, so
+            // this can only fail if the process is out of memory — which
+            // is propagated rather than dressed up as a bad argument.
+            try options.peers.append(arena, peer);
+        } else if (std.mem.eql(u8, flag, "--lookup-peer")) {
+            const id = ozai.NodeId.parseZ32(value) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+            try options.lookup_peers.append(arena, id);
+        } else if (std.mem.eql(u8, flag, "--dns-server")) {
+            const server = cli_values.parseSocket(value) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+            if (server.port == 0) {
+                try cli_values.reject(out, flag, value, error.AddressNotReachable);
+                return .{ .rejected = error.AddressNotReachable };
+            }
+            options.dns_server = server;
+        } else if (std.mem.eql(u8, flag, "--dns-origin")) {
+            options.dns_origin = cli_values.parseDnsOrigin(value) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+            // Wire DNS names must be absolute; accept the usual suffix
+            // spelling without silently relying on a host search domain.
+            if (!std.mem.endsWith(u8, options.dns_origin, "."))
+                options.dns_origin = try std.fmt.allocPrint(arena, "{s}.", .{options.dns_origin});
+        } else if (std.mem.eql(u8, flag, "--lookup-deadline")) {
+            options.lookup_deadline_ms = cli_values.parseLookupMilliseconds(
+                i32,
+                value,
+                std.math.maxInt(i32),
+            ) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+        } else if (std.mem.eql(u8, flag, "--lookup-interval")) {
+            options.lookup_interval_ms = cli_values.parseLookupMilliseconds(
+                u64,
+                value,
+                cli_values.max_lookup_interval_ms,
+            ) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+        } else if (std.mem.eql(u8, flag, "--expect-peer")) {
+            options.expect_peer = ozai.NodeId.parseZ32(value) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+        } else if (std.mem.eql(u8, flag, "--key-seed")) {
+            const seed = ozai.base32.decode(
+                ozai.base32.z32,
+                SecretKey.seed_length,
+                value,
+            ) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+            options.secret = SecretKey.fromSeed(seed) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+        } else {
+            return options.parseCarrierValue(arena, flag, value, out);
+        }
+        return null;
+    }
+
+    fn parseCarrierValue(
+        options: *Options,
+        arena: Allocator,
+        flag: []const u8,
+        value: []const u8,
+        out: *std.Io.Writer,
+    ) !?Parse {
+        if (std.mem.eql(u8, flag, "--alpn")) {
+            options.alpn = value;
+        } else if (std.mem.eql(u8, flag, "--peer-relay")) {
+            const peer = cli_values.parseRelayPeer(value) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+            try options.peers.append(arena, peer);
+        } else if (std.mem.eql(u8, flag, "--relay-listen") or
+            std.mem.eql(u8, flag, "--relay-server") or
+            std.mem.eql(u8, flag, "--traversal-address"))
+        {
+            const address = cli_values.parseSocket(value) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+            if (std.mem.eql(u8, flag, "--relay-listen")) {
+                options.relay_listen = address;
+            } else {
+                if (address.port == 0) {
+                    try cli_values.reject(out, flag, value, error.AddressNotReachable);
+                    return .{ .rejected = error.AddressNotReachable };
+                }
+                if (std.mem.eql(u8, flag, "--relay-server")) {
+                    options.relay_server = address;
+                } else {
+                    if (options.traversal_addresses.items.len == 2) {
+                        try cli_values.reject(out, flag, value, error.TooManyTraversalAddresses);
+                        return .{ .rejected = error.TooManyTraversalAddresses };
+                    }
+                    try options.traversal_addresses.append(arena, address);
+                }
+            }
+        } else if (std.mem.eql(u8, flag, "--relay-host")) {
+            if (value.len == 0 or std.mem.indexOfAny(u8, value, "\r\n") != null) {
+                try cli_values.reject(out, flag, value, error.InvalidRelayHost);
+                return .{ .rejected = error.InvalidRelayHost };
+            }
+            options.relay_host = value;
+        } else if (std.mem.eql(u8, flag, "--topic-hex")) {
+            if (options.gossip_topics.items.len == 4) {
+                try cli_values.reject(out, flag, value, error.TooManyTopics);
+                return .{ .rejected = error.TooManyTopics };
+            }
+            const topic = cli_values.parseTopic(value) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+            try options.gossip_topics.append(arena, topic);
+        } else {
+            return options.parseApplicationValue(flag, value, out);
+        }
+        return null;
+    }
+
+    fn parseApplicationValue(
+        options: *Options,
+        flag: []const u8,
+        value: []const u8,
+        out: *std.Io.Writer,
+    ) !?Parse {
+        if (std.mem.eql(u8, flag, "--message")) {
+            options.message = value;
+        } else if (std.mem.eql(u8, flag, "--blob-role")) {
+            options.blob_role = std.meta.stringToEnum(BlobRole, value) orelse {
+                try cli_values.reject(out, flag, value, error.InvalidBlobRole);
+                return .{ .rejected = error.InvalidBlobRole };
+            };
+        } else if (std.mem.eql(u8, flag, "--blob-hash")) {
+            options.blob_hash = cli_values.parseBlobHash(value) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+        } else if (std.mem.eql(u8, flag, "--blob-size")) {
+            options.blob_size = std.fmt.parseInt(u64, value, 10) catch {
+                try cli_values.reject(out, flag, value, error.InvalidBlobSize);
+                return .{ .rejected = error.InvalidBlobSize };
+            };
+        } else if (std.mem.eql(u8, flag, "--blob-range")) {
+            options.blob_range = cli_values.parseBlobRange(value) catch |err| {
+                try cli_values.reject(out, flag, value, err);
+                return .{ .rejected = err };
+            };
+            options.blob_range_explicit = true;
+        } else if (std.mem.eql(u8, flag, "--blob-dir") or
+            std.mem.eql(u8, flag, "--blob-output"))
+        {
+            if (value.len == 0) {
+                try cli_values.reject(out, flag, value, error.EmptyPath);
+                return .{ .rejected = error.EmptyPath };
+            }
+            if (std.mem.eql(u8, flag, "--blob-dir")) {
+                options.blob_dir = value;
+            } else {
+                options.blob_output = value;
+            }
+        } else {
+            return options.parseRunValue(flag, value, out);
+        }
+        return null;
+    }
+
+    fn parseRunValue(
+        options: *Options,
+        flag: []const u8,
+        value: []const u8,
+        out: *std.Io.Writer,
+    ) !?Parse {
+        if (std.mem.eql(u8, flag, "--seed")) {
+            options.seed = std.fmt.parseInt(u64, value, 10) catch {
+                try cli_values.reject(out, flag, value, error.NotASeed);
+                return .{ .rejected = error.NotASeed };
+            };
+        } else if (std.mem.eql(u8, flag, "--for")) {
+            options.run_ms = std.fmt.parseInt(i64, value, 10) catch {
+                try cli_values.reject(out, flag, value, error.NotMilliseconds);
+                return .{ .rejected = error.NotMilliseconds };
+            };
+        } else {
+            try out.print("ozai-node: {s} is not an option\n", .{flag});
+            try out.writeAll(usage);
+            return .{ .rejected = error.NotAnOption };
+        }
+        return null;
     }
 
     /// Refusals are values; writer failures are program errors.
@@ -334,7 +392,8 @@ pub const Options = struct {
             return @as(?CliError, error.LookupNeedsPeer);
         }
         const refusal: ?CliError = if (options.relay_listen != null and
-            options.relay_server != null) error.TwoRelayRoles
+            options.relay_server != null)
+            error.TwoRelayRoles
         else if (options.relay_server != null and options.relay_host == null)
             error.RelayNeedsHost
         else if (options.relay_host != null and options.relay_server == null)
@@ -350,7 +409,8 @@ pub const Options = struct {
             error.TopicAlpnMismatch
         else if (options.blob_role == null and (options.blob_dir != null or
             options.blob_hash != null or options.blob_size != null or
-            options.blob_range_explicit or options.blob_output != null)) error.BlobNeedsRole
+            options.blob_range_explicit or options.blob_output != null))
+            error.BlobNeedsRole
         else if (options.blob_role != null and options.blob_hash == null)
             error.BlobNeedsHash
         else if (options.blob_role == .provider and options.blob_dir == null)
@@ -363,7 +423,8 @@ pub const Options = struct {
         else if (options.blob_role != null and options.alpn != null and
             !std.mem.eql(u8, options.alpn.?, ozai.blobs_protocol.alpn))
             error.BlobAlpnMismatch
-        else null;
+        else
+            null;
         if (refusal) |err| {
             try out.print("ozai-node: incompatible options: {t}\n", .{err});
             return @as(?CliError, err);
@@ -390,14 +451,15 @@ test "explicit lookup peers retain static peers and DNS settings" {
     var secret = try ozai.SecretKey.fromSeed(.{7} ** ozai.SecretKey.seed_length);
     defer secret.deinit();
     var id_buffer: [ozai.NodeId.z32_length + 1]u8 = undefined;
-    const id = try std.fmt.bufPrintZ(&id_buffer, "{s}", .{secret.nodeId().toZ32()});
+    const id = try std.fmt.bufPrintSentinel(&id_buffer, "{s}", .{secret.nodeId().toZ32()}, 0);
     var peer_buffer: [100]u8 = undefined;
-    const peer = try std.fmt.bufPrintZ(&peer_buffer, "{s}@127.0.0.1:9000", .{id});
+    const peer = try std.fmt.bufPrintSentinel(&peer_buffer, "{s}@127.0.0.1:9000", .{id}, 0);
     const args = [_][*:0]const u8{
-        "ozai-node", "--peer", peer,
-        "--lookup-peer", id, "--lookup-peer", id,
-        "--dns-server", "[::1]:5353", "--dns-origin", "test.invalid",
-        "--lookup-deadline", "25", "--lookup-interval", "100",
+        "ozai-node",     "--peer",            peer,
+        "--lookup-peer", id,                  "--lookup-peer",
+        id,              "--dns-server",      "[::1]:5353",
+        "--dns-origin",  "test.invalid",      "--lookup-deadline",
+        "25",            "--lookup-interval", "100",
     };
     var out: std.Io.Writer.Allocating = .init(arena.allocator());
     const parsed = try Options.parse(arena.allocator(), .{ .vector = &args }, &out.writer);
@@ -418,16 +480,34 @@ test "lookup requires explicit peers and source and bounded positive timing" {
     var secret = try ozai.SecretKey.fromSeed(.{7} ** ozai.SecretKey.seed_length);
     defer secret.deinit();
     var id_buffer: [ozai.NodeId.z32_length + 1]u8 = undefined;
-    const id = try std.fmt.bufPrintZ(&id_buffer, "{s}", .{secret.nodeId().toZ32()});
+    const id = try std.fmt.bufPrintSentinel(&id_buffer, "{s}", .{secret.nodeId().toZ32()}, 0);
     const Case = struct { args: []const [*:0]const u8, refusal: CliError };
     const cases = [_]Case{
         .{ .args = &.{ "ozai-node", "--lookup-peer", id }, .refusal = error.LookupNeedsServer },
-        .{ .args = &.{ "ozai-node", "--dns-server", "127.0.0.1:53" }, .refusal = error.LookupNeedsPeer },
-        .{ .args = &.{ "ozai-node", "--lookup-deadline", "0" }, .refusal = error.LookupTimingOutOfRange },
-        .{ .args = &.{ "ozai-node", "--lookup-deadline", "2147483648" }, .refusal = error.LookupTimingOutOfRange },
-        .{ .args = &.{ "ozai-node", "--lookup-interval", "-1" }, .refusal = error.LookupTimingOutOfRange },
-        .{ .args = &.{ "ozai-node", "--lookup-interval", "9223372036855" }, .refusal = error.LookupTimingOutOfRange },
-        .{ .args = &.{ "ozai-node", "--dns-server", "127.0.0.1:0" }, .refusal = error.AddressNotReachable },
+        .{
+            .args = &.{ "ozai-node", "--dns-server", "127.0.0.1:53" },
+            .refusal = error.LookupNeedsPeer,
+        },
+        .{
+            .args = &.{ "ozai-node", "--lookup-deadline", "0" },
+            .refusal = error.LookupTimingOutOfRange,
+        },
+        .{
+            .args = &.{ "ozai-node", "--lookup-deadline", "2147483648" },
+            .refusal = error.LookupTimingOutOfRange,
+        },
+        .{
+            .args = &.{ "ozai-node", "--lookup-interval", "-1" },
+            .refusal = error.LookupTimingOutOfRange,
+        },
+        .{
+            .args = &.{ "ozai-node", "--lookup-interval", "9223372036855" },
+            .refusal = error.LookupTimingOutOfRange,
+        },
+        .{
+            .args = &.{ "ozai-node", "--dns-server", "127.0.0.1:0" },
+            .refusal = error.AddressNotReachable,
+        },
         .{ .args = &.{ "ozai-node", "--dns-origin", "" }, .refusal = error.InvalidDnsOrigin },
     };
     for (cases) |case| {
@@ -445,7 +525,7 @@ test "static peer does not enable external DNS" {
     defer secret.deinit();
     const id = secret.nodeId().toZ32();
     var peer_buffer: [100]u8 = undefined;
-    const peer = try std.fmt.bufPrintZ(&peer_buffer, "{s}@127.0.0.1:9000", .{id});
+    const peer = try std.fmt.bufPrintSentinel(&peer_buffer, "{s}@127.0.0.1:9000", .{id}, 0);
     const args = [_][*:0]const u8{ "ozai-node", "--peer", peer };
     var out: std.Io.Writer.Allocating = .init(arena.allocator());
     const parsed = try Options.parse(arena.allocator(), .{ .vector = &args }, &out.writer);
@@ -460,12 +540,27 @@ test "carrier and pinned relay peers leave inner application independent" {
     var secret = try ozai.SecretKey.fromSeed(.{7} ** ozai.SecretKey.seed_length);
     defer secret.deinit();
     var peer_buffer: [160]u8 = undefined;
-    const peer = try std.fmt.bufPrintZ(&peer_buffer, "{s}@http://relay.invalid:8080",
-        .{secret.nodeId().toZ32()});
+    const peer = try std.fmt.bufPrintSentinel(
+        &peer_buffer,
+        "{s}@http://relay.invalid:8080",
+        .{secret.nodeId().toZ32()},
+        0,
+    );
     const args = [_][*:0]const u8{
-        "ozai-node", "--relay-server", "127.0.0.1:8080", "--relay-host", "relay.invalid",
-        "--peer-relay", peer, "--alpn", "app", "--traversal-address", "127.0.0.1:9000",
-        "--traversal-address", "[::1]:9001", "--traversal-initiate",
+        "ozai-node",
+        "--relay-server",
+        "127.0.0.1:8080",
+        "--relay-host",
+        "relay.invalid",
+        "--peer-relay",
+        peer,
+        "--alpn",
+        "app",
+        "--traversal-address",
+        "127.0.0.1:9000",
+        "--traversal-address",
+        "[::1]:9001",
+        "--traversal-initiate",
     };
     var out: std.Io.Writer.Allocating = .init(arena.allocator());
     const parsed = try Options.parse(arena.allocator(), .{ .vector = &args }, &out.writer);
@@ -473,8 +568,10 @@ test "carrier and pinned relay peers leave inner application independent" {
     try std.testing.expectEqualStrings("app", parsed.run.alpn.?);
     try std.testing.expectEqualStrings("relay.invalid", parsed.run.relay_host.?);
     try std.testing.expect(parsed.run.peers.items[0].addr == .relay);
-    try std.testing.expectEqualStrings("relay.invalid",
-        parsed.run.peers.items[0].addr.relay.hostSlice());
+    try std.testing.expectEqualStrings(
+        "relay.invalid",
+        parsed.run.peers.items[0].addr.relay.hostSlice(),
+    );
     try std.testing.expectEqual(@as(usize, 2), parsed.run.traversal_addresses.items.len);
     try std.testing.expect(parsed.run.traversal_initiate);
 }
@@ -483,8 +580,8 @@ test "gossip topics and getter options use protocol values" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const args = [_][*:0]const u8{
-        "ozai-node", "--topic-hex", "ab" ** 32, "--topic-hex", "cd" ** 32,
-        "--message", "hello", "--relay-listen", "127.0.0.1:0",
+        "ozai-node", "--topic-hex", "ab" ** 32,       "--topic-hex", "cd" ** 32,
+        "--message", "hello",       "--relay-listen", "127.0.0.1:0",
     };
     var out: std.Io.Writer.Allocating = .init(arena.allocator());
     const gossip = try Options.parse(arena.allocator(), .{ .vector = &args }, &out.writer);
@@ -493,8 +590,9 @@ test "gossip topics and getter options use protocol values" {
     try std.testing.expectEqual(@as(u8, 0xab), gossip.run.gossip_topics.items[0].bytes[0]);
     try std.testing.expectEqualStrings("hello", gossip.run.message.?);
     const blob_args = [_][*:0]const u8{
-        "ozai-node", "--blob-role", "getter", "--blob-hash", "ab" ** 32,
-        "--blob-size", "40000", "--blob-range", "15:33", "--blob-output", "verified.bin",
+        "ozai-node",    "--blob-role", "getter",       "--blob-hash", "ab" ** 32,
+        "--blob-size",  "40000",       "--blob-range", "15:33",       "--blob-output",
+        "verified.bin",
     };
     const blob = try Options.parse(arena.allocator(), .{ .vector = &blob_args }, &out.writer);
     try std.testing.expect(blob == .run);
@@ -512,11 +610,29 @@ test "protocol contradictions invalid values and removed flags are rejected" {
         .{ .args = &.{ "node", "--relay" }, .refusal = error.NotAnOption },
         .{ .args = &.{ "node", "--relay-peer", "x" }, .refusal = error.NotAnOption },
         .{ .args = &.{ "node", "--send", "x" }, .refusal = error.NotAnOption },
-        .{ .args = &.{ "node", "--relay-server", "127.0.0.1:80" }, .refusal = error.RelayNeedsHost },
+        .{
+            .args = &.{ "node", "--relay-server", "127.0.0.1:80" },
+            .refusal = error.RelayNeedsHost,
+        },
         .{ .args = &.{ "node", "--relay-host", "local" }, .refusal = error.RelayNeedsServer },
-        .{ .args = &.{ "node", "--relay-listen", "127.0.0.1:0", "--relay-server", "127.0.0.1:80", "--relay-host", "local" }, .refusal = error.TwoRelayRoles },
-        .{ .args = &.{ "node", "--blob-role", "getter", "--blob-hash", "ab" ** 32, "--alpn", "other" }, .refusal = error.BlobAlpnMismatch },
-        .{ .args = &.{ "node", "--blob-role", "provider", "--blob-hash", "ab" ** 32 }, .refusal = error.BlobNeedsDirectory },
+        .{
+            .args = &.{
+                "node",           "--relay-listen", "127.0.0.1:0",
+                "--relay-server", "127.0.0.1:80",   "--relay-host",
+                "local",
+            },
+            .refusal = error.TwoRelayRoles,
+        },
+        .{
+            .args = &.{
+                "node", "--blob-role", "getter", "--blob-hash", "ab" ** 32, "--alpn", "other",
+            },
+            .refusal = error.BlobAlpnMismatch,
+        },
+        .{
+            .args = &.{ "node", "--blob-role", "provider", "--blob-hash", "ab" ** 32 },
+            .refusal = error.BlobNeedsDirectory,
+        },
         .{ .args = &.{ "node", "--blob-role", "getter" }, .refusal = error.BlobNeedsHash },
         .{ .args = &.{ "node", "--blob-hash", "zz" ** 32 }, .refusal = error.InvalidBlobHash },
         .{ .args = &.{ "node", "--blob-hash", "ab" }, .refusal = error.InvalidBlobHash },
@@ -525,7 +641,14 @@ test "protocol contradictions invalid values and removed flags are rejected" {
         .{ .args = &.{ "node", "--blob-range", "1:2:3" }, .refusal = error.InvalidBlobRange },
         .{ .args = &.{ "node", "--blob-size", "-1" }, .refusal = error.InvalidBlobSize },
         .{ .args = &.{ "node", "--topic-hex", "ab" }, .refusal = error.InvalidTopic },
-        .{ .args = &.{ "node", "--topic-hex", "ab" ** 32, "--topic-hex", "ab" ** 32, "--topic-hex", "ab" ** 32, "--topic-hex", "ab" ** 32, "--topic-hex", "ab" ** 32 }, .refusal = error.TooManyTopics },
+        .{
+            .args = &.{
+                "node",        "--topic-hex", "ab" ** 32,    "--topic-hex", "ab" ** 32,
+                "--topic-hex", "ab" ** 32,    "--topic-hex", "ab" ** 32,    "--topic-hex",
+                "ab" ** 32,
+            },
+            .refusal = error.TooManyTopics,
+        },
     };
     for (cases) |case| {
         var out: std.Io.Writer.Allocating = .init(arena.allocator());
@@ -541,15 +664,14 @@ test "expected peer identity is explicit and curve validated" {
     var secret = try ozai.SecretKey.fromSeed(.{9} ** ozai.SecretKey.seed_length);
     defer secret.deinit();
     var buffer: [ozai.NodeId.z32_length + 1]u8 = undefined;
-    const id = try std.fmt.bufPrintZ(&buffer, "{s}", .{secret.nodeId().toZ32()});
+    const id = try std.fmt.bufPrintSentinel(&buffer, "{s}", .{secret.nodeId().toZ32()}, 0);
     const args = [_][*:0]const u8{ "node", "--expect-peer", id };
     var out: std.Io.Writer.Allocating = .init(arena.allocator());
     const parsed = try Options.parse(arena.allocator(), .{ .vector = &args }, &out.writer);
     try std.testing.expect(parsed == .run);
     try std.testing.expectEqualStrings(id, &parsed.run.expect_peer.?.toZ32());
     const invalid_args = [_][*:0]const u8{ "node", "--expect-peer", "invalid" };
-    const invalid = try Options.parse(arena.allocator(),
-        .{ .vector = &invalid_args }, &out.writer);
+    const invalid = try Options.parse(arena.allocator(), .{ .vector = &invalid_args }, &out.writer);
     try std.testing.expect(invalid == .rejected);
 }
 
@@ -558,20 +680,22 @@ test "provider directory and all chunk getter range are accepted" {
     defer arena.deinit();
     var out: std.Io.Writer.Allocating = .init(arena.allocator());
     const provider_args = [_][*:0]const u8{
-        "node", "--blob-role", "provider", "--blob-dir", "store",
-        "--blob-hash", "ab" ** 32, "--alpn", "/iroh-bytes/4",
+        "node",        "--blob-role", "provider", "--blob-dir",    "store",
+        "--blob-hash", "ab" ** 32,    "--alpn",   "/iroh-bytes/4",
     };
-    const provider = try Options.parse(arena.allocator(),
-        .{ .vector = &provider_args }, &out.writer);
+    const provider = try Options.parse(
+        arena.allocator(),
+        .{ .vector = &provider_args },
+        &out.writer,
+    );
     try std.testing.expect(provider == .run);
     try std.testing.expect(provider.run.blob_role == .provider);
     try std.testing.expectEqualStrings("store", provider.run.blob_dir.?);
     const getter_args = [_][*:0]const u8{
-        "node", "--blob-role", "getter", "--blob-hash", "ab" ** 32,
-        "--blob-range", "all", "--blob-size", "0",
+        "node",         "--blob-role", "getter",      "--blob-hash", "ab" ** 32,
+        "--blob-range", "all",         "--blob-size", "0",
     };
-    const getter = try Options.parse(arena.allocator(),
-        .{ .vector = &getter_args }, &out.writer);
+    const getter = try Options.parse(arena.allocator(), .{ .vector = &getter_args }, &out.writer);
     try std.testing.expect(getter == .run);
     try std.testing.expect(getter.run.blob_range == null);
     try std.testing.expectEqual(@as(u64, 0), getter.run.blob_size.?);
@@ -585,21 +709,43 @@ test "role dependent options do not disappear into defaults" {
         .{ .args = &.{ "node", "--blob-role", "unknown" }, .refusal = error.InvalidBlobRole },
         .{ .args = &.{ "node", "--blob-range", "all" }, .refusal = error.BlobNeedsRole },
         .{ .args = &.{ "node", "--blob-range", "-1:2" }, .refusal = error.InvalidBlobRange },
-        .{ .args = &.{ "node", "--blob-range", "0:18446744073709551616" }, .refusal = error.InvalidBlobRange },
+        .{
+            .args = &.{ "node", "--blob-range", "0:18446744073709551616" },
+            .refusal = error.InvalidBlobRange,
+        },
         .{ .args = &.{ "node", "--blob-range", "all:2" }, .refusal = error.InvalidBlobRange },
-        .{ .args = &.{ "node", "--blob-size", "18446744073709551616" }, .refusal = error.InvalidBlobSize },
-        .{ .args = &.{ "node", "--blob-role", "provider", "--blob-dir", "store", "--blob-hash", "ab" ** 32, "--blob-range", "all" }, .refusal = error.BlobProviderGetterOptions },
-        .{ .args = &.{ "node", "--blob-role", "getter", "--blob-hash", "ab" ** 32, "--blob-dir", "store" }, .refusal = error.BlobGetterDirectory },
+        .{
+            .args = &.{ "node", "--blob-size", "18446744073709551616" },
+            .refusal = error.InvalidBlobSize,
+        },
+        .{
+            .args = &.{
+                "node",        "--blob-role", "provider",     "--blob-dir", "store",
+                "--blob-hash", "ab" ** 32,    "--blob-range", "all",
+            },
+            .refusal = error.BlobProviderGetterOptions,
+        },
+        .{
+            .args = &.{
+                "node", "--blob-role", "getter", "--blob-hash", "ab" ** 32, "--blob-dir", "store",
+            },
+            .refusal = error.BlobGetterDirectory,
+        },
         .{ .args = &.{ "node", "--message", "hello" }, .refusal = error.MessageNeedsTopic },
         .{ .args = &.{ "node", "--relay-host", "" }, .refusal = error.InvalidRelayHost },
-        .{ .args = &.{ "node", "--relay-server", "127.0.0.1:0" }, .refusal = error.AddressNotReachable },
-        .{ .args = &.{ "node", "--traversal-address", "127.0.0.1:0" }, .refusal = error.AddressNotReachable },
+        .{
+            .args = &.{ "node", "--relay-server", "127.0.0.1:0" },
+            .refusal = error.AddressNotReachable,
+        },
+        .{
+            .args = &.{ "node", "--traversal-address", "127.0.0.1:0" },
+            .refusal = error.AddressNotReachable,
+        },
         .{ .args = &.{ "node", "--blob-output", "" }, .refusal = error.EmptyPath },
     };
     for (cases) |case| {
         var out: std.Io.Writer.Allocating = .init(arena.allocator());
-        const parsed = try Options.parse(arena.allocator(),
-            .{ .vector = case.args }, &out.writer);
+        const parsed = try Options.parse(arena.allocator(), .{ .vector = case.args }, &out.writer);
         try std.testing.expect(parsed == .rejected);
         try std.testing.expectEqual(case.refusal, parsed.rejected);
     }
@@ -615,12 +761,24 @@ test "explicit gossip topics select gossip and reject competing application prot
     try std.testing.expectEqualStrings(node_mod.gossip_alpn, parsed.run.alpn.?);
     const Case = struct { args: []const [*:0]const u8, refusal: CliError };
     const cases = [_]Case{
-        .{ .args = &.{ "node", "--topic-hex", "ab" ** 32, "--alpn", "other" }, .refusal = error.TopicAlpnMismatch },
-        .{ .args = &.{ "node", "--topic-hex", "ab" ** 32, "--blob-role", "getter", "--blob-hash", "ab" ** 32 }, .refusal = error.ConflictingProtocols },
+        .{
+            .args = &.{ "node", "--topic-hex", "ab" ** 32, "--alpn", "other" },
+            .refusal = error.TopicAlpnMismatch,
+        },
+        .{
+            .args = &.{
+                "node",     "--topic-hex", "ab" ** 32, "--blob-role", "getter", "--blob-hash",
+                "ab" ** 32,
+            },
+            .refusal = error.ConflictingProtocols,
+        },
     };
     for (cases) |case| {
-        const rejected = try Options.parse(arena.allocator(),
-            .{ .vector = case.args }, &out.writer);
+        const rejected = try Options.parse(
+            arena.allocator(),
+            .{ .vector = case.args },
+            &out.writer,
+        );
         try std.testing.expect(rejected == .rejected);
         try std.testing.expectEqual(case.refusal, rejected.rejected);
     }
@@ -632,12 +790,18 @@ test "native traversal requires candidates and bounds configured candidates" {
     const Case = struct { args: []const [*:0]const u8, refusal: CliError };
     const cases = [_]Case{
         .{ .args = &.{ "node", "--traversal-initiate" }, .refusal = error.TraversalNeedsAddress },
-        .{ .args = &.{ "node", "--traversal-address", "127.0.0.1:1", "--traversal-address", "127.0.0.1:2", "--traversal-address", "127.0.0.1:3" }, .refusal = error.TooManyTraversalAddresses },
+        .{
+            .args = &.{
+                "node",                "--traversal-address", "127.0.0.1:1",
+                "--traversal-address", "127.0.0.1:2",         "--traversal-address",
+                "127.0.0.1:3",
+            },
+            .refusal = error.TooManyTraversalAddresses,
+        },
     };
     for (cases) |case| {
         var out: std.Io.Writer.Allocating = .init(arena.allocator());
-        const parsed = try Options.parse(arena.allocator(),
-            .{ .vector = case.args }, &out.writer);
+        const parsed = try Options.parse(arena.allocator(), .{ .vector = case.args }, &out.writer);
         try std.testing.expect(parsed == .rejected);
         try std.testing.expectEqual(case.refusal, parsed.rejected);
     }

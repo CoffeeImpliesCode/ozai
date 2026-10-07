@@ -38,15 +38,23 @@ fn collectVendoredSources(
     while (try it.next(io)) |entry| {
         if (entry.kind == .directory) {
             var sub = try dir.openDir(io, entry.name, .{ .iterate = true });
+            // Recursion closes its own subdirectories, not this borrowed handle.
+            // zwanzig-disable-next-line: store-violations-engine
             defer sub.close(io);
-            try collectVendoredSources(gpa, io, sub, try std.fmt.allocPrint(gpa, "{s}{s}/", .{
-                prefix,
-                entry.name,
-            }), out);
+            const sub_prefix = try std.fmt.allocPrint(gpa, "{s}{s}/", .{
+                prefix, entry.name,
+            });
+            // Recursion borrows this prefix and frees only its separately allocated child prefixes.
+            // zwanzig-disable-next-line: store-violations-engine
+            defer gpa.free(sub_prefix);
+            // Recursion borrows sub; only this scope closes the newly opened handle.
+            try collectVendoredSources(gpa, io, sub, sub_prefix, out);
             continue;
         }
         if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
-        try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, entry.name }));
+        const path = try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, entry.name });
+        errdefer gpa.free(path);
+        try out.append(gpa, path);
     }
 }
 
@@ -60,7 +68,12 @@ pub fn checkVendoredFileList(b: *std.Build) void {
     const io = b.graph.io;
 
     var found: std.ArrayList([]const u8) = .empty;
-    defer found.deinit(gpa);
+    defer {
+        for (found.items) |path| gpa.free(path);
+        found.deinit(gpa);
+    }
+    // The recursive walk borrows this handle; this scope closes it exactly once.
+    // zwanzig-disable-next-line: store-violations-engine
     var dir = b.build_root.handle.openDir(io, root, .{ .iterate = true }) catch |err| {
         std.debug.panic("cannot read {s}: {s}", .{ root, @errorName(err) });
     };
@@ -71,6 +84,7 @@ pub fn checkVendoredFileList(b: *std.Build) void {
 
     for (found.items) |relative| {
         const wanted = std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, relative }) catch @panic("oom");
+        defer gpa.free(wanted);
         const listed = for (vendored_invariants.vendored_files) |entry| {
             if (std.mem.eql(u8, entry, wanted)) break true;
         } else false;

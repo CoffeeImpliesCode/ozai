@@ -582,7 +582,7 @@ fn challengeOf(round: u8) Challenge {
 /// break that is a fixture that should fail this test rather than a claim about
 /// a path no caller walks.
 fn runRounds(rates: []const u64) Error!Exchange {
-    var exchange = try arm(Exchange{}, challengeOf(0));
+    var exchange = try arm(.{}, challengeOf(0));
     exchange = try observe(exchange, 0, sample(challengeOf(0), 0));
     var covered: u64 = 0;
     var index: usize = 0;
@@ -603,10 +603,10 @@ fn runRounds(rates: []const u64) Error!Exchange {
 }
 
 test "one exchange runs one round at a time" {
-    try t.expectEqual(@as(?Probe, null), probe(Exchange{}));
+    try t.expectEqual(@as(?Probe, null), probe(.{}));
 
-    const armed = try arm(Exchange{}, challengeOf(1));
-    const outstanding = probe(armed).?;
+    const armed = try arm(.{}, challengeOf(1));
+    const outstanding = probe(armed) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(usize, 0), outstanding.round);
     try t.expectEqual(here, outstanding.family);
     try t.expectEqual(challengeOf(1), outstanding.challenge);
@@ -619,11 +619,12 @@ test "one exchange runs one round at a time" {
     const answered = try observe(armed, 0, sample(challengeOf(1), 10));
     try t.expectEqual(@as(?Probe, null), probe(answered));
     const rearmed = try arm(answered, challengeOf(2));
-    try t.expectEqual(@as(usize, 1), probe(rearmed).?.round);
+    const next = probe(rearmed) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(usize, 1), next.round);
 }
 
 test "a reply that is not this round's answer is refused by name, and nothing moves" {
-    const armed = try arm(Exchange{}, challengeOf(1));
+    const armed = try arm(.{}, challengeOf(1));
 
     // The right challenge on the wrong path family: two number spaces, and
     // differencing one against the other would produce a plausible wrong rate.
@@ -636,18 +637,19 @@ test "a reply that is not this round's answer is refused by name, and nothing mo
 
     // Neither refusal closed the exchange or armed anything: the round this one
     // was asked about is still outstanding, so its own reply is still accepted.
-    try t.expectEqual(challengeOf(1), probe(armed).?.challenge);
+    const outstanding = probe(armed) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(challengeOf(1), outstanding.challenge);
     try t.expectEqual(@as(usize, 0), armed.round_count);
     try t.expectEqual(@as(?Answer, null), answer(armed));
 
     // And with nothing armed there is nothing to fold a frame into.
-    const idle = Exchange{};
+    const idle: Exchange = .{};
     try t.expectError(error.NoRoundInFlight, observe(idle, 0, sample(challengeOf(1), 1)));
     try t.expectError(error.NoRoundInFlight, expire(idle));
 }
 
 test "the first reply is a baseline, not a measurement and not a zero" {
-    const armed = try arm(Exchange{}, challengeOf(1));
+    const armed = try arm(.{}, challengeOf(1));
     const answered = try observe(armed, second, sample(challengeOf(1), 10));
     try t.expectEqual(Result{ .baseline = {} }, answered.rounds[0].result);
     try t.expectEqual(@as(usize, 1), answered.round_count);
@@ -660,7 +662,7 @@ test "a reply with nothing new measures zero, because the wire said so" {
     // The peer answered and reported the packet number it reported last time:
     // an observation of an idle path, and a real one.
     const first = try observe(
-        try arm(Exchange{}, challengeOf(1)),
+        try arm(.{}, challengeOf(1)),
         0,
         sample(challengeOf(1), 10),
     );
@@ -675,7 +677,7 @@ test "a reply with nothing new measures zero, because the wire said so" {
 
 test "a round whose reply never arrived is absent, and the gap is not forgotten" {
     var exchange = try observe(
-        try arm(Exchange{}, challengeOf(1)),
+        try arm(.{}, challengeOf(1)),
         0,
         sample(challengeOf(1), 10),
     );
@@ -688,7 +690,7 @@ test "a round whose reply never arrived is absent, and the gap is not forgotten"
     const lost = try expire(try arm(exchange, challengeOf(3)));
     try t.expectEqual(Result{ .absent = {} }, lost.rounds[2].result);
     // Nothing about the reference moved: not the packet number, not the instant.
-    try t.expectEqual(@as(u64, 20), lost.covered.?);
+    try t.expectEqual(@as(?u64, 20), lost.covered);
     try t.expectEqual(second, lost.previous_at);
 
     // So the next reply is differenced against round one and measured over the
@@ -704,7 +706,7 @@ test "a round whose reply never arrived is absent, and the gap is not forgotten"
 
 test "a sample that numbers behind the last one is absent, not zero" {
     const first = try observe(
-        try arm(Exchange{}, challengeOf(1)),
+        try arm(.{}, challengeOf(1)),
         0,
         sample(challengeOf(1), 50),
     );
@@ -717,12 +719,12 @@ test "a sample that numbers behind the last one is absent, not zero" {
     // behind where it was, which is a different fact.
     try t.expectEqual(Result{ .absent = {} }, behind.rounds[1].result);
     // And the reference did not move, so the next reply is still comparable.
-    try t.expectEqual(@as(u64, 50), behind.covered.?);
+    try t.expectEqual(@as(?u64, 50), behind.covered);
 }
 
 test "two replies in one nanosecond measure nothing" {
     const first = try observe(
-        try arm(Exchange{}, challengeOf(1)),
+        try arm(.{}, challengeOf(1)),
         7,
         sample(challengeOf(1), 10),
     );
@@ -751,7 +753,7 @@ test "the answer is the median of the measured rounds, not the fastest and not t
     // move the answer by nothing at all.
     const measured = [_]u64{ 1000, 10, 20, 30 };
     const exchange = try runRounds(&measured);
-    const settled = answer(exchange).?;
+    const settled = answer(exchange) orelse return error.TestUnexpectedResult;
     try t.expectEqual(Outcome.exhausted, settled.outcome);
     try t.expectEqual(@as(?Rate, 20), settled.rate);
     try t.expectEqual(@as(usize, 5), settled.rounds_run);
@@ -769,7 +771,7 @@ test "a path that alternates idle and busy never settles and says so" {
     // A busy round, an idle one, busy, busy: the spread never closes, so the
     // bound decides, and the outcome is named rather than the loop running on.
     const exchange = try runRounds(&.{ 1000, 0, 1000, 1000 });
-    const settled = answer(exchange).?;
+    const settled = answer(exchange) orelse return error.TestUnexpectedResult;
     try t.expectEqual(Outcome.exhausted, settled.outcome);
     try t.expectEqual(@as(usize, 5), settled.rounds_run);
     // Three thousands and a zero: the lower middle is still a thousand, and it
@@ -783,7 +785,7 @@ test "a stable slow path converges early, because the spread is about variation"
     // convergence: every round agrees with every other, and what the spread
     // measures is variability rather than speed.
     const exchange = try runRounds(&.{ 4, 4, 4, 4 });
-    const settled = answer(exchange).?;
+    const settled = answer(exchange) orelse return error.TestUnexpectedResult;
     try t.expectEqual(Outcome.converged, settled.outcome);
     try t.expectEqual(@as(?Rate, 4), settled.rate);
     // Converged on the third measurement, so the fourth round never ran and the
@@ -794,7 +796,7 @@ test "a stable slow path converges early, because the spread is about variation"
 
 test "one lost reply still reaches three measurements, which is why five rounds" {
     var exchange = try observe(
-        try arm(Exchange{}, challengeOf(0)),
+        try arm(.{}, challengeOf(0)),
         0,
         sample(challengeOf(0), 0),
     );
@@ -820,7 +822,7 @@ test "one lost reply still reaches three measurements, which is why five rounds"
     // Three measurements out of five rounds, so an answer at all. Had the bound
     // been four, the same peer would have ended `.undetermined` and every
     // measurement it made would have been thrown away.
-    const settled = answer(exchange).?;
+    const settled = answer(exchange) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(usize, 5), settled.rounds_run);
     try t.expectEqual(@as(usize, 3), settled.measured);
     try t.expectEqual(@as(?Rate, 4), settled.rate);
@@ -835,7 +837,7 @@ test "too few measured rounds end as undetermined, with no rate at all" {
     // all: an exchange with no measurement publishes no rate, rather than a
     // rate of zero or a rate from the one sample it took.
     var exchange = try observe(
-        try arm(Exchange{}, challengeOf(1)),
+        try arm(.{}, challengeOf(1)),
         0,
         sample(challengeOf(1), 10),
     );
@@ -843,7 +845,7 @@ test "too few measured rounds end as undetermined, with no rate at all" {
     while (round <= 5) : (round += 1) {
         exchange = try expire(try arm(exchange, challengeOf(round)));
     }
-    const settled = answer(exchange).?;
+    const settled = answer(exchange) orelse return error.TestUnexpectedResult;
     try t.expectEqual(Outcome.undetermined, settled.outcome);
     try t.expectEqual(@as(?Rate, null), settled.rate);
     try t.expectEqual(@as(usize, 5), settled.rounds_run);

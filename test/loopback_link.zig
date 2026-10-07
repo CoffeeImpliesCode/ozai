@@ -27,8 +27,6 @@ const max_rounds = @import("loopback_side.zig").max_rounds;
 const Conn = bridge_mod.Conn;
 const Instant = bridge_mod.Instant;
 const Dialer = dial_mod.Dialer;
-const NodeId = ozai.NodeId;
-const SecretKey = ozai.SecretKey;
 
 /// The codepoint's own name, or `none` for a datagram that carried no
 /// control message. `Ecn` has no not-ECT tag, so "zero" is an absence here.
@@ -92,9 +90,9 @@ pub const Link = struct {
     /// the split that gave this module its own name introduced.
     pub fn init(
         self: *Link,
-        client_secret: SecretKey,
-        server_secret: SecretKey,
-        pinned: NodeId,
+        client_secret: ozai.SecretKey,
+        server_secret: ozai.SecretKey,
+        pinned: ozai.NodeId,
         engine_seed: u64,
     ) !void {
         self.* = .{
@@ -293,7 +291,7 @@ pub const Link = struct {
     ///
     /// `pub` because `loopback_test.zig` calls it across the file boundary the
     /// split that gave this module its own name introduced.
-    pub fn exchange(self: *Link, at: Instant) !bool {
+    pub fn exchange(self: *Link, at: bridge_mod.Instant) !bool {
         const moved = try self.step(0, 1, at);
         return (try self.step(1, 0, at)) or moved;
     }
@@ -309,7 +307,7 @@ pub const Link = struct {
     ///
     /// `pub` because `loopback_test.zig` calls it across the file boundary the
     /// split that gave this module its own name introduced.
-    pub fn drive(self: *Link, at: Instant, goal: fn (*Side, *Side) bool) !void {
+    pub fn drive(self: *Link, at: bridge_mod.Instant, goal: fn (*Side, *Side) bool) !void {
         var round: usize = 0;
         while (round < max_rounds) : (round += 1) {
             if (goal(&self.client, &self.server)) return;

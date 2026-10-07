@@ -47,6 +47,61 @@ The current Linux driver uses `Io.Threaded`. `Io.Uring` cannot send a UDP
 datagram in Zig 0.16.0, and `Io.Evented` uses Uring on Linux.
 Neither runtime owns this stack's send path.
 
+## Strict gate coverage boundary
+
+The gate separates current uninstrumented checks from retained instrumented coverage.
+Default always runs configured full checks and current Debug/ReleaseSafe builds and tests before retained validation.
+Its test scope includes `test`, `test-portable`, `quic-test`, `invariants` and `test-gate-policy`.
+Format, syntax, ziglint, zlint, native ZBC, Zwanzig and configured cross-target checks remain required.
+Missing cross-target runners mean build-only status, not runtime acceptance.
+Default does not start a new instrumented measurement.
+The legacy `refdecls`/`compile-all` names map to declaration sweeps within executed test roots, not separate driver sections.
+Those roots belong to `test`, `test-portable`, `quic-test` and `test-gate-policy`.
+`invariants` checks vendored source contracts. It does not replace core runtime tests.
+Issue #2 also permits [named standalone-subsystem admissions](../TODO.md#issue-2-named-standalone-admissions).
+These cover unused blob variants, ticket use/lifecycle/loss logging, interface discovery, topic tables, statistics, ECN policy, budgets and broader relay authorization.
+The admitted models have no claimed Node consumer or real-route proof.
+Challenge-authenticated relay, socket ECN and configured native candidates remain distinct implemented paths.
+
+`measure.runSafetyModes(runner, zig)` shares the actual first two `buildMode` stages.
+Both default and `measure` use those uninstrumented build/test stages for Debug and ReleaseSafe.
+The explicit `measure` command also captures fresh instrumented coverage in both modes.
+`record.validateRetained(gpa, io, env)` reads the required machine reference and calls the common full validator.
+`validate <path>` uses the same full replay and requires the exact referenced path and file SHA-256.
+These helpers use explicit allocators and `Io`. Temporary owners release their data after validation.
+
+The machine ledger and Measurement use schema 3.
+One `ozai-coverage-v2` fence requires `measurement: {path, sha256}`.
+The reference must have a nonempty path and a 64-hex-character captured-file SHA-256.
+The validator checks that hash before it trusts the manifest.
+It binds the snapshot to current source, compiler, scope and both modes.
+It checks source/artifact/raw/report hashes, raw completeness, ordered report rows, exact-PC projection and exact counters.
+The complete positive DWARF numeric-row universe and direct-PC hit method remain unchanged.
+Capture binds the original absolute runtime object path and SHA-256.
+Replay rehashes that object independently of fresh `OZAI_COVERAGE_RT`.
+The source inventory includes absent roots and test sources.
+Cold DWARF rows can outnumber mapped PCs without corruption.
+Coverage documents have a 64 MiB limit.
+
+Stored `Measurement.cold_items` must match replay-generated tuples by content.
+The identity fields are `mode`, `path`, `source_sha256`, `line` and `unit`.
+Duplicates, omissions, stale metadata and extra tuples fail.
+Ledger decisions must match exact cold tuples. Covered or stale extra decisions do not qualify.
+Project-unmapped and source-unowned totals and hits must also match exactly.
+Any missing reference or source/compiler/scope/artifact drift fails closed.
+There is no advisory mode, opt-out, skip, old-schema fallback, tolerance or retry-to-green.
+
+Issue #15 permits dated source-bound coverage with on-demand refresh.
+Earlier schema-2 capture, replay and default-gate receipts are historical after the current source repairs.
+Fresh schema-3 capture, exact all-cold dispositions, strict replay and the full default gate remain pending.
+The [integration snapshot](../README.md#integration-snapshot-2026-10-08) records current normal-root `bg317` acceptance.
+Debug and ReleaseSafe each passed 28/28 steps and 2538/2538 tests, including the repaired public consumer regressions.
+Fresh schema-3 capture, full default gate and live smokes have not run.
+This integration does not establish final acceptance or new wire-interoperability proof.
+Rust interop and controlled-NAT evidence remain separate from this replay.
+See the [README workflow](../README.md#strict-coverage-snapshot-workflow) for capture and validation commands.
+
+
 ## Module tree
 
 Names are chosen for what they are *for* in Zig, not for their Rust originals.
@@ -119,6 +174,42 @@ Peer identity and certificates do not prove a mapping.
 Native wire support therefore does not justify offering the separate `/iroh-qad/0` service.
 The router keeps that service reserved and unoffered.
 
+### Public ownership and refusal boundaries
+
+Blob transfer decisions are pure. The getter supplies a finite byte allowance to Bao verification.
+The response header exposes `claimed_size`, not authenticated total size.
+`verified_size` requires matching expected size or authenticated terminal data.
+A nonterminal proof verifies selected payload only.
+The claim can tighten the getter allowance without granting verification.
+Missing data and provider refusal close the affected stream. Other provider errors still propagate.
+Node supports GET only. `BlobSet` and `BlobClaim` have no Node transfer consumer.
+
+Node owns root key copies in `config.secret` and optional `config.relay.client.secret`.
+`wipeConfigSecrets` clears both on construction rollback and after nested runtime teardown.
+Bridge, Dialer and relay client cleanup clear their own separate copies.
+Caller-held keys, borrowed keys and independent byte copies remain the caller's responsibility.
+
+DNS fallback retains one pending TCP connection across finite cancellation slices under the original request deadline.
+Explicit global Resolver cancellation is terminal. Retrieval cancellation is operation-local and preserves Resolver reuse.
+Real follow-up UDP queries passed after cancellation during UDP wait, pending TCP fallback and partial TCP fallback.
+The current normal-root Debug and ReleaseSafe suites include these public regressions (`bg317`).
+`Answer.records` owns TXT bytes. Lookup streams borrow those bytes and own their parsed items.
+The parent keeps the answer alive through stream teardown.
+
+Failed post-spawn child construction retains the actual process owner and its start error.
+Cleanup errors and deadlines retain storage and identity until reap succeeds.
+Process I/O must establish exact identity before a signal.
+Deinitialization requires completed cleanup, not merely an expired watchdog.
+
+Actual incoming gossip permits 4,096 encoded bytes. Outgoing admission requires fewer than 4,096.
+Public preflight precedes startup timers, output, cache and statistics mutation.
+Derived refill refusal preserves valid receive, departure and timeout cleanup without committing pending requests.
+Peer-owned stream assemblies survive another connection for that peer closing.
+
+QUIC assembly failure publishes no usable prefix and closes the connection.
+First path abandonment instead requeues reliable retransmission and preserves packet-number history for ordinary ACKs.
+The native sequence/last-local cancellation model is standalone, not a Node cancellation route.
+
 ## Invariants
 
 These are the things that break silently. Each is stated with the failure it
@@ -161,6 +252,23 @@ prevents, and each belongs in a test.
    whose `deinit` is the single exit path; the connection actor must never
    outlive it.
 
+`relay/tcp_processor.zig` owns the client and server protocol transitions.
+Each processor takes a decoded event and explicit state.
+It returns new state and at most two ordered actions, without sockets, clocks or allocators.
+The TCP client and server decode bounded input through separate protocol drivers.
+`tcp_http`, `tcp_forward`, `tcp_execution`, `tcp_listener`, `tcp_native_path` and `tcp_ws_processor` separate their remaining responsibilities.
+`tcp_session.Transport` provides a borrowed read/write/close seam for deterministic I/O failures.
+The default adapter uses the real TCP driver.
+There is no public compatibility `Listener` or obsolete carrier module.
+`node_close.closeConnections` drains each inner QUIC close through the mapped transport.
+It then calls `node_relay_runtime.State.flush` before endpoint shutdown.
+This bounded pass performs output only, without inbound or handshake work.
+Partial writes and `WouldBlock` preserve queued bytes and carrier ownership.
+An incomplete close leaves the endpoint live. Repeated close resumes the same pending output.
+Remote application close code 0 proves completion in the mixed-relay smoke.
+A timeout does not satisfy that contract.
+
+
 ### Discovery
 
 11. **pkarr signs the BEP-0044 signable form** —
@@ -183,6 +291,16 @@ prevents, and each belongs in a test.
 16. **Prune `Unusable` paths first, always**, and cap `Inactive` at 10 of 30
     non-relay paths per peer.
 17. **A selected relay path is not a reason to stop punching.**
+
+The production route and generic gate have different inputs.
+`node_holepunch.prepare` selects the smallest authenticated client connection ID.
+`node_native.pass` restricts client initiation to that ID. Servers advertise and respond without initiating.
+`prepare`/`received` compare that connection's accepted packet counter around each datagram.
+Only accepted physical-source 1-RTT traffic records `.open`. Synthetic relay sources do not qualify.
+This is not a per-path application-byte signal.
+No production adapter supplies a Number-Time QNT round or mirrors native counters into the generic path table.
+The generic holepunch gate and path policy remain standalone under the explicit admissions in
+[`TODO.md`](../TODO.md#issue-16-checklist-disposition).
 
 ### Endpoint
 
@@ -208,12 +326,10 @@ prevents, and each belongs in a test.
   `Io`, no allocator and no clock and name resolution belongs to
   `src/discovery/`. Upstream's DERP client parses `url.host` as a socket address
   outright, so the literal case is its shape and the named case is our open half.
-  **Nothing in `src/` resolves a name today**: `dns.zig` builds only the
-  `_iroh.<z32>.<origin>` TXT query and there is no A/AAAA path. A relay URL
-  with a named host cannot yet be reached. A live transport
-  does exist — `discovery/lookup_live.zig` is the datagram seam over
-  `transport/socket.zig` — but it carries those questions rather than turning a
-  host into an address.
+  The production node can resolve identity-only addresses through `dns_live`
+  and signed `pkarr_live` records. These routes resolve endpoint identities to
+  advertised transport addresses. They do not make `RelayUrl.socketAddr`
+  resolve a host name.
 - **Ticket and address encodings are explicit.** `parseHex` / `parseZ32` /
   `parseLocalTlsName` rather than one `FromStr` that guesses by length.
 - **The synthetic-ULA host bits are injected, not drawn.** Upstream's

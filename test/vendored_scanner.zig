@@ -93,6 +93,8 @@ pub const Scanner = struct {
             if (tok.tag == .keyword_fn) {
                 want_fn_body = true;
                 if (self.fnNameAfter(i)) |name| {
+                    // zbc cannot prove this append grows local_fns, not the token slice.
+                    // zbc-disable-next-line: slice-loop-reentrant-grow
                     try self.local_fns.append(alloc, name);
                 }
             }

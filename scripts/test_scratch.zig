@@ -1,6 +1,19 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Dir = std.Io.Dir;
 const gate_scratch = @import("gate_scratch.zig");
+pub const CreateError = std.process.Environ.CreateMapError ||
+    gate_scratch.ValidateError || std.mem.Allocator.Error || Dir.OpenError ||
+    Dir.CreateDirError || std.Io.File.StatError || std.Io.RandomSecureError ||
+    error{ NoSpaceLeft, SharedScratchParent, UnapprovedScratch };
+const CreateTmpDirError = gate_scratch.ValidateError || Dir.OpenError ||
+    Dir.CreateDirError || std.Io.File.StatError || std.Io.RandomSecureError ||
+    error{ NoSpaceLeft, SharedScratchParent };
+const ParentValidationError = Dir.OpenError || std.Io.File.StatError ||
+    error{ SharedScratchParent, UnapprovedScratch };
+const CleanupError = gate_scratch.ValidateError || ParentValidationError ||
+    Dir.RealPathError || Dir.StatFileError || std.process.RunError ||
+    Dir.DeleteTreeError || error{ NoSpaceLeft, ScratchIdentityChanged, UnprovenScratchCleanup };
 
 // Only inspect the owned tree and this test process, never unrelated users' PIDs.
 // A mounted descendant, foreign entry, symlink, hard link, open descriptor or
@@ -76,8 +89,8 @@ pub const TmpDir = struct {
         };
     }
 
-    fn removeOwnedChild(self: *TmpDir) !void {
-        try validatePrivateParent(self.parent_dir, self.io);
+    fn removeOwnedChild(self: *TmpDir) CleanupError!void {
+        try validatePrivateParent(self.io, self.parent_dir);
         try gate_scratch.validateRoot(self.gpa, self.io, &self.environment, self.path);
         var parent_buffer: [Dir.max_path_bytes]u8 = undefined;
         const parent_path = parent_buffer[0..try self.parent_dir.realPath(self.io, &parent_buffer)];
@@ -89,7 +102,7 @@ pub const TmpDir = struct {
         });
         if (metadata.kind != .directory or metadata.inode != self.inode)
             return error.ScratchIdentityChanged;
-        const process_id = switch (@import("builtin").os.tag) {
+        const process_id = switch (builtin.os.tag) {
             .linux => std.os.linux.getpid(),
             else => return error.UnprovenScratchCleanup,
         };
@@ -114,7 +127,7 @@ pub const TmpDir = struct {
 };
 
 /// A test-only replacement for std.testing.tmpDir; no repository cache fallback.
-pub fn tmpDir(opts: Dir.OpenOptions) !TmpDir {
+pub fn tmpDir(opts: Dir.OpenOptions) CreateError!TmpDir {
     const t = std.testing;
     var environment = try t.environ.createMap(t.allocator);
     errdefer environment.deinit();
@@ -127,12 +140,12 @@ fn createTmpDir(
     io: std.Io,
     environment: *const std.process.Environ.Map,
     opts: Dir.OpenOptions,
-) !TmpDir {
+) CreateTmpDirError!TmpDir {
     const scratch = try gate_scratch.validatedScratch(gpa, io, environment, "");
     defer gpa.free(scratch);
     const parent = try Dir.openDirAbsolute(io, scratch, .{ .follow_symlinks = false });
     errdefer parent.close(io);
-    try validatePrivateParent(parent, io);
+    try validatePrivateParent(io, parent);
     var random: [16]u8 = undefined;
     try io.randomSecure(&random);
     var sub_path: [42]u8 = undefined;
@@ -164,7 +177,7 @@ fn createTmpDir(
 }
 
 // A private child is not exclusive if another UID can rename its ancestors.
-fn validatePrivateParent(parent: Dir, io: std.Io) !void {
+fn validatePrivateParent(io: std.Io, parent: Dir) ParentValidationError!void {
     const root = try parent.openDir(io, "..", .{ .follow_symlinks = false });
     defer root.close(io);
     const base = try root.openDir(io, "..", .{ .follow_symlinks = false });
@@ -172,7 +185,7 @@ fn validatePrivateParent(parent: Dir, io: std.Io) !void {
     const scratch_metadata = try parent.stat(io);
     const root_metadata = try root.stat(io);
     const base_metadata = try base.stat(io);
-    switch (@import("builtin").os.tag) {
+    switch (builtin.os.tag) {
         .linux => {
             if (scratch_metadata.permissions.toMode() & 0o022 != 0 or
                 root_metadata.permissions.toMode() & 0o022 != 0)

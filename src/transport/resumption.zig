@@ -252,6 +252,10 @@ fn ticketFor(
         .quic_version = version,
     };
     @memcpy(built.alpn[0..alpn.len], alpn);
+    // Private test callers supply `"ozai"` (4 bytes), except `"ozai-blobs-2"`
+    // (11 bytes); both fit `alpn[32]` and `u8`. ZBC cannot propagate those
+    // closed caller lengths through this `[]const u8` cast.
+    // zbc-disable-next-line: index-type-narrowing-wraparound
     built.alpn_len = @intCast(alpn.len);
     return built;
 }

@@ -76,6 +76,8 @@ pub const PeerInfos = struct {
     pub fn init(items: []const PeerInfo) Error!PeerInfos {
         if (items.len > max_shuffle_nodes) return error.ShuffleNodeListTooLong;
         var list: PeerInfos = undefined;
+        // ZBC does not carry this guard through max_shuffle_nodes = 124, which fits in u8.
+        // zbc-disable-next-line: index-type-narrowing-wraparound
         list.count = @intCast(items.len);
         @memcpy(list.items[0..items.len], items);
         return list;

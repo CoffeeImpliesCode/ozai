@@ -143,12 +143,10 @@ pub const Schedule = struct {
         StartAfterBudget,
     };
 
-    /// A checked schedule from an offset table and a budget.
+    /// A checked schedule with at least one source, from offsets and a budget.
     ///
-    /// The checks are what make the rest of this file total: `Schedule` can be
-    /// built as a literal with an unordered table or a late first source, and
-    /// `due` on such a table answers a question about a schedule nobody would
-    /// run.
+    /// This factory refuses an empty configuration; an empty runtime schedule
+    /// can still be represented as a literal and has no sources to wait for.
     pub fn init(
         starts: []const u64,
         budget_ms: u64,
@@ -206,11 +204,13 @@ pub const Schedule = struct {
 
     /// The budget `host_io.walkDeadlineMs` would derive for this table: the
     /// last offset plus one source's whole allowance.
+    /// An empty runtime schedule has no wait budget.
     ///
     /// Offered so a caller can see the shape it is choosing against, and so a
     /// test can hold the arithmetic to `discovery/host_io.zig`'s rule without
     /// this module taking the number over.
     pub fn derivedBudgetMs(self: Schedule) u64 {
+        if (self.starts.len == 0) return 0;
         const last = self.starts[self.starts.len - 1];
         return std.math.add(u64, last, self.source_budget_ms) catch
             std.math.maxInt(u64);
@@ -354,6 +354,15 @@ test "the first source is due at zero and the rest by their offsets" {
     try t.expectEqual(@as(usize, 0), empty.due(0));
     try t.expectEqual(@as(usize, 0), empty.due(1_000_000));
     try t.expectEqual(@as(usize, 0), outstanding(empty, 0));
+}
+
+test "an empty schedule has no derived wait budget" {
+    const empty: Schedule = .{
+        .starts = &.{},
+        .budget_ms = test_budget_ms,
+        .source_budget_ms = test_source_budget_ms,
+    };
+    try t.expectEqual(@as(u64, 0), empty.derivedBudgetMs());
 }
 
 test "a budget that expires is an outcome and not an error" {

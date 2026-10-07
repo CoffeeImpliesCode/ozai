@@ -3,6 +3,7 @@ const std = @import("std");
 const Node = @import("node.zig").Node;
 const Error = @import("node_config.zig").Error;
 const wire = @import("node_gossip_wire.zig");
+const transport = @import("node_transport.zig");
 const bridge = @import("../transport/quic_bridge.zig");
 const hyparview = @import("../gossip/hyparview.zig");
 const plumtree = @import("../gossip/plumtree.zig");
@@ -35,7 +36,12 @@ pub fn broadcast(
     const now = try gossipNow(at);
     for (self.config.gossip_topics, 0..) |configured, index| {
         if (!configured.eql(topic)) continue;
-        try feedGossip(self, index, .{ .command = .{ .broadcast = .{ .content = content, .scope = scope } } }, now);
+        try feedGossip(
+            self,
+            index,
+            .{ .command = .{ .broadcast = .{ .content = content, .scope = scope } } },
+            now,
+        );
         return;
     }
     return error.UnknownGossipTopic;
@@ -88,7 +94,12 @@ fn reapStale(self: *Node, now: hyparview.Nanos) Error!bool {
     return stale.len != 0;
 }
 
-pub fn feedGossip(self: *Node, topic_index: usize, event: hyparview.InEvent, now: hyparview.Nanos) Error!void {
+pub fn feedGossip(
+    self: *Node,
+    topic_index: usize,
+    event: hyparview.InEvent,
+    now: hyparview.Nanos,
+) Error!void {
     std.debug.assert(topic_index < self.gossip_topics.len);
     var out: hyparview.Actions(hyparview.OutEvent) = .init(self.gpa);
     defer out.deinit();
@@ -123,7 +134,8 @@ pub fn feedGossip(self: *Node, topic_index: usize, event: hyparview.InEvent, now
         .emit_event => |app| switch (app) {
             .neighbor_up => {
                 self.stats.neighbor_up += 1;
-                broadcast_initial = self.config.gossip_message != null and !self.gossip.initial_sent[topic_index];
+                broadcast_initial =
+                    self.config.gossip_message != null and !self.gossip.initial_sent[topic_index];
             },
             .neighbor_down => self.stats.neighbor_down += 1,
             .received => |received| {
@@ -140,15 +152,24 @@ pub fn feedGossip(self: *Node, topic_index: usize, event: hyparview.InEvent, now
     };
     // `received.content` may borrow from this frame/cache; every action is consumed before return.
     if (broadcast_initial) {
+        const content = self.config.gossip_message orelse
+            std.debug.panic("initial gossip broadcast missing configured message", .{});
         self.gossip.initial_sent[topic_index] = true;
         try feedGossip(self, topic_index, .{ .command = .{ .broadcast = .{
-            .content = self.config.gossip_message.?,
+            .content = content,
             .scope = .neighbors,
         } } }, now);
     }
 }
 
+/// Expiry ends a peer's topic presence only after its final authenticated route is gone.
 pub fn peerGone(self: *Node, peer: NodeId, at: bridge.Instant) Error!void {
+    wire.learn(self);
+    if (self.gossip.conns.connFor(peer)) |id| {
+        if (transport.connFor(self, id)) |conn| {
+            if (!conn.closed()) return;
+        }
+    }
     wire.forget(self, peer);
     const now = try gossipNow(at);
     for (self.gossip_topics, 0..) |_, index| {

@@ -13,9 +13,11 @@ pub const Options = struct {
 test "options reject unknown missing and unbounded arguments" {
     try std.testing.expectError(error.InvalidArguments, parse(&.{"--unknown"}));
     try std.testing.expectError(error.InvalidArguments, parse(&.{"--node-peer"}));
-    try std.testing.expectError(error.InvalidArguments, parse(&.{"--for-ms", "0"}));
-    try std.testing.expectError(error.InvalidArguments, parse(&.{"--for-ms", "45001"}));
-    for ([_][]const u8{ "--zig-peer", "--rust-peer", "--zig-role", "--qad-cert", "--qad-key" }) |flag| {
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "--for-ms", "0" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "--for-ms", "45001" }));
+    for ([_][]const u8{
+        "--zig-peer", "--rust-peer", "--zig-role", "--qad-cert", "--qad-key",
+    }) |flag| {
         try std.testing.expectError(error.InvalidArguments, parse(&.{ flag, "/obsolete" }));
     }
 }
@@ -25,13 +27,17 @@ test "options require both explicit outside namespace baselines without QAD file
         "--node-peer", "/node", "--rust-relay", "/relay", "--evidence-dir", "/evidence",
     };
     try std.testing.expectError(error.InvalidArguments, parse(&paths));
-    try std.testing.expectError(error.InvalidArguments,
-        parse(&(paths ++ .{ "--original-netns", "net:[1]" })));
-    try std.testing.expectError(error.InvalidArguments,
-        parse(&(paths ++ .{ "--original-userns", "user:[2]" })));
+    try std.testing.expectError(
+        error.InvalidArguments,
+        parse(&(paths ++ .{ "--original-netns", "net:[1]" })),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        parse(&(paths ++ .{ "--original-userns", "user:[2]" })),
+    );
     const parsed = try parse(&(paths ++ .{
-        "--original-netns", "net:[1]", "--original-userns", "user:[2]",
-        "--endpoint-a-role", "server", "--for-ms", "1000",
+        "--original-netns",  "net:[1]", "--original-userns", "user:[2]",
+        "--endpoint-a-role", "server",  "--for-ms",          "1000",
     }));
     try std.testing.expectEqualStrings("/node", parsed.node_peer);
     try std.testing.expectEqualStrings("/relay", parsed.rust_relay);
@@ -52,8 +58,10 @@ test "options reject malformed namespace flags and duplicate flags" {
     var arguments = paths ++ .{
         "--original-netns", "net:[1]", "--original-userns", "user:[2]",
     };
-    for ([_][]const u8{ "", "net:[0]", "net:[01]", "net:[+1]", "net:[1]\n",
-        "net:[18446744073709551616]", "user:[1]" }) |net| {
+    for ([_][]const u8{
+        "",                           "net:[0]",  "net:[01]", "net:[+1]", "net:[1]\n",
+        "net:[18446744073709551616]", "user:[1]",
+    }) |net| {
         arguments[7] = net;
         try std.testing.expectError(error.InvalidArguments, parse(&arguments));
     }
@@ -68,10 +76,14 @@ test "options reject malformed namespace flags and duplicate flags" {
         duplicate[10] = flag;
         try std.testing.expectError(error.InvalidArguments, parse(&duplicate));
     }
-    try std.testing.expectError(error.InvalidArguments,
-        parse(&(required ++ .{ "--endpoint-a-role", "server", "--endpoint-a-role", "client" })));
-    try std.testing.expectError(error.InvalidArguments,
-        parse(&(required ++ .{ "--for-ms", "1000", "--for-ms", "2000" })));
+    try std.testing.expectError(
+        error.InvalidArguments,
+        parse(&(required ++ .{ "--endpoint-a-role", "server", "--endpoint-a-role", "client" })),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        parse(&(required ++ .{ "--for-ms", "1000", "--for-ms", "2000" })),
+    );
 }
 
 pub fn parse(args: []const []const u8) error{InvalidArguments}!Options {

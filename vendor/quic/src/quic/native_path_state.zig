@@ -167,14 +167,11 @@ test "absent MP fails closed and processing never changes its input" {
     const state = try process(initial, .{ .negotiate = .{ .local_max = null, .peer_max = 1 } });
     try std.testing.expect(!state.negotiated);
     try std.testing.expectError(error.MultipathNotNegotiated, process(state, .{ .select = 0 }));
-    try std.testing.expectError(error.MultipathNotNegotiated, process(state,
-        .{ .open = .{ .id = 1, .is_server = false } }));
+    try std.testing.expectError(error.MultipathNotNegotiated, process(state, .{ .open = .{ .id = 1, .is_server = false } }));
     try std.testing.expectError(error.MultipathNotNegotiated, process(state, .{ .accept = 1 }));
-    try std.testing.expectError(error.MultipathNotNegotiated, process(state,
-        .{ .status = .{ .id = 0, .seq = 0, .value = .backup } }));
+    try std.testing.expectError(error.MultipathNotNegotiated, process(state, .{ .status = .{ .id = 0, .seq = 0, .value = .backup } }));
     try std.testing.expectError(error.MultipathNotNegotiated, process(state, .{ .abandon = 0 }));
-    const missing_peer = try process(initial,
-        .{ .negotiate = .{ .local_max = 1, .peer_max = null } });
+    const missing_peer = try process(initial, .{ .negotiate = .{ .local_max = 1, .peer_max = null } });
     try std.testing.expect(!missing_peer.negotiated);
     try std.testing.expect(!initial.entries[1].opened);
 }
@@ -182,8 +179,7 @@ test "absent MP fails closed and processing never changes its input" {
 test "sending and authenticated receiving use independent negotiated ceilings" {
     var state = try process(.{}, .{ .negotiate = .{ .local_max = 0, .peer_max = 1 } });
     try std.testing.expect(state.negotiated);
-    try std.testing.expectError(error.MaxPathIdReached, process(state,
-        .{ .open = .{ .id = 1, .is_server = false } }));
+    try std.testing.expectError(error.MaxPathIdReached, process(state, .{ .open = .{ .id = 1, .is_server = false } }));
     try std.testing.expectError(error.MaxPathIdReached, process(state, .{ .accept = 1 }));
     state = try process(state, .{ .negotiate = .{ .local_max = 1, .peer_max = 0 } });
     state = try process(state, .{ .accept = 1 });
@@ -191,20 +187,16 @@ test "sending and authenticated receiving use independent negotiated ceilings" {
     try std.testing.expectError(error.MaxPathIdReached, process(state, .{ .select = 1 }));
     state = try process(.{}, .{ .negotiate = .{ .local_max = 9, .peer_max = 7 } });
     try std.testing.expectEqual(@as(u32, 1), state.peer_max_path_id);
-    try std.testing.expectError(error.InvalidPathId, process(state,
-        .{ .open = .{ .id = 2, .is_server = false } }));
+    try std.testing.expectError(error.InvalidPathId, process(state, .{ .open = .{ .id = 2, .is_server = false } }));
     state = try process(state, .{ .open = .{ .id = 1, .is_server = false } });
-    try std.testing.expectError(error.AlreadyOpen, process(state,
-        .{ .open = .{ .id = 1, .is_server = false } }));
+    try std.testing.expectError(error.AlreadyOpen, process(state, .{ .open = .{ .id = 1, .is_server = false } }));
 }
 
 test "client initiation and server acceptance require separate address validation" {
     var state = try process(.{}, .{ .negotiate = .{ .local_max = 1, .peer_max = 1 } });
-    try std.testing.expectError(error.ServerSideNotAllowed, process(state,
-        .{ .open = .{ .id = 1, .is_server = true } }));
+    try std.testing.expectError(error.ServerSideNotAllowed, process(state, .{ .open = .{ .id = 1, .is_server = true } }));
     try std.testing.expectError(error.ClosedPath, process(state, .{ .select = 1 }));
-    try std.testing.expectError(error.ClosedPath, process(state,
-        .{ .validated = .{ .id = 1, .value = true } }));
+    try std.testing.expectError(error.ClosedPath, process(state, .{ .validated = .{ .id = 1, .value = true } }));
     state = try process(state, .{ .accept = 1 });
     state = try process(state, .{ .accept = 1 });
     try std.testing.expectError(error.PathNotValidated, process(state, .{ .select = 1 }));
@@ -239,12 +231,10 @@ test "abandonment is permanent and never invents a validated replacement" {
     state = try process(state, .{ .select = 1 });
     state = try process(state, .{ .abandon = 1 });
     state = try process(state, .{ .negotiate = .{ .local_max = 1, .peer_max = 1 } });
-    try std.testing.expectError(error.ClosedPath, process(state,
-        .{ .open = .{ .id = 1, .is_server = false } }));
+    try std.testing.expectError(error.ClosedPath, process(state, .{ .open = .{ .id = 1, .is_server = false } }));
     try std.testing.expectError(error.ClosedPath, process(state, .{ .accept = 1 }));
     try std.testing.expectError(error.ClosedPath, process(state, .{ .select = 1 }));
-    try std.testing.expectError(error.ClosedPath, process(state,
-        .{ .validated = .{ .id = 1, .value = true } }));
+    try std.testing.expectError(error.ClosedPath, process(state, .{ .validated = .{ .id = 1, .value = true } }));
     state = try process(state, .{ .status = .{ .id = 1, .seq = 4, .value = .available } });
     try std.testing.expectEqual(@as(?u64, null), state.entries[1].status_seq);
     try std.testing.expectEqualDeep(state, try process(state, .{ .abandon = 1 }));

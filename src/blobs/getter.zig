@@ -128,15 +128,45 @@ pub fn expectedAnswer(
     return encode_mod.encode(plan, tree, data, out);
 }
 
-pub const Decoded = struct { size: u64, written: usize };
+pub const Decoded = struct {
+    /// The raw, unauthenticated response header.
+    claimed_size: u64,
+    /// Present only with matching out-of-band size or authenticated terminal data.
+    verified_size: ?u64,
+    written: usize,
+};
 pub const DecodeError = Refused || error{
     SizeMismatch,
     HashMismatch,
     BufferTooSmall,
 };
 
+/// Bound root response buffering by the decoder's existing finite plan storage.
+/// A claimed header can tighten the unknown-size allowance without trusting it.
+pub fn budget(request: GetRequest, expected_size: ?u64) DecodeError!usize {
+    if (expected_size) |size| {
+        const tree = BaoTree.init(size);
+        const selected = request.selectedRange(tree.chunks()) orelse
+            return error.NoRangeRequested;
+        const plan = plan_mod.planOf(tree, selected);
+        if (plan.overflow) return error.MalformedPlan;
+        if (plan.isEmpty()) return error.NoRangeRequested;
+        return std.math.add(usize, 8, plan.bytes) catch error.MalformedPlan;
+    }
+    const maximum_tree = BaoTree.init(std.math.maxInt(u64));
+    if (request.selectedRange(maximum_tree.chunks()) == null) return error.NoRangeRequested;
+    const item_bytes = std.math.add(
+        usize,
+        @as(usize, @intCast(ranges.block_size)),
+        tree_mod_pair_length,
+    ) catch return error.MalformedPlan;
+    const proof_bytes = std.math.mul(usize, plan_mod.max_items, item_bytes) catch
+        return error.MalformedPlan;
+    return std.math.add(usize, 8, proof_bytes) catch error.MalformedPlan;
+}
+
 /// Verify a complete `/iroh-bytes/4` response before exposing requested data.
-/// The wire size is untrusted until the Bao walk reaches the requested hash.
+/// A nonterminal Bao subtree authenticates payload, not the claimed total size.
 pub fn decode(
     request: GetRequest,
     expected_size: ?u64,
@@ -162,9 +192,11 @@ pub fn decode(
     const plan = plan_mod.planOf(tree, selected);
     var at: usize = 0;
     var written: usize = 0;
+    var verified_size: ?u64 = expected_size;
     for (plan.items[0..plan.len], 0..) |item, index| {
         const count = plan.itemBytes(tree, index);
         if (item == .data) {
+            if (item.data.endChunk() == tree.chunks()) verified_size = size;
             const bytes = item.data.bytes(tree);
             const left = @max(start, bytes.start);
             const right = @min(end, bytes.end);
@@ -178,7 +210,7 @@ pub fn decode(
         at += count;
     }
     std.debug.assert(written == length);
-    return .{ .size = size, .written = written };
+    return .{ .claimed_size = size, .verified_size = verified_size, .written = written };
 }
 
 const t = std.testing;
@@ -285,7 +317,7 @@ test "a flipped byte and a truncated answer are the verifier's refusals" {
     defer t.allocator.free(data);
     const tree = BaoTree.init(data.len);
     const hash: core.CvBytes = try tree.rootHash(data);
-    const selected = ranges.ChunkRange{ .start = 20, .end = 21 };
+    const selected: ranges.ChunkRange = .{ .start = 20, .end = 21 };
 
     const plan = plan_mod.planOf(tree, selected);
     const scratch = try t.allocator.alloc(u8, plan.bytes);
@@ -359,19 +391,83 @@ test "decode verifies wire size and clips partial final chunk payload" {
         .{ .delta = 0, .spec = .{ .widths = &.{ 47, 2 } } },
         .{ .delta = 1, .spec = range_spec.RangeSpec.empty },
     };
-    const request = GetRequest{ .hash = root, .ranges = .{ .items = &items } };
+    const request: GetRequest = .{ .hash = root, .ranges = .{ .items = &items } };
     var wire: [49189 + 1024]u8 = undefined;
     std.mem.writeInt(u64, wire[0..8], tree.size, .little);
     const proof_len = try expectedAnswer(request, tree, data, wire[8..]);
     var payload: [2048]u8 = undefined;
     const decoded = try decode(request, tree.size, root, wire[0 .. 8 + proof_len], &payload);
-    try t.expectEqual(@as(u64, 49189), decoded.size);
+    try t.expectEqual(@as(u64, 49189), decoded.claimed_size);
+    try t.expectEqual(@as(?u64, 49189), decoded.verified_size);
+    const terminal = try decode(request, null, root, wire[0 .. 8 + proof_len], &payload);
+    try t.expectEqual(@as(?u64, tree.size), terminal.verified_size);
     try t.expectEqualSlices(u8, data[47 * 1024 ..], payload[0..decoded.written]);
     try t.expectError(error.SizeMismatch, decode(
-        request, tree.size + 1, root, wire[0 .. 8 + proof_len], &payload,
+        request,
+        tree.size + 1,
+        root,
+        wire[0 .. 8 + proof_len],
+        &payload,
     ));
     wire[8 + proof_len - 1] ^= 1;
     try t.expectError(error.ChildMismatch, decode(
-        request, tree.size, root, wire[0 .. 8 + proof_len], &payload,
+        request,
+        tree.size,
+        root,
+        wire[0 .. 8 + proof_len],
+        &payload,
     ));
+}
+
+// A nonterminal subtree authenticates payload, but not the response's total size.
+test "decode separates claimed size from terminal or expected size evidence" {
+    const data = try published.blake3Input(49189);
+    defer t.allocator.free(data);
+    const tree = BaoTree.init(data.len);
+    const root = try tree.rootHash(data);
+    const prefix_items = [_]range_spec.Item{
+        .{ .delta = 0, .spec = .{ .widths = &.{ 0, 1 } } },
+        .{ .delta = 1, .spec = range_spec.RangeSpec.empty },
+    };
+    const prefix: GetRequest = .{ .hash = root, .ranges = .{ .items = &prefix_items } };
+    var wire: [49189 + 1024]u8 = undefined;
+    const prefix_len = try expectedAnswer(prefix, tree, data, wire[8..]);
+    var payload: [49189]u8 = undefined;
+    std.mem.writeInt(u64, wire[0..8], tree.size, .little);
+    const unknown = try decode(prefix, null, root, wire[0 .. 8 + prefix_len], &payload);
+    try t.expectEqual(tree.size, unknown.claimed_size);
+    try t.expectEqual(@as(?u64, null), unknown.verified_size);
+    const known = try decode(prefix, tree.size, root, wire[0 .. 8 + prefix_len], &payload);
+    try t.expectEqual(@as(?u64, tree.size), known.verified_size);
+    std.mem.writeInt(u64, wire[0..8], tree.size + 1, .little);
+    const forged = try decode(prefix, null, root, wire[0 .. 8 + prefix_len], &payload);
+    try t.expectEqual(tree.size + 1, forged.claimed_size);
+    try t.expectEqual(@as(?u64, null), forged.verified_size);
+    try t.expectEqualSlices(u8, data[0..1024], payload[0..forged.written]);
+
+    const whole = GetRequest.blob(root);
+    std.mem.writeInt(u64, wire[0..8], tree.size, .little);
+    const whole_len = try expectedAnswer(whole, tree, data, wire[8..]);
+    const terminal = try decode(whole, null, root, wire[0 .. 8 + whole_len], &payload);
+    try t.expectEqual(@as(?u64, tree.size), terminal.verified_size);
+}
+
+test "response budget derives finite known and decoder capped unknown allowances" {
+    const request = GetRequest.blob([_]u8{0} ** 32);
+    try t.expectEqual(@as(usize, 8 + 1024), try budget(request, 1024));
+    const tree = BaoTree.init(49189);
+    const plan = plan_mod.planOf(tree, .{ .start = 0, .end = tree.chunks() });
+    try t.expectEqual(8 + plan.bytes, try budget(request, tree.size));
+    const unknown = try budget(request, null);
+    try t.expect(unknown >= 8 + plan.bytes);
+    try t.expect(unknown < std.math.maxInt(usize));
+    try t.expectError(error.MalformedPlan, budget(request, std.math.maxInt(u64)));
+    try t.expectError(error.NoRangeRequested, budget(request, 0));
+    for ([_]?u64{ null, 1024 }) |size| {
+        try t.expectError(error.NoRangeRequested, budget(GetRequest.all(request.hash), size));
+        try t.expectError(error.NoRangeRequested, budget(
+            .{ .hash = request.hash, .ranges = .empty },
+            size,
+        ));
+    }
 }

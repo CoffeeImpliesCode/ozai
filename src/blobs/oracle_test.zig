@@ -11,10 +11,13 @@ const framing = @import("framing.zig");
 const postcard = @import("../wire/postcard.zig");
 const range_spec = @import("range_spec.zig");
 const store = @import("store.zig");
+const test_scratch = @import("test_scratch");
 
 fn capture(comptime name: []const u8) ![]u8 {
     const file = try std.Io.Dir.cwd().openFile(
-        t.io, "test/fixtures/blobs/" ++ name ++ ".bin", .{},
+        t.io,
+        "test/fixtures/blobs/" ++ name ++ ".bin",
+        .{},
     );
     defer file.close(t.io);
     const length = try file.length(t.io);
@@ -42,7 +45,7 @@ test "pinned Store captures match Zig outboard requests provider and verified ge
     const outboard_len = try outboard_mod.encode(tree, data, &computed_outboard);
     try t.expectEqualSlices(u8, outboard, computed_outboard[0..outboard_len]);
 
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     var names: store.NameStorage = undefined;
     const paths = store.names(&names, root);
@@ -82,21 +85,41 @@ test "pinned Store captures match Zig outboard requests provider and verified ge
         try t.expectEqualSlices(u8, response, writer.buffered());
         var payload: [49189]u8 = undefined;
         const decoded = try getter.decode(request, tree.size, root, response, &payload);
-        const start: usize = if (std.mem.eql(u8, label, "all")) 0 else if
-            (std.mem.eql(u8, label, "15-18")) 15 * 1024 else 47 * 1024;
+        const start: usize = if (std.mem.eql(u8, label, "all"))
+            0
+        else if (std.mem.eql(u8, label, "15-18"))
+            15 * 1024
+        else
+            47 * 1024;
         const end: usize = if (std.mem.eql(u8, label, "15-18")) 18 * 1024 else data.len;
         try t.expectEqualSlices(u8, data[start..end], payload[0..decoded.written]);
         try t.expectError(error.SizeMismatch, getter.decode(
-            request, tree.size + 1, root, response, &payload,
+            request,
+            tree.size + 1,
+            root,
+            response,
+            &payload,
         ));
         const damaged = try t.allocator.dupe(u8, response);
         defer t.allocator.free(damaged);
         damaged[damaged.len - 1] ^= 1;
         try t.expectError(error.ChildMismatch, getter.decode(
-            request, tree.size, root, damaged, &payload,
+            request,
+            tree.size,
+            root,
+            damaged,
+            &payload,
         ));
-        if (getter.decode(request, tree.size, root, response[0 .. response.len - 1], &payload))
-            |_| return error.TruncationAccepted
-        else |err| try t.expect(err == error.ResponseTruncated or err == error.ProofIncomplete);
+        if (getter.decode(
+            request,
+            tree.size,
+            root,
+            response[0 .. response.len - 1],
+            &payload,
+        )) |_| {
+            return error.TruncationAccepted;
+        } else |err| {
+            try t.expect(err == error.ResponseTruncated or err == error.ProofIncomplete);
+        }
     }
 }

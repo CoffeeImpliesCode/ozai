@@ -181,7 +181,8 @@ pub const SentControlFrame = union(enum) {
             .path_status_backup => |value| .{ .path_status = value.path_id },
             .path_status_available => |value| .{ .path_status = value.path_id },
             .path_new_connection_id => |value| .{ .path_new_connection_id = .{
-                .path_id = value.path_id, .seq_num = value.cid.seq_num,
+                .path_id = value.path_id,
+                .seq_num = value.cid.seq_num,
             } },
             .path_retire_connection_id => |value| .{ .path_retire_connection_id = value },
             .max_path_id => .max_path_id,
@@ -2321,8 +2322,11 @@ test "native control records survive packet-threshold loss with owned payloads" 
         .{ .path_status_backup = .{ .path_id = 2, .status_seq_no = 6 } },
         .{ .path_status_available = .{ .path_id = 2, .status_seq_no = 7 } },
         .{ .path_new_connection_id = .{ .path_id = 2, .cid = .{
-            .seq_num = 8, .retire_prior_to = 3, .cid_buf = [_]u8{0xab} ** 20,
-            .cid_len = 1, .stateless_reset_token = [_]u8{0xcd} ** 16,
+            .seq_num = 8,
+            .retire_prior_to = 3,
+            .cid_buf = [_]u8{0xab} ** 20,
+            .cid_len = 1,
+            .stateless_reset_token = [_]u8{0xcd} ** 16,
         } } },
         .{ .path_retire_connection_id = .{ .path_id = 2, .seq_num = 8 } },
         .{ .max_path_id = 12 },
@@ -2350,15 +2354,23 @@ test "native control records survive packet-threshold loss with owned payloads" 
         const record = SentControlFrame.from(frame) orelse return error.UntrackedNativeControl;
         try testing.expectEqualDeep(expected_record, record);
         var lost: SentPacket = .{
-            .pn = 0, .time_sent = 1_000_000_000, .size = 1200,
-            .ack_eliciting = true, .in_flight = true, .enc_level = .application,
+            .pn = 0,
+            .time_sent = 1_000_000_000,
+            .size = 1200,
+            .ack_eliciting = true,
+            .in_flight = true,
+            .enc_level = .application,
         };
         lost.control_frames[0] = record;
         lost.control_frame_count = 1;
         try handler.onPacketSent(lost);
         try handler.onPacketSent(.{
-            .pn = 3, .time_sent = 1_000_000_001, .size = 1200,
-            .ack_eliciting = true, .in_flight = true, .enc_level = .application,
+            .pn = 3,
+            .time_sent = 1_000_000_001,
+            .size = 1200,
+            .ack_eliciting = true,
+            .in_flight = true,
+            .enc_level = .application,
         });
         try handler.onAckReceived(.application, 3, 0, 3, &.{}, 0, 1_050_000_000, &result);
         try testing.expectEqual(@as(usize, 1), result.lost.count());
@@ -2374,8 +2386,12 @@ test "ACK on another path cannot clear an observed report loss record" {
     var result = AckResult{};
     defer result.deinit(testing.allocator);
     var sent: SentPacket = .{
-        .pn = 0, .time_sent = 1_000_000_000, .size = 1200,
-        .ack_eliciting = true, .in_flight = true, .enc_level = .application,
+        .pn = 0,
+        .time_sent = 1_000_000_000,
+        .size = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .enc_level = .application,
     };
     sent.control_frame_count = 1;
     sent.control_frames[0] = .{ .observed_address = 1 };
@@ -2387,8 +2403,12 @@ test "ACK on another path cannot clear an observed report loss record" {
     try testing.expectEqual(@as(usize, 1), second.sent[2].sent_packets.count());
     result.release(testing.allocator);
     try second.onPacketSent(.{
-        .pn = 3, .time_sent = 1_050_000_001, .size = 1200,
-        .ack_eliciting = true, .in_flight = true, .enc_level = .application,
+        .pn = 3,
+        .time_sent = 1_050_000_001,
+        .size = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .enc_level = .application,
     });
     try second.onAckReceived(.application, 3, 0, 3, &.{}, 0, 1_100_000_000, &result);
     try testing.expectEqual(@as(usize, 1), result.lost.count());
@@ -2402,8 +2422,12 @@ test "PacketHandler: off-path numbering leaves fallback recovery unchanged after
     const random = prng.random();
     const normal_pn = handler.nextPacketNumber(.application, random);
     try handler.onPacketSent(.{
-        .pn = normal_pn, .time_sent = 1000, .size = 1200,
-        .ack_eliciting = true, .in_flight = true, .enc_level = .application,
+        .pn = normal_pn,
+        .time_sent = 1000,
+        .size = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .enc_level = .application,
     });
     const deadline = handler.spacePtoDeadline(handler.sent[2], 2);
     const probe_pn = handler.nextPacketNumber(.application, random);
@@ -2444,8 +2468,12 @@ test "PacketHandler: ACK only off-path probes cannot lose outstanding fallback p
     const random = prng.random();
     const normal_pn = handler.nextPacketNumber(.application, random);
     try handler.onPacketSent(.{
-        .pn = normal_pn, .time_sent = 1000, .size = 1200,
-        .ack_eliciting = true, .in_flight = true, .enc_level = .application,
+        .pn = normal_pn,
+        .time_sent = 1000,
+        .size = 1200,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .enc_level = .application,
     });
     for (0..3) |_| {
         handler.onOffPathPacketSent(handler.nextPacketNumber(.application, random));

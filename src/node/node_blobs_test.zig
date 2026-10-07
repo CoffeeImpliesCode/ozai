@@ -1,18 +1,19 @@
 const std = @import("std");
 const blobs = @import("node_blobs.zig");
 const protocol = @import("../blobs/protocol.zig");
-const getter = @import("../blobs/getter.zig");
-const t = std.testing;
-
 const store = @import("../blobs/store.zig");
 const provider_mod = @import("../blobs/provider.zig");
 const outboard_mod = @import("../blobs/bao_outboard.zig");
+const range_spec = @import("../blobs/range_spec.zig");
+const postcard = @import("../wire/postcard.zig");
+const test_scratch = @import("test_scratch");
+const t = std.testing;
 
 // Real store answers must authenticate whole groups while exporting only requested chunks.
 test "store backed node getter exports whole blob and clipped boundary ranges" {
     var data: [49189]u8 = undefined;
     for (&data, 0..) |*byte, i| byte.* = @intCast((i * 31 + @divFloor(i, 1024)) % 251);
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     const hash = try putTestBlob(tmp.dir, &data);
 
@@ -40,9 +41,18 @@ test "store backed node getter exports whole blob and clipped boundary ranges" {
         const payload = try t.allocator.alloc(u8, end - start);
         defer t.allocator.free(payload);
         const decoded = try blobs.decodeResponse(options, wire, payload);
-        try t.expectEqual(@as(u64, data.len), decoded.size);
+        try t.expectEqual(@as(u64, data.len), decoded.claimed_size);
+        try t.expectEqual(@as(?u64, data.len), decoded.verified_size);
         try t.expectEqual(end - start, decoded.written);
         try t.expectEqualSlices(u8, data[start..end], payload[0..decoded.written]);
+        const unknown = try blobs.decodeResponse(.{ .hash = hash, .range = range }, wire, payload);
+        try t.expectEqual(@as(u64, data.len), unknown.claimed_size);
+        const verified_size: ?u64 = if (range) |selected|
+            if (selected.end == 49) data.len else null
+        else
+            data.len;
+        try t.expectEqual(verified_size, unknown.verified_size);
+        try t.expectEqualSlices(u8, data[start..end], payload[0..unknown.written]);
     }
 }
 
@@ -50,7 +60,7 @@ test "store backed node getter exports whole blob and clipped boundary ranges" {
 test "store backed node getter refuses corrupt incomplete and mismatched answers" {
     var data: [49189]u8 = undefined;
     for (&data, 0..) |*byte, i| byte.* = @intCast((i * 31 + @divFloor(i, 1024)) % 251);
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     const hash = try putTestBlob(tmp.dir, &data);
     var names: store.NameStorage = undefined;
@@ -127,24 +137,27 @@ fn answerTestRequest(
 ) !void {
     var bytes: [128]u8 = undefined;
     const encoded = try blobs.encodeRequest(options, &bytes);
-    var items: [2]@import("../blobs/range_spec.zig").Item = undefined;
+    var items: [2]range_spec.Item = undefined;
     var widths: [2]u64 = undefined;
     var storage: protocol.Storage = .{ .items = &items, .widths = &widths };
-    var reader = @import("../wire/postcard.zig").Reader.init(encoded);
+    var reader = postcard.Reader.init(encoded);
     const request = try protocol.Request.read(&reader, &storage);
     try t.expectEqual(.answered, try provider.answer(t.io, writer, request.to_eof.get));
 }
 
 test "getter sends upstream EOF request selecting boundary chunks" {
-    const options: blobs.Getter = .{ .hash = [_]u8{0x42} ** 32, .range = .{ .start = 15, .end = 18 } };
+    const options: blobs.Getter = .{
+        .hash = [_]u8{0x42} ** 32,
+        .range = .{ .start = 15, .end = 18 },
+    };
     var bytes: [128]u8 = undefined;
     const encoded = try blobs.encodeRequest(options, &bytes);
-    var items: [2]@import("../blobs/range_spec.zig").Item = undefined;
+    var items: [2]range_spec.Item = undefined;
     var widths: [2]u64 = undefined;
     var storage: protocol.Storage = .{ .items = &items, .widths = &widths };
-    var reader = @import("../wire/postcard.zig").Reader.init(encoded);
+    var reader = postcard.Reader.init(encoded);
     const decoded = try protocol.Request.read(&reader, &storage);
-    const selected = decoded.to_eof.get.selectedRange(49).?;
+    const selected = decoded.to_eof.get.selectedRange(49) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(u64, 15), selected.start);
     try t.expectEqual(@as(u64, 18), selected.end);
 }
@@ -160,8 +173,14 @@ test "getter never publishes truncated EOF as completion" {
 
 test "range request refuses empty or inverted chunk interval" {
     var bytes: [128]u8 = undefined;
-    for ([_]protocol.ChunkRange{ .{ .start = 18, .end = 18 }, .{ .start = 18, .end = 15 } }) |range| {
-        try t.expectError(error.InvalidRange, blobs.encodeRequest(.{ .hash = [_]u8{0} ** 32, .range = range }, &bytes));
+    for ([_]protocol.ChunkRange{
+        .{ .start = 18, .end = 18 },
+        .{ .start = 18, .end = 15 },
+    }) |range| {
+        try t.expectError(
+            error.InvalidRange,
+            blobs.encodeRequest(.{ .hash = [_]u8{0} ** 32, .range = range }, &bytes),
+        );
     }
 }
 
@@ -169,6 +188,8 @@ test "expected size mismatch is consumer visible before export" {
     var size: [8]u8 = undefined;
     std.mem.writeInt(u64, &size, 49189, .little);
     var payload: [1]u8 = undefined;
-    try t.expectError(error.SizeMismatch, blobs.decodeResponse(.{ .hash = [_]u8{0} ** 32, .size = 49190 }, &size, &payload));
-    _ = getter;
+    try t.expectError(
+        error.SizeMismatch,
+        blobs.decodeResponse(.{ .hash = [_]u8{0} ** 32, .size = 49190 }, &size, &payload),
+    );
 }

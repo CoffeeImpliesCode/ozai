@@ -355,8 +355,8 @@ pub const Socket = struct {
         try io.checkCancel();
         // What a stop leaves behind is dealt with first, and it is a whole of
         // its own: `restart` drains the queue and spends the wake.
-        try restart(self, io);
-        return socket_send.sendBatch(self, io, dest, payload, &self.caps);
+        try restart(io, self);
+        return socket_send.sendBatch(io, self, dest, payload, &self.caps);
     }
 
     /// Take whatever is queued, or answer that nothing is.
@@ -374,7 +374,7 @@ pub const Socket = struct {
         buffer: []u8,
         control: *ControlBuffer,
     ) ReceiveError!Received {
-        return msg.recvmsg(self.handle, io, buffer, control);
+        return msg.recvmsg(io, self.handle, buffer, control);
     }
 
     /// Wait for a datagram and take it. A `timeout_ms` of null waits as long
@@ -393,7 +393,7 @@ pub const Socket = struct {
         timeout_ms: ?i32,
     ) ReceiveError!Received {
         try self.awaitReadable(io, timeout_ms);
-        return msg.recvmsg(self.handle, io, buffer, control);
+        return msg.recvmsg(io, self.handle, buffer, control);
     }
 
     // `walkRuns` and `sendBatch` — the one `sendmsg` per run, and the two
@@ -420,7 +420,7 @@ pub const Socket = struct {
         var messages: [batch.max_cmsg]batch.Cmsg = undefined;
         var control: ControlBuffer = undefined;
         const written = try writeCmsg(batch.cmsg(run, family, &messages), &control);
-        if (try sendmsg(self.handle, io, run.contents, &name, name_length, written) == .accepted) {
+        if (try sendmsg(io, self.handle, run.contents, &name, name_length, written) == .accepted) {
             return .none;
         }
         // `EIO` and `EINVAL` are one answer from the kernel and two from here.
@@ -432,8 +432,8 @@ pub const Socket = struct {
         if (run.isSegmented()) return .segmentation;
         if (family != .v4) return error.UnknownControlMessage;
         const retried = try sendmsg(
-            self.handle,
             io,
+            self.handle,
             run.contents,
             &name,
             name_length,
@@ -595,7 +595,7 @@ pub const Socket = struct {
 /// raise a real `Socket.stop` between the drain and the flag. Another task's
 /// stop is the only thing that happens there in production, and whether this
 /// erases one is the whole of what the order below has to get right.
-fn restart(context: anytype, io: std.Io) error{ Canceled, Interrupted, Unexpected }!void {
+fn restart(io: std.Io, context: anytype) error{ Canceled, Interrupted, Unexpected }!void {
     // The old stop is spent *first*, and the order is the whole of this
     // function: a stop raised while the queue is being taken, or while the
     // counter is being emptied, has set the flag again, and a flag cleared
@@ -1080,7 +1080,7 @@ test "a refused segmentation is answered with the runs that did not leave" {
     var fixture = try refusedMiddleRun(&payload);
     var writer: Scripted = .{ .answers = &.{ .none, .segmentation } };
 
-    _ = try sendBatch(&writer, t.io, loopback, fixture.send, &fixture.caps);
+    _ = try sendBatch(t.io, &writer, loopback, fixture.send, &fixture.caps);
 
     // Every datagram on the wire exactly once, in order: the runs that were
     // sent, concatenated, are the payload — no run repeated and none missing.
@@ -1123,7 +1123,7 @@ test "a batch that took the fallback says it was degraded" {
     var fixture = try refusedMiddleRun(&payload);
     var writer: Scripted = .{ .answers = &.{ .none, .segmentation } };
 
-    const report = try sendBatch(&writer, t.io, loopback, fixture.send, &fixture.caps);
+    const report = try sendBatch(t.io, &writer, loopback, fixture.send, &fixture.caps);
 
     // The fallback `DECISIONS/0002` promised, made visible rather than a
     // slower wire to notice: the run this socket could take went out as one
@@ -1149,7 +1149,7 @@ test "a codepoint lost on the retried tail is reported with the degradation" {
     var fixture = try refusedMiddleRun(&payload);
     var writer: Scripted = .{ .answers = &.{ .none, .segmentation, .unknown_control_message } };
 
-    const report = try sendBatch(&writer, t.io, loopback, fixture.send, &fixture.caps);
+    const report = try sendBatch(t.io, &writer, loopback, fixture.send, &fixture.caps);
 
     try t.expect(report.degraded);
     try t.expect(!report.ecnSurvived());
@@ -1179,7 +1179,7 @@ test "a codepoint lost before a refused segmentation is reported too" {
     var fixture = try refusedMiddleRun(&payload);
     var writer: Scripted = .{ .answers = &.{ .unknown_control_message, .segmentation } };
 
-    const report = try sendBatch(&writer, t.io, loopback, fixture.send, &fixture.caps);
+    const report = try sendBatch(t.io, &writer, loopback, fixture.send, &fixture.caps);
 
     try t.expect(!report.ecnSurvived());
     try t.expectEqual(@as(?batch.Ecn, null), report.carried);
@@ -1213,7 +1213,7 @@ test "a codepoint lost by one datagram is not put back by the next" {
     var caps: batch.Capability = .{ .max_send_segments = 1, .max_recv_segments = 1 };
     var writer: Scripted = .{ .answers = &.{.unknown_control_message} };
 
-    const report = try sendBatch(&writer, t.io, loopback, send, &caps);
+    const report = try sendBatch(t.io, &writer, loopback, send, &caps);
 
     // No segmentation was ever refused here, so nothing about the batch is
     // degraded: one `sendmsg` per datagram is how this socket sends every
@@ -1526,7 +1526,7 @@ fn expectStopSurviving(window: StopWindow) !void {
         .window = window,
     };
 
-    try restart(&recovery, t.io);
+    try restart(t.io, &recovery);
 
     try t.expect(socket.stopped.load(.acquire));
 

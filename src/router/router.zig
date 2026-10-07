@@ -316,7 +316,6 @@ test "a retry is address validation on a direct path and a cost on a relay" {
     try t.expectEqual(Retry.cost_imposition, retryMeaning(.relay));
 }
 
-
 test "an ALPN nobody registered is dropped, not refused" {
     var recorder: Recorder = .{};
     var entries: [1]Entry = undefined;

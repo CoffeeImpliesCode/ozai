@@ -95,14 +95,27 @@ pub fn flags(arena: Allocator, plan: child.Plan) ![]const []const u8 {
 /// Start a node and put it on the roster, so that one wait in the test watches
 /// every node the test started.
 pub fn startNode(
-    roster: *roster_ns.Roster,
+    io: std.Io,
     gpa: Allocator,
     arena: Allocator,
-    io: std.Io,
+    roster: *roster_ns.Roster,
     name: []const u8,
     plan: child.Plan,
 ) !*child.Process {
-    const process = try child.Process.start(gpa, arena, io, name, plan);
+    const argv = try flags(arena, plan);
+    const started = try child.Process.start(gpa, io, .{
+        .name = name,
+        .argv = argv,
+        .final_argv = if (node_test_options.node_executor != null) argv[1..] else argv,
+        .run_ms = plan.run_ms,
+    });
+    const process = switch (started) {
+        .ready => |value| value,
+        .failed => |failure| {
+            failure.process.deinit(io);
+            return failure.cause;
+        },
+    };
     errdefer process.deinit(io);
     try roster.add(gpa, process);
     return process;
@@ -136,12 +149,4 @@ pub fn peers(
     list[0] = try peer(arena, one);
     list[1] = try peer(arena, two);
     return list;
-}
-
-/// The actual HTTP/WebSocket carrier URL from its production TCP banner.
-/// Inner peer identities are independent of the carrier service.
-pub fn relayUrl(arena: Allocator, relay: *const child.Process) ![]const u8 {
-    const address = relay.carrierBound() orelse
-        return relay.gaveUp("printed no TCP carrier listener in its banner", .{});
-    return std.fmt.allocPrint(arena, "http://{s}/", .{address});
 }

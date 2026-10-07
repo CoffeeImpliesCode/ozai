@@ -19,9 +19,6 @@ const incoming_filter = @import("../endpoint/incoming_filter.zig");
 const NodeId = base_key.NodeId;
 const SecretKey = base_key.SecretKey;
 const SocketAddr = base_addr.SocketAddr;
-const lookup_io = @import("../discovery/lookup_io.zig");
-const pkarr_live = @import("../discovery/pkarr_live.zig");
-const tls_client = @import("../discovery/tls_client.zig");
 const node_discovery = @import("node_discovery.zig");
 
 pub const gossip_alpn = "/iroh-gossip/1";
@@ -74,6 +71,8 @@ pub const Config = struct {
     /// with discovery (`src/discovery/dial_source.zig` is the module that
     /// names a lookup as its own missing half).
     ///
+    /// A relay target must match the single configured plaintext carrier.
+    /// Missing or mismatched carriers fail `start` before the attempt is recorded.
     /// Gossip bootstrap size is checked by `start`, after explicit peer dials.
     peers: []const Peer = &.{},
     /// The protocol to offer and to dispatch. See `max_alpns`.
@@ -88,6 +87,8 @@ pub const Config = struct {
     topic: hyparview.TopicConfig = .{},
     blobs: node_blobs.Config = .disabled,
     /// Carrier lifetime is independent of the inner application ALPN.
+    /// Only HTTP relay URLs matching the client's Host authority and socket port
+    /// are admitted. HTTPS is not implemented by the plaintext TCP carrier.
     relay: node_relay_runtime.Config = .{},
     address_discovery_role: @FieldType(bridge_mod.Config, "address_discovery_role") = .disabled,
     max_remote_nat_traversal_addresses: ?u8 = null,
@@ -128,8 +129,8 @@ pub const Discovery = node_discovery.Config;
 /// bytes or more"), `response` is `pkarr_live.max_header_length +
 /// pkarr_live.max_body_length` bytes or more because the response borrows it,
 /// and `bundle` is a `std.crypto.Certificate.Bundle` the caller rescanned
-/// (`tls_client.rescanTrust` is the only call in the tree that reads the disk
-/// for one). A node that trusts nothing leaves this null and publishes nothing,
+/// with `std.crypto.Certificate.Bundle.rescan`. A node that trusts nothing
+/// leaves this null and publishes nothing,
 /// which is `Publication.relay_only` reached a second way.
 pub const DiscoveryRelay = struct {
     /// The relay's base URL, as `discovery/preset.zig` spells it:
@@ -241,6 +242,7 @@ test "carrier identity must be the inner endpoint identity" {
             .address = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1234 },
             .host = "localhost",
             .secret = try SecretKey.fromSeed(@splat(10)),
+            .execution = .native,
         } },
     }));
 }

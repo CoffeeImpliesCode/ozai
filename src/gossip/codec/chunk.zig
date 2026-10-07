@@ -1,11 +1,9 @@
 //! Cutting an `IHave` list into the frames a byte budget allows.
 //!
-//! `plumtree.zig` records the reason this file exists: "**`IHave` batches are cut
-//! by count, not by bytes.** Upstream cuts them so that the encoded size fits
-//! `max_message_size` ... that codec is not in this ticket; guessing its size
-//! here would put one number in two places that could disagree." The codec is
-//! this ticket, so the guess is over: the cut is measured with the same
-//! `encodedLen` the encoder writes with, and there is one number.
+//! PlumTree's state machine batches `IHave` entries by count to stay independent
+//! of wire sizing. This separate byte-budget helper is not used by that batching
+//! path. It measures each cut with the same `encodedLen` the encoder writes
+//! with, so the byte budget does not depend on a duplicate sizing rule.
 //!
 //! Nothing here allocates, reads a clock, or touches a socket. The input is a
 //! list of values and a budget, and the output is how many of them one frame

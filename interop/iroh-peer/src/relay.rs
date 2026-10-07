@@ -145,9 +145,34 @@ async fn run_endpoint(options: &crate::Options) -> Result<()> {
         "relay probe must use exactly one dial or accept");
     println!("relay-counts: dials {} accepts {}", counters.dials, counters.accepted);
     std::io::stdout().flush()?;
-    connection.close(0u32.into(), b"relay probe complete");
+    finish_connection(&connection, options.role).await?;
     endpoint.close().await;
     Ok(())
+}
+
+async fn finish_connection(connection: &iroh::endpoint::Connection, role: crate::Role) -> Result<()> {
+    if role == crate::Role::Client {
+        // Receiving the echo FIN does not mean the responder has received our
+        // ACK of it. Only the responder knows its reply FIN is acknowledged.
+        // Keep the carrier and QUIC endpoint alive until it completes that proof
+        // and closes; run()'s deadline bounds an uncooperative responder.
+        let reason = connection.closed().await;
+        verify_responder_close(&reason)?;
+        println!("relay-peer-closed: {reason}");
+    } else {
+        connection.close(0u32.into(), b"relay probe complete");
+    }
+    Ok(())
+}
+
+fn verify_responder_close(reason: &iroh::endpoint::ConnectionError) -> Result<()> {
+    use iroh::endpoint::{ConnectionError, TransportErrorCode};
+    match reason {
+        ConnectionError::ApplicationClosed(close) if close.error_code == 0u32.into() => Ok(()),
+        ConnectionError::ConnectionClosed(close)
+            if close.error_code == TransportErrorCode::NO_ERROR => Ok(()),
+        _ => anyhow::bail!("responder did not close gracefully: {reason}"),
+    }
 }
 
 async fn wait_selected(connection: &iroh::endpoint::Connection, direct: bool) -> Result<()> {
@@ -199,6 +224,40 @@ fn report_phase(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn endpoint_completion_rejects_timeout_reset_and_nonzero_peer_close() {
+        use iroh::endpoint::{
+            ApplicationClose, ConnectionError, TransportError, TransportErrorCode,
+        };
+        for reason in [
+            ConnectionError::TimedOut,
+            ConnectionError::Reset,
+            ConnectionError::LocallyClosed,
+            ConnectionError::VersionMismatch,
+            ConnectionError::CidsExhausted,
+            ConnectionError::ApplicationClosed(ApplicationClose {
+                error_code: 1u32.into(),
+                reason: bytes::Bytes::from_static(b"failed"),
+            }),
+            ConnectionError::ConnectionClosed(
+                TransportError::new(TransportErrorCode::INTERNAL_ERROR, String::new()).into(),
+            ),
+            ConnectionError::TransportError(
+                TransportError::new(TransportErrorCode::INTERNAL_ERROR, String::new()),
+            ),
+        ] {
+            assert!(verify_responder_close(&reason).is_err(), "accepted {reason}");
+        }
+        let normal = ConnectionError::ApplicationClosed(ApplicationClose {
+            error_code: 0u32.into(),
+            reason: bytes::Bytes::from_static(b"relay probe complete"),
+        });
+        assert!(verify_responder_close(&normal).is_ok());
+        let normal_transport = ConnectionError::ConnectionClosed(
+            TransportError::new(TransportErrorCode::NO_ERROR, String::new()).into(),
+        );
+        assert!(verify_responder_close(&normal_transport).is_ok());
+    }
 
     #[tokio::test]
     async fn real_carrier_preserves_exact_datagram_bytes_and_sender() -> Result<()> {
@@ -220,6 +279,52 @@ mod tests {
         }).await??;
         server.shutdown().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn endpoint_initiator_keeps_connection_live_until_responder_finishes() -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(iroh::SecretKey::from_bytes(&[15; 32]))
+                .alpns(vec![ALPN.to_vec()])
+                .relay_mode(iroh::RelayMode::Disabled)
+                .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>()?)?
+                .bind().await?;
+            let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(iroh::SecretKey::from_bytes(&[16; 32]))
+                .alpns(vec![ALPN.to_vec()])
+                .relay_mode(iroh::RelayMode::Disabled)
+                .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>()?)?
+                .bind().await?;
+            let (caller, responder) = tokio::try_join!(
+                async { Ok::<_, anyhow::Error>(client.connect(server.addr(), ALPN).await?) },
+                async {
+                    Ok::<_, anyhow::Error>(server.accept().await
+                        .context("missing incoming endpoint connection")?.await?)
+                },
+            )?;
+            let payload = b"\0exact endpoint completion bytes\xff";
+            tokio::try_join!(
+                exchange(&caller, crate::Role::Client, payload),
+                exchange(&responder, crate::Role::Server, payload),
+            )?;
+            let mut completion = std::pin::pin!(
+                finish_connection(&caller, crate::Role::Client)
+            );
+            // Poll without elapsed time: finishing the caller must neither return nor
+            // emit CONNECTION_CLOSE while the responder still owns its completion.
+            std::future::poll_fn(|cx| {
+                assert!(Future::poll(completion.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            }).await;
+            ensure!(caller.close_reason().is_none(), "caller closed before responder completion");
+            ensure!(responder.close_reason().is_none(), "responder observed premature close");
+            finish_connection(&responder, crate::Role::Server).await?;
+            completion.await?;
+            client.close().await;
+            server.close().await;
+            Result::<()>::Ok(())
+        }).await.context("endpoint completion regression deadline elapsed")?
     }
 
     #[tokio::test]

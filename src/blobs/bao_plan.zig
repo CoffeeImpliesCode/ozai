@@ -276,7 +276,7 @@ test "the clip is the range layer's own reading of the request" {
         const tree = BaoTree.init(size);
         for (0..@as(usize, @intCast(tree.chunks() + 3))) |start| {
             for ([_]u64{ 0, 1, 5, 16, 17, 1000 }) |length| {
-                const request = ranges.ChunkRange{ .start = start, .end = start + length };
+                const request: ranges.ChunkRange = .{ .start = start, .end = start + length };
                 const got = clip(tree, request);
                 if (start >= tree.chunks()) {
                     // Upstream's rule, inherited: a span at or past the end is

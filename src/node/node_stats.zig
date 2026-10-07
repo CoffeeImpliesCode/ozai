@@ -41,8 +41,7 @@ pub const Stats = struct {
     /// because they are not the same question: `discovery_lookups` counts
     /// questions asked and `Refused` says what became of each, and a node
     /// whose asks grow while nothing leaves is a finding rather than an
-    /// absence — which is what the gossip counters above were for before the
-    /// codec was wired.
+    /// absence.
     discovery_lookups: u64 = 0,
     /// Answers that carried records, and the items the resolution path made of
     /// them. `discovery_answers - discovery_lookups` is every question that did

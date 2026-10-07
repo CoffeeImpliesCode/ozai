@@ -356,6 +356,8 @@ pub fn TicketCache(comptime capacity: usize) type {
         /// the last entry, so this is the only place a gap is made.
         fn dropAt(self: *Self, index: usize) NodeAddr {
             const gone = self.entries[index].addr;
+            // ZBC cannot prove `dropAt`'s callers supply an index from a nonempty prefix.
+            // zbc-disable-next-line: index-minus-one-without-zero-guard
             self.entries[index] = self.entries[self.len - 1];
             self.len -= 1;
             return gone;

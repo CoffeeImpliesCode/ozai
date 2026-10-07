@@ -4,8 +4,14 @@ const ozai = @import("ozai");
 const cli_values = @import("cli_values.zig");
 const cli_report = @import("cli_report.zig");
 const Progress = @import("progress.zig").Snapshot;
+const test_scratch = @import("test_scratch");
 const Node = ozai.node.Node;
 const Instant = ozai.transport_quic_bridge.Instant;
+
+const BlobOutputError = std.Io.File.OpenError || std.Io.File.Writer.Error;
+pub const DriveError = ozai.node.Error || cli_values.CliError ||
+    std.Io.Writer.Error || BlobOutputError || error{BlobNotVerified};
+pub const ShutError = ozai.node.Error || cli_values.CliError;
 
 pub var stopped = ozai.node.Stop.init();
 const stop_signals = [_]std.posix.SIG{ .INT, .TERM };
@@ -24,7 +30,7 @@ pub fn watchForStop() void {
     for (stop_signals) |sig| std.posix.sigaction(sig, &act, null);
 }
 
-pub fn nowNs(io: std.Io) cli_values.CliError!Instant {
+pub fn nowNs(io: std.Io) cli_values.CliError!ozai.transport_quic_bridge.Instant {
     const stamp = std.Io.Clock.awake.now(io);
     return std.math.cast(Instant, stamp.nanoseconds) orelse error.NoClock;
 }
@@ -35,7 +41,7 @@ pub fn drive(
     blob_output: ?[]const u8,
     evidence: *cli_report.GossipEvidence,
     progress: ?*std.Io.Writer,
-) !void {
+) DriveError!void {
     var dialled = false;
     var exported = false;
     var previous: ?Progress = null;
@@ -50,11 +56,25 @@ pub fn drive(
         if (evidence.failure) |err| return err;
         if (!exported) {
             if (node.blobs.firstCompletedConnection()) |connection| {
-                const payload = node.blobs.payload(connection).?;
+                const payload = node.blobs.payload(connection) orelse
+                    @panic("completed blob connection has no verified payload");
                 if (blob_output) |path|
                     try writeBlobOutput(io, std.Io.Dir.cwd(), path, payload);
-                try evidence.writer.print("blob verified hash {x} size {d} bytes {d}\n",
-                    .{ node.blobs.last_hash.?, node.blobs.last_size.?, payload.len });
+                const hash = node.blobs.last_hash orelse
+                    @panic("completed blob transfer has no verified hash");
+                if (node.blobs.last_size) |size| {
+                    try evidence.writer.print(
+                        "blob verified hash {x} size {d} bytes {d}\n",
+                        .{ hash, size, payload.len },
+                    );
+                } else {
+                    const claimed_size = node.blobs.last_claimed_size orelse
+                        @panic("completed blob transfer has no size claim");
+                    try evidence.writer.print(
+                        "blob verified hash {x} unverified size claim {d} bytes {d}\n",
+                        .{ hash, claimed_size, payload.len },
+                    );
+                }
                 try evidence.writer.flush();
                 exported = true;
             }
@@ -72,13 +92,18 @@ pub fn drive(
     if (blob_output != null and !exported) return error.BlobNotVerified;
 }
 
-pub fn shut(io: std.Io, node: *Node, owed: usize) !cli_report.Close {
+pub fn shut(io: std.Io, node: *Node, owed: usize) ShutError!cli_report.Close {
     const before = node.stats.datagrams_out;
     try node.close(io, try nowNs(io), node.generator());
     return .{ .connections = owed, .datagrams = node.stats.datagrams_out - before };
 }
 
-fn writeBlobOutput(io: std.Io, dir: std.Io.Dir, path: []const u8, payload: []const u8) !void {
+fn writeBlobOutput(
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    payload: []const u8,
+) BlobOutputError!void {
     const file = try dir.createFile(io, path, .{ .truncate = true });
     defer file.close(io);
     try file.writeStreamingAll(io, payload);
@@ -86,7 +111,7 @@ fn writeBlobOutput(io: std.Io, dir: std.Io.Dir, path: []const u8, payload: []con
 
 test "blob output truncates stale bytes and preserves the complete verified binary payload" {
     const t = std.testing;
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     const stale = try tmp.dir.createFile(t.io, "blob", .{});
     try stale.writeStreamingAll(t.io, "stale bytes to truncate");

@@ -324,7 +324,6 @@ const Recorder = struct {
     }
 };
 
-
 /// A direct-path attempt: a real socket address, nothing proved.
 fn direct(id: u64) Incoming {
     const remote: base_addr.SocketAddr = .{
@@ -365,7 +364,6 @@ fn answered(present: ?IncomingFilter, incoming: Incoming) Verdict {
     return decide(ask(present, incoming), incoming);
 }
 
-
 test "no filter is upstream's default: every attempt is accepted" {
     // `if let Some(filter) = &incoming_filter` (`protocol.rs:573`) — an absent
     // filter falls through to the spawn, so the answer is the accept one and the
@@ -374,7 +372,6 @@ test "no filter is upstream's default: every attempt is accepted" {
     try t.expectEqual(Answer.accept, ask(null, relayed(1)));
     try t.expectEqual(Verdict.accept, answered(null, relayed(1)));
 }
-
 
 test "a retry is source validation on a direct path and a cost on a relay" {
     // Same verb, one function, and the path is what tells them apart. The

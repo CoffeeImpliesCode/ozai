@@ -36,7 +36,6 @@
 //!
 //! Nothing here allocates, reads a clock, or reaches for a global.
 
-const std = @import("std");
 const ozai = @import("ozai");
 
 const ws = ozai.relay_ws_frame;

@@ -63,7 +63,7 @@ pub const max_queue_peers = 32;
 pub const Error = error{
     /// An iTree peer set would have grown past `max_peers`.
     PeerSetFull,
-    /// A payload is longer than `max_content`.
+    /// A payload exceeds storage capacity or its broadcast reaches the strict wire-body limit.
     MessageTooLarge,
     /// More distinct missing ids than `max_missing`, or more claims for one
     /// id than `max_claims`.

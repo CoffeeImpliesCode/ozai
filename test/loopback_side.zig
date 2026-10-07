@@ -22,8 +22,6 @@ const Instant = bridge_mod.Instant;
 const Egress = bridge_mod.Egress;
 const Socket = socket_mod.Socket;
 const ControlBuffer = socket_mod.ControlBuffer;
-const NodeId = ozai.NodeId;
-const SecretKey = ozai.SecretKey;
 const SocketAddr = ozai.SocketAddr;
 
 /// A seeded generator's engine, kept beside every value handed out from it:
@@ -94,8 +92,8 @@ pub const Side = struct {
     pub fn init(
         self: *Side,
         name: []const u8,
-        secret: SecretKey,
-        expect: ?NodeId,
+        secret: ozai.SecretKey,
+        expect: ?ozai.NodeId,
         engine_seed: u64,
     ) !void {
         self.* = .{

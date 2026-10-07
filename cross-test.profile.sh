@@ -4,7 +4,11 @@
 # pointer/register-width combinations. The complete survey still records them.
 # Full Hexagon Debug socket/node artifacts crash the pinned compiler. Its pure
 # modules remain executable in the complete survey.
+# LoongArch64 uses canonical musl (lp64d) and soft-float (lp64s). The
+# single-float muslf32 (lp64f) ABI is unstandardized in pinned LLVM.
 CROSS_BUILD_STEP=test
+# Native test rows need the detected host loader on Nix, not a deployment path.
+CROSS_BUILD_ARGS=(-Dnative-test-linker=true)
 # Keep the 6.3 MB receive-window burst intact. Its isolated GNU AArch64 run
 # takes minutes under QEMU; bound parallelism and allow emulated execution.
 CROSS_JOBS=2
@@ -19,7 +23,6 @@ CROSS_MATRIX=(
     'thumb-linux-musleabihf|auto'
     'aarch64-linux-musl|auto'
     'loongarch64-linux-musl|auto'
-    'loongarch64-linux-muslf32|auto'
     'loongarch64-linux-muslsf|auto'
     'mipsel-linux-musleabi|auto'
     'mipsel-linux-musleabihf|auto'

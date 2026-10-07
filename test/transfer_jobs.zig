@@ -40,8 +40,8 @@ const decode_slots = 16;
 // Jobs
 // ---------------------------------------------------------------------------
 
-/// Which of the four request types a job puts on the wire.
-const Kind = enum {
+/// Which of the three request types a job puts on the wire.
+pub const Kind = enum {
     get,
     observe,
     push,

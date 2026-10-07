@@ -332,7 +332,7 @@ test "the two size answers are different, and the boundary belongs to one" {
     // A buffer one byte too short for that frame is a small buffer.
     const short = try std_testing.allocator.alloc(u8, needed - 1);
     defer std_testing.allocator.free(short);
-    const outgoing = Outgoing{ .fin = true, .opcode = .binary, .key = fixedMaskKey() };
+    const outgoing: Outgoing = .{ .fin = true, .opcode = .binary, .key = fixedMaskKey() };
     try std_testing.expectError(error.BufferFull, encode(short, .client, outgoing, payload));
 
     // A buffer exactly big enough is not short, which is the other half of the

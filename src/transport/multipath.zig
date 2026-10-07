@@ -1,68 +1,15 @@
-//! Historical observations and actuators for the two supported native paths.
+//! Historical observations for the two supported native paths.
 //! The eight-entry mirror retains retired address-pair history; it is not an
-//! eight-path transport capability. Initialized slots are read through the
-//! bridge snapshot API, never by inspecting an undefined native array element.
-//! Policy lives in net/path_action.zig. Time and randomness are lifted into the
-//! actuator, and planned slot IDs are rechecked against their address pairs.
+//! eight-path transport capability. Reports carry the core's byte authority.
+//! Native snapshot copying and policy actuation live in native_path.zig.
 
 const std = @import("std");
 const quic = @import("quic");
 const base_addr = @import("../base/addr.zig");
 const path_action = @import("../net/path_action.zig");
 const bridge_config = @import("bridge_config.zig");
-const bridge_conn = @import("bridge_conn.zig");
 
 const SocketAddr = base_addr.SocketAddr;
-const Conn = bridge_conn.Conn;
-
-pub const ActionError = bridge_conn.PathError || error{StalePath};
-
-/// Copies only initialized bridge snapshots; there is no native-array read.
-pub fn actionSlots(conn: Conn) path_action.Slots {
-    var slots: path_action.Slots = .{ null, null };
-    for (0..core_slots) |index| {
-        const snapshot = conn.pathSnapshot(@intCast(index)) orelse continue;
-        const local = snapshot.local orelse continue;
-        const peer = snapshot.peer orelse continue;
-        slots[index] = .{
-            .key = .{ .local = local, .peer = peer },
-            .validated = snapshot.validated,
-            .selected = snapshot.selected,
-            .probing = snapshot.state == .pending,
-        };
-    }
-    return slots;
-}
-
-/// Applies one bounded policy action. The caller owns the candidate provenance,
-/// connection lifetime, clock and random source; none are acquired here.
-pub fn applyAction(
-    conn: Conn,
-    action: path_action.Action,
-    at: Instant,
-    random: std.Random,
-) ActionError!?u8 {
-    switch (action) {
-        .none => return null,
-        .open => |key| return try conn.openPath(key.local, key.peer, at, random),
-        .probe, .select, .revalidate => |target| {
-            const slots = actionSlots(conn);
-            if (!path_action.matches(target, &slots)) return error.StalePath;
-            switch (action) {
-                .select => {
-                    if (path_action.planSelect(target.key, &slots) == .none) return null;
-                    try conn.selectPath(target.id);
-                },
-                .probe, .revalidate => {
-                    if (path_action.planProbe(target.key, &slots) == .none) return null;
-                    try conn.probePath(target.id, at, random);
-                },
-                .none, .open => unreachable,
-            }
-            return null;
-        },
-    }
-}
 
 /// The instant the core is driven at, on the core's own timeline: `i64`
 /// nanoseconds, and the same type `Conn.drain` and `Bridge.recv` take. Named
@@ -472,6 +419,10 @@ pub const Table = struct {
     /// pruning for its own reasons calls this.
     pub fn forget(self: *Table, key: Key) bool {
         const index = self.indexOf(key) orelse return false;
+        // `indexOf` returns only an index visited under `index < self.len`; this
+        // successful unwrap proves `self.len > 0`. ZBC does not carry that scan
+        // invariant through `orelse` to the subtraction below.
+        // zbc-disable-next-line: index-minus-one-without-zero-guard
         self.entries[index] = self.entries[self.len - 1];
         self.len -= 1;
         return true;
@@ -509,39 +460,24 @@ pub const Table = struct {
         }
         const at = victim orelse return .full;
         const gone = self.entries[at].key;
+        // `victim` is assigned only inside `index < self.len`, so unwrapping it
+        // proves the scan ran and `self.len > 0`. ZBC does not infer this loop-
+        // to-unwrap invariant at the subtraction.
+        // zbc-disable-next-line: index-minus-one-without-zero-guard
         self.entries[at] = self.entries[self.len - 1];
         self.len -= 1;
         return .{ .evicted = gone };
     }
 
-    /// Snapshot every initialized slot, including a non-selected candidate.
-    pub fn mirror(self: *Table, conn: Conn, at: Instant) Mirror {
-        // Only the bridge can distinguish an unopened slot from an address.
-        self.conn = conn.id();
-        var observations: Observations = .{ null, null };
-        for (0..core_slots) |index| {
-            const id: u8 = @intCast(index);
-            const snapshot = conn.pathSnapshot(id) orelse continue;
-            const local = snapshot.local orelse continue;
-            const peer = snapshot.peer orelse continue;
-            observations[index] = .{
-                .key = .{ .local = local, .peer = peer },
-                .report = .{
-                    .slot = id,
-                    .validated = snapshot.validated,
-                    .state = snapshot.state,
-                    .sent = snapshot.sent,
-                    .received = snapshot.received,
-                },
-            };
-        }
-        return self.mirrorObservations(&observations, at);
-    }
-
     /// Pure snapshot fold. A null slot retires its previous address pair.
     pub fn mirrorObservations(self: *Table, observations: *const Observations, at: Instant) Mirror {
         var result: Mirror = .{
-            .live = 0, .filed = 0, .revived = 0, .retired = 0, .refused = 0, .evicted = 0,
+            .live = 0,
+            .filed = 0,
+            .revived = 0,
+            .retired = 0,
+            .refused = 0,
+            .evicted = 0,
         };
         for (observations, 0..) |observation, index| {
             const slot: u8 = @intCast(index);
@@ -565,7 +501,6 @@ pub const Table = struct {
         return result;
     }
 };
-
 
 // --- tests
 
@@ -667,10 +602,9 @@ const Rig = struct {
     }
 
     /// The one connection this rig holds.
-    fn conn(self: *Rig) !Conn {
+    fn conn(self: *Rig) !@import("bridge_conn.zig").Conn {
         return self.bridge.connectionAt(0) orelse error.TestUnexpectedResult;
     }
-
 };
 
 test "a path is its two addresses and the connection is the core's own id" {
@@ -689,7 +623,7 @@ test "a path is its two addresses and the connection is the core's own id" {
     try t.expect(conn.established());
 
     var table: Table = .{};
-    const first = table.mirror(conn, start);
+    const first = @import("native_path.zig").mirror(&table, conn, start);
     // The unopened slot is absent from the bridge snapshot; it is never read.
     try t.expectEqual(@as(usize, 1), first.live);
     try t.expectEqual(@as(usize, 1), first.filed);
@@ -700,9 +634,9 @@ test "a path is its two addresses and the connection is the core's own id" {
 
     // The identity is the core's pair, read through the bridge's own address
     // translation rather than spelled a second time here.
-    try t.expectEqual(client_addr, conn.peer().?);
-    try t.expectEqual(server_addr, conn.local().?);
-    const entry = table.get(directKey()).?;
+    try t.expectEqual(@as(?SocketAddr, client_addr), conn.peer());
+    try t.expectEqual(@as(?SocketAddr, server_addr), conn.local());
+    const entry = table.get(directKey()) orelse return error.TestUnexpectedResult;
     try t.expect(entry.key.eql(directKey()));
     try t.expectEqual(@as(?u8, 0), entry.slot);
     try t.expect(entry.live());
@@ -721,7 +655,7 @@ test "a path is its two addresses and the connection is the core's own id" {
 
     // And the second pass over an unmoved connection is the same answer, so a
     // caller may mirror on every turn.
-    const again = table.mirror(conn, start);
+    const again = @import("native_path.zig").mirror(&table, conn, start);
     try t.expectEqual(@as(usize, 1), again.live);
     try t.expectEqual(@as(usize, 0), again.filed);
     try t.expectEqual(@as(usize, 0), again.retired);
@@ -778,13 +712,14 @@ test "historical snapshots retire missing pairs and revive history without dupli
     try t.expectEqual(@as(usize, 2), added.live);
     try t.expectEqual(@as(usize, 1), added.filed);
     try t.expectEqual(@as(usize, 0), added.retired);
-    try t.expectEqual(Validation.challenging, table.get(reboundKey()).?.validation);
+    const rebound = table.get(reboundKey()) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(Validation.challenging, rebound.validation);
 
     const remaining: Observations = .{ null, next[1] };
     const retired = table.mirrorObservations(&remaining, start + 2);
     try t.expectEqual(@as(usize, 1), retired.live);
     try t.expectEqual(@as(usize, 1), retired.retired);
-    const gone = table.get(directKey()).?;
+    const gone = table.get(directKey()) orelse return error.TestUnexpectedResult;
     try t.expect(!gone.live());
     try t.expectEqual(@as(?u8, null), gone.slot);
     try t.expectEqual(@as(?Instant, start + 2), gone.retired_at);
@@ -795,8 +730,9 @@ test "historical snapshots retire missing pairs and revive history without dupli
     try t.expectEqual(@as(usize, 1), returned.revived);
     try t.expectEqual(@as(usize, 0), returned.retired);
     try t.expectEqual(@as(usize, 2), table.slice().len);
-    try t.expectEqual(start, table.get(directKey()).?.since);
-    try t.expectEqual(@as(?Instant, null), table.get(directKey()).?.retired_at);
+    const revived = table.get(directKey()) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(start, revived.since);
+    try t.expectEqual(@as(?Instant, null), revived.retired_at);
 }
 
 test "a round trip is the caller's, and it stops being believed when it is stale" {
@@ -804,13 +740,13 @@ test "a round trip is the caller's, and it stops being believed when it is stale
     defer rig.deinit();
     const conn = try rig.conn();
     var table: Table = .{};
-    _ = table.mirror(conn, start);
+    _ = @import("native_path.zig").mirror(&table, conn, start);
 
     // This sample is supplied by the caller rather than a congestion estimator.
     const rtt: Nanos = 20 * std.time.ns_per_ms;
     const age: Instant = @intCast(rtt_max_age);
     try t.expect(table.sample(directKey(), rtt, start));
-    const entry = table.get(directKey()).?;
+    const entry = table.get(directKey()) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(?Nanos, rtt), entry.latency(start));
     try t.expectEqual(@as(?Nanos, rtt), entry.latency(start + age));
     try t.expectEqual(@as(?Nanos, null), entry.latency(start + age + 1));
@@ -822,10 +758,12 @@ test "a round trip is the caller's, and it stops being believed when it is stale
     // `used` stamps liveness and nothing else: the byte counts are the core's and
     // arrive through `observe`, so one field has one writer.
     try t.expect(table.used(directKey(), start + 1));
-    try t.expectEqual(@as(?Instant, start + 1), table.get(directKey()).?.last_active.?);
-    const before = table.get(directKey()).?.tx_bytes;
+    const used = table.get(directKey()) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(?Instant, start + 1), used.last_active);
+    const before = used.tx_bytes;
     try t.expect(table.used(directKey(), start + 2));
-    try t.expectEqual(before, table.get(directKey()).?.tx_bytes);
+    const after = table.get(directKey()) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(before, after.tx_bytes);
 
     // A pair this connection has never been told about is refused both ways: a
     // measurement of it would be a round trip nobody measured.
@@ -945,11 +883,12 @@ test "a mirror pass observes both initialized slots and retires abandoned slots"
 }
 
 test "actuator refuses actions whose native slot no longer holds the planned pair" {
+    const native_path = @import("native_path.zig");
     var rig = try Rig.init(12, 9);
     defer rig.deinit();
     const conn = try rig.conn();
     const snapshot = conn.pathSnapshot(0) orelse return error.TestUnexpectedResult;
-    const slots = actionSlots(conn);
+    const slots = native_path.actionSlots(conn);
     const selected = slots[0] orelse return error.TestUnexpectedResult;
     try t.expect(selected.key.eql(.{
         .local = snapshot.local orelse return error.TestUnexpectedResult,
@@ -959,26 +898,29 @@ test "actuator refuses actions whose native slot no longer holds the planned pai
     try t.expect(selected.selected);
     try t.expect(slots[1] == null);
     try t.expect(conn.pathSnapshot(@intCast(core_slots)) == null);
-    try t.expectEqual(@as(?u8, null), try applyAction(conn, .{
+    try t.expectEqual(@as(?u8, null), try native_path.applyAction(conn, .{
         .select = .{ .id = 0, .key = selected.key },
     }, start, rig.client.random()));
-    try t.expectError(error.StalePath, applyAction(conn, .{
+    try t.expectError(error.StalePath, native_path.applyAction(conn, .{
         .select = .{
             .id = 0,
             .key = .{ .local = server_addr, .peer = reboundKey().peer },
         },
     }, start, rig.client.random()));
-    try t.expectError(error.StalePath, applyAction(conn, .{
+    try t.expectError(error.StalePath, native_path.applyAction(conn, .{
         .select = .{ .id = @intCast(core_slots), .key = selected.key },
     }, start, rig.client.random()));
-    try t.expectError(error.StalePath, applyAction(conn, .{
+    try t.expectError(error.StalePath, native_path.applyAction(conn, .{
         .probe = .{
             .id = 1,
             .key = .{ .local = server_addr, .peer = client_addr },
         },
     }, start, rig.client.random()));
-    try t.expectEqual(@as(?u8, null), try applyAction(
-        conn, .none, start, rig.client.random(),
+    try t.expectEqual(@as(?u8, null), try native_path.applyAction(
+        conn,
+        .none,
+        start,
+        rig.client.random(),
     ));
     try t.expectEqualDeep(snapshot, conn.pathSnapshot(0).?);
 }

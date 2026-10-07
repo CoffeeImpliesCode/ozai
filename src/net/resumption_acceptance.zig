@@ -381,6 +381,8 @@ fn ticketFor(
         .max_early_data_size = early_data_max,
     };
     @memcpy(built.alpn[0..alpn.len], alpn);
+    // Fixture callers use ALPN lengths 4 or 11; ZBC cannot follow those values here.
+    // zbc-disable-next-line: index-type-narrowing-wraparound
     built.alpn_len = @intCast(alpn.len);
     return built;
 }

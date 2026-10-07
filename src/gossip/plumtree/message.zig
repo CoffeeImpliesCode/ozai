@@ -145,6 +145,8 @@ pub const IHaves = struct {
     pub fn init(items: []const IHave) Error!IHaves {
         if (items.len > max_ihaves_per_message) return error.IHaveListTooLong;
         var list: IHaves = undefined;
+        // ZBC does not carry this guard through max_ihaves_per_message = 124, which fits in u16.
+        // zbc-disable-next-line: index-type-narrowing-wraparound
         list.count = @intCast(items.len);
         @memcpy(list.items[0..items.len], items);
         return list;

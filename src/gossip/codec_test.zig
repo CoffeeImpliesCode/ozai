@@ -1,16 +1,7 @@
-//! The gossip codec, exercised over bytes.
+//! Declared vectors pin field order. Captured upstream outputs have fixture provenance.
+//! The captures are serializer and state-machine outputs, not packet captures.
 //!
-//! **Every byte sequence asserted below is a declared vector, not a captured
-//! one.** They are what the upstream declarations in `codec/tags.zig` have to
-//! produce, written out so that a later edit to a table or a field order cannot
-//! move them silently. `AGENTS.md` §2 asks for bytes captured from the Rust
-//! implementation before any interoperability claim, `codec.zig` says what is
-//! still missing, and this file is where those vectors go when they exist.
-//!
-//! The oracle for a round trip is the fixed point: `encode(decode(bytes))` is
-//! `bytes` again. It is stronger than comparing fields, because a field that was
-//! dropped, reordered or defaulted cannot produce the same bytes back, and it is
-//! what `AGENTS.md` §2 asks of a decoder boundary.
+//! Round trips check a fixed point. Captured-byte comparisons check upstream compatibility.
 
 const std = @import("std");
 
@@ -18,6 +9,7 @@ const codec = @import("codec.zig");
 const gossip = @import("hyparview.zig");
 const key = @import("../base/key.zig");
 const limits = @import("codec/limits.zig");
+const peer_data = @import("hyparview/peer_data.zig");
 const plumtree = @import("plumtree.zig");
 const postcard = @import("../wire/postcard.zig");
 const test_node_id = @import("plumtree/test_node_id.zig");
@@ -493,7 +485,11 @@ test "pinned upstream frames use fixed four-byte big-endian lengths" {
     var header: [36]u8 = @splat(0);
     header[3] = 32;
     const topic = gossip.TopicId.fromBytes(@splat(0));
-    try t.expectEqualSlices(u8, &header, try codec.encodeStreamHeader(.{ .topic_id = topic }, &out));
+    try t.expectEqualSlices(
+        u8,
+        &header,
+        try codec.encodeStreamHeader(.{ .topic_id = topic }, &out),
+    );
     try t.expect((try codec.decodeStreamHeader(&header)).topic_id.eql(topic));
 }
 
@@ -577,8 +573,9 @@ test "decoded PeerData is copied before receive storage is reused" {
     const original = [_]u8{0x42} ** 300;
     var frame: [room]u8 = undefined;
     const encoded = try codec.encode(.{ .swarm = .{ .join = &original } }, &frame);
-    const borrowed = (try codec.decode(encoded)).swarm.join.?;
-    var contacts: @import("hyparview/peer_data.zig").PeerDataMap = .{};
+    // Encoding a populated Join must preserve its borrowed PeerData on decode.
+    const borrowed = (try codec.decode(encoded)).swarm.join orelse return error.MissingPeerData;
+    var contacts: peer_data.PeerDataMap = .{};
     const peer = try testNodeId(6);
     try contacts.put(peer, borrowed);
     @memset(&frame, 0xa5);

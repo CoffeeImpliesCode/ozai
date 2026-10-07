@@ -15,8 +15,6 @@ const node_ns = @import("protocol_node.zig");
 const swarm = @import("protocol_swarm.zig");
 const wire = @import("protocol_wire.zig");
 
-const NodeId = ozai.NodeId;
-
 /// One peer's contact data as this node received it, and as that peer
 /// advertised it.
 pub const Mismatch = struct {
@@ -84,7 +82,7 @@ pub fn asymmetricLinks(mesh: *const swarm.Mesh) usize {
 }
 
 /// Whether the node at `index` lists `id` in its active view.
-pub fn holdsNeighbor(mesh: *const swarm.Mesh, index: usize, id: NodeId) bool {
+pub fn holdsNeighbor(mesh: *const swarm.Mesh, index: usize, id: ozai.NodeId) bool {
     for (mesh.nodes[index].topic.swarm.activeView()) |held| {
         if (held.order(id) == .eq) return true;
     }

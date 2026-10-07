@@ -1123,5 +1123,7 @@ fn hexdump(bytes: []const u8) [2 * max_dumped_bytes]u8 {
         out[index * 2 + 1] = digits[byte & 15];
     }
     @memset(out[shown * 2 ..], ' ');
+    // ZBC cannot combine the loop's byte pairs with memset to prove the full array initialized.
+    // zbc-disable-next-line: use-undefined
     return out;
 }

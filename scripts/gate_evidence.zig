@@ -12,6 +12,9 @@ pub const sources = inventory.sources;
 pub const sourceDigest = inventory.sourceDigest;
 pub const createRoot = @import("gate_scratch.zig").createRoot;
 pub const validateRoot = @import("gate_scratch.zig").validateRoot;
+pub const RunError = std.process.RunError || std.mem.Allocator.Error ||
+    std.Io.Dir.WriteFileError || error{CommandFailed};
+const WriteLogError = std.mem.Allocator.Error || std.Io.Dir.WriteFileError;
 
 pub const Runner = struct {
     gpa: Allocator,
@@ -19,11 +22,11 @@ pub const Runner = struct {
     environment: *std.process.Environ.Map,
     root: []const u8,
 
-    pub fn path(self: Runner, relative: []const u8) ![]const u8 {
+    pub fn path(self: Runner, relative: []const u8) std.mem.Allocator.Error![]const u8 {
         return std.fs.path.join(self.gpa, &.{ self.root, relative });
     }
 
-    pub fn run(self: Runner, label: []const u8, argv: []const []const u8) !std.process.RunResult {
+    pub fn run(self: Runner, label: []const u8, argv: []const []const u8) RunError!std.process.RunResult {
         const result = try std.process.run(self.gpa, self.io, .{
             .argv = argv,
             .environ_map = self.environment,
@@ -50,7 +53,7 @@ pub const Runner = struct {
         return result;
     }
 
-    fn writeLog(self: Runner, label: []const u8, suffix: []const u8, data: []const u8) !void {
+    fn writeLog(self: Runner, label: []const u8, suffix: []const u8, data: []const u8) WriteLogError!void {
         const name = try std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ label, suffix });
         defer self.gpa.free(name);
         const destination = try self.path(name);

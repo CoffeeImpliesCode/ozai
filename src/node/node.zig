@@ -209,20 +209,20 @@ pub const Node = struct {
     /// `start`'s own rule.
     joined: bool,
 
-
     stats: Stats,
     /// Build a node from `config`, with `seed` as the root of every generator
     /// it draws from. `node_build.create` is where the lifetimes are stated:
     /// what `gpa` must outlive, what `config` is copied and what it borrows,
     /// and which one thing `io` is used for.
-    pub fn create(gpa: Allocator, io: std.Io, config: Config, seed: u64) Error!*Node {
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, seed: u64) Error!*Node {
         return node_build.create(gpa, io, config, seed);
     }
 
-    /// Free everything the node owns. `node_build.deinit` is where the order is
+    /// Free everything the node owns. `node_build.release` is where the order is
     /// stated, and why a close that never ran is a misuse rather than a cleanup.
     pub fn deinit(self: *Node) void {
-        node_build.deinit(self);
+        node_build.release(self);
+        self.gpa.destroy(self);
     }
 
     /// The node id this node presents, which is the id a peer dials it by.
@@ -272,12 +272,22 @@ pub const Node = struct {
     }
 
     /// Broadcast through the subscribed topic's gossip state machine.
-    pub fn broadcast(self: *Node, topic: hyparview.TopicId, content: []const u8, at: Instant) Error!void {
+    pub fn broadcast(
+        self: *Node,
+        topic: hyparview.TopicId,
+        content: []const u8,
+        at: Instant,
+    ) Error!void {
         return node_gossip.broadcast(self, topic, content, .swarm, at);
     }
 
     /// Broadcast only to the subscribed topic's current neighbors.
-    pub fn broadcastNeighbors(self: *Node, topic: hyparview.TopicId, content: []const u8, at: Instant) Error!void {
+    pub fn broadcastNeighbors(
+        self: *Node,
+        topic: hyparview.TopicId,
+        content: []const u8,
+        at: Instant,
+    ) Error!void {
         return node_gossip.broadcast(self, topic, content, .neighbors, at);
     }
 
@@ -367,7 +377,6 @@ pub const Node = struct {
     pub fn run(self: *Node, io: std.Io, stop: *const Stop) Error!void {
         return node_loop.run(self, io, stop);
     }
-
 };
 
 const t = std.testing;
@@ -420,6 +429,8 @@ fn briskTopic() hyparview.TopicConfig {
 /// Close before release even when a test assertion fails.
 fn closedOnExit(node: *Node) void {
     defer node.deinit();
+    // ZBC cannot distinguish this test-only teardown failure panic from production error recovery.
+    // zbc-disable-next-line: catch-error-panic
     node.close(t.io, start_ns, node.generator()) catch |err|
         std.debug.panic("node close failed during test teardown: {t}", .{err});
 }
@@ -1076,8 +1087,14 @@ const GossipInbox = struct {
     seen: [2]bool = .{ false, false },
     invalid: bool = false,
 
-    fn receive(context: ?*anyopaque, topic_id: hyparview.TopicId, peer: NodeId, bytes: []const u8) void {
-        const self: *GossipInbox = @ptrCast(@alignCast(context.?));
+    fn receive(
+        context: ?*anyopaque,
+        topic_id: hyparview.TopicId,
+        peer: NodeId,
+        bytes: []const u8,
+    ) void {
+        const self: *GossipInbox = @ptrCast(@alignCast(context orelse
+            @panic("gossip inbox callback requires its configured context")));
         if (peer.order(self.peer) != .eq or !std.mem.eql(u8, bytes, "multi-topic-payload")) {
             self.invalid = true;
             return;
@@ -1146,7 +1163,9 @@ test "broadcast refuses a topic this node did not subscribe to" {
     try node.start(start_ns, node.generator());
     const events = node.stats.gossip_events;
     try t.expectError(error.UnknownGossipTopic, node.broadcast(
-        .fromBytes(@splat(0x43)), "not-subscribed", start_ns,
+        .fromBytes(@splat(0x43)),
+        "not-subscribed",
+        start_ns,
     ));
     try t.expectEqual(events, node.stats.gossip_events);
 }
@@ -1160,7 +1179,9 @@ test "neighbor broadcast refuses an unsubscribed topic before changing gossip st
     try node.start(start_ns, node.generator());
     const events = node.stats.gossip_events;
     try t.expectError(error.UnknownGossipTopic, node.broadcastNeighbors(
-        .fromBytes(@splat(0x43)), "not-subscribed", start_ns,
+        .fromBytes(@splat(0x43)),
+        "not-subscribed",
+        start_ns,
     ));
     try t.expectEqual(events, node.stats.gossip_events);
 }

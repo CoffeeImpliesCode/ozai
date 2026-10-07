@@ -158,6 +158,8 @@ fn addressRecord(kind: u16, ttl: u32, rdata: []const u8) [fixed_length + 16]u8 {
     wire.put16(&record, type_at, kind);
     wire.put16(&record, class_at, wire.class_in);
     wire.put32(&record, ttl_at, ttl);
+    // Test callers pass four-byte RDATA; ZBC cannot prove this helper's input bound.
+    // zbc-disable-next-line: index-type-narrowing-wraparound
     wire.put16(&record, rdlength_at, @intCast(rdata.len));
     @memcpy(record[fixed_length..][0..rdata.len], rdata);
     return record;

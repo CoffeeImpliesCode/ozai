@@ -16,24 +16,25 @@
 //! them has to handle every arm, which is what `AGENTS.md` §1 asks for and
 //! what a `transport/socket.zig` caller already gets.
 //!
-//! # `OpenError` is not written here
-//!
-//! `Tcp.create` opens a descriptor with `socket(2)` and an `eventfd(2)`, and
-//! those are the calls `transport/socket_open.zig` already wraps with the
-//! errno names already attached. This file aliases that set rather than
-//! restating it, because a second table for the same two syscalls is a second
-//! thing to change on the day a kernel grows an errno.
+//! Acquisition reuses the socket errno vocabulary and adds explicit Io
+//! cancellation before creating or accepting owned descriptors.
 
 const std = @import("std");
 
 const socket_error = @import("socket_error.zig");
 
-/// What `Tcp.create` can fail with, which is `socket_error.OpenError` under
-/// the name this file's callers spell it with.
-///
-/// The same two syscalls with the same errnos: `socket(2)` and `eventfd(2)`
-/// fail the same way whichever protocol the descriptor carries.
-pub const OpenError = socket_error.OpenError;
+/// Shared socket acquisition failures, plus task cancellation.
+pub const OpenError = socket_error.OpenError || error{Canceled};
+
+pub const ListenError = OpenError || error{Interrupted};
+pub const AcceptError = OpenError || error{
+    Interrupted,
+    ConnectionAborted,
+    NetworkDown,
+    NetworkUnreachable,
+    HostUnreachable,
+    ProtocolUnsupported,
+};
 
 /// What the wait before a connect, a read or a write can fail with.
 ///
@@ -122,7 +123,7 @@ pub const WriteError = WaitError || error{
 /// `@hasDecl` does not accept an error set, so the arms are named rather than
 /// asked for by hand, and a set that stops sharing an arm with `WaitError`
 /// fails the `comptime` block below rather than one call site's `switch`.
-fn hasArm(comptime set: anytype, comptime name: []const u8) bool {
+fn hasArm(comptime set: type, comptime name: []const u8) bool {
     for (@typeInfo(set).error_set.?) |member| {
         if (std.mem.eql(u8, member.name, name)) return true;
     }

@@ -490,22 +490,27 @@ pub const Frame = union(FrameType) {
                     ecn_ce = try packet.readVarInt(reader);
                 }
 
-
                 if (is_path) {
                     if (is_ecn) break :blk .{ .path_ack_ecn = .{
                         .path_id = path_id,
                         .ack = .{
-                            .largest_ack = largest_ack, .ack_delay = ack_delay,
-                            .first_ack_range = first_ack_range, .ack_range_count = range_count,
+                            .largest_ack = largest_ack,
+                            .ack_delay = ack_delay,
+                            .first_ack_range = first_ack_range,
+                            .ack_range_count = range_count,
                             .ack_ranges = additional_ranges,
-                            .ecn_ect0 = ecn_ect0, .ecn_ect1 = ecn_ect1, .ecn_ce = ecn_ce,
+                            .ecn_ect0 = ecn_ect0,
+                            .ecn_ect1 = ecn_ect1,
+                            .ecn_ce = ecn_ce,
                         },
                     } };
                     break :blk .{ .path_ack = .{
                         .path_id = path_id,
                         .ack = .{
-                            .largest_ack = largest_ack, .ack_delay = ack_delay,
-                            .first_ack_range = first_ack_range, .ack_range_count = range_count,
+                            .largest_ack = largest_ack,
+                            .ack_delay = ack_delay,
+                            .first_ack_range = first_ack_range,
+                            .ack_range_count = range_count,
                             .ack_ranges = additional_ranges,
                         },
                     } };
@@ -732,21 +737,21 @@ pub const Frame = union(FrameType) {
                 .reordering_threshold = try packet.readVarInt(reader),
             } },
 
-            0x9f81a6, 0x9f81a7 => .{ .observed_address =
-                try observed_address.Report.read(reader, frame_type == 0x9f81a7) },
-            0x3d7f90, 0x3d7f91 => .{ .add_address =
-                try native_nat.AddAddress.read(reader, frame_type == 0x3d7f91) },
-            0x3d7f92, 0x3d7f93 => .{ .reach_address =
-                try native_nat.ReachAddress.read(reader, frame_type == 0x3d7f93) },
+            0x9f81a6, 0x9f81a7 => .{ .observed_address = try observed_address.Report.read(reader, frame_type == 0x9f81a7) },
+            0x3d7f90, 0x3d7f91 => .{ .add_address = try native_nat.AddAddress.read(reader, frame_type == 0x3d7f91) },
+            0x3d7f92, 0x3d7f93 => .{ .reach_address = try native_nat.ReachAddress.read(reader, frame_type == 0x3d7f93) },
             0x3d7f94 => .{ .remove_address = try packet.readVarInt(reader) },
             0x3e75 => .{ .path_abandon = .{
-                .path_id = try readPathId(reader), .error_code = try packet.readVarInt(reader),
+                .path_id = try readPathId(reader),
+                .error_code = try packet.readVarInt(reader),
             } },
             0x3e76 => .{ .path_status_backup = .{
-                .path_id = try readPathId(reader), .status_seq_no = try packet.readVarInt(reader),
+                .path_id = try readPathId(reader),
+                .status_seq_no = try packet.readVarInt(reader),
             } },
             0x3e77 => .{ .path_status_available = .{
-                .path_id = try readPathId(reader), .status_seq_no = try packet.readVarInt(reader),
+                .path_id = try readPathId(reader),
+                .status_seq_no = try packet.readVarInt(reader),
             } },
             0x3e78 => blk: {
                 const path_id = try readPathId(reader);
@@ -759,19 +764,24 @@ pub const Frame = union(FrameType) {
                 var token: [16]u8 = undefined;
                 try reader.readSliceAll(&token);
                 break :blk .{ .path_new_connection_id = .{
-                    .path_id = path_id, .cid = .{
-                        .seq_num = sequence, .retire_prior_to = retire,
-                        .conn_id = cid, .stateless_reset_token = token,
+                    .path_id = path_id,
+                    .cid = .{
+                        .seq_num = sequence,
+                        .retire_prior_to = retire,
+                        .conn_id = cid,
+                        .stateless_reset_token = token,
                     },
                 } };
             },
             0x3e79 => .{ .path_retire_connection_id = .{
-                .path_id = try readPathId(reader), .seq_num = try packet.readVarInt(reader),
+                .path_id = try readPathId(reader),
+                .seq_num = try packet.readVarInt(reader),
             } },
             0x3e7a => .{ .max_path_id = try readPathId(reader) },
             0x3e7b => .{ .paths_blocked = try readPathId(reader) },
             0x3e7c => .{ .path_cids_blocked = .{
-                .path_id = try readPathId(reader), .next_seq = try packet.readVarInt(reader),
+                .path_id = try readPathId(reader),
+                .next_seq = try packet.readVarInt(reader),
             } },
             else => return error.FrameEncodingError,
         };
@@ -1061,8 +1071,7 @@ pub const Frame = union(FrameType) {
     /// so a decoded frame and a hand-built one answer the same.
     pub fn isAckEliciting(self: Frame) bool {
         return switch (self) {
-            .padding, .ack, .ack_ecn, .path_ack, .path_ack_ecn,
-            .connection_close, .application_close => false,
+            .padding, .ack, .ack_ecn, .path_ack, .path_ack_ecn, .connection_close, .application_close => false,
             .datagram, .datagram_with_length => true,
             else => true,
         };
@@ -1076,8 +1085,7 @@ pub const Frame = union(FrameType) {
     /// answer true.
     pub fn isProbing(self: Frame) bool {
         return switch (self) {
-            .padding, .path_challenge, .path_response, .new_connection_id,
-            .observed_address => true,
+            .padding, .path_challenge, .path_response, .new_connection_id, .observed_address => true,
             else => false,
         };
     }
@@ -1108,10 +1116,20 @@ pub const Frame = union(FrameType) {
             .handshake_done,
             .ack_frequency,
             .immediate_ack,
-            .observed_address, .add_address, .reach_address, .remove_address,
-            .path_ack, .path_ack_ecn, .path_abandon,
-            .path_status_backup, .path_status_available, .path_new_connection_id,
-            .path_retire_connection_id, .max_path_id, .paths_blocked, .path_cids_blocked,
+            .observed_address,
+            .add_address,
+            .reach_address,
+            .remove_address,
+            .path_ack,
+            .path_ack_ecn,
+            .path_abandon,
+            .path_status_backup,
+            .path_status_available,
+            .path_new_connection_id,
+            .path_retire_connection_id,
+            .max_path_id,
+            .paths_blocked,
+            .path_cids_blocked,
             => pkt_type == .one_rtt,
             // All others: 0-RTT and 1-RTT only
             .reset_stream,
@@ -2168,13 +2186,20 @@ test "native extension malformed path IDs and ACK ranges" {
 }
 
 test "native extension frame fuzz canonical encoding fixed point" {
-    try std.testing.fuzz({}, fuzzNativeFrame, .{});
+    // Coverage needs fuzz instrumentation, but Zig 0.16.0's fuzz runner has bug #36326.
+    if (comptime @import("builtin").fuzz and @import("coverage_options").coverage) {
+        var smith: std.testing.Smith = .{ .in = &.{} };
+        try fuzzNativeFrame({}, &smith);
+    } else {
+        try std.testing.fuzz({}, fuzzNativeFrame, .{});
+    }
 }
 
 fn fuzzNativeFrame(_: void, smith: *std.testing.Smith) !void {
     const types = [_]u64{
         0x9f81a6, 0x9f81a7, 0x3d7f90, 0x3d7f91, 0x3d7f92, 0x3d7f93, 0x3d7f94,
-        0x3e, 0x3f, 0x3e75, 0x3e76, 0x3e77, 0x3e78, 0x3e79, 0x3e7a, 0x3e7b, 0x3e7c,
+        0x3e,     0x3f,     0x3e75,   0x3e76,   0x3e77,   0x3e78,   0x3e79,
+        0x3e7a,   0x3e7b,   0x3e7c,
     };
     var input: [128]u8 = undefined;
     var stream = io.fixedBufferStream(&input);
@@ -2200,8 +2225,10 @@ test "multipath pending CID owns storage and writes complete body" {
     const pending = PendingControlFrame{ .path_new_connection_id = .{
         .path_id = 1,
         .cid = .{
-            .seq_num = 0, .retire_prior_to = 0,
-            .cid_buf = .{0xab} ** 20, .cid_len = 1,
+            .seq_num = 0,
+            .retire_prior_to = 0,
+            .cid_buf = .{0xab} ** 20,
+            .cid_len = 1,
             .stateless_reset_token = .{0xcd} ** 16,
         },
     } };
@@ -2213,8 +2240,7 @@ test "multipath pending CID owns storage and writes complete body" {
     try std.testing.expectEqual(writer.seek, consumed);
     try std.testing.expectEqual(@as(u32, 1), frame.path_new_connection_id.path_id);
     try std.testing.expectEqualSlices(u8, &.{0xab}, frame.path_new_connection_id.cid.conn_id);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xcd} ** 16),
-        &frame.path_new_connection_id.cid.stateless_reset_token);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xcd} ** 16), &frame.path_new_connection_id.cid.stateless_reset_token);
     try std.testing.expect(!frame.isProbing());
     for (0..writer.seek) |cut| {
         if (Frame.parse(buffer[0..cut])) |_| return error.AcceptedTruncatedCid else |_| {}

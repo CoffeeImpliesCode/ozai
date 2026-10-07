@@ -86,8 +86,9 @@
 //! - **`IHave` batches are cut by count, not by bytes.** Upstream cuts them so
 //!   that the encoded size fits `max_message_size` (`on_dispatch_timer`). The
 //!   frame size depends on how a `NodeId` and a `TopicId` are written on the
-//!   wire, and that codec is not in this ticket; guessing its size here would
-//!   put one number in two places that could disagree.
+//!   wire. This state stays independent of the wire codec to avoid duplicating
+//!   sizing rules. The separate `codec.chunkLen` byte-budget helper is not used
+//!   by this batching path.
 //! - **Batches and payloads borrow their content.** A `Gossip` handed to
 //!   `OutEvent.send_message` borrows either the caller's buffer (a local
 //!   broadcast) or this state's own cache (a `Graft` reply). Both are valid
@@ -176,4 +177,7 @@ test {
     _ = @import("plumtree/state_test.zig");
     _ = @import("plumtree/recovery_test.zig");
     _ = @import("plumtree/cache_test.zig");
+    _ = @import("plumtree/broadcast_budget_test.zig");
+    _ = @import("plumtree/receive_budget_test.zig");
+    _ = @import("plumtree/forward_budget_test.zig");
 }

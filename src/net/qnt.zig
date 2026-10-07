@@ -389,10 +389,15 @@ pub fn decode(bytes: []const u8) Error!Decoded {
         try checkRange(first, last, if (index == 0) null else ranges[index - 1]);
         ranges[index] = .{ .first = first, .last = last };
     }
+    // The guarded memcpy fills all eight challenge bytes before this aggregate return;
+    // ZBC also reports the initialized field at the enclosing return expression.
+    // zbc-disable-next-line: use-undefined
     return .{
         .frame = .{
             .family = family,
             .sequence = sequence,
+            // Guard and memcpy fill Challenge; ZBC cannot prove its initialization.
+            // zbc-disable-next-line: use-undefined
             .challenge = challenge,
             .timestamp = timestamp,
             .ranges = ranges,

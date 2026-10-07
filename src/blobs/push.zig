@@ -138,6 +138,7 @@ const requests = @import("requests.zig");
 const resume_mod = @import("resume.zig");
 const store = @import("store.zig");
 const tree_mod = @import("bao_tree.zig");
+const test_scratch = @import("test_scratch");
 
 /// The node id a grant is issued to. `base/key.zig` owns it; this file spells it
 /// for the reason `store.zig` spells `Hash`.
@@ -404,7 +405,7 @@ test "a push the grant does not cover is refused, and writes nothing" {
     const stranger = try test_ids.testNodeId(22);
     const other_hash: Hash = @splat(0x44);
 
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
 
     const cases = [_]struct { name: []const u8, peer: NodeId, hash: Hash, size: u64 }{
@@ -450,7 +451,7 @@ test "a covered push is admitted, and writes only under the partial names" {
     defer t.allocator.free(b.data);
     const peer = try test_ids.testNodeId(21);
 
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     var name_storage: store.NameStorage = undefined;
     var scratch: [64]u8 = undefined;
@@ -492,7 +493,7 @@ test "a push onto a blob this node already holds is refused, and the blob surviv
     defer t.allocator.free(b.data);
     const peer = try test_ids.testNodeId(21);
 
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     try commitBlob(tmp.dir, b.data, b.tree, b.root);
 
@@ -534,7 +535,7 @@ test "an interrupted push is discarded rather than resumed, even when the bytes 
     defer t.allocator.free(b.data);
     const peer = try test_ids.testNodeId(21);
 
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     var name_storage: store.NameStorage = undefined;
     const paths = store.names(&name_storage, b.root);
@@ -588,7 +589,7 @@ test "a completed push commits the pair, and the pair is the blob" {
     defer t.allocator.free(b.data);
     const peer = try test_ids.testNodeId(21);
 
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     var name_storage: store.NameStorage = undefined;
     var scratch: [64]u8 = undefined;
@@ -638,7 +639,7 @@ test "promote refuses an unfinished transfer, and refuses a blob committed meanw
     defer t.allocator.free(b.data);
     const peer = try test_ids.testNodeId(21);
 
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     var name_storage: store.NameStorage = undefined;
     var scratch: [64]u8 = undefined;
@@ -686,7 +687,7 @@ test "a grant is for one peer and one blob, and swapping either changes the answ
     const second = try test_ids.testNodeId(22);
     const other_hash: Hash = @splat(0x55);
 
-    var tmp = try @import("test_scratch").tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     var name_storage: store.NameStorage = undefined;
     var scratch: [64]u8 = undefined;

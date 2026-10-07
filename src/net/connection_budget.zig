@@ -303,7 +303,7 @@ test "every refusal reaches the peer as a rejection and never as a silence" {
 
 test "a refusal reserves nothing, and a departure is what frees the slot" {
     const stranger = try test_ids.testNodeId(5);
-    const attempt = Attempt{ .peer = stranger, .returning = false, .held = max_peers };
+    const attempt: Attempt = .{ .peer = stranger, .returning = false, .held = max_peers };
 
     // Asked twice at the same count, refused twice: the first refusal queued
     // nothing, so the second is the same question with the same answer rather

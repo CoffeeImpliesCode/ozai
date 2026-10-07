@@ -423,7 +423,10 @@ test "native transport options reach peers through the bridge and dial handshake
                 server_config.initial_max_path_id = 1;
             }
             pair.server_bridge = try Bridge.create(
-                t.allocator, t.io, server_config, pair.engine.random(),
+                t.allocator,
+                t.io,
+                server_config,
+                pair.engine.random(),
             );
             errdefer pair.server_bridge.destroy();
             var client_config: Config = .{
@@ -449,8 +452,13 @@ test "native transport options reach peers through the bridge and dial handshake
         );
         var log: StateLog = .{};
         try exchange(
-            pair.dialer, dial.conn, pair.server_bridge, &pair.map,
-            &log, start, pair.engine.random(),
+            pair.dialer,
+            dial.conn,
+            pair.server_bridge,
+            &pair.map,
+            &log,
+            start,
+            pair.engine.random(),
         );
         const accepted = pair.server_bridge.connectionAt(0) orelse
             return error.TestUnexpectedResult;
@@ -513,18 +521,23 @@ test "native transport options reach peers through the bridge and dial handshake
                 try t.expectEqual(@as(usize, 0), client.remoteTraversalCandidates(&candidates).len);
                 const pn = server.pkt_handler.next_pn[2];
                 try t.expectEqual(@as(usize, 0), try server.sendAt(
-                    &packet_bytes, start, pair.engine.random(),
+                    &packet_bytes,
+                    start,
+                    pair.engine.random(),
                 ));
                 try t.expectEqual(pn, server.pkt_handler.next_pn[2]);
                 const client_pn = client.pkt_handler.next_pn[2];
                 try t.expectEqual(@as(usize, 0), try client.sendAt(
-                    &packet_bytes, start, pair.engine.random(),
+                    &packet_bytes,
+                    start,
+                    pair.engine.random(),
                 ));
                 try t.expectEqual(client_pn, client.pkt_handler.next_pn[2]);
             }
             const physical_v6 = quic.address.Address.initIpv6(
                 .{ 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
-                4040, 0,
+                4040,
+                0,
             );
             const v6_reach: quic.frame.Frame = .{
                 .reach_address = .{ .round = 1, .address = physical_v6 },

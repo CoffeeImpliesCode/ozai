@@ -169,9 +169,18 @@ pub const KeyContext = struct {
 // HashMapUnmanaged returns a type; PascalCase is required for this binding.
 // zwanzig-disable-next-line: identifier-style
 const Forward = std.HashMapUnmanaged(Key, Ula, KeyContext, max_load);
+const ReverseEntry = struct {
+    key: Key,
+    relay_target: ?RelayUrl = null,
+};
 // This reverse index is another type returned by the same factory.
 // zwanzig-disable-next-line: identifier-style
-const Reverse = std.HashMapUnmanaged(Ula, Key, std.hash_map.AutoContext(Ula), max_load);
+const Reverse = std.HashMapUnmanaged(
+    Ula,
+    ReverseEntry,
+    std.hash_map.AutoContext(Ula),
+    max_load,
+);
 
 /// The bidirectional map between a key and the synthetic address it answers
 /// with. Upstream's `MappedAddrs` holds one `AddrMap` per key arm; with the
@@ -238,7 +247,27 @@ pub const MappedAddrs = struct {
     /// handed out: anything `ula.classify` called a direct path, and a
     /// synthetic address belonging to somebody else's map.
     pub fn lookup(self: *const MappedAddrs, addr: Ula) ?Key {
-        return self.by_addr.get(addr);
+        const entry = self.by_addr.getPtr(addr) orelse return null;
+        return entry.key;
+    }
+
+    /// Retain the physical relay separately from the canonical peer identity.
+    pub fn getRelay(
+        self: *MappedAddrs,
+        gpa: std.mem.Allocator,
+        peer: NodeId,
+        target: RelayUrl,
+        random: std.Random,
+    ) GetError!Ula {
+        const addr = try self.get(gpa, .{ .any_path = peer }, random);
+        self.by_addr.getPtr(addr).?.relay_target = target;
+        return addr;
+    }
+
+    /// An ingress-only mapping has no requested egress carrier yet.
+    pub fn relayTarget(self: *const MappedAddrs, addr: Ula) ?*const RelayUrl {
+        const entry = self.by_addr.getPtr(addr) orelse return null;
+        return if (entry.relay_target) |*target| target else null;
     }
 
     /// Draw host bits until one lands on an address the reverse index does not
@@ -276,7 +305,7 @@ pub const MappedAddrs = struct {
         key: Key,
         addr: Ula,
     ) std.mem.Allocator.Error!void {
-        try self.by_addr.put(gpa, addr, key);
+        try self.by_addr.put(gpa, addr, .{ .key = key });
         errdefer _ = self.by_addr.fetchRemove(addr);
         try self.by_key.put(gpa, key, addr);
     }

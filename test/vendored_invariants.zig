@@ -175,7 +175,7 @@ pub fn audit(alloc: std.mem.Allocator) rulebook.AuditError!void {
     inline for (vendored_files) |embedded| {
         const src: [:0]const u8 = @embedFile("../" ++ embedded);
         const path = embedded;
-        test_blocks += try judge.scanFile(&scanner, alloc, src, path);
+        test_blocks += try judge.scanFile(alloc, &scanner, src, path);
     }
 
     if (scanner.hits == 0) return;
@@ -206,7 +206,7 @@ fn scanSynthetic(
     defer scanner.tokens.deinit(alloc);
     defer scanner.scaffolding.deinit(alloc);
     defer scanner.local_fns.deinit(alloc);
-    const tests = try judge.scanFile(&scanner, alloc, src, path);
+    const tests = try judge.scanFile(alloc, &scanner, src, path);
     return .{ .hits = scanner.hits, .tests = tests };
 }
 

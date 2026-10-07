@@ -90,7 +90,6 @@ pub const Conn = struct {
         };
     }
 
-
     /// The negotiated protocol, borrowed until this connection is destroyed.
     pub fn alpn(self: Conn) ?[]const u8 {
         if (!self.established()) return null;
@@ -121,7 +120,10 @@ pub const Conn = struct {
         random: std.Random,
     ) PathError!u8 {
         return self.entry.conn.openPath(
-            toCoreAddress(local_addr), toCoreAddress(peer_addr), at, random,
+            toCoreAddress(local_addr),
+            toCoreAddress(peer_addr),
+            at,
+            random,
         );
     }
 
@@ -291,7 +293,14 @@ pub const Conn = struct {
             } else if (len != run_size or !std.meta.eql(to, run_to) or ecn != run_ecn) {
                 // Segmented datagrams share size, destination and ECN treatment.
                 used = try closeRun(
-                    out, used, buffer, run_start, filled, run_size, run_ecn, run_to,
+                    out,
+                    used,
+                    buffer,
+                    run_start,
+                    filled,
+                    run_size,
+                    run_ecn,
+                    run_to,
                 );
                 run_start = filled;
                 run_size = len;
@@ -420,66 +429,34 @@ pub const Stream = struct {
         self.entry.send.close();
     }
 
-    /// Take up to 64 ready runs from this stream, appending them to `sink`.
+    /// Append up to 64 ready runs, consuming at most `byte_budget` bytes this call.
     ///
-    /// Returns whether anything was appended, so a caller can fold this into
-    /// its own "did this pass move anything" answer without a second read.
-    /// Nothing is ready is false rather than a refusal: a stream with nothing
-    /// on it yet is a peer that has not spoken, not a fault.
+    /// Returns whether any bytes were appended; `false` means no run was ready.
+    /// A ready run larger than the remaining budget returns `error.ByteBudgetExceeded`
+    /// before any allocation or consumption of that run, including with a zero budget.
+    /// The core reads whole runs, so a rejected run is not partially consumed.
     ///
-    /// **The sink is the caller's and it grows, because a read has no length
-    /// worth guessing.** The core hands back whatever contiguous run it holds —
-    /// `FrameSorter.pop` returns a whole chunk, coalesced up to `MAX_COALESCED`
-    /// (`stream.zig:72`) — so the size of a read is a function of what the peer
-    /// sent and of nothing the caller can see coming. A caller that owned a
-    /// fixed buffer had two answers and both were wrong: sized to a frame it
-    /// refused the run *after* popping it, and the bytes were already gone
-    /// (`stream.zig:390-396` hands over ownership), and sized to the ceiling it
-    /// allocated the ceiling per stream for the whole life of the connection.
-    /// A sink that grows pays for what actually arrived and nothing for what a
-    /// peer might send.
+    /// Sink growth is bounded by its initial length plus `byte_budget`, without
+    /// shrinking capacity the caller already owns. Room is reserved before reading:
+    /// `error.OutOfMemory` leaves the refused run pending, even if FIN was received.
+    /// Either error retains earlier appended runs in `sink` and all unread bytes
+    /// on the stream, in order. Compare sink lengths to account for that prefix.
+    /// Retry with sufficient budget or memory to consume exactly the unread suffix.
     ///
-    /// **One copy, not two.** The core hands its chunk to the application to
-    /// free (`ReceiveStream.read`, `stream.zig:523`), so `gpa` is the allocator
-    /// that made it — which is the bridge's own, and a caller passes the one it
-    /// created the bridge with. The append is the copy, and it has to be one:
-    /// a framed protocol parses a message in place and borrows into the bytes
-    /// it was handed, and those bytes must outlive the message, which a borrow
-    /// of the core's chunk cannot because the next read has already taken it.
-    ///
-    /// **The room is taken before the bytes, because the bytes are gone once
-    /// the core has handed them over.** A read advances the stream's position,
-    /// charges the peer for what it read, and transfers an owned allocation
-    /// out; an allocator that then refuses the append has dropped a run the
-    /// peer will never retransmit, because from the core's side it was
-    /// delivered. So this asks the core how much the next read holds —
-    /// `ReceiveStream.peekLen`, which consumes nothing — reserves exactly
-    /// that, and reads afterwards.
-    ///
-    /// **What a refused allocation leaves.** Everything appended before the
-    /// refusal stays in `sink`, which is the caller's, and every byte the sink
-    /// did not take is still pending on the stream, in order. A retry with an
-    /// allocator that answers appends exactly the bytes this call stopped at,
-    /// and none of them twice. An error may leave a committed prefix: compare
-    /// `sink.items.len` before and after the call to find it. `false` means
-    /// that no bytes were appended and no run was ready.
-    ///
-    /// **A partial sink is rarer than the sentence above suggests.** Contiguous
-    /// frames are coalesced into one run before it is read, and a second run is
-    /// only readable once the gap before it is filled, so a drain in practice
-    /// either moves one whole run or moves nothing: the common refusal is the
-    /// first reserve, and the sink is untouched. The contract above is the one
-    /// that holds either way.
-    ///
-    /// Each call consumes at most 64 ready runs. Drain again until `false`
-    /// before treating the receive side as empty. `sink` must use the same
-    /// allocator as the stream.
+    /// `sink` must use the stream's allocator, passed as `gpa`; the caller owns
+    /// and releases the sink. This performs one copy into the sink and frees each
+    /// consumed core allocation. Neither argument is retained.
+    /// Drain until `false` before treating the receive side as empty: `finished`
+    /// describes receipt of FIN, not consumption, and the 64-run bound may leave data.
     pub fn drain(
         self: *Stream,
         gpa: std.mem.Allocator,
         sink: *std.ArrayList(u8),
-    ) std.mem.Allocator.Error!bool {
+        byte_budget: usize,
+    ) error{ OutOfMemory, ByteBudgetExceeded }!bool {
         var moved = false;
+        var remaining = byte_budget;
+        const capacity_limit = sink.items.len +| byte_budget;
         // Bounded by what the stream can hold rather than by its data: a run is
         // taken per pass and each pass consumes what it took, so the loop ends
         // when the stream is drained. The bound is the backstop for a bug that
@@ -487,11 +464,18 @@ pub const Stream = struct {
         var runs: usize = 0;
         while (runs < max_drain_runs) : (runs += 1) {
             const len = self.entry.recv.peekLen() orelse break;
-            try sink.ensureUnusedCapacity(gpa, len);
+            if (len > remaining) return error.ByteBudgetExceeded;
+            const needed = std.math.add(usize, sink.items.len, len) catch
+                return error.OutOfMemory;
+            if (sink.capacity < needed) {
+                const capacity = @min(std.ArrayList(u8).growCapacity(needed), capacity_limit);
+                try sink.ensureTotalCapacityPrecise(gpa, capacity);
+            }
             const chunk = self.entry.recv.read() orelse return error.OutOfMemory;
             sink.appendSliceAssumeCapacity(chunk);
             gpa.free(chunk);
             moved = true;
+            remaining -= len;
         }
         return moved;
     }
@@ -711,13 +695,44 @@ test "an allocator that refuses the sink leaves every byte pending for the next 
     // already buffered and untouched, because the room is taken before the
     // read that would hand it over.
     var refusing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
-    try t.expectError(error.OutOfMemory, stream.drain(refusing.allocator(), &sink));
+    try t.expectError(
+        error.OutOfMemory,
+        stream.drain(refusing.allocator(), &sink, std.math.maxInt(usize)),
+    );
     try t.expectEqual(@as(usize, 0), sink.items.len);
 
     // The retry yields the bytes the refusal interrupted at, once, in order.
-    try t.expect(try stream.drain(t.allocator, &sink));
+    try t.expect(try stream.drain(t.allocator, &sink, std.math.maxInt(usize)));
     try t.expectEqualStrings(message, sink.items);
-    try t.expect(!try stream.drain(t.allocator, &sink));
+    try t.expect(!try stream.drain(t.allocator, &sink, std.math.maxInt(usize)));
+}
+
+test "drain byte budget rejects pending FIN bytes without consuming and permits exact retry" {
+    // A rejected read must keep the same bytes available, even after all FIN data arrived.
+    const message = "exact byte budget";
+    var owner = quic_stream.StreamsMap.init(t.allocator, true);
+    defer owner.deinit();
+    const core = try owner.getOrCreateStream(0);
+    try core.recv.handleStreamFrame(0, message, true);
+    var stream: Stream = .{ .entry = core, .owner = &owner };
+    var sink: std.ArrayList(u8) = .empty;
+    defer sink.deinit(t.allocator);
+    var refusing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    try t.expect(stream.finished());
+    for ([_]usize{ 0, message.len - 1 }) |budget| {
+        try t.expectError(
+            error.ByteBudgetExceeded,
+            stream.drain(refusing.allocator(), &sink, budget),
+        );
+        try t.expectEqual(@as(usize, 0), sink.items.len);
+        try t.expectEqual(@as(u64, 0), core.recv.bytes_read);
+        try t.expectEqual(@as(?usize, message.len), core.recv.peekLen());
+        try t.expect(!refusing.has_induced_failure);
+    }
+    try t.expect(try stream.drain(t.allocator, &sink, message.len));
+    try t.expectEqualStrings(message, sink.items);
+    try t.expectEqual(message.len, sink.capacity);
+    try t.expect(!try stream.drain(t.allocator, &sink, 0));
 }
 
 test "receive copy-out OOM is not mistaken for a finished stream" {
@@ -731,14 +746,14 @@ test "receive copy-out OOM is not mistaken for a finished stream" {
     var sink: std.ArrayList(u8) = .empty;
     defer sink.deinit(gpa);
     try sink.ensureTotalCapacity(gpa, 10);
-    const ready = core.recv.peekLen().?;
+    const ready = core.recv.peekLen() orelse return error.TestUnexpectedResult;
     var stream: Stream = .{ .entry = core, .owner = &owner };
     refusing.fail_index = refusing.alloc_index;
-    try t.expectError(error.OutOfMemory, stream.drain(gpa, &sink));
+    try t.expectError(error.OutOfMemory, stream.drain(gpa, &sink, std.math.maxInt(usize)));
     try t.expectEqual(@as(usize, 0), sink.items.len);
-    try t.expectEqual(ready, core.recv.peekLen().?);
+    try t.expectEqual(@as(?usize, ready), core.recv.peekLen());
     refusing.fail_index = std.math.maxInt(usize);
-    try t.expect(try stream.drain(gpa, &sink));
+    try t.expect(try stream.drain(gpa, &sink, std.math.maxInt(usize)));
     try t.expectEqualStrings("helloworld", sink.items);
 }
 
@@ -754,7 +769,8 @@ test "unpin queues a stream that settled while pinned after guarded GC stood dow
     try stream.write("done");
     stream.close();
     core.send.send_window = 4;
-    const sent = core.send.popStreamFrame(4).?.stream;
+    const frame = core.send.popStreamFrame(4) orelse return error.TestUnexpectedResult;
+    const sent = frame.stream;
     try t.expect(sent.fin);
     try t.expectEqual(@as(u64, 4), sent.length);
     try core.recv.handleStreamFrame(0, "", true);
@@ -791,7 +807,8 @@ test "unpin retains a closed stream until its FIN is acknowledged" {
     const stream_id = stream.id();
     try stream.pin();
     stream.close();
-    const sent = core.send.popStreamFrame(0).?.stream;
+    const frame = core.send.popStreamFrame(0) orelse return error.TestUnexpectedResult;
+    const sent = frame.stream;
     try t.expect(sent.fin);
     try core.recv.handleStreamFrame(0, "", true);
     owner.closeIfDone(core);
@@ -823,7 +840,8 @@ test "unpin uses the disposal queue overflow backstop" {
     const stream_id = stream.id();
     try stream.pin();
     stream.close();
-    const sent = core.send.popStreamFrame(0).?.stream;
+    const frame = core.send.popStreamFrame(0) orelse return error.TestUnexpectedResult;
+    const sent = frame.stream;
     try core.recv.handleStreamFrame(0, "", true);
     owner.closeIfDone(core);
     try core.send.onAck(sent.offset, sent.length, sent.fin);

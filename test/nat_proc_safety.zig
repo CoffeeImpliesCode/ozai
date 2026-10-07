@@ -2,8 +2,13 @@
 const std = @import("std");
 const c = std.c;
 pub const Error = error{
-    InvalidProc, ProcOverflow, ProcUnavailable, OwnershipMismatch, UnsafeNamespace,
-    InvalidCommand, CommandOverflow,
+    InvalidProc,
+    ProcOverflow,
+    ProcUnavailable,
+    OwnershipMismatch,
+    UnsafeNamespace,
+    InvalidCommand,
+    CommandOverflow,
 };
 
 /// Borrowed identities captured by the caller before entering private namespaces.
@@ -25,6 +30,8 @@ fn validateNamespaceIdentity(identity: []const u8, kind: Namespace) Error!void {
     };
     if (identity.len <= prefix.len + 1 or identity.len > prefix.len + 21)
         return error.UnsafeNamespace;
+    // zbc cannot carry the earlier length guard through prefix selection.
+    // zbc-disable-next-line: index-minus-one-without-zero-guard
     if (!std.mem.startsWith(u8, identity, prefix) or identity[identity.len - 1] != ']')
         return error.UnsafeNamespace;
     const digits = identity[prefix.len .. identity.len - 1];
@@ -45,30 +52,53 @@ fn checkNamespaceSeparation(baseline: Baseline, own: Baseline) Error!void {
 test "namespace baselines require canonical nonzero bounded decimal identities" {
     try validateBaseline(.{ .net = "net:[1]", .user = "user:[18446744073709551615]" });
     const malformed = [_][]const u8{
-        "", "net:[]", "net:[0]", "net:[01]", "net:[+1]", "net:[-1]",
-        "net:[ 1]", "net:[1 ]", "net:[1]\n", "net:[1]junk", "user:[1]",
-        "net:[18446744073709551616]", "net:[100000000000000000000]",
+        "",
+        "net:[]",
+        "net:[0]",
+        "net:[01]",
+        "net:[+1]",
+        "net:[-1]",
+        "net:[ 1]",
+        "net:[1 ]",
+        "net:[1]\n",
+        "net:[1]junk",
+        "user:[1]",
+        "net:[18446744073709551616]",
+        "net:[100000000000000000000]",
     };
     for (malformed) |net| {
-        try std.testing.expectError(error.UnsafeNamespace,
-            validateBaseline(.{ .net = net, .user = "user:[2]" }));
+        try std.testing.expectError(
+            error.UnsafeNamespace,
+            validateBaseline(.{ .net = net, .user = "user:[2]" }),
+        );
     }
     for ([_][]const u8{ "", "user:[0]", "user:[01]", "user:[+2]", "net:[2]" }) |user| {
-        try std.testing.expectError(error.UnsafeNamespace,
-            validateBaseline(.{ .net = "net:[1]", .user = user }));
+        try std.testing.expectError(
+            error.UnsafeNamespace,
+            validateBaseline(.{ .net = "net:[1]", .user = user }),
+        );
     }
 }
 
 test "private namespaces must both differ from the explicit outside baseline" {
     const baseline: Baseline = .{ .net = "net:[1]", .user = "user:[2]" };
     try checkNamespaceSeparation(baseline, .{ .net = "net:[3]", .user = "user:[4]" });
-    try std.testing.expectError(error.UnsafeNamespace,
-        checkNamespaceSeparation(baseline, .{ .net = "net:[1]", .user = "user:[4]" }));
-    try std.testing.expectError(error.UnsafeNamespace,
-        checkNamespaceSeparation(baseline, .{ .net = "net:[3]", .user = "user:[2]" }));
-    try std.testing.expectError(error.UnsafeNamespace, checkNamespaceSeparation(baseline, baseline));
-    try std.testing.expectError(error.UnsafeNamespace,
-        checkNamespaceSeparation(baseline, .{ .net = "net:[03]", .user = "user:[4]" }));
+    try std.testing.expectError(
+        error.UnsafeNamespace,
+        checkNamespaceSeparation(baseline, .{ .net = "net:[1]", .user = "user:[4]" }),
+    );
+    try std.testing.expectError(
+        error.UnsafeNamespace,
+        checkNamespaceSeparation(baseline, .{ .net = "net:[3]", .user = "user:[2]" }),
+    );
+    try std.testing.expectError(
+        error.UnsafeNamespace,
+        checkNamespaceSeparation(baseline, baseline),
+    );
+    try std.testing.expectError(
+        error.UnsafeNamespace,
+        checkNamespaceSeparation(baseline, .{ .net = "net:[03]", .user = "user:[4]" }),
+    );
 }
 
 test "uid map permits only root mapped to one specified caller" {
@@ -103,8 +133,8 @@ pub fn statusField(status: []const u8, name: []const u8) ?[]const u8 {
 }
 
 pub fn statusNumber(status: []const u8, name: []const u8) Error!u32 {
-    return std.fmt.parseInt(u32, statusField(status, name) orelse return error.InvalidProc, 10)
-        catch return error.InvalidProc;
+    const field = statusField(status, name) orelse return error.InvalidProc;
+    return std.fmt.parseInt(u32, field, 10) catch return error.InvalidProc;
 }
 
 pub fn checkStatus(status: []const u8, uid: u32, parent: c.pid_t) Error!void {
@@ -112,48 +142,50 @@ pub fn checkStatus(status: []const u8, uid: u32, parent: c.pid_t) Error!void {
     var fields = std.mem.tokenizeAny(u8, statusField(status, "Uid:") orelse
         return error.InvalidProc, " \t");
     for (0..4) |_| {
-        const value = std.fmt.parseInt(u32, fields.next() orelse return error.InvalidProc, 10)
-            catch return error.InvalidProc;
+        const field = fields.next() orelse return error.InvalidProc;
+        const value = std.fmt.parseInt(u32, field, 10) catch return error.InvalidProc;
         if (value != uid) return error.OwnershipMismatch;
     }
     if (fields.next() != null) return error.InvalidProc;
 }
 
-pub fn excludeAncestors(pid: c.pid_t) Error!void {
+pub fn excludeAncestors(io: std.Io, pid: c.pid_t) Error!void {
     if (pid <= 1) return error.OwnershipMismatch;
     var ancestor = c.getpid();
     for (0..128) |_| {
         if (ancestor == pid) return error.OwnershipMismatch;
         if (ancestor <= 1) return;
         var buffer: [4096]u8 = undefined;
-        ancestor = @intCast(try statusNumber(try procRead(ancestor, "status", &buffer), "PPid:"));
+        ancestor = @intCast(try statusNumber(try procRead(io, ancestor, "status", &buffer), "PPid:"));
     }
     return error.OwnershipMismatch;
 }
 
-pub fn procRead(pid: c.pid_t, leaf: []const u8, buffer: []u8) Error![]const u8 {
+pub fn procRead(io: std.Io, pid: c.pid_t, leaf: []const u8, buffer: []u8) Error![]const u8 {
     var path_buffer: [128]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/{s}", .{ pid, leaf })
-        catch return error.InvalidProc;
-    return readPath(path, buffer);
+    const path = std.fmt.bufPrintSentinel(
+        &path_buffer,
+        "/proc/{d}/{s}",
+        .{ pid, leaf },
+        0,
+    ) catch return error.InvalidProc;
+    return readPath(io, path, buffer);
 }
 
-fn readPath(path: [:0]const u8, buffer: []u8) Error![]const u8 {
-    const fd = c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
-    if (fd < 0) return error.ProcUnavailable;
-    defer std.debug.assert(c.close(fd) == 0);
+fn readPath(io: std.Io, path: []const u8, buffer: []u8) Error![]const u8 {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.ProcUnavailable;
+    defer file.close(io);
     var offset: usize = 0;
     for (0..32) |_| {
         var probe: [1]u8 = undefined;
         const target = if (offset < buffer.len) buffer[offset..] else &probe;
-        const count = c.read(fd, target.ptr, target.len);
-        if (count == 0) return buffer[0..offset];
-        if (count < 0) {
-            if (c.errno(count) == .INTR) continue;
-            return error.ProcUnavailable;
-        }
+        const count = file.readStreaming(io, &.{target}) catch |err| switch (err) {
+            error.EndOfStream => return buffer[0..offset],
+            else => return error.ProcUnavailable,
+        };
+        if (count == 0) continue;
         if (offset == buffer.len) return error.ProcOverflow;
-        offset += @intCast(count);
+        offset += count;
     }
     return error.ProcOverflow;
 }
@@ -176,9 +208,8 @@ fn checkUidMap(map: []const u8, caller_uid: u32) Error!void {
 }
 
 pub fn verifyUidMapping(io: std.Io, pid: c.pid_t, caller_uid: u32) Error!void {
-    _ = io;
     var buffer: [256]u8 = undefined;
-    try checkUidMap(try procRead(pid, "uid_map", &buffer), caller_uid);
+    try checkUidMap(try procRead(io, pid, "uid_map", &buffer), caller_uid);
 }
 
 pub const Namespace = enum { user, net };
@@ -189,20 +220,24 @@ pub fn namespaceIdentity(
     kind: Namespace,
     buffer: *[128]u8,
 ) Error![]const u8 {
-    _ = io;
     var path_buffer: [128]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/ns/{s}", .{ pid, @tagName(kind) })
-        catch return error.InvalidProc;
-    const count = c.readlink(path.ptr, buffer, buffer.len);
-    if (count <= 0 or count >= buffer.len) return error.ProcUnavailable;
-    return buffer[0..@intCast(count)];
+    const path = std.fmt.bufPrintSentinel(
+        &path_buffer,
+        "/proc/{d}/ns/{s}",
+        .{ pid, @tagName(kind) },
+        0,
+    ) catch return error.InvalidProc;
+    const count = std.Io.Dir.readLinkAbsolute(io, path, buffer) catch
+        return error.ProcUnavailable;
+    if (count == 0 or count >= buffer.len) return error.ProcUnavailable;
+    return buffer[0..count];
 }
 
 pub fn assertPrivate(io: std.Io, baseline: Baseline) Error!void {
     try validateBaseline(baseline);
     if (c.getuid() != 0 or c.geteuid() != 0) return error.UnsafeNamespace;
     var map_buffer: [256]u8 = undefined;
-    const map = try procRead(c.getpid(), "uid_map", &map_buffer);
+    const map = try procRead(io, c.getpid(), "uid_map", &map_buffer);
     var fields = std.mem.tokenizeAny(u8, map, " \t\r\n");
     _ = fields.next() orelse return error.UnsafeNamespace;
     const outside = std.fmt.parseInt(u32, fields.next() orelse
@@ -235,7 +270,7 @@ pub fn setPrivateForwarding(
     defer std.debug.assert(c.close(fd) == 0);
     if (c.write(fd, "1\n", 2) != 2) return error.UnsafeNamespace;
     var value_buffer: [16]u8 = undefined;
-    const value = try readPath(path, &value_buffer);
+    const value = try readPath(io, path, &value_buffer);
     if (!std.mem.eql(u8, std.mem.trim(u8, value, " \t\r\n"), "1"))
         return error.UnsafeNamespace;
 }
@@ -261,12 +296,17 @@ pub fn assertOwnedDir(dir: std.Io.Dir) Error!void {
 
 pub fn verifyProcOwner(pid: c.pid_t, uid: u32) Error!void {
     var path_buffer: [64]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{d}", .{pid})
-        catch return error.InvalidProc;
+    const path = std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}", .{pid}, 0) catch
+        return error.InvalidProc;
     var info: std.os.linux.Statx = undefined;
     const requested: std.os.linux.STATX = .{ .TYPE = true, .UID = true };
-    if (statx(std.os.linux.AT.FDCWD, path, std.os.linux.AT.SYMLINK_NOFOLLOW,
-        @bitCast(requested), &info) != 0) return error.ProcUnavailable;
+    if (statx(
+        std.os.linux.AT.FDCWD,
+        path,
+        std.os.linux.AT.SYMLINK_NOFOLLOW,
+        @bitCast(requested),
+        &info,
+    ) != 0) return error.ProcUnavailable;
     if (!info.mask.TYPE or !info.mask.UID) return error.OwnershipMismatch;
     if (info.uid != uid) return error.OwnershipMismatch;
     if (info.mode & std.os.linux.S.IFMT != std.os.linux.S.IFDIR)
@@ -293,4 +333,150 @@ pub fn encodeCommand(buffer: []u8, argv: []const []const u8) Error![]const u8 {
         offset += 1;
     }
     return buffer[0..offset];
+}
+
+// Borrow the runner's backend, replacing only proc reads; no global proc stub or mutation.
+const ProcReadTripwire = struct {
+    fail_open: bool,
+    opens: usize = 0,
+    reads: usize = 0,
+    links: usize = 0,
+    closes: usize = 0,
+    content: ?[]const u8 = null,
+    content_offset: usize = 0,
+    empty_reads: usize = 0,
+
+    fn context(userdata: ?*anyopaque) *ProcReadTripwire {
+        return @ptrCast(@alignCast(userdata.?));
+    }
+
+    fn open(
+        userdata: ?*anyopaque,
+        _: std.Io.Dir,
+        path: []const u8,
+        _: std.Io.Dir.OpenFileOptions,
+    ) std.Io.File.OpenError!std.Io.File {
+        const self = context(userdata);
+        std.debug.assert(std.mem.startsWith(u8, path, "/proc/"));
+        self.opens += 1;
+        if (self.fail_open) return error.AccessDenied;
+        return .{ .handle = -1, .flags = .{ .nonblocking = false } };
+    }
+
+    fn read(
+        userdata: ?*anyopaque,
+        _: std.Io.File,
+        _: []const []u8,
+        _: u64,
+    ) std.Io.File.ReadPositionalError!usize {
+        context(userdata).reads += 1;
+        return error.InputOutput;
+    }
+
+    fn operate(
+        userdata: ?*anyopaque,
+        operation: std.Io.Operation,
+    ) std.Io.Cancelable!std.Io.Operation.Result {
+        std.debug.assert(operation == .file_read_streaming);
+        const self = context(userdata);
+        self.reads += 1;
+        const content = self.content orelse
+            return .{ .file_read_streaming = error.InputOutput };
+        if (self.empty_reads != 0) {
+            self.empty_reads -= 1;
+            return .{ .file_read_streaming = 0 };
+        }
+        if (self.content_offset == content.len)
+            return .{ .file_read_streaming = error.EndOfStream };
+        const read_operation = operation.file_read_streaming;
+        std.debug.assert(read_operation.data.len == 1);
+        const target = read_operation.data[0];
+        const count = @min(target.len, content.len - self.content_offset);
+        @memcpy(target[0..count], content[self.content_offset..][0..count]);
+        self.content_offset += count;
+        return .{ .file_read_streaming = count };
+    }
+
+    fn close(userdata: ?*anyopaque, files: []const std.Io.File) void {
+        context(userdata).closes += files.len;
+        for (files) |file| std.debug.assert(file.handle == -1);
+    }
+
+    fn readLink(
+        userdata: ?*anyopaque,
+        _: std.Io.Dir,
+        path: []const u8,
+        _: []u8,
+    ) std.Io.Dir.ReadLinkError!usize {
+        std.debug.assert(std.mem.startsWith(u8, path, "/proc/"));
+        context(userdata).links += 1;
+        return error.AccessDenied;
+    }
+
+    fn io(self: *ProcReadTripwire, vtable: *std.Io.VTable) std.Io {
+        vtable.* = std.testing.io.vtable.*;
+        vtable.dirOpenFile = open;
+        vtable.fileReadPositional = read;
+        vtable.operate = operate;
+        vtable.fileClose = close;
+        vtable.dirReadLink = readLink;
+        return .{ .userdata = self, .vtable = vtable };
+    }
+};
+
+test "proc uid mapping open and read failures obey supplied Io" {
+    for ([_]bool{ true, false }) |fail_open| {
+        var tripwire: ProcReadTripwire = .{ .fail_open = fail_open };
+        var vtable: std.Io.VTable = undefined;
+        const io = tripwire.io(&vtable);
+        // Reading our own uid_map is harmless even on the broken backend bypass.
+        try std.testing.expectError(
+            error.ProcUnavailable,
+            verifyUidMapping(io, c.getpid(), 1000),
+        );
+        try std.testing.expectEqual(@as(usize, 1), tripwire.opens);
+        try std.testing.expectEqual(@as(usize, if (fail_open) 0 else 1), tripwire.reads);
+        try std.testing.expectEqual(@as(usize, if (fail_open) 0 else 1), tripwire.closes);
+    }
+}
+
+test "proc namespace identity failure obeys supplied Io" {
+    var tripwire: ProcReadTripwire = .{ .fail_open = true };
+    var vtable: std.Io.VTable = undefined;
+    const io = tripwire.io(&vtable);
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectError(
+        error.ProcUnavailable,
+        namespaceIdentity(io, c.getpid(), .net, &buffer),
+    );
+    try std.testing.expectEqual(@as(usize, 1), tripwire.links);
+}
+
+test "proc uid mapping survives no progress and accepts streaming EOF after the row" {
+    var tripwire: ProcReadTripwire = .{
+        .fail_open = false,
+        .content = "0 1000 1\n",
+        .empty_reads = 1,
+    };
+    var vtable: std.Io.VTable = undefined;
+    try verifyUidMapping(tripwire.io(&vtable), 42, 1000);
+    try std.testing.expectEqual(@as(usize, 1), tripwire.opens);
+    try std.testing.expectEqual(@as(usize, 3), tripwire.reads);
+    try std.testing.expectEqual(@as(usize, 1), tripwire.closes);
+}
+
+test "proc read probes past a full buffer without accepting truncation" {
+    for ([_][]const u8{ "1234", "12345" }) |content| {
+        var tripwire: ProcReadTripwire = .{ .fail_open = false, .content = content };
+        var vtable: std.Io.VTable = undefined;
+        var buffer: [4]u8 = undefined;
+        const result = procRead(tripwire.io(&vtable), 42, "status", &buffer);
+        if (content.len == buffer.len) {
+            try std.testing.expectEqualStrings(content, try result);
+        } else {
+            try std.testing.expectError(error.ProcOverflow, result);
+        }
+        try std.testing.expectEqual(@as(usize, 2), tripwire.reads);
+        try std.testing.expectEqual(@as(usize, 1), tripwire.closes);
+    }
 }

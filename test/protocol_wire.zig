@@ -109,8 +109,8 @@ pub const Wire = struct {
         self: *Wire,
         name: []const u8,
         index: usize,
-        secret: SecretKey,
-        expect_peer: ?NodeId,
+        secret: ozai.SecretKey,
+        expect_peer: ?ozai.NodeId,
         alpn: []const u8,
         seed: u64,
     ) !void {

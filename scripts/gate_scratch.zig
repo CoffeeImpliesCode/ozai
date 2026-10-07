@@ -1,5 +1,8 @@
 const std = @import("std");
 const Dir = std.Io.Dir;
+pub const ValidateError = std.mem.Allocator.Error || std.process.RunError ||
+    error{ MissingScratch, UnapprovedScratch, MissingHome };
+pub const CreateError = ValidateError || std.Io.RandomSecureError || Dir.CreateDirError;
 
 // Re-source the host policy, then prove ownership and the selected physical mount.
 // Positional arguments prevent shell interpretation of environment paths.
@@ -46,9 +49,12 @@ const validate_script =
     \\printf '%s\n' "$physical_scratch"
 ;
 
-pub fn validatedScratch(gpa: std.mem.Allocator, io: std.Io,
-    environment: *const std.process.Environ.Map, target: []const u8) ![]const u8
-{
+pub fn validatedScratch(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    target: []const u8,
+) ValidateError![]const u8 {
     const selected = environment.get("HOST_SCRATCH_ROOT") orelse return error.MissingScratch;
     if (!std.fs.path.isAbsolute(selected)) return error.UnapprovedScratch;
     const home = environment.get("HOME") orelse return error.MissingHome;
@@ -75,15 +81,18 @@ pub fn validatedScratch(gpa: std.mem.Allocator, io: std.Io,
     return gpa.dupe(u8, scratch);
 }
 
-pub fn validateRoot(gpa: std.mem.Allocator, io: std.Io,
-    environment: *const std.process.Environ.Map, path: []const u8) !void
-{
+pub fn validateRoot(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    path: []const u8,
+) ValidateError!void {
     if (!std.fs.path.isAbsolute(path)) return error.UnapprovedScratch;
     const scratch = try validatedScratch(gpa, io, environment, path);
     defer gpa.free(scratch);
 }
 
-pub fn createRoot(init: std.process.Init, environment: *std.process.Environ.Map) ![]const u8 {
+pub fn createRoot(init: std.process.Init, environment: *std.process.Environ.Map) CreateError![]const u8 {
     const gpa = init.arena.allocator();
     const scratch = try validatedScratch(gpa, init.io, environment, "");
     defer gpa.free(scratch);
