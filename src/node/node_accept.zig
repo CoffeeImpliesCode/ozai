@@ -12,7 +12,6 @@ const std = @import("std");
 const node_mod = @import("node.zig");
 const node_config = @import("node_config.zig");
 const node_close = @import("node_close.zig");
-const node_relay_release = @import("node_relay_release.zig");
 const node_transport = @import("node_transport.zig");
 
 const bridge_mod = @import("../transport/quic_bridge.zig");
@@ -43,15 +42,6 @@ pub const max_accepts = 64;
 /// second protocol arrives with a second bridge field rather than as a list
 /// `node.zig` fills.
 ///
-/// **Raising this is the cheap half of wiring `/iroh-qad/0` and it is not
-/// enough on its own.** The core's `TlsConfig.alpn` is `[]const []const u8`
-/// and its matcher walks every entry, so `[2]` in
-/// `transport/bridge_manager.zig:82` and `transport/dial_client.zig:82` would
-/// carry two names with no vendor patch. What does not follow is a working
-/// QAD route: `vendor/quic/` has no OBSERVED_ADDRESS frame and no
-/// `address_discovery` transport parameter, and it is read-only here. A node
-/// that raised this alone would offer a protocol it cannot serve.
-/// `router/qad_route.zig` records that decision and what closes it.
 pub const max_alpns = 1;
 
 /// The deepest chain of endpoint events one `feed` can enqueue.
@@ -293,16 +283,7 @@ pub fn handler(self: *Node) router.ProtocolHandler {
     };
 }
 
-/// `ProtocolHandler::accept`: one connection handed to this node's protocol.
-///
-/// Upstream's runs until the connection ends (`protocol.rs:258-261`), which is
-/// what makes the shutdown ordering load-bearing — a handler's `shutdown`
-/// closes connections its own `accept` is still using. There is nothing to run
-/// here: the gossip wire format does not exist yet (see `node.zig`'s module
-/// doc), so a
-/// body that looped would be a lie about what this node serves. It counts the
-/// connection and returns, and `Stats.handler_connections` is what a caller
-/// reads.
+/// Admission records the authenticated connection; protocol work runs in `step`.
 pub fn acceptConnection(ptr: *anyopaque, connection: router.Connection) router.AcceptError!void {
     // The handle a handler is given is the node itself, and asserting it is
     // what turns "the endpoint mints the handle" into a checked claim.
@@ -322,12 +303,6 @@ pub fn shutdownHandler(ptr: *anyopaque) void {
     const self: *Node = @ptrCast(@alignCast(ptr));
     self.stats.handler_shutdowns += 1;
     self.timers.clearRetainingCapacity();
-    // The relay is this handler's own state, and it is given up here rather
-    // than in `deinit`: this is the phase upstream gives a handler's resources
-    // in — while the accepts that might still be using them are running, and
-    // never after. `close_endpoint` closes the connections the clients were
-    // on, so every disconnect is reported before a single socket write.
-    node_relay_release.relayClose(self);
 }
 
 /// Whether one of these ALPNs was registered before this one.

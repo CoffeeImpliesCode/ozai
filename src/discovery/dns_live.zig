@@ -357,10 +357,7 @@ pub const Retrieval = struct {
         if (self.stopped.load(.acquire)) return error.Canceled;
         if (reply.from.order(self.server) != .eq) return error.ForeignSource;
         const retry = host_io.streamRetry(reply.bytes, self.id, self.server, framed) catch |err|
-            switch (err) {
-                error.ShortMessage, error.ForeignTransaction, error.NotAResponse => return err,
-                else => unreachable,
-            };
+            return liveRetryError(err);
         if (retry) |over_stream| {
             const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - started.nanoseconds;
             const timeout_ms = if (request.deadline_ms) |deadline|
@@ -382,6 +379,17 @@ pub const Retrieval = struct {
         return answer.readAnswer(alloc, reply.bytes, request.name, self.id, &self.owner);
     }
 };
+
+/// The host seam has semantic errors outside the TXT seam's public set.
+/// Keep them as failures in the existing vocabulary, never as empty answers.
+fn liveRetryError(err: host_io.Error) Error {
+    return switch (err) {
+        error.MessageTooLong => error.BufferTooSmall,
+        error.BadRecordLength => error.MalformedResponse,
+        error.CnameLoop => error.BadName,
+        else => |rest| rest,
+    };
+}
 
 /// One query, as one datagram, to the server the retrieval named.
 ///
@@ -605,6 +613,16 @@ test "a timeout and an empty answer are two arms, and neither carries a service"
     // records, which is what `Resolver.service` needs.
     const with_records: Answer = .{ .records = .init("relay=https://one.example./\x00") };
     try t.expect(with_records.hasRecords());
+}
+
+test "host semantic errors retain live DNS failure conventions" {
+    // A host decoder failure must not become an empty or truncated TXT answer.
+    try t.expectEqual(error.BufferTooSmall, liveRetryError(error.MessageTooLong));
+    try t.expectEqual(error.MalformedResponse, liveRetryError(error.BadRecordLength));
+    try t.expectEqual(error.BadName, liveRetryError(error.CnameLoop));
+    try t.expectEqual(error.ShortMessage, liveRetryError(error.ShortMessage));
+    try t.expectEqual(error.ForeignTransaction, liveRetryError(error.ForeignTransaction));
+    try t.expectEqual(error.NotAResponse, liveRetryError(error.NotAResponse));
 }
 
 test "a name that does not exist is refused, which is a third fact again" {
@@ -958,3 +976,4 @@ const TcpDnsFixture = struct {
         }
     }
 };
+

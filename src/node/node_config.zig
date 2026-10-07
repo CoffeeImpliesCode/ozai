@@ -1,13 +1,4 @@
-//! What a node is told to be, in this project's own vocabulary.
-//!
-//! `Config` is the only place a caller's spelling of a node is translated into
-//! the seams below it, and `Error` is the union of everything those seams
-//! refuse. Neither is written anywhere else: `transport/quic_bridge.zig` gives
-//! the rule — "a translation nobody can read is a translation nobody can
-//! check" — and a second place to translate from would be that rule broken.
-//!
-//! The relay's own vocabulary is here too — `Relay`, `Role`, `Serve` — because
-//! a relay is what a node is configured to be and not a thing it is handed.
+//! Borrowed application configuration and construction-time validation.
 
 const std = @import("std");
 
@@ -19,9 +10,10 @@ const bridge_mod = @import("../transport/quic_bridge.zig");
 const dial_mod = @import("../transport/dial.zig");
 const socket_mod = @import("../transport/socket.zig");
 const router = @import("../router/router.zig");
-const relay_frame = @import("../relay/frame.zig");
-const relay_server = @import("../relay/server.zig");
-const node_relay_table = @import("node_relay_table.zig");
+const node_blobs = @import("node_blobs.zig");
+const node_relay_runtime = @import("node_relay_runtime.zig");
+const addr_map = @import("../transport/addr_map.zig");
+const node_native = @import("node_native.zig");
 const incoming_filter = @import("../endpoint/incoming_filter.zig");
 
 const NodeId = base_key.NodeId;
@@ -32,81 +24,13 @@ const pkarr_live = @import("../discovery/pkarr_live.zig");
 const tls_client = @import("../discovery/tls_client.zig");
 const node_discovery = @import("node_discovery.zig");
 
-/// The bounds a `Relay` is sized by; they live with the storage they size.
-const max_relay_clients = node_relay_table.max_relay_clients;
-const default_relay_queue_depth = node_relay_table.default_relay_queue_depth;
-
-/// The gossip protocol's ALPN, which is also the only protocol this node
-/// speaks. `docs/PLAN.md` names it at M11.
 pub const gossip_alpn = "/iroh-gossip/1";
+pub const blobs_alpn = "/iroh-bytes/4";
+pub const max_gossip_topics = 4;
 
-/// The relay protocol's ALPN, which a node sets as its own when it is a relay
-/// or a relay's client. See `node.zig`'s module doc, "The relay, and where
-/// it sits in the loop", for why a relay node cannot also gossip.
-pub const relay_alpn = "/iroh-relay/1";
-
-/// How many clients a relay admits, how deep their queues are, and how far
-/// this node will read and write one connection in a single pass.
-///
-/// A relay is sized by its operator, and every number here is one they set:
-/// admitting more clients than `max_relay_clients` needs the tables `node.zig`
-/// allocates to grow, which they are built not to.
-pub const Relay = struct {
-    /// Which half of the relay handshake this node runs. Upstream's relay is a
-    /// process of its own and its client a library call, and the difference
-    /// between them is exactly which half of one handshake a node runs.
-    role: Role = .off,
-};
-
-/// Which half of the relay handshake a node runs, and against whom.
-pub const Role = union(enum) {
-    /// This node speaks gossip and nothing else, which is every node above
-    /// this milestone and every node that is not one of the two below.
-    off,
-    /// This node admits clients and forwards datagrams between them.
-    serve: Serve,
-    /// This node dials this relay and speaks to it.
-    client: Peer,
-};
-
-/// What a relay admits and how much room it gives them.
-pub const Serve = struct {
-    /// How many clients. `max_relay_clients` is what the tables `node.zig`
-    /// allocates are sized for, and `create` refuses a larger one as
-    /// `error.TooManyRelayClients` rather than growing them.
-    ///
-    /// **Fixed at construction.** `create` allocates `clients × queue_depth`
-    /// of each queue type and one `queue_depth * max_datagram` datagram ring
-    /// per client from these two numbers and reads them again nowhere else, so
-    /// a later write changes nothing this node does — it cannot widen a relay
-    /// that was built narrower. See `Node.config`.
-    clients: usize = max_relay_clients,
-    /// How many datagrams one client's queue holds. See
-    /// `default_relay_queue_depth`, and `error.RelayQueueDepthZero` for the
-    /// refusal `create` makes of zero.
-    ///
-    /// **This one is read on every pass, and it is the field that makes the
-    /// pair construction-fixed rather than merely construction-sized.**
-    /// `queueDepth` returns it, and `queuesOf` and `ringOf` re-cut every live
-    /// client's two queues and its ring out of storage `initRelay` sized from
-    /// the value this node was built with, once, in `create`. So a write to it
-    /// after `create` re-points or overruns storage that was never resized: a
-    /// larger depth indexes past the end of `packets` and `messages`, and a
-    /// smaller one silently hands every live client another client's slots.
-    queue_depth: usize = default_relay_queue_depth,
-    /// How many queued messages one client may be given in one pass.
-    ///
-    /// A bound, and the reason the two queues can be seen to be two: a relay
-    /// that wrote out everything one client had queued would let that client
-    /// starve every other one, and a client this pass will not write for is
-    /// exactly the client whose datagram queue fills.
-    ///
-    /// **This is the one field of the three that may be written after
-    /// `create`.** `serve` reads it on every pass and hands it to
-    /// `serveQueues`, and it sizes no storage, so a write changes how much one
-    /// pass may write out and nothing else — the queues behind it were cut
-    /// from `queue_depth`, not from this.
-    drain_room: usize = 4,
+pub const Traversal = struct {
+    local_candidates: []const SocketAddr = &.{},
+    initiate: bool = false,
 };
 
 /// Every allocation goes through a handle the caller handed in: nothing here
@@ -136,6 +60,8 @@ pub const Config = struct {
     /// This node's identity: the seed the presented certificate is built from
     /// and the id a peer compares it against.
     secret: SecretKey,
+    /// Optional pin applied to every accepted inner connection.
+    expect_peer: ?NodeId = null,
     /// Where the socket binds. Port zero means the kernel chooses, which is
     /// what makes two nodes in one process both bind.
     listen: SocketAddr = .{
@@ -148,29 +74,25 @@ pub const Config = struct {
     /// with discovery (`src/discovery/dial_source.zig` is the module that
     /// names a lookup as its own missing half).
     ///
-    /// **A list longer than `hyparview.max_bootstrap` is refused, and refused
-    /// after the dials rather than before them.** `start` walks this list
-    /// first, so every peer in it is attempted and recorded in
-    /// `Stats.dials` or `Stats.dials_refused`, and only then does the length
-    /// check answer `error.BootstrapListTooLong` — which leaves the gossip
-    /// layer unjoined and the node willing rather than latched, so the next
-    /// `start` refuses the same way instead of reporting a join that never
-    /// happened. `create` accepts any length and this bound is checked at
-    /// `start` rather than at construction; the relay's sizing by contrast is
-    /// refused by `create` as `error.TooManyRelayClients` or
-    /// `error.RelayQueueDepthZero`, which is where an operator's number is
-    /// validated before a node exists.
+    /// Gossip bootstrap size is checked by `start`, after explicit peer dials.
     peers: []const Peer = &.{},
     /// The protocol to offer and to dispatch. See `max_alpns`.
     alpn: []const u8 = gossip_alpn,
     /// Applied before connection allocation, after core token validation.
     initial_policy: ?incoming_filter.InitialPolicy = null,
-    /// Membership and broadcast. The defaults are upstream's, and a test that
-    /// wants them faster overrides them here rather than the other way round.
+    /// Explicit subscriptions; identities and callback/message storage outlive the node.
+    gossip_topics: []const hyparview.TopicId = &.{},
+    on_gossip: ?*const fn (?*anyopaque, hyparview.TopicId, NodeId, []const u8) void = null,
+    on_gossip_context: ?*anyopaque = null,
+    gossip_message: ?[]const u8 = null,
     topic: hyparview.TopicConfig = .{},
-    /// What this node is toward relays. Off unless it says otherwise, and see
-    /// `node.zig`'s module doc for what a relay node gives up by being one.
-    relay: Relay = .{},
+    blobs: node_blobs.Config = .disabled,
+    /// Carrier lifetime is independent of the inner application ALPN.
+    relay: node_relay_runtime.Config = .{},
+    address_discovery_role: @FieldType(bridge_mod.Config, "address_discovery_role") = .disabled,
+    max_remote_nat_traversal_addresses: ?u8 = null,
+    initial_max_path_id: ?u32 = null,
+    traversal: Traversal = .{},
     /// What this node does about being found, and about finding one peer.
     ///
     /// **`Discovery{}` — the default — publishes nothing and looks nobody
@@ -262,8 +184,10 @@ pub const Error =
     socket_mod.ReceiveError ||
     router.AcceptError ||
     router.RegisterError ||
-    relay_frame.Error ||
-    relay_server.Queue(relay_server.Packet).PushError ||
+    node_blobs.Error ||
+    node_relay_runtime.Error ||
+    addr_map.GetError ||
+    node_native.NativeError ||
     hyparview.Error ||
     plumtree.Error ||
     Allocator.Error ||
@@ -274,20 +198,99 @@ pub const Error =
         /// this runs on, and refused rather than `@intCast`ed so a clock that
         /// is not what it claims is a named answer instead of a panic.
         InstantOutOfRange,
-        /// A datagram handed to `sendThrough` is longer than `max_datagram`,
-        /// and the slot it would be queued into is that long. A relay
-        /// forwards datagrams; this is the length of one.
-        DatagramTooLarge,
-        /// `sendThrough` was asked of a node that has not reached a relay, so
-        /// there is no stream to write it on.
-        NoRelay,
-        /// A relay was configured to admit more clients than this node's tables
-        /// hold. `max_relay_clients` sizes them and they are built not to grow,
-        /// so this is the operator's number to lower rather than a relay that
-        /// has to shed connections to fit.
-        TooManyRelayClients,
-        /// A relay was configured with a queue of no room, which can never take
-        /// anything and would drop every datagram while reporting that it
-        /// forwarded none.
-        RelayQueueDepthZero,
+        TooManyGossipTopics,
+        DuplicateGossipTopic,
+        UnknownGossipTopic,
+        InvalidGossipAlpn,
+        InvalidBlobAlpn,
+        RelayIdentityMismatch,
+        RelayIngressLimit,
+        InvalidTraversalConfig,
+        UnexpectedRelayPeer,
     };
+
+test "gossip subscriptions reject duplicate identities and more than four topics" {
+    const secret = try SecretKey.fromSeed(@splat(7));
+    const topics = [_]hyparview.TopicId{
+        .fromBytes(@splat(1)), .fromBytes(@splat(2)), .fromBytes(@splat(3)),
+        .fromBytes(@splat(4)), .fromBytes(@splat(5)),
+    };
+    try std.testing.expectError(error.TooManyGossipTopics, validate(.{
+        .secret = secret,
+        .gossip_topics = &topics,
+    }));
+    const repeated = [_]hyparview.TopicId{ .fromBytes(@splat(1)), .fromBytes(@splat(1)) };
+    try std.testing.expectError(error.DuplicateGossipTopic, validate(.{
+        .secret = secret,
+        .gossip_topics = &repeated,
+    }));
+}
+
+test "blob transfer configuration requires its application protocol" {
+    const secret = try SecretKey.fromSeed(@splat(8));
+    try std.testing.expectError(error.InvalidBlobAlpn, validate(.{
+        .secret = secret,
+        .blobs = .{ .getter = .{ .hash = @splat(0) } },
+    }));
+}
+
+test "carrier identity must be the inner endpoint identity" {
+    try std.testing.expectError(error.RelayIdentityMismatch, validate(.{
+        .secret = try SecretKey.fromSeed(@splat(9)),
+        .relay = .{ .client = .{
+            .address = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1234 },
+            .host = "localhost",
+            .secret = try SecretKey.fromSeed(@splat(10)),
+        } },
+    }));
+}
+
+test "native traversal cannot initiate without candidates or negotiate nonexistent path slots" {
+    const secret = try SecretKey.fromSeed(@splat(11));
+    try std.testing.expectError(error.InvalidTraversalConfig, validate(.{
+        .secret = secret,
+        .traversal = .{ .initiate = true },
+        .max_remote_nat_traversal_addresses = 2,
+        .initial_max_path_id = 1,
+    }));
+    try std.testing.expectError(error.InvalidTraversalConfig, validate(.{
+        .secret = secret,
+        .initial_max_path_id = 2,
+    }));
+}
+
+pub fn validate(config: Config) Error!void {
+    if (config.traversal.local_candidates.len > 32) return error.InvalidTraversalConfig;
+    if (config.initial_max_path_id) |maximum| {
+        if (maximum > 1) return error.InvalidTraversalConfig;
+    }
+    if (config.max_remote_nat_traversal_addresses) |maximum| {
+        if (maximum == 0 or maximum > 32) return error.InvalidTraversalConfig;
+    }
+    if (config.traversal.initiate and config.traversal.local_candidates.len == 0) {
+        return error.InvalidTraversalConfig;
+    }
+    if (config.traversal.local_candidates.len != 0 and
+        (config.max_remote_nat_traversal_addresses == null or
+            config.initial_max_path_id == null))
+    {
+        return error.InvalidTraversalConfig;
+    }
+    if (config.gossip_topics.len > max_gossip_topics) return error.TooManyGossipTopics;
+    for (config.gossip_topics, 0..) |topic_id, index| {
+        for (config.gossip_topics[0..index]) |previous| {
+            if (topic_id.eql(previous)) return error.DuplicateGossipTopic;
+        }
+    }
+    if (config.gossip_topics.len != 0 and !std.mem.eql(u8, config.alpn, gossip_alpn)) {
+        return error.InvalidGossipAlpn;
+    }
+    if (config.blobs != .disabled and !std.mem.eql(u8, config.alpn, blobs_alpn)) {
+        return error.InvalidBlobAlpn;
+    }
+    if (config.relay.client) |client| {
+        if (client.secret.nodeId().order(config.secret.nodeId()) != .eq) {
+            return error.RelayIdentityMismatch;
+        }
+    }
+}

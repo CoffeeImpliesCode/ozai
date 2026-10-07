@@ -3,6 +3,15 @@ const addr = @import("../base/addr.zig");
 const holepunch = @import("../net/holepunch.zig");
 const run = @import("../net/holepunch_run.zig");
 const bridge_mod = @import("../transport/quic_bridge.zig");
+const ula = @import("../base/ula.zig");
+
+pub const Native = struct {
+    id: u64,
+    advertised: usize = 0,
+    initiated: bool = false,
+    started_at: ?bridge_mod.Instant = null,
+    round: @import("../transport/bridge_conn.zig").RoundState = .idle,
+};
 
 const Fact = struct {
     id: u64,
@@ -16,14 +25,16 @@ const Slot = struct {
     join: run.Join = .{},
     live: bool = false,
     before: Fact = undefined,
+    native: Native = undefined,
 };
 
-/// Facts only: no native NAT traversal call or outcome is synthesized here.
+/// Receipt facts and native per-connection latches occupy separate counted prefixes.
 /// Slots are bounded by the manager's live-connection limit and allocated once.
 pub const State = struct {
     slots: []Slot,
     peer_count: usize = 0,
     before_count: usize = 0,
+    native_count: usize = 0,
     traffic_refused: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, max_connections: usize) error{OutOfMemory}!State {
@@ -42,6 +53,37 @@ pub const State = struct {
             if (std.mem.eql(u8, &slot.peer.toBytes(), &peer.toBytes())) return &slot.join;
         }
         return null;
+    }
+
+    pub fn nativeFor(self: *State, id: u64) *Native {
+        for (self.slots[0..self.native_count]) |*slot| {
+            if (slot.native.id == id) return &slot.native;
+        }
+        std.debug.assert(self.native_count < self.slots.len);
+        const native = &self.slots[self.native_count].native;
+        native.* = .{ .id = id };
+        self.native_count += 1;
+        return native;
+    }
+
+    pub fn sweepNative(self: *State, bridge: *bridge_mod.Bridge) void {
+        var index: usize = 0;
+        while (index < self.native_count) {
+            var found = false;
+            var connection_index: usize = 0;
+            while (bridge.connectionAt(connection_index)) |conn| : (connection_index += 1) {
+                if (conn.id() == self.slots[index].native.id and !conn.closed()) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) {
+                index += 1;
+            } else {
+                self.native_count -= 1;
+                self.slots[index].native = self.slots[self.native_count].native;
+            }
+        }
     }
 
     fn begin(self: *State) void {
@@ -92,6 +134,7 @@ pub const State = struct {
     }
 
     fn accepted(self: *State, fact: Fact, source: addr.SocketAddr) void {
+        if (ula.classify(source) != .ip) return;
         for (self.slots[0..self.before_count]) |*slot| {
             const before = slot.before;
             if (before.id != fact.id or fact.packets <= before.packets) continue;
@@ -104,7 +147,7 @@ pub const State = struct {
     }
 };
 
-fn authenticated(conn: bridge_mod.Conn) ?Fact {
+pub fn authenticated(conn: bridge_mod.Conn) ?Fact {
     if (!conn.established() or conn.closed()) return null;
     const handshake = conn.entry.conn.tls13_hs orelse return null;
     const bytes = handshake.peerNodeId() orelse return null;
@@ -212,4 +255,35 @@ test "publicly decryptable Initial and other long headers are not authenticated 
     try t.expect(!applicationDatagram(&.{0x00}));
     try t.expect(applicationDatagram(&.{0x40}));
     try t.expect(applicationDatagram(&.{0x5f}));
+}
+
+test "native connection latches do not move fact or peer prefixes" {
+    const t = std.testing;
+    var state = try State.init(t.allocator, 2);
+    defer state.deinit(t.allocator);
+    const peer = try addr.NodeId.fromBytes([_]u8{7} ** 32);
+    state.begin();
+    state.connection(.{ .id = 41, .peer = peer, .side = .client, .packets = 9 });
+    state.end();
+    const native = state.nativeFor(41);
+    native.advertised = 2;
+    native.initiated = true;
+    try t.expectEqual(@as(usize, 2), state.nativeFor(41).advertised);
+    try t.expect(state.nativeFor(41).initiated);
+    try t.expect(!state.nativeFor(42).initiated);
+    try t.expectEqual(@as(u64, 41), state.slots[0].before.id);
+    try t.expectEqual(@as(?usize, 41), state.get(peer).?.punch.punch);
+}
+
+test "synthetic relay receipt is never direct path proof" {
+    const t = std.testing;
+    var state = try State.init(t.allocator, 1);
+    defer state.deinit(t.allocator);
+    const peer = try addr.NodeId.fromBytes([_]u8{7} ** 32);
+    state.begin();
+    state.connection(.{ .id = 41, .peer = peer, .side = .client, .packets = 9 });
+    state.end();
+    const fact: Fact = .{ .id = 41, .peer = peer, .side = .client, .packets = 10 };
+    state.accepted(fact, @import("../base/ula.zig").default_fake_addr);
+    try t.expectEqual(@as(usize, 0), state.get(peer).?.path_count);
 }
