@@ -1,63 +1,7 @@
-//! One datagram, one relay message: the mapping between an inner QUIC payload
-//! and the frame that carries it through a relay.
-//!
-//! # What is being carried
-//!
-//! **A datagram and its GSO segmentation, not a blob.** `batch.Send` — what the
-//! core's `Conn.drain` hands over per socket write — is
-//! `{ ecn, contents, segment_size }`, and `frame.Datagrams` is the same three
-//! fields with the same rule attached (`batch_run.zig:48`,
-//! `frame_types.zig:418`): a segment size is set exactly when the payload holds
-//! more than one datagram, and the last one may be shorter. The two are the same
-//! shape on purpose, so carrying a core payload through a relay is a field for
-//! field move and not a re-segmentation. `carry` is that move.
-//!
-//! That matters in both directions. A node dialled over a relay route asks the
-//! core for writes against a synthetic address (`transport/dial_route.zig`), and
-//! the answer is a `batch.Send` the node would otherwise put on a socket; a
-//! relay hands a client one `Packet` per datagram and has to turn each into a
-//! `relay_to_client_datagram` (`node_relay_forward.zig:185`). Both are this
-//! function with a different `Direction`, and neither has to decide the batch
-//! question on its own.
-//!
-//! # The frame type is the segment size's own answer
-//!
-//! **One datagram goes out as `*_datagram` and several go out as
-//! `*_datagram_batch`, decided by `Datagrams.frameType` and nowhere else.** It
-//! is the right half of rule 7 in `docs/ARCHITECTURE.md`, and getting it wrong in
-//! either direction produces a frame the peer cannot use: a single datagram
-//! carrying a segment size names a batch of one, and a batch carrying no segment
-//! size cannot be drained (`takeSegments` loses the size the moment one
-//! datagram or fewer is left in it). `frame_encode.zig` refuses the first
-//! combination as `error.InvalidFrame`; this file cannot produce it.
-//!
-//! # The bounds, checked before a frame exists
-//!
-//! `carry` refuses a zero segment size and a payload the codec could not write,
-//! naming the codec's own errors, and it does so *before* it builds a message.
-//! The codec would catch both at `encode` — but by then the caller has already
-//! decided what to do with a datagram that is not going anywhere, and a relay
-//! that counted a forwarded datagram it then failed to write would be reporting
-//! something that did not happen. A zero-length payload is not an error: it is a
-//! datagram of no bytes, which this protocol permits.
-//!
-//! **Nothing is copied and nothing is retained.** The returned `Message` borrows
-//! `contents`, exactly as `Datagrams` documents, so the caller owns the payload
-//! until `frame.encode` has written it and the peer's buffer must stay put until
-//! the frame it produced is done with.
-//!
-//! # What this file does not do
-//!
-//! It does not open a connection, choose a version, authenticate anybody, or
-//! decide where a datagram goes — `relay/conn_version.zig`, `relay/client.zig`
-//! and `node/node_relay_route.zig` are those. And it adds no transport: a relay
-//! connection in this tree is a QUIC stream to a relay that speaks
-//! `iroh-relay`, not a WebSocket over a TCP socket, so nothing here needs
-//! TLS-over-TCP and nothing here provides one. That listener stays the declared
-//! debt of `docs/DECISIONS/0001` ("`std.crypto.tls` has a client-only driver
-//! with no server"), and a relay reachable only over an unauthenticated TCP
-//! socket would be a new debt rather than a cleared one. See the report for what
-//! that leaves unpinned.
+//! Native iroh-relay 1.3 datagram/GRO message mapping.
+//! The HTTP/WebSocket TCP runtime is `tcp_carrier.zig`. A relay message contains
+//! a destination/source identity, ECN, and optionally a big-endian GRO segment
+//! size. QUIC bytes remain opaque; end-to-end authentication belongs to QUIC.
 
 const std = @import("std");
 const key = @import("../base/key.zig");
@@ -315,4 +259,52 @@ test "carried names the ten frames that are not datagrams" {
     var table: usize = 0;
     inline for (@typeInfo(frame.FrameType).@"enum".fields) |_| table += 1;
     try std_testing.expectEqual(rest.len + 4, table);
+}
+
+// Cached iroh-relay 1.3.0 protos/relay.rs test_relay_client_frames_snapshot.
+// This upstream snapshot is independent of this encoder's output.
+test "iroh relay 1.3 GRO snapshot delivers exact native segments" {
+    const bytes = [_]u8{
+        0x07,
+        0x19, 0x7f, 0x6b, 0x23, 0xe1, 0x6c, 0x85, 0x32,
+        0xc6, 0xab, 0xc8, 0x38, 0xfa, 0xcd, 0x5e, 0xa7,
+        0x89, 0xbe, 0x0c, 0x76, 0xb2, 0x92, 0x03, 0x34,
+        0x03, 0x9b, 0xfa, 0x8b, 0x3d, 0x36, 0x8d, 0x61,
+        0x03, 0x00, 0x06,
+        0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20,
+        0x57, 0x6f, 0x72, 0x6c, 0x64, 0x21,
+    };
+    var packet = carried(try frame.decode(&bytes, .v2)).?;
+    try std_testing.expectEqual(@as(?frame.Ecn, .ce), packet.datagrams.ecn);
+    try std_testing.expectEqualStrings("Hello ", packet.datagrams.takeSegments(1).contents);
+    try std_testing.expectEqualStrings("World!", packet.datagrams.takeSegments(1).contents);
+    try std_testing.expectEqual(@as(usize, 0), packet.datagrams.contents.len);
+    var output: [bytes.len]u8 = undefined;
+    try std_testing.expectEqualSlices(u8, &bytes, try frame.encode(
+        try carry(packet.node_id, .{
+            .ecn = .ce,
+            .segment_size = 6,
+            .contents = "Hello World!",
+        }, .relay_to_client),
+        .v2,
+        &output,
+    ));
+}
+
+test "native datagram prefixes reject missing identity and GRO metadata" {
+    const secret = try key.SecretKey.fromSeed(.{42} ** 32);
+    const peer = secret.nodeId();
+    var output: [80]u8 = undefined;
+    const encoded = try frame.encode(try carry(peer, .{
+        .ecn = null,
+        .segment_size = 6,
+        .contents = "Hello World!",
+    }, .client_to_relay), .v2, &output);
+    // Type + node id + ECN + u16 segment size are required before any QUIC bytes.
+    for (1..36) |length| {
+        try std_testing.expectError(error.InvalidFrame, frame.decode(encoded[0..length], .v2));
+    }
+    output[34] = 0;
+    output[35] = 0;
+    try std_testing.expectError(error.ZeroSegmentSize, frame.decode(encoded, .v2));
 }

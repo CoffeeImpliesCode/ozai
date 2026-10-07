@@ -298,7 +298,7 @@ pub const Direction = enum {
 pub const FrameType = enum(u8) {
     /// 16 bytes of challenge for the client to sign.
     server_challenge = 0,
-    /// 32-byte node id, then a 64-byte signature over the derived challenge.
+    /// 32-byte node id, then postcard length 0x40 and a 64-byte challenge signature.
     client_auth = 1,
     /// Nothing. The client authenticated.
     server_confirms_auth = 2,
@@ -640,9 +640,10 @@ pub const ServerChallenge = struct {
 /// here for the reason `docs/ARCHITECTURE.md` gives: the value is never used as a
 /// key in this API, it addresses a node.
 ///
-/// Self-contained and fixed width: `decode` copies both fields out of the message
-/// buffer, so this is the one handshake payload that outlives the bytes it was
-/// read from. A node id that is not a point at all is `error.InvalidNodeId` on
+/// Self-contained: `decode` copies both fields out of the message buffer.
+/// The wire is a raw 32-byte key followed by a postcard byte string of length 64
+/// (`serde_bytes` in `handshake.rs:88-96`), so its payload is 97 bytes.
+/// A node id that is not a point at all is `error.InvalidNodeId` on
 /// the way in; a value a caller builds by hand is not checked here, and the only
 /// thing left that can fail with it is `verifyClientAuth`.
 pub const ClientAuth = struct {
@@ -650,9 +651,9 @@ pub const ClientAuth = struct {
     /// refuses the 32 bytes of a frame that are not one.
     node_id: NodeId,
     /// The signature over the derived message of the challenge that was issued
-    /// (`relay/client.zig` is where that message is built). Sixty-four bytes
-    /// rather than a 65-byte `r‖s` pair, because a fixed array is written as raw
-    /// bytes by the one codec in this protocol that postcards anything.
+    /// (`relay/client.zig` is where that message is built). The value is 64 bytes;
+    /// the wire adds postcard's byte-string length prefix because upstream uses
+    /// `serde_bytes`, not fixed-array serialization, for this field.
     signature: Signature,
 };
 
