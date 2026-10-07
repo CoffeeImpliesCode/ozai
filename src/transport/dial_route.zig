@@ -58,6 +58,8 @@ pub const Route = struct {
 /// `error.NoPeerId` when it is null. Custom targets copy their payload into the
 /// key and do not use `peer`. Allocation errors leave existing mappings intact,
 /// but may retain map capacity and consume random draws.
+/// Relay URLs choose the physical carrier, not the inner peer identity. Relay
+/// ingress and every configured relay for this peer share its any-path address.
 pub fn resolveRoute(
     gpa: std.mem.Allocator,
     map: *addr_map.MappedAddrs,
@@ -67,11 +69,11 @@ pub fn resolveRoute(
 ) Error!Route {
     switch (transport) {
         .ip => |socket| return .{ .socket = socket, .key = null, .subnet = null },
-        .relay => |url| return routeThrough(
+        .relay => return routeThrough(
             gpa,
             map,
-            .{ .relay = .{ .relay = url, .node = peer orelse return error.NoPeerId } },
-            .relay,
+            .{ .any_path = peer orelse return error.NoPeerId },
+            .any_path,
             random,
         ),
         .custom => |custom| return routeThrough(
@@ -153,19 +155,15 @@ test "a relay target becomes one address the core is told, and the map says whos
     // Three separate answers, and the dial needs all three: the core is told
     // the address, the caller is handed the key, and `ula.classify` is what a
     // receiver on the other side will use to get the key back.
-    try t.expectEqual(base_ula.Path.relay, route.subnet.?);
+    try t.expectEqual(base_ula.Path.any_path, route.subnet.?);
     try t.expectEqual(
-        base_ula.Classification{ .relay = route.socket.ip.v6 },
+        base_ula.Classification{ .any_path = route.socket.ip.v6 },
         base_ula.classify(route.socket),
     );
-    // The /64 is the relay subnet's and the host bits are this map's
-    // allocation, so the address is the prefix and nothing else that is fixed.
-    try t.expectEqualSlices(u8, &base_ula.prefixFor(.relay), route.socket.ip.v6[0..8]);
+    // The peer identity is stable across carrier URLs and ingress/egress.
+    try t.expectEqualSlices(u8, &base_ula.prefixFor(.any_path), route.socket.ip.v6[0..8]);
     try t.expectEqual(base_ula.mapped_port, route.socket.port);
-    const expected_key: addr_map.Key = .{ .relay = .{
-        .relay = (try relayTarget()).relay,
-        .node = peer,
-    } };
+    const expected_key: addr_map.Key = .{ .any_path = peer };
     try t.expectEqual(expected_key, route.key.?);
     // And the map agrees, which is what lets a sender turn an `Egress` back
     // into a peer and a relay.
@@ -183,6 +181,13 @@ test "a relay target becomes one address the core is told, and the map says whos
         again_engine.random(),
     );
     try t.expectEqual(route.socket, again.socket);
+    const ingress = try pair.map.get(t.allocator, .{ .any_path = peer }, again_engine.random());
+    try t.expectEqual(route.socket,
+        base_ula.socketAddrFor(.any_path, addr_map.hostBitsOf(ingress)));
+    const other_relay = try resolveRoute(t.allocator, &pair.map,
+        .{ .relay = try base_addr.RelayUrl.parse("http://another-relay.example/") },
+        peer, again_engine.random());
+    try t.expectEqual(route.socket, other_relay.socket);
     try t.expectEqual(@as(usize, 1), pair.map.by_key.count());
 }
 

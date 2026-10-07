@@ -1,4 +1,4 @@
-//! The connect-only TCP stream: a descriptor, a stop, and three operations.
+//! Nonblocking TCP streams and listeners, with caller-owned buffers and polling.
 //!
 //! This file mirrors `transport/socket.zig`, and the mirroring is the point —
 //! the datagram socket is the seam this project already established, and a
@@ -60,30 +60,19 @@
 //! would be a restart that has to invent somewhere to put the bytes it just
 //! threw away.
 //!
-//! # The boundary, and why it is a boundary and not a stub
+//! # Listener and incremental connect
 //!
-//! **This seam connects. It does not listen, accept, or set socket options, and
-//! none of the three is a stub.** Each is a decision about who owns the other
-//! end of a connection, and each names the module that owns it:
+//! `Listener` owns a nonblocking listening descriptor. `accept` never waits:
+//! an empty queue returns null, and a successful accept transfers a new `Tcp`
+//! with its own wake descriptor to the caller. The bound address is read back
+//! from the kernel so an ephemeral bind reports its actual port.
 //!
-//! - **No listener and no accept.** A listener is the other half of a service,
-//!   and this project's listeners live in `endpoint/` and `relay/`, which own
-//!   them for a reason that has nothing to do with a client seam. The
-//!   asymmetry is real: a caller that needs both halves writes them in two
-//!   places, which is the correct place for them.
-//! - **No socket options.** `SO_REUSEADDR` and `SO_REUSEPORT` are a *bind*
-//!   concern, and there is no bind here — the kernel chooses the local address
-//!   and the ephemeral port at `connect`. `TCP_NODELAY` and `TCP_KEEPALIVE`
-//!   are latency and liveness policies that belong to whatever protocol runs
-//!   over the stream, not to the stream: this module cannot tell whether a
-//!   caller wants every byte immediately or wants the kernel to coalesce.
-//!   Adding an `Options` struct would make a decision that is not this
-//!   module's, and would be wrong for at least one caller.
-//!
-//! So the absence is a *fact* about the surface rather than an unfinished
-//! function body: every call this file makes is one whose answer it can name,
-//! and no path exists here that could reach an unimplemented arm. A stub
-//! would be a call whose answer is guessed; this has no such call.
+//! `startConnect` starts one handshake and records its state. Further starts
+//! report that state without repeating `connect(2)`. `finishConnect` polls
+//! with a zero timeout and returns false while the handshake is pending.
+//! `connect` is the bounded-wait convenience over the same state machine.
+//! A failed handshake retains its error: reading `SO_ERROR` clears the kernel
+//! error, but must not turn a failed stream into a successful one.
 //!
 //! # The half-close, and the short write
 //!
@@ -160,13 +149,13 @@ const createWake = socket_open.createWake;
 /// anything in this file, which is the whole of what a wake carries.
 const wake_width = @sizeOf(u64);
 
-/// A TCP stream that is not yet connected.
+/// An owned TCP stream, created unconnected or accepted already connected.
 ///
 /// No `Io` is stored, for the reason the module doc gives. No buffer is
 /// either: the receive buffer is the caller's, which is what lets a stack pool
-/// one and what lets a test hand over a stack array. Two descriptors and one
-/// flag, and every one of the three is about being stopped rather than about
-/// carrying a byte; see `stop`.
+/// one and what lets a test hand over a stack array. The descriptors own the
+/// connection and its terminal stop wake; connect state records the handshake
+/// independently of the stop flag.
 ///
 /// A successful `create` owns both descriptors. Close them exactly once, with
 /// `close`, after all operations and stop callers finish. Copies share those
@@ -174,10 +163,8 @@ const wake_width = @sizeOf(u64);
 /// it. Serialize connects, reads and writes. Only `stop` may run concurrently
 /// with them. An operation borrows `io` and its backend only until it returns.
 ///
-/// One `connect` per stream: a second one is `EISCONN`, which
-/// `tcp_sys.connectFromErrno` reports as `error.Unexpected`, and that is
-/// deliberate — a caller that reaches it has a bug this struct will not paper
-/// over.
+/// Connect state is retained, so repeated starts never restart a handshake.
+/// A failed handshake requires closing the stream and creating a fresh one.
 pub const Tcp = struct {
     /// The descriptor. `O_NONBLOCK` from the moment it exists, which is what
     /// makes `EAGAIN` a fact a caller can act on instead of a stall.
@@ -189,14 +176,18 @@ pub const Tcp = struct {
     /// module doc says why there cannot be one; every wait on a stopped
     /// stream answers `error.Canceled` at once.
     stopped: std.atomic.Value(bool),
-    /// Where this stream was asked to connect, and — after `connect` has
-    /// returned — where it is connected to.
+    /// Requested destination for a client, or the accepted peer for a server.
     peer: base_addr.SocketAddr,
-    /// Where the stream is bound, with the ephemeral port the kernel chose.
-    /// Port zero until `connect` returns, because that is what the kernel
-    /// spells before the handshake: an unconnected stream is bound to the
-    /// wildcard address on no port at all.
+    /// Actual local address after connection or accept. Port zero while a
+    /// client has not completed its handshake.
     local: base_addr.SocketAddr,
+    /// Handshake state; callers must not mutate it or restart a failed stream.
+    connect_state: union(enum) {
+        idle,
+        connecting,
+        connected,
+        failed: ConnectError,
+    } = .idle,
 
     /// Open a stream for `peer`'s family. Nothing is sent and nothing is
     /// bound: the local address is the kernel's to choose at `connect`, which
@@ -271,21 +262,70 @@ pub const Tcp = struct {
     /// `ECONNREFUSED` implementation-defined, so a caller that wants to try
     /// again closes this one and opens another.
     pub fn connect(self: *Tcp, io: std.Io, timeout_ms: ?i32) ConnectError!void {
-        // **Ask, then wait.** A `poll` for writability on a descriptor with no
-        // handshake behind it is not ready and never will be — the connect has
-        // to be started before there is anything to wait for, so the wait is
-        // second and there is only one.
-        if (try tcp_sys.beginConnect(self.handle, io, self.peer)) {
-            self.local = try tcp_sys.localAddress(self.handle);
-            return;
-        }
-        // The handshake is in the kernel now, so the wait for it is a second
-        // one — and it is a `poll` for writability, because a connect that is
-        // still running is a descriptor that is not yet writable and not yet
-        // either of the other two.
+        try io.checkCancel();
+        if (try self.startConnect()) return;
         try self.awaitReady(io, timeout_ms, posix.POLL.OUT);
-        try tcp_sys.connectResult(self.handle);
-        self.local = try tcp_sys.localAddress(self.handle);
+        if (!try self.finishConnect(io)) return error.WouldBlock;
+    }
+
+    /// Start one nonblocking handshake. True means connected; false means pending.
+    /// Repeated calls report the retained state without issuing another connect.
+    /// A terminal error is retained until close; the descriptor cannot be reused.
+    pub fn startConnect(self: *Tcp) ConnectError!bool {
+        if (self.stopped.load(.acquire)) return error.Canceled;
+        switch (self.connect_state) {
+            .idle => {},
+            .connecting => return false,
+            .connected => return true,
+            .failed => |err| return err,
+        }
+        var name: c.sockaddr.storage = undefined;
+        const length = writeSockaddr(self.peer, &name);
+        const result = c.connect(self.handle, @as(*const c.sockaddr, @ptrCast(&name)), length);
+        switch (c.errno(result)) {
+            .SUCCESS => return self.completeConnect(),
+            // EINTR may leave the handshake running; never issue a second connect.
+            .INPROGRESS, .ALREADY, .AGAIN, .INTR => {
+                self.connect_state = .connecting;
+                return false;
+            },
+            else => |errno| {
+                const err = connectError(errno);
+                self.connect_state = .{ .failed = err };
+                return err;
+            },
+        }
+    }
+
+    /// Poll a pending handshake once with zero timeout, without restarting it.
+    /// False means not ready yet. Calling before startConnect is Unexpected.
+    pub fn finishConnect(self: *Tcp, io: std.Io) ConnectError!bool {
+        try io.checkCancel();
+        if (self.stopped.load(.acquire)) return error.Canceled;
+        switch (self.connect_state) {
+            .idle => return error.Unexpected,
+            .connecting => {},
+            .connected => return true,
+            .failed => |err| return err,
+        }
+        self.awaitReady(io, 0, posix.POLL.OUT) catch |err| switch (err) {
+            error.WouldBlock => return false,
+            else => return err,
+        };
+        tcp_sys.connectResult(self.handle) catch |err| {
+            self.connect_state = .{ .failed = err };
+            return err;
+        };
+        return self.completeConnect();
+    }
+
+    fn completeConnect(self: *Tcp) ConnectError!bool {
+        self.local = tcp_sys.localAddress(self.handle) catch |err| {
+            self.connect_state = .{ .failed = err };
+            return err;
+        };
+        self.connect_state = .connected;
+        return true;
     }
 
     /// Take up to `buffer.len` bytes, waiting for them when asked to, and say
@@ -361,6 +401,7 @@ pub const Tcp = struct {
         events: i16,
     ) WaitError!void {
         try io.checkCancel();
+        if (self.stopped.load(.acquire)) return error.Canceled;
         var descriptors = [_]posix.pollfd{
             .{
                 .fd = self.handle,
@@ -383,6 +424,119 @@ pub const Tcp = struct {
     }
 };
 
+fn connectError(errno: c.E) ConnectError {
+    return switch (errno) {
+        .CONNREFUSED => error.ConnectionRefused,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .NETUNREACH => error.NetworkUnreachable,
+        .HOSTUNREACH => error.HostUnreachable,
+        .NETDOWN => error.NetworkDown,
+        .ADDRNOTAVAIL => error.AddressNotAvailable,
+        .ACCES, .PERM => error.PermissionDenied,
+        .CONNRESET => error.ConnectionReset,
+        .NOMEM, .NOBUFS => error.ResourcesExhausted,
+        else => error.Unexpected,
+    };
+}
+
+/// Socket creation and binding errors, plus interruption of listen.
+pub const ListenError = OpenError || error{Interrupted};
+/// Accept errors include creation of the accepted stream's owned wake descriptor.
+pub const AcceptError = OpenError || error{
+    Interrupted,
+    ConnectionAborted,
+    NetworkDown,
+    NetworkUnreachable,
+    HostUnreachable,
+    ProtocolUnsupported,
+};
+
+/// An owned nonblocking listener. Close exactly once after accept callers finish.
+/// Copies share the descriptor; serialize accept calls and do not close a copy.
+pub const Listener = struct {
+    handle: c.fd_t,
+    /// Actual bound address, including the kernel-selected ephemeral port.
+    local: base_addr.SocketAddr,
+
+    /// Bind and listen with a bounded kernel backlog; no runtime or wake is stored.
+    pub fn init(bind: base_addr.SocketAddr) ListenError!Listener {
+        const handle = try tcp_sys.createStream(bind.ip);
+        errdefer _ = c.close(handle);
+        var name: c.sockaddr.storage = undefined;
+        const length = writeSockaddr(bind, &name);
+        try socket_open.bindSocket(handle, &name, length);
+        var attempt: usize = 0;
+        while (attempt < max_syscall_attempts) : (attempt += 1) {
+            const result = c.listen(handle, 128);
+            switch (c.errno(result)) {
+                .SUCCESS => return .{
+                    .handle = handle,
+                    .local = try socket_open.boundAddress(handle),
+                },
+                .INTR => continue,
+                .ADDRINUSE => return error.AddressInUse,
+                .ACCES, .PERM => return error.PermissionDenied,
+                .NOMEM, .NOBUFS => return error.ResourcesExhausted,
+                .OPNOTSUPP => return error.SocketModeUnsupported,
+                .INVAL => return error.InvalidArgument,
+                else => return error.Unexpected,
+            }
+        }
+        return error.Interrupted;
+    }
+
+    /// Return null immediately when no connection is queued. A returned stream
+    /// owns both accepted and wake descriptors and must be closed exactly once.
+    pub fn accept(self: *const Listener) AcceptError!?Tcp {
+        var attempt: usize = 0;
+        while (attempt < max_syscall_attempts) : (attempt += 1) {
+            var name: c.sockaddr.storage = undefined;
+            var length: c.socklen_t = @sizeOf(c.sockaddr.storage);
+            const handle = c.accept4(
+                self.handle,
+                @as(*c.sockaddr, @ptrCast(&name)),
+                &length,
+                linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+            );
+            if (handle >= 0) {
+                errdefer _ = c.close(handle);
+                const peer = readSockaddr(&name) orelse return error.AddressFamilyUnsupported;
+                const local = try socket_open.boundAddress(handle);
+                const wake = try createWake();
+                return Tcp{
+                    .handle = handle,
+                    .wake = wake,
+                    .stopped = .init(false),
+                    .peer = peer,
+                    .local = local,
+                    .connect_state = .connected,
+                };
+            }
+            switch (c.errno(handle)) {
+                .INTR => continue,
+                .AGAIN => return null,
+                .CONNABORTED => return error.ConnectionAborted,
+                .ACCES, .PERM => return error.PermissionDenied,
+                .MFILE, .NFILE => return error.DescriptorQuotaExceeded,
+                .NOMEM, .NOBUFS => return error.ResourcesExhausted,
+                .NETDOWN => return error.NetworkDown,
+                .NETUNREACH => return error.NetworkUnreachable,
+                .HOSTUNREACH, .HOSTDOWN => return error.HostUnreachable,
+                .PROTO, .NOPROTOOPT => return error.ProtocolUnsupported,
+                .OPNOTSUPP => return error.SocketModeUnsupported,
+                .INVAL => return error.InvalidArgument,
+                else => return error.Unexpected,
+            }
+        }
+        return error.Interrupted;
+    }
+
+    /// Close the listener, not streams already transferred by accept.
+    pub fn close(self: *Listener) void {
+        _ = c.close(self.handle);
+    }
+};
+
 const t = std.testing;
 
 /// Loopback, which is where every test here connects. `127.0.0.1` and not a
@@ -392,12 +546,80 @@ fn loopback(port: u16) base_addr.SocketAddr {
     return .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = port };
 }
 
+test "a nonblocking listener reports an empty accept queue" {
+    // An empty queue must return immediately without allocating a stream or wake.
+    var listener = try Listener.init(loopback(0));
+    defer listener.close();
+    try t.expect(listener.local.port != 0);
+    try t.expect((try listener.accept()) == null);
+}
+
+test "incremental connect and listener exchange bytes with correct addresses" {
+    // Exercise the public server seam and repeated starts without a second handshake.
+    var listener = try Listener.init(loopback(0));
+    defer listener.close();
+    var client = try Tcp.create(listener.local);
+    defer client.close();
+    const connected = try client.startConnect();
+    try t.expectEqual(connected, try client.startConnect());
+    var ready = [_]posix.pollfd{
+        .{ .fd = client.handle, .events = posix.POLL.OUT, .revents = 0 },
+        .{ .fd = listener.handle, .events = posix.POLL.IN, .revents = 0 },
+    };
+    _ = try posix.poll(&ready, fixture_timeout_ms);
+    try t.expect(try client.finishConnect(t.io));
+    try t.expect(try client.startConnect());
+    try t.expect(try client.finishConnect(t.io));
+    var server = (try listener.accept()) orelse return error.TestFixtureRefused;
+    defer server.close();
+    try t.expectEqual(listener.local, server.local);
+    try t.expectEqual(client.local, server.peer);
+    try t.expectEqual(server.local, client.peer);
+    const flags = c.fcntl(server.handle, c.F.GETFL, @as(c_int, 0));
+    try t.expect(flags >= 0);
+    const nonblock: c_uint = @bitCast(linux.O{ .NONBLOCK = true });
+    try t.expect((@as(c_uint, @bitCast(@as(c_int, flags))) & nonblock) != 0);
+    try t.expectEqual(@as(usize, 4), try client.write(t.io, "ping", fixture_timeout_ms));
+    var buffer: [4]u8 = undefined;
+    try t.expectEqual(@as(usize, 4), try server.read(t.io, &buffer, fixture_timeout_ms));
+    try t.expectEqualStrings("ping", &buffer);
+    try t.expectEqual(@as(usize, 4), try server.write(t.io, "pong", fixture_timeout_ms));
+    try t.expectEqual(@as(usize, 4), try client.read(t.io, &buffer, fixture_timeout_ms));
+    try t.expectEqualStrings("pong", &buffer);
+    try t.expect((try listener.accept()) == null);
+    server.stop();
+    try t.expectError(error.Canceled, server.read(t.io, &buffer, 0));
+    client.stop();
+    try t.expectError(error.Canceled, client.startConnect());
+    try t.expectError(error.Canceled, client.finishConnect(t.io));
+}
+
+test "incremental connect retains a failed result and never restarts it" {
+    // SO_ERROR is consumed by reads, so a refused handshake must retain its result.
+    const handle = try bindLoopback(0);
+    defer _ = c.close(handle);
+    var client = try Tcp.create(loopback(try portOf(handle)));
+    defer client.close();
+    try t.expectError(error.Unexpected, client.finishConnect(t.io));
+    const connected = client.startConnect() catch |err| {
+        try t.expectEqual(error.ConnectionRefused, err);
+        try t.expectError(error.ConnectionRefused, client.startConnect());
+        return;
+    };
+    try t.expect(!connected);
+    var ready = [_]posix.pollfd{
+        .{ .fd = client.handle, .events = posix.POLL.OUT, .revents = 0 },
+    };
+    _ = try posix.poll(&ready, fixture_timeout_ms);
+    try t.expectError(error.ConnectionRefused, client.finishConnect(t.io));
+    try t.expectError(error.ConnectionRefused, client.finishConnect(t.io));
+    try t.expectError(error.ConnectionRefused, client.startConnect());
+}
+
 /// A real peer on the other end of a real stream, for the tests that need one.
 ///
-/// Built with `std.c` directly and not through this module's own surface. The
-/// module doc's "no listener, no accept" is a boundary fact about the *seam*,
-/// not a claim that a listener is unwritable — and a fixture that built its
-/// peer out of `Tcp` could not tell a forwarding bug from a working one.
+/// Built with `std.c` directly rather than this module's own listener, so
+/// the legacy stream tests retain an independent peer implementation.
 const Pair = struct {
     /// The listening end, kept open for the life of the pair so that nothing
     /// else can take the port.

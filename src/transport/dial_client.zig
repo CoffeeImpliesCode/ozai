@@ -560,12 +560,12 @@ test "a dial runs initiated to connected as a function of datagrams and nothing 
 
     // What the core was told, and what it learned. The synthetic address
     // survived the trip into the core's own representation and `classify`
-    // still names the relay subnet: the core does not validate a peer's
+    // still names the peer's any-path subnet: the core does not validate a peer's
     // address, and a client is not even subject to the anti-amplification
     // limit.
     try t.expectEqual(dial.route.socket, dial.conn.peer().?);
     try t.expectEqual(
-        base_ula.Classification{ .relay = dial.route.socket.ip.v6 },
+        base_ula.Classification{ .any_path = dial.route.socket.ip.v6 },
         base_ula.classify(dial.conn.peer().?),
     );
     try t.expectEqual(dial.route.key.?, ownerOf(&pair.map, dial.conn.peer().?).?);
@@ -698,8 +698,8 @@ test "two targets to one peer are two connections, because the core has one path
     try t.expectEqual(over_relay.route.socket, over_relay.conn.peer().?);
     try t.expectEqual(over_ip.route.socket, over_ip.conn.peer().?);
     // One address each, and both are what the core was told: the relay one in
-    // the relay subnet, the direct one untouched.
-    try t.expectEqual(base_ula.Path.relay, over_relay.route.subnet.?);
+    // the peer's any-path subnet, the direct one untouched.
+    try t.expectEqual(base_ula.Path.any_path, over_relay.route.subnet.?);
     try t.expectEqual(@as(?base_ula.Path, null), over_ip.route.subnet);
     try t.expectEqual(
         base_ula.Classification{ .ip = direct_addr },
