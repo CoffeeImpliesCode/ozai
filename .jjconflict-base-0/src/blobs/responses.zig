@@ -41,8 +41,8 @@ const expectHex = test_support.expectHex;
 ///
 /// # There is no error frame
 ///
-/// Nothing on this path has a wire form of its own. A `get` answer is bao data
-/// until the provider stops writing, and a provider that does not have the
+/// A `get` answer contains a little-endian u64 size followed by Bao proof data
+/// until the provider stops writing. A provider that does not have the
 /// data stops writing: upstream's `# Responses` section
 /// (`src/protocol.rs:320`) says the provider "will close just the stream used
 /// to send the response", and the reason is recovered from the resulting
@@ -51,8 +51,8 @@ const expectHex = test_support.expectHex;
 /// So this type has no error arm and cannot be decoded from an error value. A
 /// short answer is a short answer: `bytes` is what arrived, and whether that
 /// covers the request is a question for the bao decoder and not for this one.
-/// An empty answer and a zero-length blob are the same bytes, which is the
-/// whole reason the decision cannot be made here.
+/// A successful empty blob still has an eight-byte size header. Missing data
+/// produces no response bytes.
 pub const BaoResponse = struct {
     /// Every byte the provider wrote, borrowed from the caller's buffer.
     bytes: []const u8,
@@ -65,11 +65,8 @@ pub const BaoResponse = struct {
 
     /// The provider ended the stream without writing anything.
     ///
-    /// This is what a provider that does not have the requested data looks
-    /// like from here, and also what an empty blob's answer looks like. The
-    /// two are the same bytes and this type cannot tell them apart, which is
-    /// the honest answer and the reason a missing range cannot be a decoded
-    /// value.
+    /// A provider that does not have the requested data writes no bytes.
+    /// An empty blob has a size header and is therefore not EOF.
     pub fn isEof(self: BaoResponse) bool {
         return self.bytes.len == 0;
     }

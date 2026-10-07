@@ -74,12 +74,11 @@
 //!
 //! # The outboard is emptied, never resumed
 //!
-//! Nothing above says where in the transfer the outboard had got to, and its
-//! pairs are read back by `provider.answer` without a check of their own. A
-//! resume therefore truncates the outboard partial to nothing and the caller
-//! writes it whole beside the data it appends. A stale outboard beside fresh
-//! data is the one state that makes a committed store serve answers that fail
-//! verification, and it costs one write to be unreachable.
+//! Nothing above says where in the transfer the outboard had got to. A resume
+//! therefore truncates the outboard partial to nothing and the caller writes
+//! it whole beside the data it appends. The provider validates stored pairs
+//! before completing a response, but rebuilding here avoids committing a stale
+//! outboard that would abort every later transfer.
 //!
 //! # Purity
 //!

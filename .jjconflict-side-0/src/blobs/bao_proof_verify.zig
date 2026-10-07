@@ -131,6 +131,7 @@ pub const Verifier = struct {
     /// impossible, since a tree's chunk count is at most 2^54. A node of one
     /// chunk is a leaf and cannot be the parent a pair claims to be.
     pub fn init(tree: BaoTree, plan: Plan, trusted_root: core.CvBytes) Error!Verifier {
+        if (plan.overflow) return error.MalformedPlan;
         if (plan.isEmpty()) return error.NoRangeRequested;
         for (plan.items[0..plan.len]) |item| {
             const node = item.node();
@@ -167,6 +168,14 @@ pub const Verifier = struct {
             .skip => try self.closeChild(null),
             .data => |node| try self.closeChild(self.hash(node, bytes)),
         }
+    }
+
+    /// Accept a caller-streamed data item's hash without buffering its bytes.
+    pub fn takeDataHash(self: *Verifier, cv: core.CvBytes) Error!void {
+        if (self.next >= self.plan.len) return error.MalformedPlan;
+        if (self.plan.items[self.next] != .data) return error.MalformedPlan;
+        self.next += 1;
+        try self.closeChild(cv);
     }
 
     /// The value of `node` from the bytes that just arrived. With no parent

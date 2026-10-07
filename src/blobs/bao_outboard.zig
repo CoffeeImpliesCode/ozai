@@ -31,10 +31,8 @@
 //! compresses the same two words in the same order.
 //!
 //! Not pinned: that this is the *whole* of an upstream outboard, or that a
-//! peer's pairs mean what these do. No captured Bao bytes exist on this
-//! machine, so nothing here claims interoperability. What would close it is one
-//! outboard captured from the Rust `bao-tree` crate and kept beside
-//! `crypto/blake3_subtree_vectors.zig`.
+//! peer's pairs mean what these do. `oracle_test.zig` checks this representation
+//! against actual pinned upstream Store exports, loaded from capture files.
 
 const std = @import("std");
 
@@ -108,20 +106,31 @@ const Writer = struct {
 /// pairs a proof carries are the outboard's own bytes" a statement about
 /// bytes at a named offset rather than an argument about two walks.
 pub fn pairIndex(tree: BaoTree, node: Node) ?usize {
-    var cursor: usize = 0;
-    return indexOf(tree.root(), node, &cursor);
-}
-
-fn indexOf(at: Node, wanted: Node, cursor: *usize) ?usize {
-    if (!at.isOutboardParent()) return null;
-    // Preorder consumes one index per stored pair, and a node that is not a
-    // stored pair consumes none: this is the writer's count, not the tree's.
-    const index = cursor.*;
-    cursor.* += 1;
-    if (at.eql(wanted)) return index;
-    const children = at.children();
-    if (indexOf(children.left, wanted, cursor)) |found| return found;
-    return indexOf(children.right, wanted, cursor);
+    if (!node.isOutboardParent()) return null;
+    var at = tree.root();
+    var index: u64 = 0;
+    for (0..64) |_| {
+        if (!at.isOutboardParent()) return null;
+        if (at.eql(node)) return @intCast(index);
+        const children = at.children();
+        if (node.start_chunk >= children.left.start_chunk and
+            node.endChunk() <= children.left.endChunk())
+        {
+            at = children.left;
+            index += 1;
+        } else if (node.start_chunk >= children.right.start_chunk and
+            node.endChunk() <= children.right.endChunk())
+        {
+            // Every left group contributes one leaf; leaves minus one parents
+            // occupy the skipped preorder subtree.
+            const left_parents = (children.left.span - 1) / tree_mod.chunks_per_block;
+            index += 1 + left_parents;
+            at = children.right;
+        } else {
+            return null;
+        }
+    }
+    return null;
 }
 
 const t = std.testing;

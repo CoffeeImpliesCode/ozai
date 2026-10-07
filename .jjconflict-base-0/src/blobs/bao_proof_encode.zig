@@ -9,9 +9,9 @@
 //! Two things are written in an order that needs saying. A pair is written
 //! *before* the children's bytes but its two values are only known *after* they
 //! have been walked, so the writer reserves the 64 bytes, walks the children,
-//! and fills the reservation in. A node the request takes whole is written as
-//! its own bytes and not as a pair, because its value is then computed by
-//! hashing exactly the bytes the verifier will hash.
+//! and fills the reservation in. A wholly selected node below the group line
+//! carries its data; above that line its pair is retained, as required by the
+//! upstream Bao decoder.
 //!
 //! Nothing here verifies anything. An encoder handed a blob that does not fill
 //! the claimed size is refused, and one handed a plan that does not describe
@@ -51,6 +51,7 @@ pub const Error = tree_mod.HashError || error{
 /// `data` must be the blob the tree was cut for and `out` must be at least
 /// `plan.bytes` long. Both are checked rather than assumed.
 pub fn encode(plan: Plan, tree: BaoTree, data: []const u8, out: []u8) Error!usize {
+    if (plan.overflow) return error.PlanMismatch;
     if (plan.isEmpty()) return 0;
     var writer: Writer = .{ .tree = tree, .data = data, .out = out, .plan = plan };
     _ = try writer.walk(tree.root(), true);
@@ -141,20 +142,28 @@ const published = @import("../gossip/plumtree/blake3_vectors.zig");
 
 const block_size: usize = @intCast(tree_mod.block_size);
 
-// A whole-blob proof is the blob. Nothing else is written, so the proof of the
-// whole blob and the blob itself are the same bytes, and there is no pair in it
-// to check: every byte is bound by the one root hash at the end.
-test "a whole-blob proof is the blob" {
+// A whole multigroup proof still carries every persisted parent.
+test "whole proofs interleave persisted parents and group data" {
     const data = try published.blake3Input(49153);
     defer t.allocator.free(data);
 
     const tree = BaoTree.init(data.len);
     const plan = plan_mod.planOf(tree, .{ .start = 0, .end = tree.chunks() });
 
-    var out: [49153]u8 = @splat(0);
+    var out: [49153 + 3 * pair_length]u8 = @splat(0);
     const written = try encode(plan, tree, data, &out);
-    try t.expectEqual(data.len, written);
-    try t.expectEqualSlices(u8, data, out[0..written]);
+    try t.expectEqual(data.len + 3 * pair_length, written);
+    var at: usize = 0;
+    for (plan.items[0..plan.len], 0..) |item, index| {
+        const count = plan.itemBytes(tree, index);
+        if (item == .data) {
+            const bytes = item.data.bytes(tree);
+            try t.expectEqualSlices(
+                u8, data[@intCast(bytes.start)..@intCast(bytes.end)], out[at..][0..count],
+            );
+        }
+        at += count;
+    }
 }
 
 // The pairs a proof carries are the outboard's own bytes, and the data follows
