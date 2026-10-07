@@ -8,6 +8,9 @@
 //! socket and node drivers require libc and take `std.Io` per operation.
 //! Allocating results name their release operation at the owning declaration.
 //! Address lists and runtime handles are shallow copies, not independent owners.
+//! `relay_tcp_carrier` and `transport_tcp` expose live TCP drivers; `blobs_store`
+//! owns file-backed blob storage. The native NAT modules and `path_action`
+//! expose pure packet, state and path-planning logic.
 
 const std = @import("std");
 
@@ -22,6 +25,9 @@ pub const holepunch = @import("net/holepunch.zig");
 pub const net_probe = @import("net/probe.zig");
 pub const net_probe_run = @import("net/probe_run.zig");
 pub const net_holepunch_run = @import("net/holepunch_run.zig");
+pub const native_nat = @import("net/native_nat.zig");
+pub const native_nat_state = @import("net/native_nat_state.zig");
+pub const path_action = @import("net/path_action.zig");
 
 pub const discovery_item = @import("discovery/item.zig");
 pub const discovery_resolve = @import("discovery/resolve.zig");
@@ -34,12 +40,14 @@ pub const discovery_lookup_live = @import("discovery/lookup_live.zig");
 pub const relay_frame = @import("relay/frame.zig");
 pub const relay_client = @import("relay/client.zig");
 pub const relay_server = @import("relay/server.zig");
+pub const relay_tcp_carrier = @import("relay/tcp_carrier.zig");
 
 pub const addr_map = @import("transport/addr_map.zig");
 pub const transport_batch = @import("transport/batch.zig");
 pub const transport_quic_bridge = @import("transport/quic_bridge.zig");
 pub const transport_socket = @import("transport/socket.zig");
 pub const transport_dial = @import("transport/dial.zig");
+pub const transport_tcp = @import("transport/tcp.zig");
 
 pub const endpoint = @import("endpoint/endpoint.zig");
 pub const incoming_filter = @import("endpoint/incoming_filter.zig");
@@ -51,9 +59,9 @@ pub const blobs_protocol = @import("blobs/protocol.zig");
 pub const blobs_framing = @import("blobs/framing.zig");
 pub const blobs_requests = @import("blobs/requests.zig");
 pub const blobs_responses = @import("blobs/responses.zig");
+pub const blobs_store = @import("blobs/store.zig");
 pub const endpoint_ticket = @import("ticket/endpoint_ticket.zig");
 pub const blob_ticket = @import("ticket/blob_ticket.zig");
-pub const node_relay_carrier = @import("node/node_relay_carrier.zig");
 pub const node_gossip_wire = @import("node/node_gossip_wire.zig");
 pub const node_discovery = @import("node/node_discovery.zig");
 pub const bao_tree = @import("blobs/bao_tree.zig");
@@ -168,7 +176,6 @@ test {
     const relay_http_upgrade = @import("relay/http_upgrade.zig");
     const relay_version_translate = @import("relay/version_translate.zig");
     const relay_ws_frame_mask = @import("relay/ws_frame_mask.zig");
-    const transport_tcp = @import("transport/tcp.zig");
     const transport_tcp_error = @import("transport/tcp_error.zig");
     const transport_tcp_sys = @import("transport/tcp_sys.zig");
     std.testing.refAllDecls(crypto_blake3_core);
@@ -197,7 +204,6 @@ test {
     const discovery_pkarr_live = @import("discovery/pkarr_live.zig");
     const discovery_publisher = @import("discovery/publisher.zig");
     const discovery_tls_client = @import("discovery/tls_client.zig");
-    const node_node_relay_route = @import("node/node_relay_route.zig");
     const relay_access_policy = @import("relay/access_policy.zig");
     const relay_carrier = @import("relay/carrier.zig");
     const relay_conn_version = @import("relay/conn_version.zig");
@@ -213,13 +219,11 @@ test {
     std.testing.refAllDecls(discovery_pkarr_live);
     std.testing.refAllDecls(discovery_publisher);
     std.testing.refAllDecls(discovery_tls_client);
-    std.testing.refAllDecls(node_node_relay_route);
     std.testing.refAllDecls(relay_access_policy);
     std.testing.refAllDecls(relay_carrier);
     std.testing.refAllDecls(relay_conn_version);
     std.testing.refAllDecls(relay_liveness);
     std.testing.refAllDecls(relay_reconnect);
-    const blobs_store = @import("blobs/store.zig");
     const blobs_provider = @import("blobs/provider.zig");
     const blobs_getter = @import("blobs/getter.zig");
     const blobs_resume = @import("blobs/resume.zig");
@@ -245,29 +249,21 @@ test {
     std.testing.refAllDecls(net_probe_live);
     const net_observed_address = @import("net/observed_address.zig");
     const net_observed_reporter = @import("net/observed_reporter.zig");
-    const relay_auth_challenge = @import("relay/auth_challenge.zig");
-    const relay_auth_credential = @import("relay/auth_credential.zig");
     const transport_resumption = @import("transport/resumption.zig");
     const transport_early_data = @import("transport/early_data.zig");
     const transport_session_store = @import("transport/session_store.zig");
     std.testing.refAllDecls(net_observed_address);
     std.testing.refAllDecls(net_observed_reporter);
-    std.testing.refAllDecls(relay_auth_challenge);
-    std.testing.refAllDecls(relay_auth_credential);
     std.testing.refAllDecls(transport_resumption);
     std.testing.refAllDecls(transport_early_data);
     std.testing.refAllDecls(transport_session_store);
     const blobs_blob_set = @import("blobs/blob_set.zig");
     const net_blobs_route = @import("net/blobs_route.zig");
     const net_path_revalidate = @import("net/path_revalidate.zig");
-    const relay_relay_egress = @import("relay/relay_egress.zig");
-    const relay_relay_ingress = @import("relay/relay_ingress.zig");
     const transport_multipath = @import("transport/multipath.zig");
     std.testing.refAllDecls(blobs_blob_set);
     std.testing.refAllDecls(net_blobs_route);
     std.testing.refAllDecls(net_path_revalidate);
-    std.testing.refAllDecls(relay_relay_egress);
-    std.testing.refAllDecls(relay_relay_ingress);
     std.testing.refAllDecls(transport_multipath);
     const blobs_blob_claim = @import("blobs/blob_claim.zig");
     const blobs_observe = @import("blobs/observe.zig");
@@ -293,8 +289,6 @@ test {
     const node_shutdown_budget = @import("node/shutdown_budget.zig");
     const node_ticket_cache = @import("node/ticket_cache.zig");
     const node_ticket_lifecycle = @import("node/ticket_lifecycle.zig");
-    const relay_relay_auth_wiring = @import("relay/relay_auth_wiring.zig");
-    const relay_relay_auth_policy = @import("relay/relay_auth_policy.zig");
     std.testing.refAllDecls(blobs_blob_claim);
     std.testing.refAllDecls(blobs_observe);
     std.testing.refAllDecls(blobs_push);
@@ -319,8 +313,6 @@ test {
     std.testing.refAllDecls(node_shutdown_budget);
     std.testing.refAllDecls(node_ticket_cache);
     std.testing.refAllDecls(node_ticket_lifecycle);
-    std.testing.refAllDecls(relay_relay_auth_wiring);
-    std.testing.refAllDecls(relay_relay_auth_policy);
     std.testing.refAllDecls(base32);
     std.testing.refAllDecls(key);
     std.testing.refAllDecls(addr);
@@ -341,6 +333,7 @@ test {
     std.testing.refAllDecls(relay_frame);
     std.testing.refAllDecls(relay_client);
     std.testing.refAllDecls(relay_server);
+    std.testing.refAllDecls(relay_tcp_carrier);
     std.testing.refAllDecls(range_spec);
     std.testing.refAllDecls(blobs_protocol);
     std.testing.refAllDecls(addr_map);
@@ -348,6 +341,21 @@ test {
     std.testing.refAllDecls(transport_quic_bridge);
     std.testing.refAllDecls(transport_socket);
     std.testing.refAllDecls(transport_dial);
+    std.testing.refAllDecls(native_nat);
+    std.testing.refAllDecls(native_nat_state);
+    std.testing.refAllDecls(path_action);
+    const native_nat_probe = @import("net/native_nat_probe.zig");
+    std.testing.refAllDecls(native_nat_probe);
+    const blobs_oracle_test = @import("blobs/oracle_test.zig");
+    std.testing.refAllDecls(blobs_oracle_test);
+    const node_blobs = @import("node/node_blobs.zig");
+    const node_native = @import("node/node_native.zig");
+    const node_holepunch = @import("node/node_holepunch.zig");
+    const node_relay_runtime = @import("node/node_relay_runtime.zig");
+    std.testing.refAllDecls(node_blobs);
+    std.testing.refAllDecls(node_native);
+    std.testing.refAllDecls(node_holepunch);
+    std.testing.refAllDecls(node_relay_runtime);
     std.testing.refAllDecls(endpoint);
     std.testing.refAllDecls(incoming_filter);
     std.testing.refAllDecls(router);

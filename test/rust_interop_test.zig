@@ -10,12 +10,9 @@
 //!
 //! # What is asserted, and where each half of it was earned
 //!
-//! 1. **The peer's ALPN offer is the Zig tree's.** The peer prints one `offer`
-//!    line per protocol; this file compares that list against
-//!    `node.gossip_alpn`, `node.relay_alpn`, `blobs_protocol.alpn` and the
-//!    transport ALPN, and against `router.qad_alpn` to say the reserved one is
-//!    absent. A contract written in two implementations and compared across is a
-//!    contract; one written in one is a comment.
+//! 1. **Stock transport offers only `ozai`.** The peer's live `offer` lines
+//!    are compared against the loopback transport ALPN. Actual gossip, blobs
+//!    and relay interoperability belongs to their dedicated protocol drivers.
 //! 2. **The peer's identity is compared with its expected id.** In the
 //!    direct `rpk` server mode, rustls pins the Zig client's raw key during TLS.
 //!    Stock iroh keeps its verifier unchanged; the harness reads the accepted
@@ -37,10 +34,9 @@
 //! This is testing the wire, so the Zig half is the transport this repository
 //! exposes — `loopback_side.Side` and `transport_dial.Dialer` — driven by the
 //! same round loop `test/loopback_link.zig` uses, with the far end being a
-//! foreign process rather than a second `Side`. `Side.init` pins the loopback
-//! fixture's own ALPN, so the two one-element ALPN lists this test writes put
-//! the gossip protocol on the wire; the rest of `Side` — socket, bridge,
-//! buffers, `takeStream` — is reused as it stands.
+//! foreign process rather than a second `Side`. The bridge and dialer use the
+//! transport ALPN `ozai`; dedicated protocol drivers exercise actual gossip,
+//! Bao blobs and the HTTP relay carrier instead of generic byte echoes.
 //!
 //! # Time
 //!
@@ -56,7 +52,6 @@ const ozai = @import("ozai");
 const t = std.testing;
 
 const loopback_side = @import("loopback_side.zig");
-const progress_ns = @import("two_process_progress.zig");
 const rust_peer = @import("rust_interop_child.zig");
 
 const Side = loopback_side.Side;
@@ -72,15 +67,8 @@ const NodeId = ozai.NodeId;
 const SecretKey = ozai.SecretKey;
 const SocketAddr = ozai.SocketAddr;
 
-/// The protocol this driver speaks. A node registers exactly one ALPN
-/// (`src/node/node_accept.zig:45`), and this half is a transport below the node
-/// layer, so the gossip protocol is the one whose spelling matters.
-const alpn: []const u8 = ozai.node.gossip_alpn;
-
-/// The transport-level protocol the two in-tree loopback drivers speak
-/// (`test/loopback_side.zig:36`), named here because it is one of the four the
-/// peer offers and the contract check compares against it.
-const transport_alpn: []const u8 = loopback_side.alpn;
+/// These are transport exchanges, not fake gossip application messages.
+const alpn: []const u8 = loopback_side.alpn;
 
 /// Seed for each exchange's virtual clock.
 const start: Instant = loopback_side.start;
@@ -183,25 +171,20 @@ const Zig = struct {
 // The peer's offer, and the reservation it must not contain
 // ---------------------------------------------------------------------------
 
-test "the peer's ALPN offer is this tree's, and the reserved one is not in it" {
+test "stock iroh transport offers only ozai and never the reserved QAD ALPN" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     var secret = try SecretKey.fromSeed(zig_seed);
     defer secret.deinit();
 
-    var peer = try startPeer(arena.allocator(), secret.nodeId(), "contract", "rpk");
+    var peer = try startPeer(arena.allocator(), secret.nodeId(), "contract", "iroh");
     defer peer.deinit(t.io);
     try awaitBanner(t.io, peer);
 
-    // Four protocols, compared one at a time against the Zig tree's own
-    // constants. Read off the peer rather than off its source: a peer that
-    // offered a fifth protocol, or spelled one differently, fails here.
+    // Stock transport must not advertise fake gossip, blobs or relay handlers.
     const offered = try peer.lines("offer ", arena.allocator());
-    try t.expectEqual(@as(usize, 4), offered.len);
-    try t.expectEqualStrings(ozai.node.gossip_alpn, offered[0]);
-    try t.expectEqualStrings(ozai.node.relay_alpn, offered[1]);
-    try t.expectEqualStrings(ozai.blobs_protocol.alpn, offered[2]);
-    try t.expectEqualStrings(transport_alpn, offered[3]);
+    try t.expectEqual(@as(usize, 1), offered.len);
+    try t.expectEqualStrings(alpn, offered[0]);
 
     // The reservation, from the Zig side's own constant. An iroh peer may offer
     // `/iroh-qad/0` because iroh owns that protocol, and this tree refuses the
@@ -310,14 +293,6 @@ fn authenticatedByteExchange(tls: []const u8) !void {
     // wrote the response. The Rust handler independently checks request bytes.
     try drivePeerUntil(t.io, peer, &zig.side, &clock, struct {
         fn holds(child: *const Process) bool {
-            const seen = child.progress() orelse return false;
-            return (progress_ns.Need{ .field = "received", .want = question.len }).holds(seen) and
-                (progress_ns.Need{ .field = "sent", .want = answer.len }).holds(seen);
-        }
-    }.holds, "peer sent and received counters");
-
-    try drivePeerUntil(t.io, peer, &zig.side, &clock, struct {
-        fn holds(child: *const Process) bool {
             return child.line("stopped:") != null;
         }
     }.holds, "peer's final report");
@@ -325,6 +300,12 @@ fn authenticatedByteExchange(tls: []const u8) !void {
         return peer.gaveUp("exited without a final report", .{});
     try t.expect(std.mem.indexOf(u8, report, &rust_peer.hexId(secret.nodeId())) != null);
     try t.expectEqualStrings(alpn, valueAfter(report, "alpn "));
+    try t.expectEqual(@as(u64, question.len), try std.fmt.parseInt(
+        u64, valueAfter(report, "received "), 10,
+    ));
+    try t.expectEqual(@as(u64, answer.len), try std.fmt.parseInt(
+        u64, valueAfter(report, "sent "), 10,
+    ));
     try drivePeerUntil(t.io, peer, &zig.side, &clock, struct {
         fn holds(child: *const Process) bool {
             return child.finished();
@@ -407,14 +388,6 @@ fn reciprocalClientExchange(tls: []const u8) !void {
 
     try drivePeerUntil(t.io, peer, &side, &clock, struct {
         fn holds(child: *const Process) bool {
-            const seen = child.progress() orelse return false;
-            return (progress_ns.Need{ .field = "sent", .want = question.len }).holds(seen) and
-                (progress_ns.Need{ .field = "received", .want = answer.len }).holds(seen);
-        }
-    }.holds, "peer sent and received counters");
-
-    try drivePeerUntil(t.io, peer, &side, &clock, struct {
-        fn holds(child: *const Process) bool {
             return child.line("stopped:") != null;
         }
     }.holds, "peer's final report");
@@ -422,6 +395,12 @@ fn reciprocalClientExchange(tls: []const u8) !void {
         return peer.gaveUp("exited without a final report", .{});
     try t.expect(std.mem.indexOf(u8, report, &rust_peer.hexId(zig_secret.nodeId())) != null);
     try t.expectEqualStrings(alpn, valueAfter(report, "alpn "));
+    try t.expectEqual(@as(u64, question.len), try std.fmt.parseInt(
+        u64, valueAfter(report, "sent "), 10,
+    ));
+    try t.expectEqual(@as(u64, answer.len), try std.fmt.parseInt(
+        u64, valueAfter(report, "received "), 10,
+    ));
     try drivePeerUntil(t.io, peer, &side, &clock, struct {
         fn holds(child: *const Process) bool {
             return child.finished();
@@ -447,10 +426,8 @@ fn startZig(secret: SecretKey) !Zig {
     try zig.side.init("zig", secret, null, engine_seed);
     zig.side_live = true;
 
-    // `Side.init` configures the loopback fixture's own ALPN. The gossip
-    // protocol is the one a node registers, so the bridge's one-element list and
-    // the dialer's are both written to it. Both lists are storage those two
-    // already own, so this is a write and not an allocation.
+    // Both TLS lists must select transport `ozai`, matching the stock Rust
+    // transport handler. Dedicated protocol drivers own their application ALPNs.
     zig.side.bridge.alpn_list[0] = alpn;
     zig.side.bridge.manager.tls_config.alpn = zig.side.bridge.alpn_list[0..];
     zig.dialer = try Dialer.create(t.allocator, zig.side.bridge, .{
@@ -684,15 +661,8 @@ fn awaitBanner(io: std.Io, peer: *Process) !void {
 /// so two runs at once and a socket left over from the last one cannot collide.
 fn peerAddress(io: std.Io, peer: *Process) !SocketAddr {
     try awaitBanner(io, peer);
-    const text = peer.value("listening") orelse
-        return peer.gaveUp("said it was listening without saying where", .{});
-    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse
-        return peer.gaveUp("printed an address with no port", .{});
-    const host = ozai.IpAddress.parse(text[0..colon]) orelse
-        return peer.gaveUp("printed {s}, which is not an address", .{text});
-    const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch
-        return peer.gaveUp("printed {s}, whose port does not parse", .{text});
-    return .{ .ip = host, .port = port };
+    return (try peer.address()) orelse
+        peer.gaveUp("said it was listening without saying where", .{});
 }
 
 /// The host clock in milliseconds. Only ever a bound on a wait.

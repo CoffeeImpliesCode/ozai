@@ -23,9 +23,10 @@ pub const progress_prefix = "progress: ";
 
 /// Named counters in the CLI snapshot. An array permits runtime iteration.
 const progress_fields = [_][]const u8{
-    "dials",     "refused",     "accepted",   "finished",     "up",
-    "admitted",  "established", "registered", "sent",         "received",
-    "forwarded", "attempts",    "spawned",    "disconnected", "closed",
+    "dials",                    "refused",         "accepted",
+    "finished",                 "up",              "attempts",
+    "spawned",                  "neighbour up",    "broadcasts received",
+    "blob transfers completed", "blob sent bytes", "blob received bytes",
 };
 
 /// One `progress:` line, read whole.
@@ -51,13 +52,21 @@ pub const Progress = struct {
 /// changes its line produces a named failure here rather than a gate that
 /// quietly never holds.
 pub fn parseProgress(line_text: []const u8) ?Progress {
+    if (!std.mem.startsWith(u8, line_text, progress_prefix)) return null;
     var result: Progress = .{};
     var rest = line_text[progress_prefix.len..];
     for (progress_fields, 0..) |name, at| {
+        if (at == progress_fields.len - 1 and std.mem.indexOf(u8, rest, ", ") != null) {
+            return null;
+        }
         const piece, const rest_after = splitOnce(rest) orelse return null;
-        if (!std.mem.startsWith(u8, piece, name)) return null;
-        const digits = std.mem.trim(u8, piece[name.len..], " ");
+        if (piece.len <= name.len or !std.mem.startsWith(u8, piece, name)) return null;
+        if (piece[name.len] != ' ') return null;
+        const digits = piece[name.len + 1 ..];
         if (digits.len == 0) return null;
+        for (digits) |digit| {
+            if (!std.ascii.isDigit(digit)) return null;
+        }
         result.counts[at] = std.fmt.parseInt(u64, digits, 10) catch return null;
         rest = rest_after;
     }
