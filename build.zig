@@ -70,7 +70,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const run_quic_tests = b.addRunArtifact(b.addTest(.{ .root_module = quic_test_mod }));
+    const quic_tests = b.addTest(.{
+        .name = "ozai-quic-test",
+        .root_module = quic_test_mod,
+    });
+    const run_quic_tests = b.addRunArtifact(quic_tests);
     const quic_step = b.step("quic-test", "Run the vendored QUIC core's own tests");
     quic_step.dependOn(&run_quic_tests.step);
 
@@ -82,8 +86,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const invariants_tests = b.addTest(.{ .root_module = invariants_mod });
+    const invariants_tests = b.addTest(.{
+        .name = "ozai-invariants-test",
+        .root_module = invariants_mod,
+    });
     const run_invariants_tests = b.addRunArtifact(invariants_tests);
+    b.step("invariants", "Run vendored source invariants").dependOn(&run_invariants_tests.step);
 
     // `@embedFile` cannot glob, so the gate names every vendored file in a
     // list. Comparing that list against the directory is the only way an
@@ -153,7 +161,10 @@ pub fn build(b: *std.Build) void {
     // a silent hole. The vendored QUIC core must never need this — it opens no
     // socket — and `test/vendored_invariants.zig` is what keeps that true.
     lib_test_mod.link_libc = true;
-    const lib_unit_tests = b.addTest(.{ .root_module = lib_test_mod });
+    const lib_unit_tests = b.addTest(.{
+        .name = "ozai-lib-test",
+        .root_module = lib_test_mod,
+    });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
     const portable_test_mod = b.createModule(.{
@@ -162,7 +173,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     portable_test_mod.addImport("quic", quic_mod);
-    const run_portable_tests = b.addRunArtifact(b.addTest(.{ .root_module = portable_test_mod }));
+    const portable_tests = b.addTest(.{
+        .name = "ozai-portable-test",
+        .root_module = portable_test_mod,
+    });
+    const run_portable_tests = b.addRunArtifact(portable_tests);
     const portable_step = b.step(
         "test-portable",
         "Run socket-free protocol and state-machine tests",
@@ -179,7 +194,10 @@ pub fn build(b: *std.Build) void {
     });
     integration_mod.addImport("ozai", lib_mod);
     integration_mod.link_libc = true;
-    const integration_tests = b.addTest(.{ .root_module = integration_mod });
+    const integration_tests = b.addTest(.{
+        .name = "ozai-integration-test",
+        .root_module = integration_mod,
+    });
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
     // The loopback test gets its own module for the same reason, and one more
@@ -202,6 +220,7 @@ pub fn build(b: *std.Build) void {
     // the one `std.options` reads and the generated runner is not in the
     // picture at all.
     const loopback_tests = b.addTest(.{
+        .name = "ozai-loopback-test",
         .root_module = loopback_mod,
         .test_runner = .{ .path = b.path("test/expected_log_runner.zig"), .mode = .server },
     });
@@ -236,6 +255,7 @@ pub fn build(b: *std.Build) void {
     protocol_mod.addImport("ozai", lib_mod);
     protocol_mod.link_libc = true;
     const protocol_tests = b.addTest(.{
+        .name = "ozai-protocol-test",
         .root_module = protocol_mod,
         .test_runner = .{ .path = b.path("test/expected_log_runner.zig"), .mode = .server },
     });
@@ -257,6 +277,7 @@ pub fn build(b: *std.Build) void {
     transfer_mod.addImport("ozai", lib_mod);
     transfer_mod.link_libc = true;
     const transfer_tests = b.addTest(.{
+        .name = "ozai-transfer-test",
         .root_module = transfer_mod,
         .test_runner = .{ .path = b.path("test/expected_log_runner.zig"), .mode = .server },
     });
@@ -296,6 +317,7 @@ pub fn build(b: *std.Build) void {
     node_test_options.addOption(?[]const u8, "node_executor", node_executor);
     two_process_mod.addOptions("node_test_options", node_test_options);
     const two_process_tests = b.addTest(.{
+        .name = "ozai-two-process-test",
         .root_module = two_process_mod,
         .test_runner = .{ .path = b.path("test/expected_log_runner.zig"), .mode = .server },
     });
@@ -357,10 +379,54 @@ pub fn build(b: *std.Build) void {
     relay_wire_mod.addImport("ozai", lib_mod);
     relay_wire_mod.link_libc = true;
     const relay_wire_tests = b.addTest(.{
+        .name = "ozai-relay-wire-test",
         .root_module = relay_wire_mod,
         .test_runner = .{ .path = b.path("test/expected_log_runner.zig"), .mode = .server },
     });
     const run_relay_wire_tests = b.addRunArtifact(relay_wire_tests);
+
+    // Tooling stays in separate test roots, never in the public library.
+    const coverage_policy_tests = b.addTest(.{
+        .name = "ozai-coverage-policy-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/coverage_policy.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const project_gate_tests = b.addTest(.{
+        .name = "ozai-project-gate-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/project_gate.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_coverage_policy_tests = b.addRunArtifact(coverage_policy_tests);
+    const run_project_gate_tests = b.addRunArtifact(project_gate_tests);
+    const gate_policy_step = b.step("test-gate-policy", "Run strict gate and coverage policy tests");
+    gate_policy_step.dependOn(&run_coverage_policy_tests.step);
+    gate_policy_step.dependOn(&run_project_gate_tests.step);
+
+    const coverage_artifacts = [_]*std.Build.Step.Compile{
+        lib_unit_tests,
+        integration_tests,
+        loopback_tests,
+        protocol_tests,
+        transfer_tests,
+        two_process_tests,
+        relay_wire_tests,
+        portable_tests,
+        quic_tests,
+        invariants_tests,
+        coverage_policy_tests,
+        project_gate_tests,
+        node_exe,
+    };
+    const coverage_all_step = b.step(
+        "coverage-all",
+        "Run all instrumented tests and install their binaries and node child",
+    );
 
     // Coverage instrumentation is opt-in because it pins the LLVM backend,
     // links the zig-cov runtime into the artifacts, and makes them write a
@@ -374,47 +440,62 @@ pub fn build(b: *std.Build) void {
         "coverage",
         "Instrument tests and their node child",
     ) orelse false;
-    const coverage_rt = b.option([]const u8, "coverage-rt", "Path to zig-cov-rt.o");
+    const coverage_rt = b.option([]const u8, "coverage-rt", "Absolute path to zig-cov-rt.o");
     if (coverage) {
-        const rt = coverage_rt orelse std.debug.panic(
-            "-Dcoverage=true also needs -Dcoverage-rt=<path to zig-cov-rt.o>. " ++
-                "Run coverage through `zig-cov test`, which passes both.",
-            .{},
-        );
-
-        // The fuzz runtime's `runner_*` callbacks, which every artifact below
-        // links once `fuzz` is on and none of them can ever be reached: the
-        // test runners among them refuse the start message that is the only
-        // way into `fuzzer_main`, and the node is not a test and has no runner
-        // to ask. One module owns all seven so the answer is written once.
-        const coverage_abi_mod = b.createModule(.{
-            .root_source_file = b.path("test/coverage_abi.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        for ([_]*std.Build.Step.Compile{
-            lib_unit_tests,
-            integration_tests,
-            loopback_tests,
-            protocol_tests,
-            transfer_tests,
-            two_process_tests,
-            relay_wire_tests,
-            node_exe,
-        }) |artifact| {
-            // The self-hosted backends emit no counters, `fuzz` is the only
-            // switch that makes LLVM emit them, and the runtime flushes from a
-            // libc atexit handler, so all three settings are load-bearing.
-            artifact.use_llvm = true;
-            artifact.root_module.fuzz = true;
-            artifact.root_module.link_libc = true;
-            artifact.root_module.addObjectFile(.{ .cwd_relative = rt });
-            // Attached to the root of each of them, so `test/coverage_abi.zig`
-            // resolves from the node's own `main` as well as from a runner
-            // compiled into a test artifact. A root that does not reach it
-            // keeps no import to name and is unaffected outside coverage.
-            artifact.root_module.addImport("coverage_abi", coverage_abi_mod);
+        const runtime_failure: ?*std.Build.Step.Fail = if (coverage_rt) |rt|
+            if (std.fs.path.isAbsolute(rt))
+                null
+            else
+                b.addFail("-Dcoverage-rt must be an absolute path to zig-cov-rt.o")
+        else
+            b.addFail("-Dcoverage=true requires -Dcoverage-rt=/absolute/zig-cov-rt.o");
+        if (runtime_failure) |failure| {
+            coverage_all_step.dependOn(&failure.step);
+            for (coverage_artifacts) |artifact| {
+                artifact.step.dependOn(&failure.step);
+            }
+        } else {
+            const rt = coverage_rt.?;
+            const coverage_abi_mod = b.createModule(.{
+                .root_source_file = b.path("test/coverage_abi.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            for (coverage_artifacts) |artifact| {
+                // LLVM emits counters through fuzz; libc flushes them at exit.
+                artifact.use_llvm = true;
+                artifact.root_module.fuzz = true;
+                artifact.root_module.link_libc = true;
+                artifact.root_module.addObjectFile(.{ .cwd_relative = rt });
+                // Default runners own their ABI. Only custom runners and the
+                // node reach this import, so vendored production roots stay clean.
+                artifact.root_module.addImport("coverage_abi", coverage_abi_mod);
+                coverage_all_step.dependOn(&b.addInstallArtifact(artifact, .{
+                    .dest_dir = .{ .override = .bin },
+                }).step);
+            }
+            for ([_]*std.Build.Step.Run{
+                run_lib_unit_tests,
+                run_integration_tests,
+                run_loopback_tests,
+                run_protocol_tests,
+                run_transfer_tests,
+                run_two_process_tests,
+                run_relay_wire_tests,
+                run_portable_tests,
+                run_quic_tests,
+                run_invariants_tests,
+                run_coverage_policy_tests,
+                run_project_gate_tests,
+            }) |run_tests| {
+                coverage_all_step.dependOn(&run_tests.step);
+            }
         }
+    } else {
+        const missing_coverage = b.addFail(
+            "coverage-all requires -Dcoverage=true -Dcoverage-rt=/absolute/zig-cov-rt.o",
+        );
+        coverage_all_step.dependOn(&missing_coverage.step);
     }
 
     const test_step = b.step("test", "Run unit tests and integration tests");
@@ -426,6 +507,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_two_process_tests.step);
     test_step.dependOn(&run_relay_wire_tests.step);
     test_step.dependOn(&run_invariants_tests.step);
+    test_step.dependOn(gate_policy_step);
 
     // fuzzing
     //
