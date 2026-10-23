@@ -369,7 +369,7 @@ test "a node splits at the largest power of two below its span" {
     };
     for (cases) |case| {
         try t.expectEqual(case.left, splitAt(case.span));
-        const node = Node{ .start_chunk = 0, .span = case.span };
+        const node: Node = .{ .start_chunk = 0, .span = case.span };
         const children = node.children();
         try t.expectEqual(case.left, children.left.span);
         try t.expectEqual(case.span - case.left, children.right.span);
@@ -504,7 +504,7 @@ test "a parent pair is the left chaining value and then the right" {
 
     const tree = BaoTree.init(2048);
     const children = tree.root().children();
-    const pair = Pair{
+    const pair: Pair = .{
         .left = try tree.nodeCv(children.left, data),
         .right = try tree.nodeCv(children.right, data),
     };
@@ -554,7 +554,7 @@ test "a tree refuses bytes that are not its declared length" {
 
 test "last byte range at maximum declared size does not overflow" {
     const tree = BaoTree.init(std.math.maxInt(u64));
-    const node = Node{ .start_chunk = tree.chunks() - 1, .span = 1 };
+    const node: Node = .{ .start_chunk = tree.chunks() - 1, .span = 1 };
     try t.expectEqual(tree.size, node.bytes(tree).end);
     try t.expectEqual(@as(u64, 1023), node.bytes(tree).end - node.bytes(tree).start);
 }

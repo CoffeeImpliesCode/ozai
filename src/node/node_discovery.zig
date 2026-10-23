@@ -65,7 +65,6 @@ const node_discovery_record = @import("node_discovery_record.zig");
 const node_discovery_wire = @import("node_discovery_wire.zig");
 
 const lookup_wire = @import("../discovery/lookup_wire.zig");
-const pkarr_live = @import("../discovery/pkarr_live.zig");
 const host_io = @import("../discovery/host_io.zig");
 const lookup_io = @import("../discovery/lookup_io.zig");
 const preset = @import("../discovery/preset.zig");
@@ -75,8 +74,9 @@ const tls_client = @import("../discovery/tls_client.zig");
 const base_addr = @import("../base/addr.zig");
 const base_key = @import("../base/key.zig");
 const bridge_mod = @import("../transport/quic_bridge.zig");
+const tcp_execution = @import("../transport/tcp_execution.zig");
 
-const Node = node_mod.Node;
+const Self = node_mod.Node;
 const Instant = bridge_mod.Instant;
 const NodeId = base_key.NodeId;
 
@@ -164,6 +164,11 @@ pub const Source = struct {
     /// other servers before repeating a query" is a policy and needs an instant
     /// this node deliberately does not keep, so one source asks one server.
     server: base_addr.SocketAddr,
+    /// Borrowed source stop latch, live for every pass just like `datagram.ctx`.
+    /// TCP fallback keeps observing it after the UDP callback has returned.
+    resolver_stopped: ?*const std.atomic.Value(bool) = null,
+    /// Borrowed fallback provider, live through every synchronous lookup and cleanup.
+    stream_execution: tcp_execution.Execution = .native,
 };
 
 /// What one node's discovery pass owns, and what it has refused.
@@ -250,7 +255,7 @@ pub const State = struct {
 /// nameserver is slow keeps gossiping. `Node.step`'s own rule is that a failed
 /// pass is a node to be closed rather than a pass to be replayed, and a
 /// discovery failure is the worst possible reason to close one.
-pub fn pass(self: *Node, io: std.Io, at: Instant, random: std.Random) bool {
+pub fn pass(self: *Self, io: std.Io, at: Instant, random: std.Random) bool {
     var moved = republish(self, io, at, random);
     moved = lookup(self, io, at, random) or moved;
     return moved;
@@ -275,7 +280,7 @@ pub fn pass(self: *Node, io: std.Io, at: Instant, random: std.Random) bool {
 /// * `.stale` — the record is reported as not published. Counted and nothing
 ///   else: `publisher.abandon` is the way back and it is a caller's decision,
 ///   not this pass's.
-fn republish(self: *Node, io: std.Io, at: Instant, random: std.Random) bool {
+fn republish(self: *Self, io: std.Io, at: Instant, random: std.Random) bool {
     const now_ms = millisOf(at) orelse {
         // A clock before this node's epoch cannot be expressed in the timers'
         // unit, so no tick can be asked. Named rather than asserted, and
@@ -338,7 +343,7 @@ fn republish(self: *Node, io: std.Io, at: Instant, random: std.Random) bool {
 /// anyway: a node configured with no peers is a node that will have none by the
 /// next tick too, and the counter is what says so once rather than a pass that
 /// silently does nothing for ever.
-fn lookup(self: *Node, io: std.Io, at: Instant, random: std.Random) bool {
+fn lookup(self: *Self, io: std.Io, at: Instant, random: std.Random) bool {
     const now_ms = millisOf(at) orelse {
         node_discovery_wire.count(self, .clock_unusable);
         return false;
@@ -410,7 +415,7 @@ const max_passes = 8;
 
 /// The offset a question's `QTYPE` sits at: past the header, the name, and the
 /// root label's zero octet.
-fn wire_question_length(asked: []const u8) usize {
+fn wireQuestionLength(asked: []const u8) usize {
     return lookup_wire.header_length + asked.len + 1;
 }
 
@@ -547,8 +552,8 @@ fn answerWithoutRecords(self: *const Scripted, into: []u8) !usize {
 ///
 /// Everything the pass needs is named here so a test that changes one of them
 /// says so at the call site rather than in a helper four frames away.
-fn nodeOver(script: *Scripted, peers: []const node_config.Peer) !*Node {
-    return Node.create(t.allocator, t.io, .{
+fn nodeOver(script: *Scripted, peers: []const node_config.Peer) !*Self {
+    return Self.create(t.allocator, t.io, .{
         .secret = try SecretKey.fromSeed(@splat(0xa7)),
         .listen = loopback,
         .peers = peers,
@@ -566,7 +571,7 @@ fn askedNameFor(peer_id: NodeId, out: []u8) ![]const u8 {
 /// A bound rather than a timer, and generous: a pass here cannot block because
 /// the scripted seam answers or refuses immediately, so a lookup that has not
 /// happened by the bound is not going to happen at all.
-fn driveUntil(node: *Node, at: *Instant, reached: *const fn (*Node) bool) !void {
+fn driveUntil(node: *Self, at: *Instant, reached: *const fn (*Self) bool) !void {
     var passes: usize = 0;
     while (passes < max_passes and !reached(node)) : (passes += 1) {
         at.* += time_quantum;
@@ -575,10 +580,9 @@ fn driveUntil(node: *Node, at: *Instant, reached: *const fn (*Node) bool) !void 
     std.debug.assert(reached(node));
 }
 
-fn oneLookupHappened(node: *Node) bool {
+fn oneLookupHappened(node: *Self) bool {
     return node.stats.discovery_lookups > 0;
 }
-
 
 test "a lookup the node's own pass asks reaches the node's resolution path" {
     // The whole of the wiring, through `Node.step`: the pass's timer asks,
@@ -610,7 +614,7 @@ test "a lookup the node's own pass asks reaches the node's resolution path" {
     try t.expectEqual(lookup_io.queryLength(script.asked), script.sent_len);
     try t.expectEqual(
         lookup_io.type_txt,
-        lookup_wire.be16(&script.sent, wire_question_length(script.asked)),
+        lookup_wire.be16(&script.sent, wireQuestionLength(script.asked)),
     );
     // The name on the wire is read back with `discovery/lookup_name.zig`, the
     // decoder the answer path itself uses, and compared to the presentation
@@ -706,7 +710,7 @@ test "a node with no relay and no lookup publishes nothing and asks nobody" {
     // address to a third party. Asserted rather than assumed, because the
     // alternative — a slot armed with an empty record — would put a publisher
     // timer that came due for ever over a packet nobody wanted.
-    const node = try Node.create(t.allocator, t.io, .{
+    const node = try Self.create(t.allocator, t.io, .{
         .secret = try SecretKey.fromSeed(@splat(0xc3)),
         .listen = loopback,
     }, 0xfeed);
@@ -736,11 +740,11 @@ test "a node with no relay and no lookup publishes nothing and asks nobody" {
 }
 
 test "lookup configuration refuses unbounded deadlines before opening a node" {
-    try t.expectError(error.InvalidDiscoveryConfig, Node.create(t.allocator, t.io, .{
+    try t.expectError(error.InvalidDiscoveryConfig, Self.create(t.allocator, t.io, .{
         .secret = try SecretKey.fromSeed(@splat(0xd4)),
         .discovery = .{ .deadline_ms = 0 },
     }, 42));
-    try t.expectError(error.InvalidDiscoveryConfig, Node.create(t.allocator, t.io, .{
+    try t.expectError(error.InvalidDiscoveryConfig, Self.create(t.allocator, t.io, .{
         .secret = try SecretKey.fromSeed(@splat(0xd4)),
         .discovery = .{ .interval_ms = 0 },
     }, 42));

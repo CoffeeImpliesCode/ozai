@@ -1,7 +1,8 @@
 //! Exercise the production TCP/WebSocket relay through real kernel streams.
 const std = @import("std");
 const ozai = @import("ozai");
-const carrier = ozai.relay_tcp_carrier;
+const relay_client = ozai.relay_tcp_client;
+const relay_server = ozai.relay_tcp_server;
 const tcp = ozai.transport_tcp;
 const frame = ozai.relay_frame;
 const websocket = ozai.relay_ws_frame;
@@ -15,8 +16,12 @@ const Raw = struct {
     length: usize = 0,
     upgraded: bool = false,
 
-    fn init(server: *carrier.Server) !Raw {
-        var socket = try tcp.Tcp.create(server.address);
+    fn init(server: *relay_server.Server) !Raw {
+        var socket = try tcp.Tcp.create(
+            t.io,
+            server.address,
+            ozai.transport_tcp_execution.Execution.native,
+        );
         errdefer socket.close();
         try socket.connect(t.io, 1000);
         return .{ .socket = socket };
@@ -34,13 +39,14 @@ const Raw = struct {
         return error.WriteTimeout;
     }
 
-    fn message(self: *Raw, server: *carrier.Server) !frame.Message {
+    fn message(self: *Raw, server: *relay_server.Server) !frame.Message {
         for (0..rounds_max) |_| {
             try server.poll(t.io);
             if (!self.upgraded) {
-                if (std.mem.indexOf(u8, self.buffer[0..self.length], "\r\n\r\n")) |end| {
-                    try t.expect(std.mem.startsWith(u8, self.buffer[0..self.length],
-                        "HTTP/1.1 101"));
+                if (std.mem.find(u8, self.buffer[0..self.length], "\r\n\r\n")) |end| {
+                    try t.expect(
+                        std.mem.startsWith(u8, self.buffer[0..self.length], "HTTP/1.1 101"),
+                    );
                     self.consume(end + 4);
                     self.upgraded = true;
                 }
@@ -48,16 +54,18 @@ const Raw = struct {
             if (self.upgraded and self.length > 0) {
                 const decoded: ?websocket.Decoded =
                     websocket.decode(self.buffer[0..self.length], .client) catch |err|
-                    switch (err) {
-                        error.UnexpectedEnd => null,
-                        else => return err,
-                    };
+                        switch (err) {
+                            error.UnexpectedEnd => null,
+                            else => return err,
+                        };
                 if (decoded) |value| {
                     try t.expectEqual(websocket.Opcode.binary, value.frame.opcode);
                     // Challenge/auth-confirm payloads own no borrowed slices.
                     const result = try frame.decode(value.payload, .v2);
-                    self.consume(value.frame.header_length + @as(usize,
-                        @intCast(value.frame.payload_length)));
+                    self.consume(
+                        value.frame.header_length +
+                            @as(usize, @intCast(value.frame.payload_length)),
+                    );
                     return result;
                 }
             }
@@ -74,12 +82,11 @@ const Raw = struct {
     }
 
     fn consume(self: *Raw, count: usize) void {
-        std.mem.copyForwards(u8, self.buffer[0 .. self.length - count],
-            self.buffer[count..self.length]);
+        @memmove(self.buffer[0 .. self.length - count], self.buffer[count..self.length]);
         self.length -= count;
     }
 
-    fn upgrade(self: *Raw, server: *carrier.Server) !frame.ServerChallenge {
+    fn upgrade(self: *Raw, server: *relay_server.Server) !frame.ServerChallenge {
         try self.send("GET /relay HTTP/1.1\r\nHost: localhost\r\n" ++
             "Upgrade: websocket\r\nConnection: Upgrade\r\n" ++
             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
@@ -92,11 +99,14 @@ const Raw = struct {
 
     fn sendFrame(self: *Raw, payload: []const u8, opcode: websocket.Opcode) !void {
         var bytes: [2048]u8 = undefined;
-        try self.send(try websocket.encode(&bytes, .client,
-            .{ .fin = true, .opcode = opcode, .key = websocket.fixedMaskKey() }, payload));
+        try self.send(try websocket.encode(&bytes, .client, .{
+            .fin = true,
+            .opcode = opcode,
+            .key = websocket.fixedMaskKey(),
+        }, payload));
     }
 
-    fn authenticate(self: *Raw, server: *carrier.Server, secret: *const ozai.SecretKey) !void {
+    fn authenticate(self: *Raw, server: *relay_server.Server, secret: *const ozai.SecretKey) !void {
         const challenge = try self.upgrade(server);
         var bytes: [256]u8 = undefined;
         try self.sendFrame(try frame.encode(.{
@@ -108,7 +118,7 @@ const Raw = struct {
         }
     }
 
-    fn expectClosed(self: *Raw, server: *carrier.Server) !void {
+    fn expectClosed(self: *Raw, server: *relay_server.Server) !void {
         var bytes: [2048]u8 = undefined;
         for (0..rounds_max) |_| {
             try server.poll(t.io);
@@ -124,7 +134,11 @@ const Raw = struct {
 };
 
 test "production carrier rejects authentication signed for a different challenge" {
-    var server = try carrier.Server.init(loopback);
+    var server = try relay_server.Server.init(
+        t.io,
+        loopback,
+        ozai.transport_tcp_execution.Execution.native,
+    );
     defer server.deinit();
     var raw = try Raw.init(&server);
     defer raw.socket.close();
@@ -140,7 +154,11 @@ test "production carrier rejects authentication signed for a different challenge
 }
 
 test "production carrier rejects malformed relay payload after signed registration" {
-    var server = try carrier.Server.init(loopback);
+    var server = try relay_server.Server.init(
+        t.io,
+        loopback,
+        ozai.transport_tcp_execution.Execution.native,
+    );
     defer server.deinit();
     var raw = try Raw.init(&server);
     defer raw.socket.close();
@@ -152,7 +170,11 @@ test "production carrier rejects malformed relay payload after signed registrati
 }
 
 test "production carrier rejects unmasked client frames and closes a registered session" {
-    var server = try carrier.Server.init(loopback);
+    var server = try relay_server.Server.init(
+        t.io,
+        loopback,
+        ozai.transport_tcp_execution.Execution.native,
+    );
     defer server.deinit();
     var raw = try Raw.init(&server);
     defer raw.socket.close();
@@ -164,7 +186,11 @@ test "production carrier rejects unmasked client frames and closes a registered 
 }
 
 test "production carrier closes a WebSocket close session without forwarding payload" {
-    var server = try carrier.Server.init(loopback);
+    var server = try relay_server.Server.init(
+        t.io,
+        loopback,
+        ozai.transport_tcp_execution.Execution.native,
+    );
     defer server.deinit();
     var raw = try Raw.init(&server);
     defer raw.socket.close();
@@ -177,18 +203,28 @@ test "production carrier closes a WebSocket close session without forwarding pay
 }
 
 test "two production carrier clients deliver exact datagrams with signed source identities" {
-    var server = try carrier.Server.init(loopback);
+    var server = try relay_server.Server.init(
+        t.io,
+        loopback,
+        ozai.transport_tcp_execution.Execution.native,
+    );
     defer server.deinit();
     var alice_secret = try ozai.SecretKey.fromSeed(@splat(0x5a));
     defer alice_secret.deinit();
     var bob_secret = try ozai.SecretKey.fromSeed(@splat(0x6c));
     defer bob_secret.deinit();
-    var alice = try carrier.Client.init(.{
-        .address = server.address, .host = "localhost", .secret = alice_secret,
+    var alice = try relay_client.Client.init(t.io, .{
+        .address = server.address,
+        .host = "localhost",
+        .secret = alice_secret,
+        .execution = ozai.transport_tcp_execution.Execution.native,
     });
     defer alice.deinit();
-    var bob = try carrier.Client.init(.{
-        .address = server.address, .host = "localhost", .secret = bob_secret,
+    var bob = try relay_client.Client.init(t.io, .{
+        .address = server.address,
+        .host = "localhost",
+        .secret = bob_secret,
+        .execution = ozai.transport_tcp_execution.Execution.native,
     });
     defer bob.deinit();
     for (0..rounds_max) |_| {
@@ -231,12 +267,19 @@ test "production client distinguishes malformed server close from orderly close"
     for ([_][]const u8{
         &.{0x03}, &.{ 0x03, 0xed }, &.{ 0x03, 0xe8, 0xff }, &.{},
     }, 0..) |payload, case| {
-        var server = try carrier.Server.init(loopback);
+        var server = try relay_server.Server.init(
+            t.io,
+            loopback,
+            ozai.transport_tcp_execution.Execution.native,
+        );
         defer server.deinit();
         var secret = try ozai.SecretKey.fromSeed(@splat(0x55));
         defer secret.deinit();
-        var client = try carrier.Client.init(.{
-            .address = server.address, .host = "localhost", .secret = secret,
+        var client = try relay_client.Client.init(t.io, .{
+            .address = server.address,
+            .host = "localhost",
+            .secret = secret,
+            .execution = ozai.transport_tcp_execution.Execution.native,
         });
         defer client.deinit();
         for (0..rounds_max) |_| {
@@ -247,10 +290,17 @@ test "production client distinguishes malformed server close from orderly close"
         }
         try t.expect(client.isReady());
         var bytes: [32]u8 = undefined;
-        const encoded = try websocket.encode(&bytes, .server,
-            .{ .fin = true, .opcode = .close, .key = websocket.fixedMaskKey() }, payload);
-        const registered = &server.peers[0].?;
-        try t.expectEqual(secret.nodeId(), registered.identity.?);
+        const encoded = try websocket.encode(&bytes, .server, .{
+            .fin = true,
+            .opcode = .close,
+            .key = websocket.fixedMaskKey(),
+        }, payload);
+        const registered = if (server.peers[0]) |*peer|
+            peer
+        else
+            return error.TestUnexpectedResult;
+        const identity = registered.identity orelse return error.TestUnexpectedResult;
+        try t.expectEqual(secret.nodeId(), identity);
         try t.expectEqual(encoded.len, try registered.connection.stream.write(t.io, encoded, 1000));
         var rejected = false;
         for (0..rounds_max) |_| {

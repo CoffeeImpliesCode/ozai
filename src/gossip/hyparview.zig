@@ -187,4 +187,9 @@ test {
     _ = @import("hyparview/peer_data_test.zig");
     _ = @import("hyparview/config_test.zig");
     _ = @import("hyparview/sim_test.zig");
+    _ = @import("hyparview/join_budget_test.zig");
+    _ = @import("hyparview/neighbor_budget_test.zig");
+    _ = @import("hyparview/forward_join_budget_test.zig");
+    _ = @import("hyparview/shuffle_budget_test.zig");
+    _ = @import("hyparview/refill_budget_test.zig");
 }

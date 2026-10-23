@@ -73,7 +73,7 @@ const pair_length = bao_plan.pair_length;
 ///
 /// The constants are named after the files a `test/corpus/bao/` carries for
 /// these seeds, so moving them out of line is a rename and nothing else.
-const empty_seed = [_]u8{};
+const empty_seed: [0]u8 = .{};
 const one_byte = [_]u8{0x00};
 const one_byte_high = [_]u8{0xff};
 const bare_pair = [_]u8{0x00} ** pair_length;
@@ -150,7 +150,8 @@ comptime {
     // `.error_set` is optional because `Type` is a union; the branch is the one
     // an error set is in, and a null there means `VerifyError` stopped being an
     // error set, which is as much of a stop as a rename is.
-    const fields = @typeInfo(VerifyError).error_set.?;
+    const fields: []const std.builtin.Type.Error =
+        @typeInfo(VerifyError).error_set orelse @compileError("VerifyError must be an error set");
     if (fields.len != refusal_names.len) {
         @compileError("the proof verifier gained or lost a refusal");
     }
@@ -200,7 +201,7 @@ fn check(
     // `RangeSpec.verified_size` mean what its name says, so a run that never
     // asked for more than it could get would never reach it.
     const start = byteAt(bytes, 1) % (tree.chunks() + 2);
-    const request = ChunkRange{ .start = start, .end = start + byteAt(bytes, 2) % 40 };
+    const request: ChunkRange = .{ .start = start, .end = start + byteAt(bytes, 2) % 40 };
 
     // A blob of the size the tree was cut for and of no other length, because
     // `rootHash` refuses any other and the walk hashes slices of this.

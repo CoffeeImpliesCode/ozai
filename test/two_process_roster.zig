@@ -194,8 +194,7 @@ pub const Roster = struct {
         budget: i64,
     ) !?std.process.Child.Term {
         if (!try self.await(io, process, &Process.finished, budget)) return null;
-        const term = try process.child.wait(io);
-        process.reaped = true;
+        const term = try process.waitForExit(io);
         return term;
     }
 

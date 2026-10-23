@@ -10,8 +10,13 @@ pub const Result = transition.Result;
 /// Limits follow State::new: local TP limits remotes, peer TP limits locals.
 pub const Candidate = transition.Candidate;
 pub const Error = error{
-    WrongConnectionSide, TooManyAddresses, NotEnoughAddresses, InvalidAddress, InvalidSequence,
-    ProbeNotPending, TooManyChallenges,
+    WrongConnectionSide,
+    TooManyAddresses,
+    NotEnoughAddresses,
+    InvalidAddress,
+    InvalidSequence,
+    ProbeNotPending,
+    TooManyChallenges,
 };
 const sequence_max: u64 = (1 << 62) - 1;
 const capacity = policy.candidate_limit;
@@ -303,7 +308,6 @@ pub const State = struct {
         return if (responsive or self.challenge_count != 0) .probing else .failed;
     }
 
-
     pub fn currentRound(self: *const State) u64 {
         return self.round;
     }
@@ -324,10 +328,6 @@ pub const State = struct {
         return snapshot(self.remoteCandidates(), out);
     }
 };
-
-
-
-
 
 /// Explicit state-in/state-out transition. Input and output may alias to avoid a large copy.
 /// Nonaliased input is unchanged. On errors output retains the input's logical state.
@@ -431,7 +431,7 @@ test "nine Noq default probe attempts expire and a new round resets the schedule
     try voidResult(&client, .{ .receiveAdd = .{ .sequence = 0, .address = second } });
     try voidResult(&client, .{ .initiate = 0 });
     const times = [_]i64{
-        0, 33_300_000, 66_600_000, 133_200_000, 266_400_000,
+        0,           33_300_000,    66_600_000,    133_200_000,   266_400_000,
         532_800_000, 1_065_600_000, 2_131_200_000, 4_131_200_000,
     };
     for (times, 0..) |now, index| {
@@ -492,7 +492,8 @@ test "mapped addresses canonicalize and bounded challenge storage rejects a tent
     }
     try voidResult(&state, .{ .recordChallenge = .{ .address = mapped, .token = [_]u8{0} ** 8 } });
     try std.testing.expectError(
-        error.TooManyChallenges, voidResult(&state, .{ .recordChallenge = .{ .address = first, .token = [_]u8{9} ** 8 } }),
+        error.TooManyChallenges,
+        voidResult(&state, .{ .recordChallenge = .{ .address = first, .token = [_]u8{9} ** 8 } }),
     );
     try std.testing.expect(matchedResult(&state, mapped, [_]u8{0} ** 8));
     try std.testing.expect(!matchedResult(&state, first, [_]u8{1} ** 8));
@@ -524,7 +525,8 @@ test "pure transition output aliases or preserves input and clamps peer address 
     try std.testing.expect(output.canRecordChallenge(first));
     for (0..9) |index| {
         const result = try process(&output, .{ .recordChallenge = .{
-            .address = first, .token = [_]u8{@intCast(index)} ** 8,
+            .address = first,
+            .token = [_]u8{@intCast(index)} ** 8,
         } }, &output);
         try std.testing.expectEqual(@as(Result, .none), result);
     }
@@ -557,11 +559,13 @@ test "peer limit 255 is legal but candidate work remains bounded to 32 addresses
     for (0..32) |index| {
         const address = Address.initIpv4(.{ 192, 0, 2, @intCast(index) }, 1000);
         try std.testing.expectEqual(
-            @as(?u64, @intCast(index)), try sequenceResult(&state, .{ .add = address }),
+            @as(?u64, @intCast(index)),
+            try sequenceResult(&state, .{ .add = address }),
         );
     }
     try std.testing.expectError(
-        error.TooManyAddresses, sequenceResult(&state, .{ .add = third }),
+        error.TooManyAddresses,
+        sequenceResult(&state, .{ .add = third }),
     );
     try std.testing.expectEqual(@as(usize, 32), state.localCandidates().len);
 }
@@ -643,7 +647,8 @@ test "exhausted attempts expire all tokens after final response grace" {
     for (0..9) |index| {
         try std.testing.expect(Address.eql(second, probeResult(&state, now).?));
         try voidResult(&state, .{ .recordProbe = .{
-            .address = second, .token = [_]u8{@intCast(index)} ** 8,
+            .address = second,
+            .token = [_]u8{@intCast(index)} ** 8,
         } });
         now = state.deadline().?;
     }

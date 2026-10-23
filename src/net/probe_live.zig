@@ -486,7 +486,7 @@ fn readHead(self: *Live, stop_at: std.Io.Timestamp, cap_ms: i32) ?[]const u8 {
     const buffer = self.options.response;
     var at: usize = 0;
     while (at < buffer.len) {
-        if (std.mem.indexOf(u8, buffer[0..at], header_end)) |end| return buffer[0..end];
+        if (std.mem.find(u8, buffer[0..at], header_end)) |end| return buffer[0..end];
         const left = waitMs(self, stop_at, cap_ms);
         if (left == 0) return null;
         const got = self.options.stream.vtable.read(
@@ -506,10 +506,10 @@ fn readHead(self: *Live, stop_at: std.Io.Timestamp, cap_ms: i32) ?[]const u8 {
 /// this file does not speak is still a status a caller can time, so the version
 /// is skipped rather than matched, and a reason phrase is optional.
 fn statusOf(head: []const u8) ?u16 {
-    const line_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
-    const first = std.mem.indexOfScalar(u8, head[0..line_end], ' ') orelse return null;
+    const line_end = std.mem.find(u8, head, "\r\n") orelse head.len;
+    const first = std.mem.findScalar(u8, head[0..line_end], ' ') orelse return null;
     const rest = head[0..line_end][first + 1 ..];
-    const digits = if (std.mem.indexOfScalar(u8, rest, ' ')) |at| rest[0..at] else rest;
+    const digits = if (std.mem.findScalar(u8, rest, ' ')) |at| rest[0..at] else rest;
     return std.fmt.parseInt(u16, digits, 10) catch null;
 }
 

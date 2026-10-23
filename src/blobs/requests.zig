@@ -447,7 +447,7 @@ test "GetManyRequest.allRanges is upstream's FromIterator" {
 
 test "single blob range resolution clips chunks and refuses disjoint or collection walks" {
     const hash: Hash = @splat(0);
-    const whole = GetRequest.blob(hash).selectedRange(49).?;
+    const whole = GetRequest.blob(hash).selectedRange(49) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u64, 0), whole.start);
     try testing.expectEqual(@as(u64, 49), whole.end);
     try testing.expectEqual(null, GetRequest.all(hash).selectedRange(49));
@@ -456,7 +456,7 @@ test "single blob range resolution clips chunks and refuses disjoint or collecti
         .{ .delta = 1, .spec = range_spec.RangeSpec.empty },
     };
     const partial: GetRequest = .{ .hash = hash, .ranges = .{ .items = &partial_items } };
-    const clipped = partial.selectedRange(49).?;
+    const clipped = partial.selectedRange(49) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u64, 47), clipped.start);
     try testing.expectEqual(@as(u64, 49), clipped.end);
     const gapped_items = [_]range_spec.Item{

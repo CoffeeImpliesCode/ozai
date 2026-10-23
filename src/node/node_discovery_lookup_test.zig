@@ -17,7 +17,9 @@ const Server = struct {
     foreign: bool = false,
 
     fn run(self: *Server) void {
-        self.answer() catch |err| { self.failure = err; };
+        self.answer() catch |err| {
+            self.failure = err;
+        };
     }
 
     fn answer(self: *Server) !void {
@@ -40,19 +42,29 @@ const Server = struct {
         wire.put16(&response, end + 2, 16);
         wire.put16(&response, end + 4, 1);
         wire.put32(&response, end + 6, 60);
+        // ZBC cannot infer `bufPrint`'s successful output is bounded by `record`.
+        // zbc-disable-next-line: index-type-narrowing-wraparound
         wire.put16(&response, end + 10, @intCast(value.len + 1));
+        // ZBC cannot infer `bufPrint`'s successful output length bound at this cast.
+        // zbc-disable-next-line: index-type-narrowing-wraparound
         response[end + 12] = @intCast(value.len);
         @memcpy(response[end + 13 ..][0..value.len], value);
-        _ = try self.handle.send(t.io, got.from, batch.Send.single(response[0 .. end + 13 + value.len], null));
+        _ = try self.handle.send(
+            t.io,
+            got.from,
+            batch.Send.single(response[0 .. end + 13 + value.len], null),
+        );
     }
 };
 
 fn release(value: *node.Node) void {
-    value.close(t.io, 1_000_000_000, value.generator()) catch unreachable;
+    value.close(t.io, 1_000_000_000, value.generator()) catch |err| {
+        std.debug.panic("discovery fixture close failed: {t}", .{err});
+    };
     value.deinit();
 }
 
-test "identity-only discovery resolves through local DNS and carries authenticated application bytes" {
+test "identity-only discovery resolves locally and carries authenticated application bytes" {
     const listener = try node.Node.create(t.allocator, t.io, .{
         .secret = try key.SecretKey.fromSeed(@splat(0x51)),
         .listen = loopback,
@@ -68,7 +80,15 @@ test "identity-only discovery resolves through local DNS and carries authenticat
         .secret = try key.SecretKey.fromSeed(@splat(0xc1)),
         .listen = loopback,
         .alpn = "ozai-discovery-fixture/1",
-        .discovery = .{ .peer_ids = &ids, .lookup = .{ .datagram = resolver.seam(), .server = nameserver.address } },
+        .discovery = .{
+            .peer_ids = &ids,
+            .lookup = .{
+                .datagram = resolver.seam(),
+                .server = nameserver.address,
+                .resolver_stopped = &resolver.stopped,
+                .stream_execution = resolver.stream_execution,
+            },
+        },
     }, 0x2222);
     defer release(client);
     var server: Server = .{ .handle = &nameserver, .target = listener.address() };
@@ -88,8 +108,10 @@ test "identity-only discovery resolves through local DNS and carries authenticat
     if (server.failure) |err| return err;
     try t.expectEqual(@as(usize, 1), client.establishedCount());
     try t.expectEqual(@as(usize, 1), listener.establishedCount());
-    const conn = client.bridge.connectionAt(0).?;
-    try t.expectEqualSlices(u8, &listener.nodeId().toBytes(), &conn.entry.conn.tls13_hs.?.peerNodeId().?);
+    const conn = client.bridge.connectionAt(0) orelse return error.ExpectedClientConnection;
+    const handshake = conn.entry.conn.tls13_hs orelse return error.ExpectedClientHandshake;
+    const peer_id = handshake.peerNodeId() orelse return error.ExpectedAuthenticatedPeer;
+    try t.expectEqualSlices(u8, &listener.nodeId().toBytes(), &peer_id);
     try t.expectEqual(@as(u64, 1), client.stats.discovery_lookups);
     try t.expectEqual(@as(u64, 1), client.stats.dials);
     var stream = try bridge.Stream.open(conn);
@@ -103,10 +125,11 @@ test "identity-only discovery resolves through local DNS and carries authenticat
         at += 1_000_000;
         _ = try client.step(t.io, at, client.generator());
         _ = try listener.step(t.io, at, listener.generator());
-        const accepted = listener.bridge.connectionAt(0).?;
+        const accepted = listener.bridge.connectionAt(0) orelse
+            return error.ExpectedListenerConnection;
         if (accepted.stream(stream_id)) |borrowed| {
             var inbound = borrowed;
-            _ = try inbound.drain(t.allocator, &received);
+            _ = try inbound.drain(t.allocator, &received, payload.len - received.items.len);
         }
     }
     try t.expectEqualStrings(payload, received.items);
@@ -121,7 +144,15 @@ test "failed discovery neither dials nor reports records and is not retried on l
     const client = try node.Node.create(t.allocator, t.io, .{
         .secret = try key.SecretKey.fromSeed(@splat(0xc1)),
         .listen = loopback,
-        .discovery = .{ .peer_ids = &ids, .lookup = .{ .datagram = resolver.seam(), .server = nameserver.address } },
+        .discovery = .{
+            .peer_ids = &ids,
+            .lookup = .{
+                .datagram = resolver.seam(),
+                .server = nameserver.address,
+                .resolver_stopped = &resolver.stopped,
+                .stream_execution = resolver.stream_execution,
+            },
+        },
     }, 0x2222);
     defer release(client);
     var server: Server = .{ .handle = &nameserver, .target = nameserver.address, .foreign = true };
@@ -164,7 +195,12 @@ test "an already attempted static peer is not looked up or dialled twice" {
         .peers = &peers,
         .discovery = .{
             .peer_ids = &ids,
-            .lookup = .{ .datagram = resolver.seam(), .server = nameserver.address },
+            .lookup = .{
+                .datagram = resolver.seam(),
+                .server = nameserver.address,
+                .resolver_stopped = &resolver.stopped,
+                .stream_execution = resolver.stream_execution,
+            },
             .deadline_ms = 1,
         },
     }, 0x2222);

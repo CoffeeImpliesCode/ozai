@@ -69,16 +69,23 @@ pub fn planOpen(
 }
 
 pub fn planSelect(key: Key, slots: *const Slots) Action {
-    const target = find(key, slots) orelse return .none;
-    const path = slots[target.id].?;
-    if (!path.validated or path.selected) return .none;
-    return .{ .select = target };
+    for (slots, 0..) |snapshot, id| {
+        const path = snapshot orelse continue;
+        if (!path.key.eql(key)) continue;
+        if (!path.validated or path.selected) return .none;
+        return .{ .select = .{ .id = @intCast(id), .key = key } };
+    }
+    return .none;
 }
 
 pub fn planProbe(key: Key, slots: *const Slots) Action {
-    const target = find(key, slots) orelse return .none;
-    if (slots[target.id].?.probing) return .none;
-    return .{ .probe = target };
+    for (slots, 0..) |snapshot, id| {
+        const path = snapshot orelse continue;
+        if (!path.key.eql(key)) continue;
+        if (path.probing) return .none;
+        return .{ .probe = .{ .id = @intCast(id), .key = key } };
+    }
+    return .none;
 }
 
 pub fn planRevalidate(
@@ -123,11 +130,12 @@ test "selection cannot promote unvalidated path and action identity detects reus
     const key: Key = .{ .local = local, .peer = peer };
     var slots: Slots = .{ null, .{ .key = key, .validated = false } };
     try std.testing.expect(planSelect(key, &slots) == .none);
-    slots[1].?.validated = true;
+    const selected_slot = if (slots[1]) |*snapshot| snapshot else return error.TestUnexpectedResult;
+    selected_slot.validated = true;
     const action = planSelect(key, &slots);
     try std.testing.expect(action == .select);
     try std.testing.expect(matches(action.select, &slots));
-    slots[1].?.key.peer = local;
+    selected_slot.key.peer = local;
     try std.testing.expect(!matches(action.select, &slots));
     slots[1] = null;
     try std.testing.expect(!matches(action.select, &slots));
@@ -137,8 +145,13 @@ test "pending challenge prevents repeated probes while stale evidence requests r
     const key: Key = .{ .local = local, .peer = peer };
     var slots: Slots = .{ .{ .key = key, .validated = true, .selected = true }, null };
     const entry: path_table.Entry = .{ .addr = .{ .ip = peer }, .status = .open, .rtt = 1 };
-    try std.testing.expect(planRevalidate(&entry, revalidate.revalidate_after + 1, &slots) == .revalidate);
-    slots[0].?.probing = true;
+    try std.testing.expect(
+        planRevalidate(&entry, revalidate.revalidate_after + 1, &slots) == .revalidate,
+    );
+    const probing_slot = if (slots[0]) |*snapshot| snapshot else return error.TestUnexpectedResult;
+    probing_slot.probing = true;
     try std.testing.expect(planProbe(key, &slots) == .none);
-    try std.testing.expect(planRevalidate(&entry, revalidate.revalidate_after + 1, &slots) == .none);
+    try std.testing.expect(
+        planRevalidate(&entry, revalidate.revalidate_after + 1, &slots) == .none,
+    );
 }

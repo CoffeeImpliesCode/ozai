@@ -41,7 +41,7 @@ const std_testing = std.testing;
 /// widening of `Error`: `http_upgrade_types.Error` is what a *request* can be
 /// refused with, and a response that cannot fit its caller's buffer is not a
 /// malformed request.
-const BuildError = Error || error{BufferFull};
+pub const BuildError = Error || error{BufferFull};
 
 const Sha1 = std.crypto.hash.Sha1;
 
@@ -170,7 +170,7 @@ test "RFC 6455 section 1.3: the accept value, directly" {
 
     // The GUID is the RFC's own, and it is the only part of the computation that
     // is not derived from the key, so a wrong constant shows here.
-    try std_testing.expectEqualStrings("258EAFA5-E914-47DA-95CA-C5AB0DC85B11", websocket_guid);
+    try std_testing.expectEqualStrings(vectors.handshake_guid, websocket_guid);
 
     // A different key gives a different accept, which is what makes the value a
     // check on the handshake rather than a constant to copy.

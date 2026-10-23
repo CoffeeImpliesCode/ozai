@@ -445,10 +445,11 @@ test "every step the wind-down performs is in the order, and in it once" {
 test "no step waits on a step the order performs after it" {
     var edges: usize = 0;
     for (order) |step| {
-        const at = position(step).?;
+        const at = position(step) orelse return error.TestUnexpectedResult;
         for (blockedBy(step)) |needed| {
             edges += 1;
-            try t.expect(position(needed).? < at);
+            const needed_at = position(needed) orelse return error.TestUnexpectedResult;
+            try t.expect(needed_at < at);
         }
     }
     // A vacuous pass is a pass over no dependencies, so the sweep above would

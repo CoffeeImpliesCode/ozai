@@ -121,7 +121,7 @@ pub fn Lifecycle(comptime peers: usize) type {
         /// The claims this lifecycle holds. Named so a caller can build the
         /// cache type without naming `ticket_cache`, and so `Self.Cache` reads
         /// as the type of the `cache` field rather than as a second cache.
-        pub const Cache = ticket_cache.TicketCache(ticket_cache.max_tickets);
+        pub const Cache: type = ticket_cache.TicketCache(ticket_cache.max_tickets);
         /// How many peers the connection directory this lifecycle reads holds.
         /// Named because it is the bound the caller passed, and a caller
         /// building a lifecycle wants to read it back rather than repeat it.

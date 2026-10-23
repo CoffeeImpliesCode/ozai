@@ -156,12 +156,11 @@ pub const Report = struct {
     /// mapping hands a different public address to every relay, so a port
     /// guessed from one of them is wrong for all the others.
     pub fn mappingVariesByDest(self: Report) ?bool {
-        const v4 = self.mapping_varies_by_dest_ipv4;
-        const v6 = self.mapping_varies_by_dest_ipv6;
-        if (v4 != null and v6 != null) return v4.? or v6.?;
-        if (v6 != null) return v6;
-        if (v4 != null) return v4;
-        return null;
+        if (self.mapping_varies_by_dest_ipv4) |v4| {
+            if (self.mapping_varies_by_dest_ipv6) |v6| return v4 or v6;
+            return v4;
+        }
+        return self.mapping_varies_by_dest_ipv6;
     }
 
     /// Structural equality, field for field.
@@ -257,61 +256,72 @@ pub const History = struct {
 /// know whether the node is reachable directly has to have probed first.
 pub fn fold(probes: []const ProbeResult, history: History, now: Nanos) Report {
     var report: Report = .{};
-    var varying_v4: Varying = .{};
-    var varying_v6: Varying = .{};
-    var best_v4: ?QadProbe = null;
-    var best_v6: ?QadProbe = null;
+    var ipv4: FoldFamily = .{};
+    var ipv6: FoldFamily = .{};
 
     for (probes) |probe| {
         // A full list is not a fold failure: it costs a slower preferred relay,
         // not a wrong one, and the report has no field to record it in.
         _ = report.relay_latency.update(probe.relay(), probe.latency(), probe.kind());
-        switch (probe) {
-            .https => {},
-            .qad_ipv4 => |qad| switch (qad.addr.ip) {
-                .v4 => {
-                    report.udp_v4 = true;
-                    varying_v4.observe(qad.addr);
-                    if (best_v4 == null or beats(qad, best_v4.?)) best_v4 = qad;
-                },
-                // A relay answering a v4 probe with a v6 address. Upstream logs
-                // it and returns, and the return comes after the latency is
-                // already recorded, so the measurement is kept and the address is
-                // dropped. Kept here for the same reason, and the address is not
-                // classified: a NAT characterised from an address of the wrong
-                // family is the failure this module exists to prevent.
-                .v6 => {},
-            },
-            .qad_ipv6 => |qad| switch (qad.addr.ip) {
-                .v6 => {
-                    report.udp_v6 = true;
-                    varying_v6.observe(qad.addr);
-                    if (best_v6 == null or beats(qad, best_v6.?)) best_v6 = qad;
-                },
-                .v4 => {},
-            },
-        }
+        foldObserve(probe, &ipv4, &ipv6);
     }
 
-    report.mapping_varies_by_dest_ipv4 = varying_v4.classify();
-    report.mapping_varies_by_dest_ipv6 = varying_v6.classify();
-    if (best_v4) |probe| report.global_v4 = probe.addr;
-    if (best_v6) |probe| report.global_v6 = probe.addr;
-
-    if (history.last) |last| {
-        // A round that measured nothing inherits the last answer rather than
-        // dropping back to "unknown", which would make an unchanged NAT look
-        // newly unclassified every time a probe failed.
-        if (report.mapping_varies_by_dest_ipv4 == null) {
-            report.mapping_varies_by_dest_ipv4 = last.mapping_varies_by_dest_ipv4;
-        }
-        if (report.mapping_varies_by_dest_ipv6 == null) {
-            report.mapping_varies_by_dest_ipv6 = last.mapping_varies_by_dest_ipv6;
-        }
-    }
+    report.udp_v4 = ipv4.varying.count != 0;
+    report.udp_v6 = ipv6.varying.count != 0;
+    report.mapping_varies_by_dest_ipv4 = ipv4.varying.classify();
+    report.mapping_varies_by_dest_ipv6 = ipv6.varying.classify();
+    report.global_v4 = ipv4.address();
+    report.global_v6 = ipv6.address();
+    foldInheritClassification(&report, history.last);
 
     choosePreferredRelay(&report, history, now);
     return report;
+}
+
+const FoldFamily = struct {
+    varying: Varying = .{},
+    best: ?QadProbe = null,
+
+    fn observe(self: *FoldFamily, probe: QadProbe) void {
+        self.varying.observe(probe.addr);
+        if (self.best) |held| {
+            if (beats(probe, held)) self.best = probe;
+        } else {
+            self.best = probe;
+        }
+    }
+
+    fn address(self: *const FoldFamily) ?SocketAddr {
+        const best = self.best orelse return null;
+        return best.addr;
+    }
+};
+
+fn foldObserve(probe: ProbeResult, ipv4: *FoldFamily, ipv6: *FoldFamily) void {
+    switch (probe) {
+        .https => {},
+        .qad_ipv4 => |qad| switch (qad.addr.ip) {
+            .v4 => ipv4.observe(qad),
+            // Keep the latency but reject an address from the wrong family:
+            // it cannot classify the NAT that this probe measured.
+            .v6 => {},
+        },
+        .qad_ipv6 => |qad| switch (qad.addr.ip) {
+            .v6 => ipv6.observe(qad),
+            .v4 => {},
+        },
+    }
+}
+
+fn foldInheritClassification(report: *Report, previous: ?Report) void {
+    const last = previous orelse return;
+    // A round without a classification retains the previous answer.
+    if (report.mapping_varies_by_dest_ipv4 == null) {
+        report.mapping_varies_by_dest_ipv4 = last.mapping_varies_by_dest_ipv4;
+    }
+    if (report.mapping_varies_by_dest_ipv6 == null) {
+        report.mapping_varies_by_dest_ipv6 = last.mapping_varies_by_dest_ipv6;
+    }
 }
 
 /// Whether `candidate` is the better of two observations of the same public
@@ -369,8 +379,10 @@ fn choosePreferredRelay(report: *Report, history: History, now: Nanos) void {
 
     if (history.last) |last| {
         const current = last.preferred_relay orelse return;
-        const moved = report.preferred_relay == null or
-            report.preferred_relay.?.order(current) != .eq;
+        const moved = if (report.preferred_relay) |preferred|
+            preferred.order(current) != .eq
+        else
+            true;
         // Two thirds, floored: `(latency / 3) * 2` upstream, and the comparison
         // is strict so a challenger that is exactly two thirds does not move us.
         if (moved and current_latency != 0 and best_any > @divFloor(current_latency, 3) * 2) {
@@ -425,7 +437,7 @@ test "two probes that report the same public address do not vary" {
     try t.expectEqual(@as(?bool, false), report.mappingVariesByDest());
     try t.expect(report.udp_v4);
     try t.expect(!report.udp_v6);
-    try t.expectEqual(public_v4, report.global_v4.?);
+    try t.expectEqual(@as(?SocketAddr, public_v4), report.global_v4);
 }
 
 test "two probes that report different public addresses vary by destination" {
@@ -469,7 +481,7 @@ test "one probe has nothing to compare against" {
     try t.expectEqual(@as(?bool, null), report.mappingVariesByDest());
     // The address is still reported: one probe is enough to publish, and is not
     // enough to classify.
-    try t.expectEqual(public_v4, report.global_v4.?);
+    try t.expectEqual(@as(?SocketAddr, public_v4), report.global_v4);
     try t.expect(report.hasUdp());
 }
 
@@ -528,7 +540,7 @@ test "an address of the wrong family is a measurement and nothing more" {
     try t.expectEqual(@as(?SocketAddr, null), report.global_v4);
     try t.expectEqual(@as(?bool, null), report.mapping_varies_by_dest_ipv4);
     // The latency stands: the relay did answer.
-    try t.expectEqual(millis(10), report.relay_latency.get(a).?);
+    try t.expectEqual(@as(?Nanos, millis(10)), report.relay_latency.get(a));
 }
 
 test "folding nothing produces a report that claims nothing" {
@@ -567,7 +579,7 @@ test "the public address is the one on the best observation" {
             .addr = other_v4,
         } },
     }, .{}, test_now);
-    try t.expectEqual(public_v4, fastest.global_v4.?);
+    try t.expectEqual(@as(?SocketAddr, public_v4), fastest.global_v4);
 
     // Equal latency, so the fresher observation wins — and it is a property of
     // the probe, not of where it sat in the slice.
@@ -585,7 +597,7 @@ test "the public address is the one on the best observation" {
             .addr = other_v4,
         } },
     }, .{}, test_now);
-    try t.expectEqual(other_v4, tied.global_v4.?);
+    try t.expectEqual(@as(?SocketAddr, other_v4), tied.global_v4);
     // Whichever way that went, the two addresses disagree, so the mapping is
     // destination-dependent and the choice above is only which one to publish.
     try t.expectEqual(@as(?bool, true), tied.mapping_varies_by_dest_ipv4);
@@ -601,7 +613,8 @@ test "the preferred relay is the lowest recent latency" {
         .{ .https = .{ .relay = c, .instant = test_now, .latency = millis(30) } },
     }, .{}, test_now);
 
-    try t.expectEqual(std.math.Order.eq, report.preferred_relay.?.order(b));
+    const preferred = report.preferred_relay orelse return error.TestUnexpectedResult;
+    try t.expectEqual(std.math.Order.eq, preferred.order(b));
 }
 
 test "a report outside the age window stops steering the preferred relay" {
@@ -618,20 +631,23 @@ test "a report outside the age window stops steering the preferred relay" {
     const fresh = fold(&probes, .{
         .entries = &.{.{ .instant = test_now - millis(1), .report = old_report }},
     }, test_now);
-    try t.expectEqual(std.math.Order.eq, fresh.preferred_relay.?.order(b));
+    const fresh_preferred = fresh.preferred_relay orelse return error.TestUnexpectedResult;
+    try t.expectEqual(std.math.Order.eq, fresh_preferred.order(b));
 
     // Same claim, one nanosecond too old. `now` is the only clock in the fold,
     // and moving it is the only thing that retires the measurement.
     const stale = fold(&probes, .{
         .entries = &.{.{ .instant = test_now - max_report_age - 1, .report = old_report }},
     }, test_now);
-    try t.expectEqual(std.math.Order.eq, stale.preferred_relay.?.order(a));
+    const stale_preferred = stale.preferred_relay orelse return error.TestUnexpectedResult;
+    try t.expectEqual(std.math.Order.eq, stale_preferred.order(a));
 
     // An entry stamped in the future is not stale; it is not yet old.
     const ahead = fold(&probes, .{
         .entries = &.{.{ .instant = test_now + millis(1), .report = old_report }},
     }, test_now);
-    try t.expectEqual(std.math.Order.eq, ahead.preferred_relay.?.order(b));
+    const ahead_preferred = ahead.preferred_relay orelse return error.TestUnexpectedResult;
+    try t.expectEqual(std.math.Order.eq, ahead_preferred.order(b));
 }
 
 test "the preferred relay holds unless a challenger beats two thirds" {
@@ -647,19 +663,22 @@ test "the preferred relay holds unless a challenger beats two thirds" {
         .{ .https = .{ .relay = a, .instant = test_now, .latency = millis(30) } },
         .{ .https = .{ .relay = b, .instant = test_now, .latency = millis(21) } },
     }, .{ .last = last }, test_now);
-    try t.expectEqual(std.math.Order.eq, held.preferred_relay.?.order(a));
+    const held_preferred = held.preferred_relay orelse return error.TestUnexpectedResult;
+    try t.expectEqual(std.math.Order.eq, held_preferred.order(a));
 
     const exact = fold(&.{
         .{ .https = .{ .relay = a, .instant = test_now, .latency = millis(30) } },
         .{ .https = .{ .relay = b, .instant = test_now, .latency = millis(20) } },
     }, .{ .last = last }, test_now);
-    try t.expectEqual(std.math.Order.eq, exact.preferred_relay.?.order(b));
+    const exact_preferred = exact.preferred_relay orelse return error.TestUnexpectedResult;
+    try t.expectEqual(std.math.Order.eq, exact_preferred.order(b));
 
     const decisive = fold(&.{
         .{ .https = .{ .relay = a, .instant = test_now, .latency = millis(30) } },
         .{ .https = .{ .relay = b, .instant = test_now, .latency = millis(19) } },
     }, .{ .last = last }, test_now);
-    try t.expectEqual(std.math.Order.eq, decisive.preferred_relay.?.order(b));
+    const decisive_preferred = decisive.preferred_relay orelse return error.TestUnexpectedResult;
+    try t.expectEqual(std.math.Order.eq, decisive_preferred.order(b));
 
     // With no previous relay there is nothing to hold, so the same measurement
     // moves at once.
@@ -667,7 +686,8 @@ test "the preferred relay holds unless a challenger beats two thirds" {
         .{ .https = .{ .relay = a, .instant = test_now, .latency = millis(30) } },
         .{ .https = .{ .relay = b, .instant = test_now, .latency = millis(20) } },
     }, .{}, test_now);
-    try t.expectEqual(std.math.Order.eq, first.preferred_relay.?.order(b));
+    const first_preferred = first.preferred_relay orelse return error.TestUnexpectedResult;
+    try t.expectEqual(std.math.Order.eq, first_preferred.order(b));
 }
 
 test "a classification carries forward until it is measured again" {
@@ -786,9 +806,10 @@ test "the fold is the same report for every ordering of the same probes" {
     try t.expectEqual(@as(?bool, true), baseline.mapping_varies_by_dest_ipv4);
     try t.expectEqual(@as(?bool, null), baseline.mapping_varies_by_dest_ipv6);
     try t.expectEqual(@as(?bool, true), baseline.mappingVariesByDest());
-    try t.expectEqual(public_v4, baseline.global_v4.?);
-    try t.expectEqual(public_v6, baseline.global_v6.?);
-    try t.expectEqual(std.math.Order.eq, baseline.preferred_relay.?.order(b));
+    try t.expectEqual(@as(?SocketAddr, public_v4), baseline.global_v4);
+    try t.expectEqual(@as(?SocketAddr, public_v6), baseline.global_v6);
+    const preferred = baseline.preferred_relay orelse return error.TestUnexpectedResult;
+    try t.expectEqual(std.math.Order.eq, preferred.order(b));
 }
 
 test "a report prints the claims it can make" {

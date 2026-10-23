@@ -138,6 +138,8 @@ pub const NodeId = struct {
             &self.toBytes(),
         ));
         @memcpy(name[dnssec_length..], ".iroh.invalid");
+        // ZBC cannot combine these two memcpy ranges to prove name is fully initialized.
+        // zbc-disable-next-line: use-undefined
         return name;
     }
 

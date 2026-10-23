@@ -223,7 +223,9 @@ const Scripted = struct {
     reason: ?[]const u8,
 
     fn decide(context: ?*anyopaque, identity: Identity) Decision {
-        const self: *Scripted = @ptrCast(@alignCast(context.?));
+        // Every Scripted policy binds its caller-owned script as the callback context.
+        const bound_context = context orelse @panic("Scripted policy has no context");
+        const self: *Scripted = @ptrCast(@alignCast(bound_context));
         self.asked += 1;
         if (self.allowed.order(identity.node_id) == .eq) return .accept;
         return .{ .refuse = .{ .code = .unknown_peer, .text = self.reason } };

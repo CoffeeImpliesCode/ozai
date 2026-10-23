@@ -35,7 +35,6 @@ const tcp_error = @import("tcp_error.zig");
 const c = std.c;
 const linux = std.os.linux;
 
-const boundAddress = socket_open.boundAddress;
 const ConnectError = tcp_error.ConnectError;
 const OpenError = tcp_error.OpenError;
 const ReadError = tcp_error.ReadError;
@@ -95,28 +94,20 @@ pub fn createStream(address: base_addr.IpAddress) OpenError!c.fd_t {
 /// leaves the state of a socket after `ECONNREFUSED` implementation-defined and
 /// no retry on the same descriptor can rely on it.
 pub fn beginConnect(
-    handle: c.fd_t,
     io: std.Io,
+    handle: c.fd_t,
     peer: base_addr.SocketAddr,
 ) ConnectError!bool {
     var name: c.sockaddr.storage = undefined;
     const length = writeSockaddr(peer, &name);
-    var attempt: usize = 0;
-    while (attempt < max_syscall_attempts) : (attempt += 1) {
-        // A signal arrived before the connect did. Asking again is the only
-        // correct answer, and the loop is also where a cancellation lands.
-        try io.checkCancel();
-        const rc = c.connect(handle, @as(*const c.sockaddr, @ptrCast(&name)), length);
-        switch (c.errno(rc)) {
-            .SUCCESS => return true,
-            .INTR => continue,
-            // The answer a non-blocking connect gives instead of the outcome,
-            // and the only two ways it gives it.
-            .INPROGRESS, .AGAIN => return false,
-            else => |errno| return connectFromErrno(errno),
-        }
-    }
-    return error.Interrupted;
+    try io.checkCancel();
+    const rc = c.connect(handle, @as(*const c.sockaddr, @ptrCast(&name)), length);
+    return switch (c.errno(rc)) {
+        .SUCCESS => true,
+        // EINTR may already have started the handshake; never repeat connect.
+        .INPROGRESS, .ALREADY, .AGAIN, .INTR => false,
+        else => |errno| connectFromErrno(errno),
+    };
 }
 
 /// The reason a connect that was in progress did not finish.
@@ -153,33 +144,11 @@ fn connectFromErrno(errno: c.E) ConnectError {
         .ACCES, .PERM => error.PermissionDenied,
         .CONNRESET => error.ConnectionReset,
         .NOMEM, .NOBUFS => error.ResourcesExhausted,
-        // `EINTR` has already been retried `max_syscall_attempts` times by
-        // the loop that calls this, so reaching it here means the retry budget
-        // ran out inside one mapping.
+        // SO_ERROR may itself still describe an interrupted outcome.
         .INTR => error.Interrupted,
         // `EAGAIN` here is a kernel that has not decided yet rather than a
         // refusal, and the caller that asked for a result expects a decision.
         .AGAIN => error.Interrupted,
-        else => error.Unexpected,
-    };
-}
-
-/// The address this descriptor is bound to, in the vocabulary a connect
-/// refuses with.
-///
-/// The `getsockname` itself is `transport/socket_open.zig`'s `boundAddress`,
-/// reused rather than reimplemented. What this adds is the translation: that
-/// function answers in `socket_error.OpenError` because for a UDP socket the
-/// bind is the interesting step and its refusals are the interesting ones,
-/// while a stream's local address is the kernel's choice at `connect` and the
-/// only two failures a caller can act on are "there is no local address" and
-/// "the answer was not one this module could read". Every other arm of
-/// `OpenError` describes a condition `socket(2)` or `bind(2)` refused with, and
-/// this descriptor exists, so they collapse to `Unexpected` rather than being
-/// spelled in two vocabularies.
-pub fn localAddress(handle: c.fd_t) ConnectError!base_addr.SocketAddr {
-    return boundAddress(handle) catch |err| switch (err) {
-        error.AddressNotAvailable => error.AddressNotAvailable,
         else => error.Unexpected,
     };
 }
@@ -199,7 +168,7 @@ pub fn localAddress(handle: c.fd_t) ConnectError!base_addr.SocketAddr {
 /// rather than raise `SIGPIPE` there, which would take down whichever task
 /// happened to hold the thread. `EPIPE` then arrives as `error.PeerClosed`
 /// with nothing written.
-pub fn sendStream(handle: c.fd_t, io: std.Io, bytes: []const u8) WriteError!usize {
+pub fn sendStream(io: std.Io, handle: c.fd_t, bytes: []const u8) WriteError!usize {
     var attempt: usize = 0;
     while (attempt < max_syscall_attempts) : (attempt += 1) {
         try io.checkCancel();
@@ -228,7 +197,7 @@ pub fn sendStream(handle: c.fd_t, io: std.Io, bytes: []const u8) WriteError!usiz
 /// and not an error because the peer that half-closed can still read — the
 /// other direction is open until this one closes it — so a refusal here would
 /// tell a caller the stream is finished when it is only half finished.
-pub fn recvStream(handle: c.fd_t, io: std.Io, buffer: []u8) ReadError!usize {
+pub fn recvStream(io: std.Io, handle: c.fd_t, buffer: []u8) ReadError!usize {
     var attempt: usize = 0;
     while (attempt < max_syscall_attempts) : (attempt += 1) {
         try io.checkCancel();
@@ -243,6 +212,84 @@ pub fn recvStream(handle: c.fd_t, io: std.Io, buffer: []u8) ReadError!usize {
             .AGAIN => return error.WouldBlock,
             .CONNRESET => return error.ConnectionReset,
             .NOTCONN => return error.NotConnected,
+            .NOMEM, .NOBUFS => return error.ResourcesExhausted,
+            else => return error.Unexpected,
+        }
+    }
+    return error.Interrupted;
+}
+
+pub fn listenStream(io: std.Io, handle: c.fd_t) tcp_error.ListenError!void {
+    var attempt: usize = 0;
+    while (attempt < max_syscall_attempts) : (attempt += 1) {
+        try io.checkCancel();
+        switch (c.errno(c.listen(handle, 128))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .ADDRINUSE => return error.AddressInUse,
+            .ACCES, .PERM => return error.PermissionDenied,
+            .NOMEM, .NOBUFS => return error.ResourcesExhausted,
+            .OPNOTSUPP => return error.SocketModeUnsupported,
+            .INVAL => return error.InvalidArgument,
+            else => return error.Unexpected,
+        }
+    }
+    return error.Interrupted;
+}
+
+pub fn acceptStream(
+    io: std.Io,
+    handle: c.fd_t,
+) tcp_error.AcceptError!?@import("tcp_execution.zig").Accepted {
+    var attempt: usize = 0;
+    while (attempt < max_syscall_attempts) : (attempt += 1) {
+        try io.checkCancel();
+        var name: c.sockaddr.storage = undefined;
+        var length: c.socklen_t = @sizeOf(c.sockaddr.storage);
+        const accepted = c.accept4(handle, @ptrCast(&name), &length, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
+        if (accepted >= 0) return .{
+            .handle = accepted,
+            .peer = socket_addr.readSockaddr(&name),
+        };
+        switch (c.errno(accepted)) {
+            .INTR => continue,
+            .AGAIN => return null,
+            .CONNABORTED => return error.ConnectionAborted,
+            .ACCES, .PERM => return error.PermissionDenied,
+            .MFILE, .NFILE => return error.DescriptorQuotaExceeded,
+            .NOMEM, .NOBUFS => return error.ResourcesExhausted,
+            .NETDOWN => return error.NetworkDown,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .HOSTUNREACH, .HOSTDOWN => return error.HostUnreachable,
+            .PROTO, .NOPROTOOPT => return error.ProtocolUnsupported,
+            .OPNOTSUPP => return error.SocketModeUnsupported,
+            .INVAL => return error.InvalidArgument,
+            else => return error.Unexpected,
+        }
+    }
+    return error.Interrupted;
+}
+
+pub fn waitStream(
+    io: std.Io,
+    options: @import("tcp_execution.zig").WaitOptions,
+) tcp_error.WaitError!void {
+    var descriptors = [_]std.posix.pollfd{
+        .{ .fd = options.handle, .events = options.events, .revents = 0 },
+        .{ .fd = options.wake, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+    var attempt: usize = 0;
+    while (attempt < max_syscall_attempts) : (attempt += 1) {
+        try io.checkCancel();
+        const result = c.poll(&descriptors, descriptors.len, options.timeout_ms orelse -1);
+        switch (c.errno(result)) {
+            .SUCCESS => {
+                if (descriptors[1].revents != 0) return error.Canceled;
+                if (descriptors[0].revents == 0) return error.WouldBlock;
+                return;
+            },
+            .INTR => continue,
+            .NETDOWN => return error.NetworkDown,
             .NOMEM, .NOBUFS => return error.ResourcesExhausted,
             else => return error.Unexpected,
         }
@@ -287,13 +334,13 @@ test "a stream nobody connected refuses the calls a stream makes" {
     const handle = try createStream(.{ .v4 = .{ 127, 0, 0, 1 } });
     defer _ = c.close(handle);
     var buffer: [8]u8 = undefined;
-    try t.expectError(error.NotConnected, recvStream(handle, t.io, &buffer));
+    try t.expectError(error.NotConnected, recvStream(t.io, handle, &buffer));
     // A write, though, is `EPIPE` and not `ENOTCONN` on Linux: `send(2)` on a
     // TCP socket in `CLOSE` answers `EPIPE` whatever state the socket is in,
     // and `EPIPE` is this module's `PeerClosed`. So the arm the *write* reaches
     // here is the one a peer that closed would reach, and the read above is the
     // one that proves the pair stays distinct from `WouldBlock`.
-    try t.expectError(error.PeerClosed, sendStream(handle, t.io, "x"));
+    try t.expectError(error.PeerClosed, sendStream(t.io, handle, "x"));
 
     // And the connect outcome of a connect nobody asked for is "no error",
     // which is `SO_ERROR` answering zero. This is the case that would be easy
@@ -305,5 +352,5 @@ test "a stream nobody connected refuses the calls a stream makes" {
     // which is what `connect` overwrites with the ephemeral port the kernel
     // chose — so `Tcp.local` starts there too rather than at a value this
     // module would have to invent.
-    try t.expectEqual(@as(u16, 0), (try localAddress(handle)).port);
+    try t.expectEqual(@as(u16, 0), (try socket_open.boundAddress(handle)).port);
 }

@@ -246,8 +246,16 @@ pub const Latencies = struct {
         self.next = if (self.next + 1 == max_samples) 0 else self.next + 1;
         if (self.len < max_samples) self.len += 1;
         self.recorded +|= 1;
-        if (self.fastest == null or value < self.fastest.?) self.fastest = value;
-        if (self.slowest == null or value > self.slowest.?) self.slowest = value;
+        if (self.fastest) |fastest| {
+            if (value < fastest) self.fastest = value;
+        } else {
+            self.fastest = value;
+        }
+        if (self.slowest) |slowest| {
+            if (value > slowest) self.slowest = value;
+        } else {
+            self.slowest = value;
+        }
     }
 
     /// Copy the window into `out`, oldest first, and hand back the part of
@@ -275,6 +283,8 @@ pub const Latencies = struct {
         const held = self.window(scratch);
         var out: Summary = .{
             .recorded = self.recorded,
+            // window returns a slice of the 16-slot array; ZBC cannot prove its length bound.
+            // zbc-disable-next-line: index-type-narrowing-wraparound
             .held = @intCast(held.len),
             .fastest = self.fastest,
             .slowest = self.slowest,
@@ -536,17 +546,17 @@ test "an instant ages from when it was marked and is absent before it" {
     try t.expectEqual(@as(?Nanos, null), last.since(100));
 
     last.mark(100);
-    try t.expectEqual(@as(Nanos, 40), last.since(140).?);
+    try t.expectEqual(@as(?Nanos, 40), last.since(140));
 
     // A caller whose timeline runs behind the mark reads zero, not a
     // subtraction that wraps into the far past.
-    try t.expectEqual(@as(Nanos, 0), last.since(40).?);
+    try t.expectEqual(@as(?Nanos, 0), last.since(40));
 
     // "Never observed" and "observed at zero" are different facts, and only
     // one of them survives the first mark.
     var at_origin: Last = .{};
     at_origin.mark(0);
-    try t.expectEqual(@as(Nanos, 0), at_origin.since(0).?);
+    try t.expectEqual(@as(?Nanos, 0), at_origin.since(0));
 }
 
 test "a ninth subject is refused and nothing is evicted" {
@@ -578,17 +588,18 @@ test "a ninth subject is refused and nothing is evicted" {
 test "a subject already carried is already and keeps every figure" {
     var table: Table = .{};
     try t.expectEqual(Opened.filed, try table.open(testSubject(1)));
-    table.find(testSubject(1)).?.attempt(millis(10), 100);
+    const initial = table.find(testSubject(1)) orelse return error.TestUnexpectedResult;
+    initial.attempt(millis(10), 100);
 
     try t.expectEqual(Opened.already, try table.open(testSubject(1)));
     try t.expectEqual(@as(usize, 1), table.count());
 
     // A repeated open cannot reset anything either: a duplicate filing on
     // every later round must not look like a fresh subject.
-    const entry = table.find(testSubject(1)).?;
+    const entry = table.find(testSubject(1)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(u64, 1), entry.attempted.value);
     try t.expectEqual(@as(u64, 1), entry.latency.recorded);
-    try t.expectEqual(@as(Nanos, 100), entry.last.at.?);
+    try t.expectEqual(@as(?Nanos, 100), entry.last.at);
 }
 
 test "closing a subject frees its slot and an absent one frees nothing" {
@@ -636,7 +647,7 @@ test "the table's order is the subjects' order and not the order they arrived" {
 test "an attempt that never got an answer is a count and no sample" {
     var table: Table = .{};
     _ = try table.open(testSubject(1));
-    const entry = table.find(testSubject(1)).?;
+    const entry = table.find(testSubject(1)) orelse return error.TestUnexpectedResult;
     var scratch: [max_samples]Nanos = undefined;
 
     entry.attempt(null, 500);
@@ -656,14 +667,14 @@ test "an attempt that never got an answer is a count and no sample" {
     entry.attempt(millis(7), 600);
     try t.expectEqual(@as(u64, 2), entry.attempted.value);
     try t.expectEqual(@as(u64, 1), entry.failed());
-    try t.expectEqual(millis(7), entry.latency.summary(&scratch).median.?);
-    try t.expectEqual(@as(Nanos, 0), entry.last.since(600).?);
+    try t.expectEqual(@as(?Nanos, millis(7)), entry.latency.summary(&scratch).median);
+    try t.expectEqual(@as(?Nanos, 0), entry.last.since(600));
 }
 
 test "the window forgets the oldest sample, counts it, and keeps the extremes" {
     var table: Table = .{};
     _ = try table.open(testSubject(1));
-    const entry = table.find(testSubject(1)).?;
+    const entry = table.find(testSubject(1)) orelse return error.TestUnexpectedResult;
     var scratch: [max_samples]Nanos = undefined;
 
     // An empty set reports nothing measured, and has dropped nothing.
@@ -683,31 +694,31 @@ test "the window forgets the oldest sample, counts it, and keeps the extremes" {
 
     // The all-time extrema survive every overwrite. 1 ms is nowhere in the
     // window any more and is still the fastest ever seen.
-    try t.expectEqual(millis(1), summary.fastest.?);
-    try t.expectEqual(millis(max_samples + 4), summary.slowest.?);
+    try t.expectEqual(@as(?Nanos, millis(1)), summary.fastest);
+    try t.expectEqual(@as(?Nanos, millis(max_samples + 4)), summary.slowest);
 
     // The window is the most recent sixteen — 5 ms through 20 ms — and the
     // median is the lower of its two middles.
-    try t.expectEqual(millis(12), summary.median.?);
+    try t.expectEqual(@as(?Nanos, millis(12)), summary.median);
 }
 
 test "the median of an even window is a sample and not a midpoint" {
     var table: Table = .{};
     _ = try table.open(testSubject(1));
-    const entry = table.find(testSubject(1)).?;
+    const entry = table.find(testSubject(1)) orelse return error.TestUnexpectedResult;
     var scratch: [max_samples]Nanos = undefined;
 
     entry.attempt(millis(10), 1);
     entry.attempt(millis(20), 2);
 
     // 15 ms is a round trip nobody made. The lower of the two middles is one.
-    try t.expectEqual(millis(10), entry.latency.summary(&scratch).median.?);
+    try t.expectEqual(@as(?Nanos, millis(10)), entry.latency.summary(&scratch).median);
 }
 
 test "the window reads oldest first once the ring has wrapped" {
     var table: Table = .{};
     _ = try table.open(testSubject(1));
-    const entry = table.find(testSubject(1)).?;
+    const entry = table.find(testSubject(1)) orelse return error.TestUnexpectedResult;
 
     var step: u64 = 1;
     while (step <= max_samples + 2) : (step += 1) entry.attempt(millis(step), step);

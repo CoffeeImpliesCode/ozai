@@ -226,7 +226,7 @@ fn millis(n: u64) Nanos {
 
 /// The relay the fold names, with `latency` as this round's figure for it.
 fn homeOn(wanted: RelayUrl, latency: Nanos) Report {
-    var latencies = report_mod.RelayLatencies{};
+    var latencies: report_mod.RelayLatencies = .{};
     _ = latencies.update(wanted, latency, .https);
     return .{ .preferred_relay = wanted, .relay_latency = latencies };
 }
@@ -342,7 +342,7 @@ test "a relay this node does not dial is refused and nothing takes its place" {
     // the report's own latency table with a slower figure, and it is not
     // promoted. Ranking it is `relay_selection`'s job, and this answer is the
     // fact that the report is about somebody else's relay.
-    var latencies = report_mod.RelayLatencies{};
+    var latencies: report_mod.RelayLatencies = .{};
     _ = latencies.update(mine, millis(90), .https);
     try t.expectEqual(millis(90), latencies.get(mine).?);
     const again = prefer(.{

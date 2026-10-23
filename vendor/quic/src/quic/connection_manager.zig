@@ -771,7 +771,10 @@ pub const ConnectionManager = struct {
                 var validation: TokenProvenance = .unvalidated;
                 if (token.len > 0) {
                     retry_token = packet.validateRetryToken(
-                        token, from, self.retry_token_key, now,
+                        token,
+                        from,
+                        self.retry_token_key,
+                        now,
                     ) catch null;
                     if (retry_token != null) {
                         validation = .retry;
@@ -808,8 +811,7 @@ pub const ConnectionManager = struct {
                     header,
                     local,
                     from,
-                    if (retry_token) |*vt| vt.getOdcid() else
-                        if (validation == .new_token) header.dcid else null,
+                    if (retry_token) |*vt| vt.getOdcid() else if (validation == .new_token) header.dcid else null,
                     if (retry_token) |*vt| vt.getRetryScid() else null,
                     now,
                     random,
@@ -868,7 +870,13 @@ pub const ConnectionManager = struct {
         random.bytes(&retry_scid);
         var token_buf: [packet.TOKEN_MAX_LEN]u8 = undefined;
         const token_len = packet.generateRetryToken(
-            &token_buf, header.dcid, &retry_scid, from, self.retry_token_key, now, random,
+            &token_buf,
+            header.dcid,
+            &retry_scid,
+            from,
+            self.retry_token_key,
+            now,
+            random,
         ) catch return .{ .dropped = {} };
         var retry_fbs = io.fixedBufferStream(out_buf);
         packet.retry(header, &retry_scid, token_buf[0..token_len], &retry_fbs) catch
@@ -1572,7 +1580,8 @@ test "Initial policy sends real Retry before allocation and accepts its echo onc
             std.debug.assert(initial.dcid.len >= MIN_INITIAL_DCID_LEN);
             std.debug.assert(initial.version == protocol.SUPPORTED_VERSIONS[0]);
             std.debug.assert(initial.local.eql(address.Address.initIpv4(
-                .{ 127, 0, 0, 1 }, 5000,
+                .{ 127, 0, 0, 1 },
+                5000,
             )));
             return if (initial.validation == .unvalidated) .retry else .accept;
         }
@@ -1589,7 +1598,13 @@ test "Initial policy sends real Retry before allocation and accepts its echo onc
         alloc.destroy(client.conn);
     }
     const response = switch (try mgr.recvDatagram(
-        buf[0..client.len], source, local, 0, &out, test_now, random,
+        buf[0..client.len],
+        source,
+        local,
+        0,
+        &out,
+        test_now,
+        random,
     )) {
         .send_response => |bytes| bytes,
         else => return error.TestUnexpectedResult,
@@ -1600,7 +1615,9 @@ test "Initial policy sends real Retry before allocation and accepts its echo onc
     try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
     try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
     client.conn.handleDatagram(@constCast(response), .{
-        .to = source, .from = local, .datagram_size = response.len,
+        .to = source,
+        .from = local,
+        .datagram_size = response.len,
     }, test_now, random);
     try std.testing.expect(client.conn.retry_received);
     const len = try client.conn.sendAt(&buf, test_now, random);
@@ -1609,7 +1626,13 @@ test "Initial policy sends real Retry before allocation and accepts its echo onc
     // A token from another source never becomes validated and costs no allocation.
     const altered = address.Address.initIpv4(.{ 127, 0, 0, 2 }, 4000);
     try std.testing.expect((try mgr.recvDatagram(
-        echo[0..len], altered, local, 0, &out, test_now, random,
+        echo[0..len],
+        altered,
+        local,
+        0,
+        &out,
+        test_now,
+        random,
     )) == .send_response);
     try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
     failing.fail_index = std.math.maxInt(usize);
@@ -1618,7 +1641,13 @@ test "Initial policy sends real Retry before allocation and accepts its echo onc
     try std.testing.expectEqual(TokenProvenance.retry, accepted.processed.initial_validation);
     try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
     try std.testing.expect((try mgr.recvDatagram(
-        echo[0..len], source, local, 0, &out, test_now, random,
+        echo[0..len],
+        source,
+        local,
+        0,
+        &out,
+        test_now,
+        random,
     )) == .processed);
     try std.testing.expectEqual(@as(usize, 1), mgr.connectionCount());
 }
@@ -1645,14 +1674,28 @@ test "Initial policy cannot send a second Retry for a validated flow" {
         alloc.destroy(client.conn);
     }
     const retry = (try mgr.recvDatagram(
-        buf[0..client.len], addr, addr, 0, &out, test_now, random,
+        buf[0..client.len],
+        addr,
+        addr,
+        0,
+        &out,
+        test_now,
+        random,
     )).send_response;
     client.conn.handleDatagram(@constCast(retry), .{
-        .to = addr, .from = addr, .datagram_size = retry.len,
+        .to = addr,
+        .from = addr,
+        .datagram_size = retry.len,
     }, test_now, random);
     const len = try client.conn.sendAt(&buf, test_now, random);
     const refused = (try mgr.recvDatagram(
-        buf[0..len], addr, addr, 0, &out, test_now, random,
+        buf[0..len],
+        addr,
+        addr,
+        0,
+        &out,
+        test_now,
+        random,
     )).send_response;
     var reader = io.fixedBufferStream(@constCast(refused));
     const header = try packet.Header.parse(&reader, 8);
@@ -1682,7 +1725,13 @@ test "Initial policy accept refuse ignore and manager Retry precedence" {
             alloc.destroy(client.conn);
         }
         const action = try mgr.recvDatagram(
-            buf[0..client.len], .unset, .unset, 0, &out, test_now, random,
+            buf[0..client.len],
+            .unset,
+            .unset,
+            0,
+            &out,
+            test_now,
+            random,
         );
         switch (answer) {
             .accept => try std.testing.expect(action == .processed),
@@ -1691,7 +1740,8 @@ test "Initial policy accept refuse ignore and manager Retry precedence" {
             .retry => unreachable,
         }
         try std.testing.expectEqual(
-            @as(usize, if (answer == .accept) 1 else 0), mgr.connectionCount(),
+            @as(usize, if (answer == .accept) 1 else 0),
+            mgr.connectionCount(),
         );
     }
     var entropy = TestRandom.init(72);
@@ -1709,7 +1759,13 @@ test "Initial policy accept refuse ignore and manager Retry precedence" {
         alloc.destroy(client.conn);
     }
     const reply = (try mgr.recvDatagram(
-        buf[0..client.len], .unset, .unset, 0, &out, test_now, random,
+        buf[0..client.len],
+        .unset,
+        .unset,
+        0,
+        &out,
+        test_now,
+        random,
     )).send_response;
     var reader = io.fixedBufferStream(@constCast(reply));
     const header = try packet.Header.parse(&reader, 8);
@@ -1734,7 +1790,11 @@ test "Initial policy sees NEW_TOKEN provenance and cannot retry it" {
     const addr = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 4000);
     var token: [packet.TOKEN_MAX_LEN]u8 = undefined;
     const token_len = try packet.generateNewToken(
-        &token, addr, mgr.retry_token_key, test_now, random,
+        &token,
+        addr,
+        mgr.retry_token_key,
+        test_now,
+        random,
     );
     var buf: [1500]u8 = .{0} ** 1500;
     var writer = io.fixedBufferStream(&buf);
@@ -1753,7 +1813,13 @@ test "Initial policy sees NEW_TOKEN provenance and cannot retry it" {
     try writer.writeInt(u16, 0x4000 | 1000, .big);
     var out: [1500]u8 = undefined;
     const refused = (try mgr.recvDatagram(
-        &buf, addr, addr, 0, &out, test_now, random,
+        &buf,
+        addr,
+        addr,
+        0,
+        &out,
+        test_now,
+        random,
     )).send_response;
     var reader = io.fixedBufferStream(@constCast(refused));
     const header = try packet.Header.parse(&reader, 8);

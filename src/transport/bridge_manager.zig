@@ -159,7 +159,9 @@ pub const Bridge = struct {
             .remote = remote,
             .local = local,
             .classification = classification,
-            .validation = if (provenance == .unvalidated) .unvalidated else
+            .validation = if (provenance == .unvalidated)
+                .unvalidated
+            else
                 incoming_filter.proved(classification, remote),
             .token_provenance = provenance,
             .version = initial.version,
@@ -891,9 +893,8 @@ test "one egress slot at a time sends as much as the whole array sends" {
 }
 
 test "project Initial policy retries before accepting and preserves validation" {
-    const incoming = @import("../endpoint/incoming_filter.zig");
     const policy = struct {
-        fn decide(_: *const anyopaque, initial: incoming.Initial) incoming.Answer {
+        fn decide(_: *const anyopaque, initial: incoming_filter.Initial) incoming_filter.Answer {
             return if (initial.token_provenance == .unvalidated) .retry else .accept;
         }
     };
@@ -917,6 +918,6 @@ test "project Initial policy retries before accepting and preserves validation" 
     try exchange(&client, bridge, &map, start);
     const conn = bridge.connectionAt(0) orelse return error.TestUnexpectedResult;
     try t.expect(conn.established());
-    try t.expectEqual(incoming.TokenProvenance.retry, conn.initialValidation());
+    try t.expectEqual(incoming_filter.TokenProvenance.retry, conn.initialValidation());
     try t.expectEqual(@as(usize, 1), bridge.manager.connectionCount());
 }

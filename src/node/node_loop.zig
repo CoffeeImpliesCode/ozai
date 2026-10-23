@@ -16,7 +16,7 @@ const node_close = @import("node_close.zig");
 
 const bridge_mod = @import("../transport/quic_bridge.zig");
 
-const Node = node_mod.Node;
+const Self = node_mod.Node;
 const Error = node_config.Error;
 const Instant = bridge_mod.Instant;
 
@@ -107,7 +107,7 @@ pub const Stop = struct {
 /// `Socket.stop` wakes it; a finite timeout bounds the next check.
 /// `run` closes the node on cancellation. A caller driving passes itself
 /// must do the same.
-pub fn wait(self: *Node, io: std.Io, timeout_ms: i32) Error!void {
+pub fn wait(self: *Self, io: std.Io, timeout_ms: i32) Error!void {
     if (self.held != null) return;
     const got = self.socket.receive(
         io,
@@ -152,7 +152,7 @@ pub fn wait(self: *Node, io: std.Io, timeout_ms: i32) Error!void {
 /// `poll_interval_ms` — the same bound `Socket.awaitReadable` names.
 ///
 /// One thread, one `run`, and never from a signal handler. See `Node`.
-pub fn run(self: *Node, io: std.Io, stop: *const Stop) Error!void {
+pub fn run(self: *Self, io: std.Io, stop: *const Stop) Error!void {
     // The instant of the pass being run, and null until one has been read.
     // A close needs an instant to stamp a connection close with and a
     // disposal does not, which is what makes this the right type for the
@@ -202,7 +202,7 @@ pub fn run(self: *Node, io: std.Io, stop: *const Stop) Error!void {
 /// after the error that ended the loop has already been decided. Whatever
 /// it cannot finish is handed to `dispose`, which is the only part of this
 /// that cannot fail.
-pub fn windDown(self: *Node, io: std.Io, at: ?Instant) void {
+pub fn windDown(self: *Self, io: std.Io, at: ?Instant) void {
     if (at) |stamp| {
         const protection = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(protection);

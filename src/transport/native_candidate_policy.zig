@@ -26,7 +26,9 @@ test "native candidate admission rejects every synthetic subnet independently of
 test "native candidate admission accepts physical families and adjacent private subnets" {
     try std.testing.expect(admit(quic.address.Address.initIpv4(.{ 192, 0, 2, 1 }, 443)));
     try std.testing.expect(admit(quic.address.Address.initIpv6(
-        .{ 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 443, 0,
+        .{ 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        443,
+        0,
     )));
     var adjacent = ula.ulaFor(.relay, @splat(0));
     adjacent[7] = 2;

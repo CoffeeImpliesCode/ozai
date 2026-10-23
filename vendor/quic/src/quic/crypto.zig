@@ -242,7 +242,9 @@ pub const Open = struct {
     ) error{AuthenticationFailed}![]u8 {
         if (packet_number > (@as(u64, 1) << 62) - 1) return error.AuthenticationFailed;
         return self.decryptWithNonce(
-            makeNonceForPath(self.nonce, path_id, packet_number), associated_data, payload,
+            makeNonceForPath(self.nonce, path_id, packet_number),
+            associated_data,
+            payload,
         );
     }
 
@@ -403,7 +405,10 @@ pub const Seal = struct {
         out: []u8,
     ) usize {
         return self.encryptWithNonce(
-            makeNonce(self.nonce, packet_number), associated_data, plaintext, out,
+            makeNonce(self.nonce, packet_number),
+            associated_data,
+            plaintext,
+            out,
         );
     }
 
@@ -424,7 +429,10 @@ pub const Seal = struct {
     ) usize {
         assert(packet_number <= (@as(u64, 1) << 62) - 1);
         return self.encryptWithNonce(
-            makeNonceForPath(self.nonce, path_id, packet_number), associated_data, plaintext, out,
+            makeNonceForPath(self.nonce, path_id, packet_number),
+            associated_data,
+            plaintext,
+            out,
         );
     }
 
@@ -1782,8 +1790,7 @@ test "RFC 9001 A.5: ChaCha20-Poly1305 short header packet" {
     // Rustls v/0.23.42 ring/quic.rs uses this same RFC fixture. Its
     // Nonce::for_path(0) equals Nonce::new, so MP0 must reproduce the bytes.
     var multipath_ciphertext: [17]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 17),
-        seal.encryptPayloadForPath(0, pn, &header, &[_]u8{0x01}, &multipath_ciphertext));
+    try std.testing.expectEqual(@as(usize, 17), seal.encryptPayloadForPath(0, pn, &header, &[_]u8{0x01}, &multipath_ciphertext));
     try std.testing.expectEqualSlices(u8, &expected_ct, &multipath_ciphertext);
 
     // Header protection: the sample starts one byte past the 3-byte pn.
@@ -1822,42 +1829,29 @@ test "multipath protection separates paths and packet numbers for both suites" {
         const header = "unprotected header";
         var path_zero: [plaintext.len + 16]u8 = undefined;
         var path_one: [plaintext.len + 16]u8 = undefined;
-        try std.testing.expectEqual(path_zero.len,
-            seal.encryptPayloadForPath(0, 7, header, plaintext, &path_zero));
+        try std.testing.expectEqual(path_zero.len, seal.encryptPayloadForPath(0, 7, header, plaintext, &path_zero));
         var legacy: [plaintext.len + 16]u8 = undefined;
-        try std.testing.expectEqual(legacy.len,
-            seal.encryptPayload(7, header, plaintext, &legacy));
+        try std.testing.expectEqual(legacy.len, seal.encryptPayload(7, header, plaintext, &legacy));
         try std.testing.expectEqualSlices(u8, &legacy, &path_zero);
-        try std.testing.expectEqual(path_one.len,
-            seal.encryptPayloadForPath(1, 7, header, plaintext, &path_one));
+        try std.testing.expectEqual(path_one.len, seal.encryptPayloadForPath(1, 7, header, plaintext, &path_one));
         try std.testing.expect(!std.mem.eql(u8, &path_zero, &path_one));
         var attempt = path_one;
-        try std.testing.expectError(error.AuthenticationFailed,
-            open.decryptPayloadForPath(0, 7, header, &attempt));
+        try std.testing.expectError(error.AuthenticationFailed, open.decryptPayloadForPath(0, 7, header, &attempt));
         attempt = path_one;
-        try std.testing.expectError(error.AuthenticationFailed,
-            open.decryptPayloadForPath(1, 8, header, &attempt));
+        try std.testing.expectError(error.AuthenticationFailed, open.decryptPayloadForPath(1, 8, header, &attempt));
         attempt = path_one;
-        try std.testing.expectEqualStrings(plaintext,
-            try open.decryptPayloadForPath(1, 7, header, &attempt));
+        try std.testing.expectEqualStrings(plaintext, try open.decryptPayloadForPath(1, 7, header, &attempt));
         attempt = path_one;
-        try std.testing.expectEqualStrings(plaintext,
-            try open.decryptPayloadForPath(1, 7, header, &attempt));
+        try std.testing.expectEqualStrings(plaintext, try open.decryptPayloadForPath(1, 7, header, &attempt));
         attempt = path_one;
-        try std.testing.expectError(error.AuthenticationFailed,
-            open.decryptPayloadForPath(1, @as(u64, 1) << 62, header, &attempt));
+        try std.testing.expectError(error.AuthenticationFailed, open.decryptPayloadForPath(1, @as(u64, 1) << 62, header, &attempt));
         try std.testing.expectEqualSlices(u8, &path_one, &attempt);
-        try std.testing.expectError(error.AuthenticationFailed,
-            open.decryptPayloadForPath(1, 7, header, attempt[0..15]));
+        try std.testing.expectError(error.AuthenticationFailed, open.decryptPayloadForPath(1, 7, header, attempt[0..15]));
 
         const packet_number_max = (@as(u64, 1) << 62) - 1;
         const path_id_max = std.math.maxInt(u32);
-        try std.testing.expectEqual(path_one.len,
-            seal.encryptPayloadForPath(path_id_max, packet_number_max,
-                header, plaintext, &path_one));
-        try std.testing.expectEqualStrings(plaintext,
-            try open.decryptPayloadForPath(path_id_max, packet_number_max,
-                header, &path_one));
+        try std.testing.expectEqual(path_one.len, seal.encryptPayloadForPath(path_id_max, packet_number_max, header, plaintext, &path_one));
+        try std.testing.expectEqualStrings(plaintext, try open.decryptPayloadForPath(path_id_max, packet_number_max, header, &path_one));
     }
 }
 
@@ -1868,33 +1862,30 @@ test "pinned rustls multipath nonce layout and full domain boundaries" {
     const expected = [_]u8{
         0x01, 0x03, 0x01, 0x07, 0x15, 0x27, 0x35, 0x43, 0x5d, 0x6f, 0x7d, 0x83,
     };
-    try std.testing.expectEqualSlices(u8, &expected,
-        &makeNonceForPath(iv, 0x01020304, 0x1122334455667788));
+    try std.testing.expectEqualSlices(u8, &expected, &makeNonceForPath(iv, 0x01020304, 0x1122334455667788));
     const zero_iv = [_]u8{0} ** nonce_len;
     const max_expected = [_]u8{
         0xff, 0xff, 0xff, 0xff, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     };
-    try std.testing.expectEqualSlices(u8, &max_expected,
-        &makeNonceForPath(zero_iv, std.math.maxInt(u32), (@as(u64, 1) << 62) - 1));
+    try std.testing.expectEqualSlices(u8, &max_expected, &makeNonceForPath(zero_iv, std.math.maxInt(u32), (@as(u64, 1) << 62) - 1));
     try std.testing.expectEqualSlices(u8, &iv, &makeNonceForPath(iv, 0, 0));
-    try std.testing.expectEqualSlices(u8, &makeNonce(iv, 12345),
-        &makeNonceForPath(iv, 0, 12345));
+    try std.testing.expectEqualSlices(u8, &makeNonce(iv, 12345), &makeNonceForPath(iv, 0, 12345));
 }
 
 // Exact Rustls v/0.23.42 crypto/ring/quic.rs test_multipath_aead_basic.
 // Upstream attributes these bytes to picoquic be0d99e6d4f8759cb7920425351c06a1c6f4a958.
 test "pinned rustls ring multipath AES path two golden ciphertext" {
     const secret = [_]u8{
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
         16, 17, 18, 19, 20, 21, 22, 23, 24, 35, 26, 27, 28, 29, 30, 31,
     };
     const plaintext = "The quick brown fox jumps over the lazy dog";
     const header = "This is a test";
     const expected = [_]u8{
-        123, 139, 232, 52, 136, 25, 201, 143, 250, 89, 87, 39, 37, 63, 0, 210,
-        220, 227, 186, 140, 183, 251, 13, 203, 6, 116, 204, 100, 166, 64, 43, 185,
-        174, 85, 212, 163, 242, 141, 24, 166, 62, 228, 187, 137, 248, 31, 152,
-        126, 240, 151, 79, 51, 253, 130, 43, 114, 173, 234, 254,
+        123, 139, 232, 52,  136, 25,  201, 143, 250, 89,  87,  39,  37,  63, 0,   210,
+        220, 227, 186, 140, 183, 251, 13,  203, 6,   116, 204, 100, 166, 64, 43,  185,
+        174, 85,  212, 163, 242, 141, 24,  166, 62,  228, 187, 137, 248, 31, 152, 126,
+        240, 151, 79,  51,  253, 130, 43,  114, 173, 234, 254,
     };
     var seal = Seal{
         .key = deriveKeyPaddedV(secret, 16, protocol.QUIC_V1),
@@ -1902,21 +1893,21 @@ test "pinned rustls ring multipath AES path two golden ciphertext" {
     };
     seal.prepareCtx();
     var ciphertext: [expected.len]u8 = undefined;
-    try std.testing.expectEqual(expected.len,
-        seal.encryptPayloadForPath(2, 12345, header, plaintext, &ciphertext));
+    try std.testing.expectEqual(expected.len, seal.encryptPayloadForPath(2, 12345, header, plaintext, &ciphertext));
     try std.testing.expectEqualSlices(u8, &expected, &ciphertext);
     var open = Open{ .key = seal.key, .nonce = seal.nonce };
     open.prepareCtx();
-    try std.testing.expectEqualStrings(plaintext,
-        try open.decryptPayloadForPath(2, 12345, header, &ciphertext));
+    try std.testing.expectEqualStrings(plaintext, try open.decryptPayloadForPath(2, 12345, header, &ciphertext));
 }
 
 // Independent PN spaces must never make an ACK for one path confirm a key
 // generation on another; encryption usage still belongs to the shared key.
 test "KeyUpdateManager multipath ACK markers and global encryption count" {
     var manager = KeyUpdateManager.init(
-        .{0xaa} ** 32, .{0xbb} ** 32,
-        .{0xcc} ** max_key_len, .{0xdd} ** max_key_len,
+        .{0xaa} ** 32,
+        .{0xbb} ** 32,
+        .{0xcc} ** max_key_len,
+        .{0xdd} ** max_key_len,
     );
     manager.onPacketSentForPath(0, 100);
     manager.onAckForPath(1, 100);
@@ -1952,8 +1943,10 @@ test "KeyUpdateManager multipath ACK markers and global encryption count" {
 // clears it only when an application packet is selected for sending.
 test "KeyUpdateManager peer update guard waits for actual application send" {
     var manager = KeyUpdateManager.init(
-        .{0xaa} ** 32, .{0xbb} ** 32,
-        .{0xcc} ** max_key_len, .{0xdd} ** max_key_len,
+        .{0xaa} ** 32,
+        .{0xbb} ** 32,
+        .{0xcc} ** max_key_len,
+        .{0xdd} ** max_key_len,
     );
     try std.testing.expect(!manager.peer_update_unacked);
     manager.onPeerKeyUpdate(1000, 100);
@@ -1976,8 +1969,10 @@ test "KeyUpdateManager peer update guard waits for actual application send" {
 // packet-space send clears update_unacked. Both routes consume shared keys.
 test "KeyUpdateManager off-path sends count without confirming peer update" {
     var manager = KeyUpdateManager.init(
-        .{0xaa} ** 32, .{0xbb} ** 32,
-        .{0xcc} ** max_key_len, .{0xdd} ** max_key_len,
+        .{0xaa} ** 32,
+        .{0xbb} ** 32,
+        .{0xcc} ** max_key_len,
+        .{0xdd} ** max_key_len,
     );
     manager.onPeerKeyUpdate(1000, 100);
     manager.onOffPathPacketSentForPath(1, 7);
@@ -1999,12 +1994,14 @@ test "KeyUpdateManager off-path sends count without confirming peer update" {
 
 test "KeyUpdateManager local rotation waits for peer acknowledgment and prior key expiry" {
     var manager = KeyUpdateManager.init(
-        .{0xaa} ** 32, .{0xbb} ** 32,
-        .{0xcc} ** max_key_len, .{0xdd} ** max_key_len,
+        .{0xaa} ** 32,
+        .{0xbb} ** 32,
+        .{0xcc} ** max_key_len,
+        .{0xdd} ** max_key_len,
     );
     const path_zero_pto_ns: i64 = 100;
     const path_one_pto_ns: i64 = 500;
-    const max_active_pto_ns = @max(path_zero_pto_ns, path_one_pto_ns);
+    const max_active_pto_ns: i64 = @max(path_zero_pto_ns, path_one_pto_ns);
     manager.onPeerKeyUpdate(1000, max_active_pto_ns);
     manager.first_acked_with_current = true;
     try std.testing.expect(!manager.canUpdate());

@@ -1,0 +1,286 @@
+{
+  "schema": 1,
+  "tool_sha256": "6baad8f048f4cf8150d6691e5b79d78b2d7bf4a804d9ec4f3b8399dcab38e08a",
+  "files": [
+    {
+      "path": "scripts/gate_dwarf_universe.zig",
+      "source_sha256": "1fdf8b1734eb08c44bff67447188a3726fbd56d4586498e573f067439d533410",
+      "reason": "collectFilePaths receives only an allocator, borrowed file/directory cache metadata and an independent Paths pool. It allocates output paths and pool storage, but cannot access or grow dwarf.compile_unit_list. numericRow receives a version, a by-value LineEntry and a file count. Its implementation only validates scalar indices and returns a value; it has no allocator, pointers or compile-unit-list handle."
+    },
+    {
+      "path": "scripts/gate_measure.zig",
+      "source_sha256": "9210a8b63548879dd07f9fe77a13bec2f562a4ac5695797b392e7f4e69eb61bd",
+      "reason": "installed enumerates every fixed binary_names entry and assigns the corresponding artifact slot before returning; any failure returns an error rather than a partial array. ZBC does not prove complete indexed loop initialization."
+    },
+    {
+      "path": "scripts/gate_raw.zig",
+      "source_sha256": "79cf2fb3c507884f79972798e5e9e3610716be0924a83a99a9bdeb3a6b7ae7e3",
+      "reason": "parseMapping is pure and allocator-free. It receives a borrowed location string and two borrowed context strings, not argv or an alias to its backing storage, so it cannot grow or invalidate the iterated argument slice."
+    },
+    {
+      "path": "scripts/gate_zbc_policy_schema.zig",
+      "source_sha256": "9bdcb9fc064dbd52cdbcebad2dd9955338e54eb49e06c353e35315a4d5f4f800",
+      "reason": "Reviewed five slice-loop-reentrant-grow false positives in parse: exactObject only reads parsed-object count/contains; field uses read-only ArrayHashMap.get returning a value, and text borrows immutable strings; validPath/validHash only scan immutable bytes and mutate a local split cursor. JSON parsing and the separate SourceFile output allocation finish before iteration; loop writes target only that independent output slice, never records.array. Exact native next-line controls preserve strict malformed-registry tests and canonical path/hash checks."
+    },
+    {
+      "path": "src/base/base32.zig",
+      "source_sha256": "53369da1f65aff15f069881c8bc5297f9d4dcd59bbdb0c6094073aabe47c6a8a",
+      "reason": "The encoder writes floor(8*n/5) symbols plus one when bits remain, exactly encodedLen(n); the final index == out.len assertion proves complete initialization. The analyzer does not prove the sequential loop and optional tail write cover the array. For valid encoded length, sequential symbol writes produce exactly n bytes, including n=0; index == n is asserted. Invalid symbols or padding return errors without returning the array. The analyzer does not establish loop coverage."
+    },
+    {
+      "path": "src/base/key.zig",
+      "source_sha256": "f0a96d8a6a2a119f0e1c3df1126eb850fb2de94c73acdf4347f54f3f500ed806",
+      "reason": "The two memcpy operations cover disjoint prefix and suffix ranges that partition the complete name; the prefix comes from fully initialized base32.encode output. The analyzer does not join the ranges."
+    },
+    {
+      "path": "src/base/ula.zig",
+      "source_sha256": "0a69ed8c2e4f32242932e6fdd66bc4041cee338453ca4fe454891494a10192da",
+      "reason": "Copies cover octets[0..8] and octets[8..16]. prefixFor initializes byte 0, global_id bytes [1..6], and subnet bytes [6..8]. The analyzer does not join the prefix and host copies."
+    },
+    {
+      "path": "src/blobs/blob_claim.zig",
+      "source_sha256": "88d5e837bda11dff11907f9eb27f942dd879da44c68977ada145daf89798be40",
+      "reason": "claim/release call dropAt only with a successful indexOf result over entries[0..len], and reap calls it only while index < len. Every call proves len > 0 before len - 1; the analyzer does not establish this caller invariant."
+    },
+    {
+      "path": "src/blobs/blob_set.zig",
+      "source_sha256": "f1b9f08e7a4ed54b239bb8f221d4f379224c6a360cd55647f2f71179db7a09a3",
+      "reason": "indexOf returns only a live-prefix index; forget returns immediately on null. A successful result proves index < len and therefore len > 0. The analyzer does not infer this relation."
+    },
+    {
+      "path": "src/blobs/provider.zig",
+      "source_sha256": "6e5b0617c5f40efd91213ef61995cd459abe229ea9d8c99358b46571b7ad73c5",
+      "reason": "Plan is passed by value and items is an inline fixed [max_items]Item array, not a reallocatable collection. runRange cannot relocate the loop's backing storage. Plan is passed by value and items is an inline fixed [max_items]Item array, not a reallocatable collection. pairIndex cannot relocate the loop's backing storage. Plan is passed by value and items is an inline fixed [max_items]Item array, not a reallocatable collection. computePair cannot relocate the loop's backing storage. Plan is passed by value and items is an inline fixed [max_items]Item array, not a reallocatable collection. mergeRoot cannot relocate the loop's backing storage. Plan is passed by value and items is an inline fixed [max_items]Item array, not a reallocatable collection. merge cannot relocate the loop's backing storage."
+    },
+    {
+      "path": "src/blobs/range_spec.zig",
+      "source_sha256": "3902f0a13ed31a3d20a689f3172ab863a4df73bb9d4bf0ef67e6a744ff5b0373",
+      "reason": "shown=min(bytes.len,32); the loop writes both hex digits for [0..2*shown], then memset initializes [2*shown..64]. These ranges cover the whole output for empty, partial, full, and oversized inputs. The analyzer does not combine the loop and memset."
+    },
+    {
+      "path": "src/blobs/wire_test_support.zig",
+      "source_sha256": "0c92fdad83c0b6526f1ceb5ae51b2caaddad7bd5cc9de98575a963c9c7e596bb",
+      "reason": "shown=min(bytes.len,64); the loop writes both hex digits for [0..2*shown], then memset initializes [2*shown..128]. These ranges cover the whole output for empty, partial, full, and oversized inputs. The analyzer does not combine the loop and memset."
+    },
+    {
+      "path": "src/crypto/blake3_core.zig",
+      "source_sha256": "d1db988b38b366e606bc0f2a790330b11513b830d256def95915f88e448afddf",
+      "reason": "Eight iterations each call store32 for a disjoint four-byte range [4*i..4*i+4], covering all 32 bytes. store32 delegates to mem.writeInt. The analyzer does not prove full-array coverage through the fixed loop. Eight iterations assign cv[i] for every word in the eight-word ChainingValue. The analyzer does not prove all words are initialized by the fixed loop."
+    },
+    {
+      "path": "src/discovery/dns_live.zig",
+      "source_sha256": "b6994b2ea9c1e73c423e74d256bc2b11ec462e5b2fc0ba47c78e620bdf58ced9",
+      "reason": "Fixture callers supply responses bounded by the 1232-byte reply buffer, an empty response, or a fixed 12-byte header; each length fits u16."
+    },
+    {
+      "path": "src/discovery/host_answer.zig",
+      "source_sha256": "77891f752a698fb3a030334d322f844c86d94c081dbb4d306d1fc1796872c1b9",
+      "reason": "Private test-only callers pass at most nine records. RDATA inputs are fixed small address arrays (including the 17-byte malformed case) or names encoded into the bounded wire-name buffer; both lengths fit u16."
+    },
+    {
+      "path": "src/discovery/host_wire.zig",
+      "source_sha256": "d8bd3117fc49b488f7ba0dda062e95a2dbdd627f246664fe18e1255ddb3b1118",
+      "reason": "Private test-helper callers supply four-byte RDATA, which fits u16 and the output buffer."
+    },
+    {
+      "path": "src/discovery/item_fixture.zig",
+      "source_sha256": "0cd999b59c8c2a291eaf5e362606209541e324590b4133e191527e93174cf28f",
+      "reason": "The loop initializes all three NodeId slots before return; seed buffers are fully initialized and the seeds 1–3 fit u8. Both same-line diagnostics share one directive."
+    },
+    {
+      "path": "src/discovery/tls_client.zig",
+      "source_sha256": "0e08c8dab61dd8b094bf09e41e492b27b15e3aac74f783f0002e8fbc55c6202d",
+      "reason": "The installed std.Io.Writer drain contract requires nonempty data, and writeSplat asserts data.len > 0; streamOut is installed as the drain callback."
+    },
+    {
+      "path": "src/discovery/txt.zig",
+      "source_sha256": "df1a45769042a888ea8ca0b884a2ea0e0e5724059f10efc4487159a46b1163d4",
+      "reason": "owned.append succeeds before endpoint.insert; no owned mutation intervenes, so the last recorded allocation exists when the duplicate-entry path frees it."
+    },
+    {
+      "path": "src/gossip/hyparview/peer_data.zig",
+      "source_sha256": "de68bd9ebd5530f70fac69662685dbe60f7247634dd85deffc5020bd517c2560",
+      "reason": "The length guard rejects values above max_shuffle_nodes; its protocol bound is 124, which fits u8. The analyzer does not carry the guard through the cap to the cast."
+    },
+    {
+      "path": "src/gossip/plumtree/message.zig",
+      "source_sha256": "eb5908622b83d6c80183d35f1602c9ce5e1dfb84d22906a76b98c13745abe75a",
+      "reason": "The length guard rejects values above max_ihaves_per_message; its protocol bound is 124, which fits u16. The analyzer does not carry the guard through the cap to the cast."
+    },
+    {
+      "path": "src/gossip/topic_membership.zig",
+      "source_sha256": "c117cbe39c85a040227a3e80d739925a1f558952c84e307c471a14cf57d4761c",
+      "reason": "indexOf scans entries[0..self.len] and returns only a live-prefix index; null returns immediately. A successful result proves index < self.len and self.len > 0. The analyzer does not infer that relationship from indexOf. The subtraction is reached only inside iteration over list.items[0..list.count], so entering the loop body proves list.count > 0. The analyzer does not derive that lower bound from the loop."
+    },
+    {
+      "path": "src/net/blobs_route.zig",
+      "source_sha256": "c4be812e2a99ef4cdf115d620784dc4e29ae18df7f3c01f65dd917c6eee4ab05",
+      "reason": "release gets an index from indexOf's live-entry scan, and removePeer calls dropEmpty only inside index < len; holderAt returns only live holder indices and the caller exits if it returns null."
+    },
+    {
+      "path": "src/net/holepunch_failure_memory.zig",
+      "source_sha256": "07f285988c0d503c4f9bd1286b38ce4e02e9844c3ecf0eb25db94a49203f8150",
+      "reason": "The subtraction occurs inside while (index < held), and held is decremented only after the right-hand side reads the last live entry."
+    },
+    {
+      "path": "src/net/holepunch_trigger.zig",
+      "source_sha256": "6e05f98ed793190245619d13c3e9dd7f13e1fe2e737d463a13391f6e9b05d140",
+      "reason": "candidateSet intentionally initializes only 0..count; callers pass that matching prefix, or use all eight slots when count is max_attempts. Both same-line diagnostics share one directive."
+    },
+    {
+      "path": "src/net/observed_reporter.zig",
+      "source_sha256": "ebdcb13c39ac2f9633c2b0118f734db8b8f36ad5181df0c6b9ad38eb4b15962d",
+      "reason": "Private Table.observe caps len at max_relays (5), and support counts matches within addrs[0..len]; len - supporting is therefore within 0..5 and fits u8."
+    },
+    {
+      "path": "src/net/path_probe.zig",
+      "source_sha256": "3106945a6d532bcdfdd1571e35ff07ece86555fd25382195f29b6da075854ed4",
+      "reason": "indexOf returns only an index from the live prefix; the orelse return handles missing and empty cases before the swap."
+    },
+    {
+      "path": "src/net/path_table.zig",
+      "source_sha256": "ac4e2c4f8fd0e14021d6d6efb6688ca4a227c286ae860556756845d45de8e7cb",
+      "reason": "forget receives only a live-prefix index from indexOf. takeSlot swaps only after a scan sets victim, with an early return when there is none. ports' sole caller fills all eight slots with unique ports 1000–1007; its two same-line use-undefined diagnostics share one directive."
+    },
+    {
+      "path": "src/net/qad.zig",
+      "source_sha256": "cc6a42472dc4548df4445be1ee2b8231f50e903acb8e7cf5cdbdf05b8d5a84a4",
+      "reason": "The remaining-length guard precedes memcpy of all four or sixteen address bytes, respectively, before the initialized array is used in its union arm."
+    },
+    {
+      "path": "src/net/qnt.zig",
+      "source_sha256": "be34147aaa2e19f2e2104569ea8c797bde2b22b5cbe29db053b6b09b74e1cc77",
+      "reason": "The 8-byte remaining-length guard precedes memcpy of the entire Challenge; the annotation is rebased to the actual .challenge = challenge use in the returned frame. decode's Challenge is exactly [8]u8. Successful quic_varint.get calls preserve offset <= bytes.len; the remaining-length guard rejects fewer than eight challenge bytes before an unconditional memcpy fills challenge[0..8]. Every successful return carries all eight initialized challenge bytes. The range array is fully zero-initialized before a loop bounded by checked range_count <= max_packet_ranges == 8, and each live entry is assigned both endpoints. Later failures return errors rather than a partial frame. Native ZBC reports the initialized challenge at both its field assignment and enclosing aggregate return; exact next-line use-undefined controls cover those locations."
+    },
+    {
+      "path": "src/net/replay_window.zig",
+      "source_sha256": "2ef4d5cbee613783f52bec4d151024c529438d6c115e37311e6c39d1f2907ca2",
+      "reason": "find returns only an index from entries[0..len]; the orelse return handles an empty or missing entry."
+    },
+    {
+      "path": "src/net/resumption_acceptance.zig",
+      "source_sha256": "201ef491dc96ece49ff122226bb26ac2f85782137aff74d8a9b0b1bcc19413b3",
+      "reason": "Private fixture callers use ALPN lengths 4 or 11, both fitting the 32-byte ticket field and u8 length."
+    },
+    {
+      "path": "src/net/statistics.zig",
+      "source_sha256": "05181492be3ebdc5b5eefa09167dbcdc2c051b4469c91b98fd704743f06212b9",
+      "reason": "window returns a slice of the fixed 16-slot sample array, and record caps its length at 16; the held.len cast to u32 is in range."
+    },
+    {
+      "path": "src/node/conn_index.zig",
+      "source_sha256": "e8d5f00ddc08638148101099b84bc140429c58c7dcd408cdd3ea179579b1e75c",
+      "reason": "A successful indexOf result comes from entries[0..len], so len is nonzero and index is in range; ZBC does not carry that prefix proof to the subtraction."
+    },
+    {
+      "path": "src/node/node_build.zig",
+      "source_sha256": "d84f0302ddac64fa19f1cda00b301daeceb1f780e817d8a26542bba296cc2025",
+      "reason": "egress is a nonoptional terminally owned slice; release is only called by Node.deinit, which destroys self immediately afterward. ZBC does not model this lifetime. out is a nonoptional terminally owned slice; release is only called by Node.deinit, which destroys self immediately afterward. ZBC does not model this lifetime. scratch is a nonoptional terminally owned slice; release is only called by Node.deinit, which destroys self immediately afterward. ZBC does not model this lifetime. buf is a nonoptional terminally owned slice; release is only called by Node.deinit, which destroys self immediately afterward. ZBC does not model this lifetime. gossip_topics is a nonoptional terminally owned slice; subsequent independent cleanups do not read it before Node.deinit destroys self. ZBC does not model this ownership sequence."
+    },
+    {
+      "path": "src/node/node_close.zig",
+      "source_sha256": "22f1ab39f9bed5cefb045335f7bc0021f2a3b9aa85250a5dd861b3762bf3bada",
+      "reason": "dispose passes null runtime and instant; the reachable shutdown handlers cannot reach the guarded closeConnections primitive. Panic marks an impossible internal failure; ZBC does not follow this path sensitivity."
+    },
+    {
+      "path": "src/node/node_discovery_lookup_test.zig",
+      "source_sha256": "5ec009bf16034c04046e8e4833c5d58b061d9dbb869ef35a63ca8b5c8b7fa63e",
+      "reason": "Successful bufPrint into record:[128]u8 bounds value.len at 128, so value.len + 1 is at most 129 and fits u16; ZBC does not infer the formatting bound. Successful bufPrint into record:[128]u8 bounds value.len at 128, which fits u8; ZBC does not infer the formatting bound."
+    },
+    {
+      "path": "src/node/node_gossip_wire.zig",
+      "source_sha256": "c3bb2345dedd3e36bcb04bbd4c1739b8d83311f190f45b828a08d1cead4350a2",
+      "reason": "Queue.push stores only successfully encoded frames in owned bytes, so decode failure indicates corrupted internal state rather than malformed peer input. ZBC does not carry the successful-encoding invariant into flush."
+    },
+    {
+      "path": "src/node/node.zig",
+      "source_sha256": "7dbfa8a8c3092b6e0b45cdb23b9715b5e444336eb05a055f42e4b859f1c1b324",
+      "reason": "This helper is test-only; panic deliberately reports a close failure during deferred test teardown instead of swallowing it. ZBC does not distinguish that test failure path from production recovery."
+    },
+    {
+      "path": "src/node/ticket_cache.zig",
+      "source_sha256": "38cc86425ed4a020ef14947199746d9235a94b5cc80230112da6b9504511b18a",
+      "reason": "dropAt is only called by take and forget after indexOf succeeds, with no intervening len mutation; ZBC does not establish the caller invariant."
+    },
+    {
+      "path": "src/node/topic_table.zig",
+      "source_sha256": "adf630e8225d016c7bb3c1f4e0ef86896d805bda1e9b410c43f0daf59cd4e63f",
+      "reason": "leave reaches dropEmpty after finding a topic; removePeer calls it only under index < len. ZBC does not combine those caller proofs. memberAt scans ids[0..members.len], so a successful lookup proves a nonempty prefix; ZBC does not carry that proof to the subtraction."
+    },
+    {
+      "path": "src/relay/frame_vectors.zig",
+      "source_sha256": "90c8d3c405b2af22f86475aa4cee88fa28f66badb6850201d7691c4af0332d01",
+      "reason": "The loop initializes [0, 2*shown) and memset initializes [2*shown, out.len), covering the whole returned array including empty/full inputs; one directive covers the duplicate same-line diagnostic columns."
+    },
+    {
+      "path": "src/transport/early_data.zig",
+      "source_sha256": "9f5960888735327850a61620516dac0a79519a98d92588f41dc22289ab16e7e0",
+      "reason": "All private test callers pass the fixed 4-byte \"ozai\" fixture, which fits the 32-byte ALPN array and u8 length; the analyzer sees only the unconstrained slice parameter."
+    },
+    {
+      "path": "src/transport/multipath.zig",
+      "source_sha256": "bb6a97ddd97d1c2913c16373003e23d984db4d88eb7205e340b4c77c74f850dd",
+      "reason": "A successful indexOf result comes only from its index < len loop, proving len > 0; ZBC does not carry that loop invariant through the optional unwrap. victim is assigned only during the index < len scan; unwrapping it proves len > 0, a loop-to-unwrap relation ZBC does not infer."
+    },
+    {
+      "path": "src/transport/resumption.zig",
+      "source_sha256": "e845c0ec5965db3f6e91902b54d7e557609a7c45584910117c2f8b1f39cbe6c8",
+      "reason": "Private test callers pass 4-byte \"ozai\" or 11-byte \"ozai-blobs-2\"; both fit alpn[32] and u8. ZBC cannot propagate those closed caller lengths through the slice cast."
+    },
+    {
+      "path": "src/transport/session_store.zig",
+      "source_sha256": "a9d1f05cfeb2e8db47c3f6d0ba7c1bd20c5a5c35f4185170593e19898e027a70",
+      "reason": "indexOf yields an index only from its index < len loop, proving len > 0 after the successful optional unwrap; ZBC loses this scan invariant. The private test fixtures are 4 and 11 bytes and fit the 512-byte ticket array and u16 length; ZBC cannot propagate their fixed caller lengths through the slice conversion. The same 4- and 11-byte fixtures fit alpn[32] and u8; ZBC cannot propagate those fixed caller lengths through the slice cast."
+    },
+    {
+      "path": "test/blobs_interop_test.zig",
+      "source_sha256": "7843d701d672f804e31a68eb3041557f60028d77824bfecd96ef39e18d5b0556",
+      "reason": "hex asserts a 32-byte input and writes both output digits for every byte, covering all 64 result slots."
+    },
+    {
+      "path": "test/gossip_codec_fuzz.zig",
+      "source_sha256": "5014a5ee25353b9a3ad9dda8c33c000a523b655150a452f367c1d08488f3758b",
+      "reason": "taken iterates over every element of the fixed output array and assigns it via bytesAt; zero length is an initialized empty array."
+    },
+    {
+      "path": "test/loopback_test.zig",
+      "source_sha256": "d479698d514c49fd8d7f905fab36dbdfe6cff7847f5ace74692944443897ba3b",
+      "reason": "The 12-byte header copy and 32-byte NodeId copy fill adjacent parts of the 44-byte output; bridge.spki_length resolves to 44."
+    },
+    {
+      "path": "test/nat_proc_safety.zig",
+      "source_sha256": "f43454622baa0d9e6eb261b0b74fc6849bf025cb23b650f86537dbf34456b18d",
+      "reason": "The earlier guard returns for identity.len <= prefix.len + 1; reaching the indexed expression proves identity.len is at least prefix.len + 2."
+    },
+    {
+      "path": "test/nat_runtime.zig",
+      "source_sha256": "4c4d73914161da2caf10149b71bb15ee7d743556e75a542201977e05e4a8d033",
+      "reason": "cleanup iterates index over 0..children.len for a three-element array, so children.len - index is positive and the final reverse index is in range."
+    },
+    {
+      "path": "test/protocol_loopback_test.zig",
+      "source_sha256": "8ac1bcc8e213af18c0dd76c65e1c4b886bf5980620a4490c85b2aa6a8957869e",
+      "reason": "The 12-byte header copy and 32-byte NodeId copy fill adjacent parts of the 44-byte output; bridge_mod.spki_length resolves to 44."
+    },
+    {
+      "path": "test/rust_interop_child.zig",
+      "source_sha256": "389b8ed018ea5a5be93f8f1cd198e035830449af39d0ed1c7ada74160a4e3632",
+      "reason": "NodeId.toBytes returns 32 bytes and the loop writes both hex digits for every byte, initializing all 64 output slots. The directive is rebased to the current return statement after the Process helper edits."
+    },
+    {
+      "path": "test/two_process_child.zig",
+      "source_sha256": "00fb3e30743d04b378bd578e9cb8adad91f96aa485b48d6e500832073040e8c9",
+      "reason": "Process.start obtains argv only from successful launch.flags. test/two_process_launch.zig appends ten unconditional arguments, with an additional leading executor exactly when the same node_test_options.node_executor is non-null. Native argv length is therefore at least 10 and executor argv length at least 11; argv[1..] retains at least ten arguments. Append failure propagates before returning argv. ZBC infers local bounds and bounded-string callees, not this imported ArrayList construction; the exact next-line slice-from-fixed-offset-without-len-check exception records that proven bound."
+    },
+    {
+      "path": "test/vendored_judge.zig",
+      "source_sha256": "e0775d842cdc6d71e21aefd3c962c8f754419fce254bae6f022a0b1f5a60c506",
+      "reason": "During the token-slice loop, rulebook.has and the Scanner query helpers only inspect token/local-function data; hit updates separate scalar hit state and prints, and sourceLine/declEnd only read. None grows or invalidates self.tokens."
+    },
+    {
+      "path": "test/vendored_scanner.zig",
+      "source_sha256": "5961e7698acdb4b7c6b410b4c6ad241d697ad49eae50fdf1efccb28f2d5e30c0",
+      "reason": "classify iterates self.tokens while appending to the independent self.local_fns ArrayList; the appended name bytes come from self.src, not token backing storage."
+    }
+  ]
+}

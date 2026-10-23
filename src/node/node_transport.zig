@@ -26,7 +26,7 @@ const base_ula = @import("../base/ula.zig");
 const addr_map = @import("../transport/addr_map.zig");
 const relay_frame = @import("../relay/frame.zig");
 
-const Node = node_mod.Node;
+const Self = node_mod.Node;
 const Error = node_config.Error;
 const Conn = bridge_mod.Conn;
 const Instant = bridge_mod.Instant;
@@ -53,7 +53,7 @@ pub const scratch_room: usize = 2 * max_datagram;
 pub const receive_room: usize = @as(usize, max_datagram) * batch.max_gro_segments_linux;
 
 /// Take everything the kernel has queued and hand it to the core.
-pub fn take(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!bool {
+pub fn take(self: *Self, io: std.Io, at: Instant, random: std.Random) Error!bool {
     var moved = false;
     // The datagram `wait` took goes first: the kernel gave it over and
     // `tryReceive` will never see it again.
@@ -81,7 +81,7 @@ pub fn take(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!bool
 
 /// One read, which may be a burst coalesced by `UDP_GRO`, through the core.
 pub fn deliver(
-    self: *Node,
+    self: *Self,
     io: std.Io,
     got: socket_mod.Received,
     at: Instant,
@@ -124,7 +124,7 @@ pub fn deliver(
 }
 
 /// Write out everything the core wants sent, then run its timers.
-pub fn drain(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!bool {
+pub fn drain(self: *Self, io: std.Io, at: Instant, random: std.Random) Error!bool {
     var moved = false;
     var index: usize = 0;
     while (self.bridge.connectionAt(index)) |conn| : (index += 1) {
@@ -137,7 +137,7 @@ pub fn drain(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!boo
 }
 
 /// Every synthetic destination is consumed by the carrier or explicitly refused.
-pub fn send(self: *Node, io: std.Io, peer: base_addr.SocketAddr, outgoing: batch.Send) Error!void {
+pub fn send(self: *Self, io: std.Io, peer: base_addr.SocketAddr, outgoing: batch.Send) Error!void {
     if (base_ula.classify(peer) == .ip) {
         note(self, try self.socket.send(io, peer, outgoing));
         self.stats.datagrams_out += outgoing.datagramCount();
@@ -149,7 +149,9 @@ pub fn send(self: *Node, io: std.Io, peer: base_addr.SocketAddr, outgoing: batch
     while (position < outgoing.contents.len) {
         const end = position + @min(size, outgoing.contents.len - position);
         const consumed = try self.relay_runtime.sendMapped(
-            &self.map, peer, outgoing.contents[position..end],
+            &self.map,
+            peer,
+            outgoing.contents[position..end],
         );
         std.debug.assert(consumed);
         self.stats.datagrams_out += 1;
@@ -159,7 +161,7 @@ pub fn send(self: *Node, io: std.Io, peer: base_addr.SocketAddr, outgoing: batch
 }
 
 /// Carrier-origin identity selects a canonical virtual peer, not a physical UDP source.
-pub fn takeRelay(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!bool {
+pub fn takeRelay(self: *Self, io: std.Io, at: Instant, random: std.Random) Error!bool {
     try self.relay_runtime.poll(io);
     var moved = false;
     for (0..16 * relay_frame.max_packet_size) |_| {
@@ -187,7 +189,7 @@ pub fn takeRelay(self: *Node, io: std.Io, at: Instant, random: std.Random) Error
     return error.RelayIngressLimit;
 }
 
-fn validateMappedPeers(self: *Node) error{UnexpectedRelayPeer}!void {
+fn validateMappedPeers(self: *Self) error{UnexpectedRelayPeer}!void {
     var index: usize = 0;
     while (self.bridge.connectionAt(index)) |conn| : (index += 1) {
         if (!conn.established() or conn.closed()) continue;
@@ -213,7 +215,7 @@ fn mappedIdentityMatches(expected: NodeId, authenticated: [32]u8) bool {
 /// A connection that ended is two things: a `join_next` upstream's loop
 /// reads for a task it holds, and a `peer_disconnected` for the gossip
 /// layer, which is how membership hears about it at all.
-pub fn expire(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!bool {
+pub fn expire(self: *Self, io: std.Io, at: Instant, random: std.Random) Error!bool {
     var moved = false;
     var index: usize = 0;
     while (self.bridge.connectionAt(index)) |conn| {
@@ -258,7 +260,7 @@ pub fn expire(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!bo
 /// with it. Found by the same index walk an accepted connection is found
 /// by, which is what makes the accept path and the dial path the same
 /// machinery rather than two of them.
-pub fn connFor(self: *Node, id: u64) ?Conn {
+pub fn connFor(self: *Self, id: u64) ?Conn {
     var index: usize = 0;
     while (self.bridge.connectionAt(index)) |conn| : (index += 1) {
         if (conn.id() == id) return conn;
@@ -269,7 +271,7 @@ pub fn connFor(self: *Node, id: u64) ?Conn {
 /// Record what a send cost. A `Report` is the socket's own account of the
 /// codepoint and of whether a batch went out as one `sendmsg`, and reading
 /// it is what keeps a degradation from being silent.
-pub fn note(self: *Node, report: batch.Report) void {
+pub fn note(self: *Self, report: batch.Report) void {
     if (report.degraded) self.stats.sends_degraded += 1;
     if (!report.ecnSurvived()) self.stats.ecn_lost += 1;
 }
@@ -280,7 +282,7 @@ pub fn note(self: *Node, report: batch.Report) void {
 /// reaches it in an orderly shutdown. A second `close` on a descriptor the
 /// kernel has already released closes whatever took its number in between,
 /// so the flag is the whole of the guarantee.
-pub fn shutdownSocket(self: *Node) void {
+pub fn shutdownSocket(self: *Self) void {
     if (!self.socket_open) return;
     self.socket_open = false;
     self.socket.close();
@@ -288,45 +290,92 @@ pub fn shutdownSocket(self: *Node) void {
 
 test "mapped egress without a relay cannot escape onto UDP" {
     const t = std.testing;
-    const node = try Node.create(t.allocator, t.io, .{
+    const node = try Self.create(t.allocator, t.io, .{
         .secret = try base_key.SecretKey.fromSeed(@splat(0x71)),
     }, 71);
     defer node.deinit();
     const peer = (try base_key.SecretKey.fromSeed(@splat(0x72))).nodeId();
     const address = try node.map.get(t.allocator, .{ .any_path = peer }, node.generator());
     const target = base_ula.socketAddrFor(.any_path, addr_map.hostBitsOf(address));
-    try t.expectError(error.RelayUnavailable,
-        send(node, t.io, target, batch.Send.single("inner QUIC", null)));
+    try t.expectError(
+        error.RelayUnavailable,
+        send(
+            node,
+            t.io,
+            target,
+            batch.Send.single("inner QUIC", null),
+        ),
+    );
     try t.expectEqual(@as(u64, 0), node.stats.datagrams_out);
     try node.close(t.io, 0, node.generator());
 }
 
 test "carrier sender preserves every GSO segment and short tail under authenticated origin" {
     const t = std.testing;
-    const carrier = @import("../relay/tcp_carrier.zig");
-    var server = try carrier.Server.init(.{
-        .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0,
-    });
+    const tcp_server = @import("../relay/tcp_server.zig");
+    var server = try tcp_server.Server.init(t.io, .{
+        .ip = .{ .v4 = .{ 127, 0, 0, 1 } },
+        .port = 0,
+    }, .native);
     defer server.deinit();
     const first_secret = try base_key.SecretKey.fromSeed(@splat(0x75));
     const second_secret = try base_key.SecretKey.fromSeed(@splat(0x76));
-    const first = try Node.create(t.allocator, t.io, .{
+    const first = try Self.create(t.allocator, t.io, .{
         .secret = first_secret,
         .relay = .{ .client = .{
-            .address = server.address, .host = "localhost", .secret = first_secret,
+            .address = server.address,
+            .host = "localhost",
+            .secret = first_secret,
+            .execution = .native,
         } },
     }, 75);
-    defer first.deinit();
-    const second = try Node.create(t.allocator, t.io, .{
+    defer {
+        defer first.deinit();
+        first.close(t.io, 0, first.generator()) catch |err|
+            std.debug.panic("node close failed during test teardown: {t}", .{err});
+    }
+    const second = try Self.create(t.allocator, t.io, .{
         .secret = second_secret,
         .relay = .{ .client = .{
-            .address = server.address, .host = "localhost", .secret = second_secret,
+            .address = server.address,
+            .host = "localhost",
+            .secret = second_secret,
+            .execution = .native,
         } },
     }, 76);
-    defer second.deinit();
-    const address = try first.map.get(t.allocator,
-        .{ .any_path = second.nodeId() }, first.generator());
+    defer {
+        defer second.deinit();
+        second.close(t.io, 0, second.generator()) catch |err|
+            std.debug.panic("node close failed during test teardown: {t}", .{err});
+    }
+    const first_client = if (first.relay_runtime.client) |*client|
+        client
+    else
+        return error.TestUnexpectedResult;
+    const second_client = if (second.relay_runtime.client) |*client|
+        client
+    else
+        return error.TestUnexpectedResult;
+    const address = try first.map.get(
+        t.allocator,
+        .{ .any_path = second.nodeId() },
+        first.generator(),
+    );
     const target = base_ula.socketAddrFor(.any_path, addr_map.hostBitsOf(address));
+    // A ready sender does not imply a registered destination. Real TCP also needs
+    // time for kernel delivery and delayed ACKs; a zero-time poll count is not a deadline.
+    // Only this socket fixture yields: the node's protocol clock remains explicitly zero.
+    for (0..256) |_| {
+        try server.poll(t.io);
+        try first.relay_runtime.poll(t.io);
+        while (try first.relay_runtime.receive()) |_| {}
+        try second.relay_runtime.poll(t.io);
+        while (try second.relay_runtime.receive()) |_| {}
+        if (first_client.isReady() and second_client.isReady()) break;
+        try std.Io.sleep(t.io, .fromMilliseconds(1), .awake);
+    }
+    try t.expect(first_client.isReady());
+    try t.expect(second_client.isReady());
     try send(first, t.io, target, try batch.Send.batch("abcdefgh", 3, null));
     const expected = [_][]const u8{ "abc", "def", "gh" };
     var received: usize = 0;
@@ -342,11 +391,10 @@ test "carrier sender preserves every GSO segment and short tail under authentica
             received += 1;
         }
         if (received == expected.len) break;
+        try std.Io.sleep(t.io, .fromMilliseconds(1), .awake);
     }
     try t.expectEqual(expected.len, received);
     try t.expectEqual(@as(u64, 3), first.stats.datagrams_out);
-    try first.close(t.io, 0, first.generator());
-    try second.close(t.io, 0, second.generator());
 }
 
 test "carrier claimed origin is not an authenticated TLS identity" {

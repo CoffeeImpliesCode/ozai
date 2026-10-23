@@ -235,6 +235,8 @@ pub fn TopicTable(comptime topics: usize) type {
         /// a freed slot holds a different topic than it did.
         fn dropEmpty(self: *Self, index: usize) bool {
             if (self.entries[index].members.len != 0) return false;
+            // ZBC cannot combine the callers' proofs that this table has a live entry.
+            // zbc-disable-next-line: index-minus-one-without-zero-guard
             self.entries[index] = self.entries[self.len - 1];
             self.len -= 1;
             return true;
@@ -254,6 +256,8 @@ fn memberAt(members: *const Members, peer: NodeId) ?usize {
 /// it was there.
 fn takePeer(members: *Members, peer: NodeId) bool {
     const index = memberAt(members, peer) orelse return false;
+    // ZBC cannot carry `memberAt`'s successful scan of the nonempty prefix into this subtraction.
+    // zbc-disable-next-line: index-minus-one-without-zero-guard
     members.ids[index] = members.ids[members.len - 1];
     members.len -= 1;
     return true;

@@ -461,7 +461,10 @@ pub fn decryptForPath(
     path_id: u32,
 ) ![]u8 {
     return decryptImpl(
-        header, fbs, space, if (header.packet_type == .one_rtt) path_id else null,
+        header,
+        fbs,
+        space,
+        if (header.packet_type == .one_rtt) path_id else null,
     );
 }
 
@@ -548,7 +551,11 @@ fn decryptImpl(
     header.packet_number = decodePacketNumber(space.next_packet_number, truncated_packet_number, header.packet_number_len * 8);
 
     const decrypted = try openPayload(
-        aead, path_id, header.packet_number, header_bytes, encrypted_payload,
+        aead,
+        path_id,
+        header.packet_number,
+        header_bytes,
+        encrypted_payload,
     );
 
     // Write decrypted first byte back into the input buffer for further processing.
@@ -674,7 +681,11 @@ fn decryptWithKeyUpdateImpl(
 
     const decrypted = if (header.key_phase == ku.key_phase)
         try openPayload(
-            &ku.current_open, path_id, header.packet_number, header_bytes, encrypted_payload,
+            &ku.current_open,
+            path_id,
+            header.packet_number,
+            header_bytes,
+            encrypted_payload,
         )
     else blk: {
         if (ku.prev_open) |*previous| {
@@ -684,7 +695,11 @@ fn decryptWithKeyUpdateImpl(
             var saved: [MAX_PACKET_LEN]u8 = undefined;
             @memcpy(saved[0..encrypted_payload.len], encrypted_payload);
             if (openPayload(
-                previous, path_id, header.packet_number, header_bytes, encrypted_payload,
+                previous,
+                path_id,
+                header.packet_number,
+                header_bytes,
+                encrypted_payload,
             )) |plaintext| {
                 break :blk plaintext;
             } else |err| switch (err) {
@@ -694,7 +709,11 @@ fn decryptWithKeyUpdateImpl(
             }
         }
         const plaintext = try openPayload(
-            &ku.next_open, path_id, header.packet_number, header_bytes, encrypted_payload,
+            &ku.next_open,
+            path_id,
+            header.packet_number,
+            header_bytes,
+            encrypted_payload,
         );
         // next_packet_number is largest received + 1 (zero before any receive).
         // Check only after next-key authentication: a reordered previous-key
@@ -1779,7 +1798,11 @@ test "path key update rejects wrong path and reconstructed packet number without
         try std.testing.expectError(
             error.AuthenticationFailed,
             decryptWithKeyUpdateForPath(
-                &header, &fbs, &space, &receiver, if (case == 0) 0 else 1,
+                &header,
+                &fbs,
+                &space,
+                &receiver,
+                if (case == 0) 0 else 1,
             ),
         );
         try std.testing.expect(!header.key_update_authenticated);
@@ -1838,7 +1861,11 @@ test "authenticated next key updates reject lower and equal packet numbers on bo
             for ([_]u64{ watermark - 1, watermark }) |pn| {
                 var bytes: [128]u8 = undefined;
                 const wire = sealPathTestPacket(
-                    &bytes, &sender.current_seal, path_id, pn, sender.key_phase,
+                    &bytes,
+                    &sender.current_seal,
+                    path_id,
+                    pn,
+                    sender.key_phase,
                 );
                 var fbs = io.fixedBufferStream(wire);
                 var header = try Header.parse(&fbs, 0);
@@ -1884,7 +1911,11 @@ test "next key update permission uses only the receiving path watermark" {
             try std.testing.expectEqualStrings(
                 "path payload",
                 try decryptWithKeyUpdateForPath(
-                    &header, &fbs, &spaces[path_id], &receiver, path_id,
+                    &header,
+                    &fbs,
+                    &spaces[path_id],
+                    &receiver,
+                    path_id,
                 ),
             );
             try std.testing.expect(header.key_update_authenticated);
@@ -1945,7 +1976,11 @@ test "new paths accept next generation packet zero but unauthenticated updates c
         try std.testing.expectError(
             error.AuthenticationFailed,
             decryptWithKeyUpdateForPath(
-                &bad_header, &bad_fbs, &received, &receiver, path_id,
+                &bad_header,
+                &bad_fbs,
+                &received,
+                &receiver,
+                path_id,
             ),
         );
         try std.testing.expect(!bad_header.key_update_authenticated);
@@ -1980,7 +2015,11 @@ test "second authenticated peer update waits for an actual send on either path" 
         try std.testing.expectEqualStrings(
             "path payload",
             try decryptWithKeyUpdateForPath(
-                &first_header, &first_fbs, &space, &receiver, path_id,
+                &first_header,
+                &first_fbs,
+                &space,
+                &receiver,
+                path_id,
             ),
         );
         try std.testing.expect(first_header.key_update_authenticated);
@@ -2054,7 +2093,10 @@ test "path opening leaves Initial and Handshake legacy protection unchanged" {
         try output.writeInt(u32, 7, ENDIAN);
         const payload_offset = output.seek;
         const len = ku.current_seal.encryptPayload(
-            7, bytes[0..payload_offset], "path payload", bytes[payload_offset..],
+            7,
+            bytes[0..payload_offset],
+            "path payload",
+            bytes[payload_offset..],
         );
         const mask = ku.current_seal.newMask(bytes[pn_offset + 4 ..][0..crypto.SAMPLE_LEN]);
         bytes[0] ^= mask[0] & 0x0f;

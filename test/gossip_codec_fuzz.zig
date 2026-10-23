@@ -17,7 +17,7 @@
 //! the name of every refusal a tag past a table gets. What it cannot do is let
 //! a fuzzer choose what goes *inside* a message, and that is where a length
 //! that disagrees with its content would show. So this file builds the same
-//! fourteen messages with the payloads, the counts and the lengths the fuzz
+//! fifteen messages with the payloads, the counts and the lengths the fuzz
 //! bytes spell, and asks four questions of each one:
 //!
 //! 1. **Refusal.** A frame and a body are the two entry points `codec.zig`
@@ -33,22 +33,20 @@
 //!    says the numbering is upstream's declaration order. That is read off the
 //!    declared table here rather than off the encoder, so an encoder and a
 //!    decoder that agreed on the wrong number would still be caught.
-//! 4. **The fixed point and the extent.** `encode(decode(bytes))` is `bytes`
-//!    again, and a re-encoding never grows past the bytes it was read from.
+//! 4. **The value, fixed point and extent.** Decoding an encoded message keeps
+//!    its fields; re-encoding is stable and never grows past the input.
 //!
 //! # What is not pinned
 //!
-//! No byte of this codec has been captured from `n0-computer/iroh-gossip`, and
-//! `codec.zig` says so and lists the three things that would close the gap.
-//! Nothing here changes that: these oracles say the codec is total and
-//! self-consistent, not that a peer from the reference would read its frames.
+//! The pinned upstream serializer vectors and live interoperability checks are
+//! separate evidence. These oracles check totality, semantic preservation and
+//! canonicalization, not interoperability by themselves.
 
 const std = @import("std");
 const ozai = @import("ozai");
 const codec = ozai.gossip_codec;
 const gossip = ozai.gossip_hyparview;
 const plumtree = ozai.gossip_plumtree;
-const postcard = ozai.postcard;
 const t = std.testing;
 
 const Message = codec.Message;
@@ -68,24 +66,22 @@ const NodeId = ozai.NodeId;
 /// gets are `codec_test.zig`'s to hold and this file does not repeat them; what
 /// it needs from those seeds is somewhere for the fuzzer to start.
 ///
-/// They are held inline rather than as `@embedFile`s under
-/// `test/corpus/gossip_codec/`, because this slice was given exactly three
-/// files and a corpus directory would be a fourth. The names on each line are
-/// the file names a `test/corpus/gossip_codec/` carries for them.
+/// Inline seeds keep ordinary replay and coverage-guided mutation on the same
+/// fixed-width frame inputs.
 const corpus = [_][]const u8{
-    &.{}, // empty: no prefix at all
-    &.{0x02}, // length_without_body: a prefix and nothing behind it
-    &.{ 0x40, 0x00 }, // length_past_end: 64 bytes named, none sent
-    &.{ 0x01, 0x00, 0x00, 0x05, 0x00 }, // trailing_byte: a body and a byte behind it
-    &.{0x02}, // unknown_layer: no arm names this layer
-    &.{ 0x80, 0x01 }, // wide_layer_varint: the same layer, two groups long
-    &.{ 0x02, 0x00, 0x06 }, // unknown_swarm_arm: one past the membership table
-    &.{ 0x02, 0x01, 0x04 }, // unknown_tree_arm: one past the broadcast table
-    &.{ 0x04, 0x00, 0x04, 0x02, 0x00 }, // unknown_priority: a `Neighbor`'s third value
-    &.{ 0x04, 0x00, 0x05, 0x02, 0x00 }, // bad_bool: a `Disconnect` whose `alive` is 2
-    &.{ 0x01, 0x00, 0x00, 0x00, 0x00 }, // arm_tag_truncated: a layer and no arm
-    &.{ 0x03, 0x01, 0x01 }, // prune_frame: a whole `Prune`
-    &.{ 0x04, 0x00, 0x05, 0x01, 0x00 }, // disconnect_frame: a whole `Disconnect`
+    &.{}, // No prefix at all.
+    &.{0x02}, // A short fixed-width prefix; also the retained crash input.
+    &.{ 0x00, 0x00, 0x00, 0x40 }, // Length past the end.
+    &.{ 0x00, 0x00, 0x00, 0x02, 0x01, 0x01, 0x00 }, // Trailing byte.
+    &.{ 0x00, 0x00, 0x00, 0x01, 0x02 }, // Unknown layer.
+    &.{ 0x00, 0x00, 0x00, 0x02, 0x80, 0x01 }, // Wide layer varint.
+    &.{ 0x00, 0x00, 0x00, 0x02, 0x00, 0x06 }, // Unknown swarm arm.
+    &.{ 0x00, 0x00, 0x00, 0x02, 0x01, 0x04 }, // Unknown tree arm.
+    &.{ 0x00, 0x00, 0x00, 0x04, 0x00, 0x04, 0x02, 0x00 }, // Unknown priority.
+    &.{ 0x00, 0x00, 0x00, 0x04, 0x00, 0x05, 0x02, 0x00 }, // Bad bool.
+    &.{ 0x00, 0x00, 0x00, 0x01, 0x00 }, // Truncated arm tag.
+    &.{ 0x00, 0x00, 0x00, 0x02, 0x01, 0x01 }, // Whole Prune.
+    &.{ 0x00, 0x00, 0x00, 0x04, 0x00, 0x05, 0x01, 0x00 }, // Whole Disconnect.
 };
 
 /// Long enough for a seed and for a mutated input to still reach a check it was
@@ -94,8 +90,7 @@ const corpus = [_][]const u8{
 const input_buffer_len = 128;
 
 /// A buffer every frame and every body this file writes fits in: a body is at
-/// most the byte budget, and the prefix in front of it is at most the widest a
-/// postcard `varint(u64)` spells.
+/// most the byte budget, with a fixed four-byte big-endian length prefix.
 const room = codec.max_message_size + codec.max_prefix_size;
 
 /// How many ids a run derives from seeds, and so how many messages can name
@@ -119,6 +114,16 @@ test "gossip codec decode" {
     try t.fuzz(Context{}, testOne, .{ .corpus = &corpus });
 }
 
+test "gossip codec fuzz oracle reads fixed-width frames" {
+    // A postcard byte-string reader would see the first zero as an empty body.
+    const frame = &[_]u8{ 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00 };
+    try t.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x00 }, try bodyOf(frame));
+    try t.expectEqual(@as(usize, frame.len), try checkMessage(try codec.decode(frame)));
+    try t.expectError(error.UnexpectedEnd, bodyOf(&.{0x02}));
+    try t.expectError(error.BadLength, bodyOf(&.{ 0x00, 0x00, 0x00, 0x03 }));
+    try t.expectError(error.TrailingBytes, bodyOf(&.{ 0x00, 0x00, 0x00, 0x00, 0x00 }));
+}
+
 fn testOne(_: Context, smith: *t.Smith) anyerror!void {
     var buffer: [input_buffer_len]u8 = undefined;
     // `in` is the corpus entry verbatim while the corpus is replayed, and null
@@ -138,6 +143,7 @@ fn checkRefusal(bytes: []const u8) !void {
     // split one. A decoder that had only ever been shown one of them has not
     // been shown the other, and `codec.zig` publishes both.
     if (codec.decode(bytes)) |message| {
+        try t.expect(borrowsFrom(bytes, message));
         // A frame that decoded is a message this codec can write, which is what
         // the value oracle asks about, and its canonical spelling is never
         // longer than the frame it was read from.
@@ -147,6 +153,7 @@ fn checkRefusal(bytes: []const u8) !void {
         try expectRefusal(err);
     }
     if (codec.decodeBody(bytes)) |message| {
+        try t.expect(borrowsFrom(bytes, message));
         const canonical = try checkMessage(message);
         // The body arrived without a prefix, so the only claim available is that
         // the framed spelling of what came out is no longer than the body plus
@@ -157,7 +164,7 @@ fn checkRefusal(bytes: []const u8) !void {
     }
 }
 
-/// The fourteen arms, with the payloads, the counts and the lengths the fuzz
+/// The fifteen arms, with the payloads, the counts and the lengths the fuzz
 /// bytes spell rather than fixed ones.
 fn checkRoundTrip(bytes: []const u8, peers: [pool]NodeId) !void {
     const messages = try buildMessages(bytes, peers);
@@ -181,6 +188,8 @@ fn checkMessage(message: Message) !usize {
     try t.expectEqual(codec.encodedLen(message), body.len);
 
     const decoded = try codec.decode(frame);
+    try expectMessageEqual(message, decoded);
+    try expectMessageEqual(message, try codec.decodeBody(body));
 
     // Oracle: the borrow. Every slice the decoded message carries is a slice of
     // the frame it was read from, so a caller may hold one exactly as long as
@@ -205,9 +214,9 @@ fn checkMessage(message: Message) !usize {
     const again = try codec.encode(decoded, &again_buf);
     try t.expectEqualSlices(u8, frame, again);
 
-    // Oracle: what this codec writes is what it admits. A body over the byte
-    // budget would be refused on the way back in by the budget rule, and a
-    // message it cannot write is one it should not read.
+    // Oracle: every generated or admitted message here is below the write
+    // budget. Receiving exactly the budget is legal but writing it is not;
+    // the bounded input window never generates that boundary.
     try t.expect(codec.encodedLen(decoded) <= codec.max_message_size);
     return frame.len;
 }
@@ -219,7 +228,7 @@ fn checkStreamHeader(bytes: []const u8) !void {
     const topic = gossip.TopicId.fromBytes(taken(gossip.topic_id_length, bytes, 0));
     const frame = try codec.encodeStreamHeader(codec.StreamHeader.init(topic), &frame_buf);
     // Oracle: size. A header body is a topic id and nothing else, so its length
-    // is the one the type declares, and the prefix in front of it is postcard's.
+    // is the one the type declares, behind a fixed four-byte big-endian prefix.
     try t.expectEqual(codec.StreamHeader.encoded_size, (try bodyOf(frame)).len);
     try t.expect(frame.len <= codec.max_header_size);
 
@@ -252,7 +261,7 @@ fn checkStreamHeader(bytes: []const u8) !void {
 /// places one appears, an empty and a non-empty byte string, and a peer list
 /// and an `IHave` list with more than one entry, because a list of one has no
 /// count a decoder could get wrong.
-fn buildMessages(bytes: []const u8, peers: [pool]NodeId) ![14]Message {
+fn buildMessages(bytes: []const u8, peers: [pool]NodeId) ![15]Message {
     const infos = try gossip.PeerInfos.init(&.{
         .{ .id = peers[0], .data = null },
         .{ .id = peers[1], .data = bytes },
@@ -285,6 +294,7 @@ fn buildMessages(bytes: []const u8, peers: [pool]NodeId) ![14]Message {
         .{ .swarm = .{ .neighbor = .{ .priority = .high, .data = null } } },
         .{ .swarm = .{ .neighbor = .{ .priority = .low, .data = bytes } } },
         .{ .swarm = .{ .disconnect = .{ .alive = true } } },
+        .{ .swarm = .{ .disconnect = .{ .alive = false } } },
         .{ .gossip = .{ .prune = {} } },
         .{ .gossip = .{ .gossip = .{
             .id = payload_id,
@@ -302,11 +312,49 @@ fn buildMessages(bytes: []const u8, peers: [pool]NodeId) ![14]Message {
     };
 }
 
-/// The bytes after a frame's length prefix, read with the reader the frame's own
-/// decoder uses rather than by counting a prefix by hand.
+/// The bytes after the fixed big-endian frame length, checked independently
+/// against the actual extent rather than parsed as a postcard byte string.
 fn bodyOf(frame: []const u8) ![]const u8 {
-    var reader = postcard.Reader.init(frame);
-    return reader.readBytes();
+    if (frame.len < codec.max_prefix_size) return error.UnexpectedEnd;
+    const length = std.mem.readInt(u32, frame[0..4], .big);
+    const body = frame[codec.max_prefix_size..];
+    if (length > body.len) return error.BadLength;
+    if (length < body.len) return error.TrailingBytes;
+    return body;
+}
+
+/// Compare active values, not the undefined spare capacity of inline lists.
+fn expectMessageEqual(expected: Message, actual: Message) !void {
+    try t.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+    switch (expected) {
+        .swarm => |inner| {
+            try t.expectEqual(std.meta.activeTag(inner), std.meta.activeTag(actual.swarm));
+            switch (inner) {
+                .shuffle => |shuffle| {
+                    const decoded = actual.swarm.shuffle;
+                    try t.expectEqualDeep(shuffle.origin, decoded.origin);
+                    try t.expectEqualDeep(shuffle.ttl, decoded.ttl);
+                    try t.expectEqualDeep(shuffle.nodes.slice(), decoded.nodes.slice());
+                },
+                .shuffle_reply => |reply| {
+                    try t.expectEqualDeep(
+                        reply.nodes.slice(),
+                        actual.swarm.shuffle_reply.nodes.slice(),
+                    );
+                },
+                else => try t.expectEqualDeep(expected, actual),
+            }
+        },
+        .gossip => |inner| {
+            try t.expectEqual(std.meta.activeTag(inner), std.meta.activeTag(actual.gossip));
+            switch (inner) {
+                .i_have => |ihaves| {
+                    try t.expectEqualDeep(ihaves.slice(), actual.gossip.i_have.slice());
+                },
+                else => try t.expectEqualDeep(expected, actual),
+            }
+        },
+    }
 }
 
 /// Whether every byte string the message carries lies inside `frame`.
@@ -383,6 +431,8 @@ fn roundOf(bytes: []const u8, index: usize) plumtree.Round {
 fn taken(comptime length: usize, bytes: []const u8, index: usize) [length]u8 {
     var out: [length]u8 = undefined;
     for (&out, 0..) |*byte, at| byte.* = bytesAt(bytes, at + index);
+    // zbc does not prove that iterating over &out assigns every fixed-array element.
+    // zbc-disable-next-line: use-undefined
     return out;
 }
 

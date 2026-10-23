@@ -606,17 +606,17 @@ test "several sources merge into one sorted unique list" {
         direct = (try direct.insert(alloc, .{
             .ip = .{ .ip = .{ .v4 = .{ 192, 0, 2, 1 } }, .port = 4433 },
         })) orelse direct;
-        const relay_two_only = Published{
+        const relay_two_only: Published = .{
             .alloc = alloc,
             .endpoint = try addr.NodeAddr.withRelay(alloc, id, relay_two),
             .last_updated = 1,
         };
-        const relay_one_only = Published{
+        const relay_one_only: Published = .{
             .alloc = alloc,
             .endpoint = try addr.NodeAddr.withRelay(alloc, id, relay_one),
             .last_updated = 2,
         };
-        const relay_and_direct = Published{
+        const relay_and_direct: Published = .{
             .alloc = alloc,
             .endpoint = direct,
             .last_updated = 3,

@@ -147,10 +147,10 @@ pub const State = struct {
     /// scheduled, and no shuffle would ever happen again. The same rule runs
     /// the other way: a `.do_shuffle` event is delivered because the caller
     /// took that timer out of its queue, so `handleShuffleTimer` releases the
-    /// latch before its fallible work and this tail re-arms on any later turn.
-    /// Neither half alone would do — a latch that is only ever set survives a
-    /// refusal to publish, and a timer queued with the latch already set is a
-    /// claim the caller never received.
+    /// latch after its candidate fits and before publishing it. A size refusal
+    /// preserves the latch and RNG; the caller must re-queue the consumed timer
+    /// if it continues driving that state. An allocation refusal leaves the
+    /// latch clear so this tail can re-arm on a later turn.
     ///
     /// **Not transactional, and the residue is named rather than hidden.** An
     /// event advances `self` and appends to `out` as it goes, so an

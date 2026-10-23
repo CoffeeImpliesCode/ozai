@@ -1,7 +1,7 @@
 //! Native iroh-relay 1.3 datagram/GRO message mapping.
-//! The HTTP/WebSocket TCP runtime is `tcp_carrier.zig`. A relay message contains
-//! a destination/source identity, ECN, and optionally a big-endian GRO segment
-//! size. QUIC bytes remain opaque; end-to-end authentication belongs to QUIC.
+//! The HTTP/WebSocket TCP drivers are `tcp_client.zig` and `tcp_server.zig`.
+//! A relay message contains a destination/source identity, ECN, and optionally
+//! a big-endian GRO segment size. QUIC bytes remain opaque; authentication belongs to QUIC.
 
 const std = @import("std");
 const key = @import("../base/key.zig");
@@ -159,7 +159,7 @@ test "a batch keeps its segmentation and its codepoint across the codec" {
     var out: [128]u8 = undefined;
     const to_relay = try carry(peer, burst, .client_to_relay);
     const read = try frame.decode(try frame.encode(to_relay, .v2, &out), .v2);
-    const arrived = carried(read).?;
+    const arrived = carried(read) orelse return error.TestUnexpectedResult;
     try std_testing.expectEqual(peer, arrived.node_id);
     try std_testing.expectEqual(@as(?frame.Ecn, .ect1), arrived.datagrams.ecn);
     try std_testing.expectEqual(@as(?u16, 4), arrived.datagrams.segment_size);
@@ -169,7 +169,7 @@ test "a batch keeps its segmentation and its codepoint across the codec" {
     // ingress: the same payload and a different node id in the same shape.
     const to_client = try carry(src, burst, .relay_to_client);
     const read_back = try frame.decode(try frame.encode(to_client, .v2, &out), .v2);
-    const delivered = carried(read_back).?;
+    const delivered = carried(read_back) orelse return error.TestUnexpectedResult;
     try std_testing.expectEqual(src, delivered.node_id);
     try std_testing.expectEqualStrings(burst.contents, delivered.datagrams.contents);
 
@@ -266,15 +266,55 @@ test "carried names the ten frames that are not datagrams" {
 test "iroh relay 1.3 GRO snapshot delivers exact native segments" {
     const bytes = [_]u8{
         0x07,
-        0x19, 0x7f, 0x6b, 0x23, 0xe1, 0x6c, 0x85, 0x32,
-        0xc6, 0xab, 0xc8, 0x38, 0xfa, 0xcd, 0x5e, 0xa7,
-        0x89, 0xbe, 0x0c, 0x76, 0xb2, 0x92, 0x03, 0x34,
-        0x03, 0x9b, 0xfa, 0x8b, 0x3d, 0x36, 0x8d, 0x61,
-        0x03, 0x00, 0x06,
-        0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20,
-        0x57, 0x6f, 0x72, 0x6c, 0x64, 0x21,
+        0x19,
+        0x7f,
+        0x6b,
+        0x23,
+        0xe1,
+        0x6c,
+        0x85,
+        0x32,
+        0xc6,
+        0xab,
+        0xc8,
+        0x38,
+        0xfa,
+        0xcd,
+        0x5e,
+        0xa7,
+        0x89,
+        0xbe,
+        0x0c,
+        0x76,
+        0xb2,
+        0x92,
+        0x03,
+        0x34,
+        0x03,
+        0x9b,
+        0xfa,
+        0x8b,
+        0x3d,
+        0x36,
+        0x8d,
+        0x61,
+        0x03,
+        0x00,
+        0x06,
+        0x48,
+        0x65,
+        0x6c,
+        0x6c,
+        0x6f,
+        0x20,
+        0x57,
+        0x6f,
+        0x72,
+        0x6c,
+        0x64,
+        0x21,
     };
-    var packet = carried(try frame.decode(&bytes, .v2)).?;
+    var packet = carried(try frame.decode(&bytes, .v2)) orelse return error.TestUnexpectedResult;
     try std_testing.expectEqual(@as(?frame.Ecn, .ce), packet.datagrams.ecn);
     try std_testing.expectEqualStrings("Hello ", packet.datagrams.takeSegments(1).contents);
     try std_testing.expectEqualStrings("World!", packet.datagrams.takeSegments(1).contents);

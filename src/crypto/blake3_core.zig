@@ -107,6 +107,8 @@ pub fn cvBytes(cv: ChainingValue) CvBytes {
     for (0..8) |i| {
         store32(bytes[i * 4 ..][0..4], cv[i]);
     }
+    // ZBC cannot prove the fixed loop's eight store32 writes cover all 32 bytes.
+    // zbc-disable-next-line: use-undefined
     return bytes;
 }
 
@@ -116,6 +118,8 @@ pub fn cvFromBytes(bytes: CvBytes) ChainingValue {
     for (0..8) |i| {
         cv[i] = load32(bytes[i * 4 ..][0..4]);
     }
+    // ZBC cannot prove the fixed loop assigns every word of the eight-word chaining value.
+    // zbc-disable-next-line: use-undefined
     return cv;
 }
 
@@ -205,7 +209,7 @@ const published = @import("../gossip/plumtree/blake3_vectors.zig");
 test "the compression alone reproduces the published digest of an empty input" {
     var cv: ChainingValue = iv;
     const block: [block_length]u8 = @splat(0);
-    const empty = Flags{ .chunk_start = true, .chunk_end = true, .root = true };
+    const empty: Flags = .{ .chunk_start = true, .chunk_end = true, .root = true };
     compressInPlace(&cv, &block, 0, 0, empty);
 
     const digest = cvBytes(cv);

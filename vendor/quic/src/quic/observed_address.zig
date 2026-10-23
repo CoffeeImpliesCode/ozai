@@ -238,8 +238,7 @@ test "observed role negotiation is directional and malformed values fail closed"
         try std.testing.expectEqual(@as(?u64, value), role.transportValue());
         try std.testing.expectEqual(role, try Role.decodeTransportValue(&.{@intCast(value)}));
         // Noq requires the declared TP length to equal the minimal varint width.
-        try std.testing.expectError(error.InvalidTransportParameter,
-            Role.decodeTransportValue(&.{ 0x40, @intCast(value) }));
+        try std.testing.expectError(error.InvalidTransportParameter, Role.decodeTransportValue(&.{ 0x40, @intCast(value) }));
     }
     for ([_][]const u8{ &.{}, &.{3}, &.{0x40}, &.{ 0, 0 }, &.{ 0x40, 3 } }) |bytes| {
         try std.testing.expectError(error.InvalidTransportParameter, Role.decodeTransportValue(bytes));
@@ -268,8 +267,7 @@ test "observed frame roundtrip boundaries truncation and consumed length" {
             try std.testing.expectError(error.NoSpaceLeft, report.encode(bytes[0 .. length - 1]));
             var short = [_]u8{0xaa} ** max_frame_length;
             try std.testing.expectError(error.NoSpaceLeft, report.encode(short[0 .. length - 1]));
-            try std.testing.expectEqualSlices(u8,
-                &([_]u8{0xaa} ** max_frame_length), &short);
+            try std.testing.expectEqualSlices(u8, &([_]u8{0xaa} ** max_frame_length), &short);
         }
     }
     const unset: Report = .{ .sequence = 0, .address = .unset };
@@ -286,7 +284,9 @@ test "observed frame roundtrip boundaries truncation and consumed length" {
 test "observed pure receive transition filters stale reports per path" {
     const initial: PathState = .{};
     const context: ReceiveContext = .{
-        .local_role = .receive_only, .peer_role = .send_only, .data_space = true,
+        .local_role = .receive_only,
+        .peer_role = .send_only,
+        .data_space = true,
     };
     const first: Report = .{ .sequence = 5, .address = .initIpv4(.{ 1, 2, 3, 4 }, 80) };
     const changed: Report = .{ .sequence = 4, .address = .initIpv4(.{ 1, 2, 3, 4 }, 81) };
@@ -315,15 +315,16 @@ test "observed pure receive transition filters stale reports per path" {
         .{ .local_role = .both, .peer_role = .receive_only, .data_space = true },
         .{ .local_role = .both, .peer_role = .both, .data_space = false },
     }) |denied| {
-        try std.testing.expectError(error.ProtocolViolation,
-            receiveTransition(transition.state, next, denied));
+        try std.testing.expectError(error.ProtocolViolation, receiveTransition(transition.state, next, denied));
         try std.testing.expectEqual(@as(u64, 7), transition.state.last_received.?.sequence);
     }
 }
 
 test "observed pure receive transition rejects malformed reports" {
     const context: ReceiveContext = .{
-        .local_role = .both, .peer_role = .both, .data_space = true,
+        .local_role = .both,
+        .peer_role = .both,
+        .data_space = true,
     };
     const valid: Report = .{ .sequence = 1, .address = .initIpv4(.{ 1, 2, 3, 4 }, 80) };
     const transition = try receiveTransition(.{}, valid, context);
@@ -332,8 +333,7 @@ test "observed pure receive transition rejects malformed reports" {
         .{ .sequence = 2, .address = .unset },
         .{ .sequence = sequence_max + 1, .address = valid.address },
     }) |invalid| {
-        try std.testing.expectError(error.ProtocolViolation,
-            receiveTransition(transition.state, invalid, context));
+        try std.testing.expectError(error.ProtocolViolation, receiveTransition(transition.state, invalid, context));
         try std.testing.expectEqual(@as(u64, 1), transition.state.last_received.?.sequence);
         try std.testing.expect(Address.eql(valid.address, transition.state.last_received.?.address));
     }
@@ -357,7 +357,13 @@ test "observed path schedules retransmission without consuming sequence before c
 }
 
 test "observed decoder fuzz normalizes successful frames" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    // Coverage needs fuzz instrumentation, but Zig 0.16.0's fuzz runner has bug #36326.
+    if (comptime @import("builtin").fuzz and @import("coverage_options").coverage) {
+        var smith: std.testing.Smith = .{ .in = &.{} };
+        try fuzzDecode({}, &smith);
+    } else {
+        try std.testing.fuzz({}, fuzzDecode, .{});
+    }
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
@@ -378,7 +384,13 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "observed frame structured fuzz preserves address and sequence" {
-    try std.testing.fuzz({}, fuzzReport, .{});
+    // Coverage needs fuzz instrumentation, but Zig 0.16.0's fuzz runner has bug #36326.
+    if (comptime @import("builtin").fuzz and @import("coverage_options").coverage) {
+        var smith: std.testing.Smith = .{ .in = &.{} };
+        try fuzzReport({}, &smith);
+    } else {
+        try std.testing.fuzz({}, fuzzReport, .{});
+    }
 }
 
 fn fuzzReport(_: void, smith: *std.testing.Smith) !void {

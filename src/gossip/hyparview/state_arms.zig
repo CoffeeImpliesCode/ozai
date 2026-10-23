@@ -10,8 +10,8 @@
 const std = @import("std");
 const key = @import("../../base/key.zig");
 const plumtree = @import("../plumtree.zig");
+const codec = @import("../codec.zig");
 const bounds = @import("bounds.zig");
-const peers = @import("peer_data.zig");
 const wire = @import("message.zig");
 const node_id = @import("node_id.zig");
 const machine = @import("state_machine.zig");
@@ -23,7 +23,6 @@ const Allocator = std.mem.Allocator;
 const NodeId = key.NodeId;
 const Actions = plumtree.Actions;
 const Error = bounds.Error;
-const PeerInfo = peers.PeerInfo;
 const Neighbor = wire.Neighbor;
 const ForwardJoin = wire.ForwardJoin;
 const SwarmMessage = wire.SwarmMessage;
@@ -38,9 +37,7 @@ pub fn handleMessage(
     out: *Actions(SwarmOutEvent),
 ) (Error || Allocator.Error)!void {
     const is_disconnect = message == .disconnect;
-    if (!is_disconnect and !self.active_view.contains(from)) {
-        self.stats.total_connections += 1;
-    }
+    const new_connection = !is_disconnect and !self.active_view.contains(from);
     switch (message) {
         .join => |data| try onJoin(self, from, data, out),
         .forward_join => |details| try onForwardJoin(self, from, details, out),
@@ -49,6 +46,7 @@ pub fn handleMessage(
         .neighbor => |details| try onNeighbor(self, from, details, out),
         .disconnect => |details| try departure.onDisconnect(self, from, details, out),
     }
+    if (new_connection) self.stats.total_connections += 1;
     // "Disconnect from passive nodes right after receiving a message."
     // Upstream's own comment is that it is not sure this is correct; it is
     // kept because the simulator is compared against upstream, and a
@@ -64,9 +62,13 @@ pub fn handleJoin(
     peer: NodeId,
     out: *Actions(SwarmOutEvent),
 ) (Error || Allocator.Error)!void {
+    const message: SwarmMessage = .{ .join = self.myData() };
+    if (codec.encodedLen(.{ .swarm = message }) >= codec.max_message_size) {
+        return error.MessageTooLarge;
+    }
     try out.push(.{ .send_message = .{
         .to = peer,
-        .message = .{ .join = self.myData() },
+        .message = message,
     } });
 }
 
@@ -77,12 +79,28 @@ pub fn handleJoin(
 /// `Join` arrives from a peer that reached us over a connection it
 /// already has, so there is nothing to prove. A `ForwardJoin` arrives from
 /// a walk, naming a peer that may never have heard of us.
+///
+/// If another active neighbor would receive an introduction, its actual
+/// `ForwardJoin` must fit the strict send budget before views or data change.
 pub fn onJoin(
     self: *State,
     peer: NodeId,
     data: ?[]const u8,
     out: *Actions(SwarmOutEvent),
 ) (Error || Allocator.Error)!void {
+    const forward: SwarmMessage = .{ .forward_join = .{
+        .peer = .{ .id = peer, .data = data },
+        .ttl = self.config.active_random_walk_length,
+    } };
+    for (self.active_view.slice()) |node| {
+        if (node_id.sameNode(node, peer)) continue;
+        // A received Join can fit while the identity-bearing introduction cannot.
+        if (codec.encodedLen(.{ .swarm = forward }) >= codec.max_message_size) {
+            return error.MessageTooLarge;
+        }
+        break;
+    }
+
     // "A node that receives a join request will start by adding the new
     // node to its active view, even if it has to drop a random node from
     // it. (6)"
@@ -90,15 +108,13 @@ pub fn onJoin(
 
     // "The contact node c will then send to all other nodes in its active
     // view a ForwardJoin request containing the new node identifier. (7)"
-    const ttl = self.config.active_random_walk_length;
-    const info: PeerInfo = .{ .id = peer, .data = data };
     var index: usize = 0;
     while (index < self.active_view.count()) : (index += 1) {
         const node = self.active_view.at(index);
         if (node_id.sameNode(node, peer)) continue;
         try out.push(.{ .send_message = .{
             .to = node,
-            .message = .{ .forward_join = .{ .peer = info, .ttl = ttl } },
+            .message = forward,
         } });
     }
 }
@@ -112,6 +128,28 @@ pub fn onForwardJoin(
     out: *Actions(SwarmOutEvent),
 ) (Error || Allocator.Error)!void {
     const peer_id = message.peer.id;
+    if (self.active_view.contains(peer_id) or
+        message.ttl.expired() or self.active_view.count() <= 1)
+    {
+        if (!self.pending_neighbor_requests.contains(peer_id)) {
+            const neighbor: SwarmMessage = .{ .neighbor = .{
+                .priority = .high,
+                .data = self.myData(),
+            } };
+            if (codec.encodedLen(.{ .swarm = neighbor }) >= codec.max_message_size) {
+                return error.MessageTooLarge;
+            }
+        }
+    } else if (!self.pending_neighbor_requests.contains(peer_id)) {
+        // Check the decremented TTL: crossing a varint boundary can make it fit.
+        const forward: SwarmMessage = .{ .forward_join = .{
+            .peer = message.peer,
+            .ttl = message.ttl.next(),
+        } };
+        if (codec.encodedLen(.{ .swarm = forward }) >= codec.max_message_size) {
+            return error.MessageTooLarge;
+        }
+    }
     // Already a neighbour: renew, by asking again.
     if (self.active_view.contains(peer_id)) {
         try self.insertPeerInfo(message.peer, out);

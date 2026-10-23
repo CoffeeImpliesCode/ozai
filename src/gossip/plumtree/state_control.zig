@@ -7,6 +7,7 @@
 const std = @import("std");
 const key = @import("../../base/key.zig");
 const actions = @import("actions.zig");
+const codec = @import("../codec.zig");
 const claim_table = @import("claim_table.zig");
 const limits = @import("limits.zig");
 const wire = @import("message.zig");
@@ -118,19 +119,31 @@ pub fn onSendGraftTimer(
 }
 
 /// Upstream `on_graft`: promote the sender, and if a payload was asked
-/// for, send it from the cache. A graft for a message that has been swept
-/// is silently unanswered, which is right: the message is gone, and the
-/// only honest reply would be silence.
+/// for, send it from the cache. A stored payload must fit the actual writer
+/// before promotion: the public cache also accepts receive-capacity entries.
+/// An unwritable candidate returns `MessageTooLarge` without changing peer
+/// sets or emitting a payload. A swept message is silently unanswered.
 pub fn onGraft(
     self: *State,
     sender: NodeId,
     details: Graft,
     out: *Actions(OutEvent),
 ) (Error || Allocator.Error)!void {
+    const message = if (details.id) |id| self.cache.get(id) else null;
+    if (message) |candidate| {
+        if (codec.encodedLen(.{ .gossip = .{ .gossip = candidate } }) >=
+            codec.max_message_size)
+        {
+            return error.MessageTooLarge;
+        }
+    }
     try push.addEager(self, sender);
-    const id = details.id orelse return;
-    const message = self.cache.get(id) orelse return;
-    try out.push(.{ .send_message = .{ .to = sender, .message = .{ .gossip = message } } });
+    if (message) |candidate| {
+        try out.push(.{ .send_message = .{
+            .to = sender,
+            .message = .{ .gossip = candidate },
+        } });
+    }
 }
 
 /// Upstream `on_neighbor_down`: a neighbour is gone, so drop it from both

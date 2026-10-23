@@ -222,72 +222,57 @@ pub fn parseTxt(
         owned.deinit(alloc);
     }
     while (set.next()) |record| {
-        const separator = std.mem.indexOfScalar(u8, record, '=') orelse
-            return error.MalformedRecord;
-        const key_text = record[0..separator];
-        const after = record[separator + 1 ..];
-        const value_end = std.mem.indexOfScalar(u8, after, '=') orelse after.len;
-        const attribute = Attribute.parse(key_text) orelse return error.MalformedRecord;
-        const value = after[0..value_end];
-        switch (attribute) {
-            .relay => {
-                const url = addr.RelayUrl.parse(value) catch continue;
-                // A duplicate is not a failure: `insert` reports one by
-                // returning null and upstream dedups too, in
-                // `EndpointData::new`. Only the error is an error.
-                endpoint = (try endpoint.insert(alloc, .{ .relay = url })) orelse endpoint;
-            },
-            .addr => {
-                // Upstream tries `SocketAddr::from_str` and then
-                // `CustomAddr::from_str`, dropping the record if neither takes
-                // it. The socket parse is `std`'s, because a socket address on
-                // a wire is Rust's `SocketAddr` text and nothing else — see
-                // `writeSocketAddr` for the other direction.
-                if (std.Io.net.IpAddress.parseLiteral(value)) |literal| {
-                    const grown = try endpoint.insert(alloc, .{ .ip = socketOf(literal) });
-                    endpoint = grown orelse endpoint;
-                } else |_| {
-                    var storage: [addr.max_inline_length]u8 = undefined;
-                    const custom = addr.CustomAddr.parse(value, &storage) catch continue;
-                    // `CustomAddr.data` borrows `storage`, which dies at the end
-                    // of this block, and `NodeAddr.insert` copies the slice
-                    // header rather than the bytes it points at. So the bytes
-                    // are copied out here, from `alloc`, and that copy has to
-                    // outlive the item — which is the rule `parseTxt` states
-                    // about its allocator.
-                    const data = try alloc.dupe(u8, custom.data);
-                    // Recorded before the address is inserted, and not after,
-                    // because recording it can fail and the insert is what makes
-                    // the item refer to the copy. Appending first means every
-                    // later path out of here frees the copy through `owned`,
-                    // where the error path walks it; the other order handed back
-                    // an item holding a buffer that nothing owned as soon as
-                    // this append failed. The one path the tracker cannot cover
-                    // is this one, and it frees the copy itself.
-                    owned.append(alloc, data) catch {
-                        alloc.free(data);
-                        return error.OutOfMemory;
-                    };
-                    const grown = endpoint.insert(alloc, .{
-                        .custom = .{ .id = custom.id, .data = data },
-                    }) catch return error.OutOfMemory;
-                    if (grown) |next| {
-                        endpoint = next;
-                    } else {
-                        // Already present, so nothing refers to the copy. It is
-                        // the last thing `owned` recorded, so freeing it is
-                        // taking back that one entry; the list itself is given
-                        // up whole below whether or not this arm ran.
-                        alloc.free(owned.items[owned.items.len - 1]);
-                        owned.items.len -= 1;
-                    }
-                }
-            },
-            .user_data => {},
+        var storage: [addr.max_inline_length]u8 = undefined;
+        var candidate = (try parseTxtRecord(record, &storage)) orelse continue;
+        if (candidate == .custom) {
+            // Track the copy before insertion can make the endpoint refer to it.
+            const data = try alloc.dupe(u8, candidate.custom.data);
+            owned.append(alloc, data) catch {
+                alloc.free(data);
+                return error.OutOfMemory;
+            };
+            candidate.custom.data = data;
+        }
+        if (try endpoint.insert(alloc, candidate)) |grown| {
+            endpoint = grown;
+        } else if (candidate == .custom) {
+            // A duplicate does not own the new copy; undo this record's allocation.
+            std.debug.assert(owned.items.len > 0);
+            alloc.free(owned.pop().?);
         }
     }
     owned.deinit(alloc);
     return item.Item.init(endpoint, provenance, null);
+}
+
+fn parseTxtRecord(
+    record: []const u8,
+    storage: *[addr.max_inline_length]u8,
+) ParseError!?addr.TransportAddr {
+    const separator = std.mem.indexOfScalar(u8, record, '=') orelse
+        return error.MalformedRecord;
+    const key_text = record[0..separator];
+    const after = record[separator + 1 ..];
+    const value_end = std.mem.indexOfScalar(u8, after, '=') orelse after.len;
+    const attribute = Attribute.parse(key_text) orelse return error.MalformedRecord;
+    const value = after[0..value_end];
+    return switch (attribute) {
+        .relay => .{ .relay = addr.RelayUrl.parse(value) catch return null },
+        .addr => parseTxtAddress(value, storage),
+        .user_data => null,
+    };
+}
+
+fn parseTxtAddress(
+    value: []const u8,
+    storage: *[addr.max_inline_length]u8,
+) ?addr.TransportAddr {
+    // Upstream tries the socket form before the custom form and drops invalid values.
+    if (std.Io.net.IpAddress.parseLiteral(value)) |literal| {
+        return .{ .ip = socketOf(literal) };
+    } else |_| {
+        return .{ .custom = addr.CustomAddr.parse(value, storage) catch return null };
+    }
 }
 
 /// `std.Io.net.IpAddress` to `addr.SocketAddr`.
@@ -338,4 +323,53 @@ pub const max_record_length = 6 + 8 + addr.RelayUrl.max_host_length + 1 + 5 + 1;
 /// list has none, so the caller sizes the buffer and owns it.
 pub fn maxTxtStringsLength(addrs: usize) usize {
     return addrs * (max_record_length + 1);
+}
+
+test "TXT fail-N preserves unique custom payloads and rolls back malformed records" {
+    // Exercise the actual consumer with duplicates and later insertion failures.
+    const t = std.testing;
+    var secret = try @import("../base/key.zig").SecretKey.fromSeed(@splat(0x51));
+    defer secret.deinit();
+    const node_id = secret.nodeId();
+    const records =
+        "addr=1_a1b2c3\x00addr=1_a1b2c3\x00addr=2_01020304\x00" ++
+        "addr=127.0.0.1:1234\x00relay=https://relay.example./\x00";
+    var reached_success = false;
+    for (0..64) |fail_index| {
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
+        const alloc = failing.allocator();
+        const value = parseTxt(alloc, node_id, .init(records), .dns) catch |err| {
+            try t.expectEqual(error.OutOfMemory, err);
+            try t.expect(failing.has_induced_failure);
+            try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            continue;
+        };
+        try t.expectEqual(@as(usize, 4), value.endpoint.addrs.len);
+        var custom_count: usize = 0;
+        for (value.endpoint.addrs) |candidate| {
+            if (candidate == .custom) {
+                custom_count += 1;
+                switch (candidate.custom.id) {
+                    1 => try t.expectEqualSlices(u8, &.{ 0xa1, 0xb2, 0xc3 }, candidate.custom.data),
+                    2 => try t.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, candidate.custom.data),
+                    else => return error.TestUnexpectedResult,
+                }
+                alloc.free(candidate.custom.data);
+            }
+        }
+        try t.expectEqual(@as(usize, 2), custom_count);
+        value.endpoint.deinit(alloc);
+        try t.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        reached_success = true;
+        break;
+    }
+    try t.expect(reached_success);
+    var rollback = t.FailingAllocator.init(t.allocator, .{});
+    try t.expectError(error.MalformedRecord, parseTxt(
+        rollback.allocator(),
+        node_id,
+        .init(records ++ "unknown=value\x00"),
+        .dns,
+    ));
+    try t.expectEqual(rollback.allocated_bytes, rollback.freed_bytes);
 }

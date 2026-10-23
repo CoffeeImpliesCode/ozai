@@ -12,9 +12,7 @@ test "native NAT varint width boundaries preserve numbers and address bytes" {
         .initIpv6([_]u8{0} ** 16, 0, 0),
     };
     for (addresses, 0..) |address, family| {
-        for ([_]u64{ 0, 63, 64, 16383, 16384, 1073741823, 1073741824,
-            0x3fffffffffffffff }) |number|
-        {
+        for ([_]u64{ 0, 63, 64, 16383, 16384, 1073741823, 1073741824, 0x3fffffffffffffff }) |number| {
             const add: AddAddress = .{ .sequence = number, .address = address };
             const reach: ReachAddress = .{ .round = number, .address = address };
             var bytes: [32]u8 = undefined;
@@ -127,7 +125,9 @@ test "native NAT source-derived golden bytes cover both frames and address famil
         .address = .initIpv6(.{ 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 0, 0),
     }, &.{
         0x80, 0x3d, 0x7f, 0x91, 0x40, 0x40,
-        0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+        0x20, 1,    0x0d, 0xb8, 0,    0,
+        0,    0,    0,    0,    0,    0,
+        0,    0,    0,    1,    0,    0,
     }, true);
     try expectGolden(ReachAddress, .{
         .round = 16384,
@@ -138,8 +138,8 @@ test "native NAT source-derived golden bytes cover both frames and address famil
         .address = .initIpv6([_]u8{0xff} ** 16, 65535, 0),
     }, &.{
         0x80, 0x3d, 0x7f, 0x93, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     }, true);
     try std.testing.expectEqual(@as(u64, 0x3d7f94), remove_frame_type);
     try std.testing.expectEqual(@as(u64, 0x3d7f91120401), transport_parameter_id);
@@ -207,7 +207,13 @@ test "native NAT rejects unset addresses and out-of-range wire integers" {
 }
 
 test "native NAT fuzz decoder canonical encoding is a fixed point" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    // Coverage needs fuzz instrumentation, but Zig 0.16.0's fuzz runner has bug #36326.
+    if (comptime @import("builtin").fuzz and @import("coverage_options").coverage) {
+        var smith: std.testing.Smith = .{ .in = &.{} };
+        try fuzzDecode({}, &smith);
+    } else {
+        try std.testing.fuzz({}, fuzzDecode, .{});
+    }
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {

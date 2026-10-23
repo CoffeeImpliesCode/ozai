@@ -54,7 +54,7 @@ const vectors = @import("frame_vectors.zig");
 /// cannot name its error set without depending on it, so it declares the two it
 /// can actually return and every caller of it widens them — which is sound
 /// because a narrower set propagates into a wider one unchanged.
-const Error = error{
+pub const Error = error{
     /// A varint named a width its bytes did not reach.
     UnexpectedEnd,
     /// A write with no room left in the buffer it was handed.

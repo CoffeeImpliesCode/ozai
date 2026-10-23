@@ -125,6 +125,8 @@ fn spkiOf(node: NodeId) [bridge.spki_length]u8 {
     var out: [bridge.spki_length]u8 = undefined;
     @memcpy(out[0..header.len], &header);
     @memcpy(out[header.len..], &node.toBytes());
+    // zbc does not resolve spki_length to 44 and the adjacent copies that fill it.
+    // zbc-disable-next-line: use-undefined
     return out;
 }
 

@@ -274,7 +274,7 @@ fn noteDelivery(node: *node_ns.Node, content: []const u8) void {
 }
 
 /// Which node this `NodeId` is, by the identity each one presents.
-pub fn indexOf(mesh: *const Mesh, id: NodeId) ?usize {
+pub fn indexOf(mesh: *const Mesh, id: ozai.NodeId) ?usize {
     for (0..node_ns.max_nodes) |index| {
         if (mesh.nodes[index].wire.id.order(id) == .eq) return index;
     }

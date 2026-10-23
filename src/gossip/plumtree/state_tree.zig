@@ -12,6 +12,7 @@
 const std = @import("std");
 const key = @import("../../base/key.zig");
 const actions = @import("actions.zig");
+const codec = @import("../codec.zig");
 const claim_table = @import("claim_table.zig");
 const settings = @import("config.zig");
 const ids = @import("id_cache.zig");
@@ -121,8 +122,8 @@ pub const State = struct {
     /// node did while it was on the topic, not protocol state: they survive
     /// `leave`, so a caller can report what happened before it left.
     ///
-    /// `payload_messages_received` counts every received `Gossip` *before* the
-    /// arm is chosen, so a spoofed frame is counted as received and then
+    /// `payload_messages_received` counts every budget-admitted `Gossip` before
+    /// hash validation, so a spoofed frame is counted as received and then
     /// discarded. That is a receive counter and not a delivery counter, and the
     /// test that a spoofed message is not penalised asserts on everything
     /// except it.
@@ -189,6 +190,12 @@ pub const State = struct {
     }
 
     /// Handle one event. `now` is the caller's clock; nothing here reads one.
+    ///
+    /// Incoming `Gossip` exceeding `max_content` or the inclusive codec receive
+    /// budget, and local `.broadcast` exceeding `max_content` or the strict
+    /// scope-specific codec send budget, return `error.MessageTooLarge` before
+    /// changing `self` or `out`, including the first-event sweep and `started`
+    /// latch. A state that has left remains inert even for oversized input.
     ///
     /// **Not transactional, and the residue is named rather than hidden.** An
     /// event advances `self` and appends to `out` as it goes, so an
@@ -257,19 +264,22 @@ pub const State = struct {
     /// `handle` copies the bytes.
     ///
     /// **The arms below run in this order, and the order is the contract.**
-    /// Within `onGossip` the arms are: validate, then either the duplicate
-    /// branch or the forward branch, and inside the forward branch the order
-    /// is remember the id, cache the payload, push to eager peers, queue ids
-    /// for lazy peers, drop the graft timer, run the tree optimisation, and
-    /// only then tell the application. Reordering those changes what a caller
+    /// `handle` admits the inclusive receive budget before any mutation.
+    /// Within `onGossip`, validate the hash, then choose the duplicate or forward
+    /// branch. The forward branch remembers the id, then caches the derived
+    /// next-round payload, pushes to eager peers and queues ids for lazy peers
+    /// only if its actual encoded length fits the writer. Even when it does
+    /// not fit, drop the graft timer,
+    /// run the tree optimisation, record the received hop and tell the application.
+    /// Reordering those changes what a caller
     /// observes: the `Graft` and `Prune` of an optimisation go out *before* the
     /// `Received` event, so a driver that has not been told the message
     /// arrived still sees the tree move under it. It is also why the
     /// `schedule_timer` for the dispatch flush appears once for a burst rather
-    /// than once per message, because the flag is latched. The entry sweep is
-    /// the same rule at the front of the function: it is queued before
-    /// `started` is set, so a refusal costs one sweep and not all of them. A
-    /// reader who finds the sequence untidy should not sort it.
+    /// than once per message, because the flag is latched. After input admission,
+    /// the entry sweep is queued before `started` is set, so a refused append
+    /// leaves the sweep eligible for the next event. Rejected input does not
+    /// start the tree. A reader who finds the sequence untidy should not sort it.
     pub fn handle(
         self: *State,
         event: InEvent,
@@ -281,6 +291,20 @@ pub const State = struct {
         // driver that has not stopped feeding; there is nothing to do and no
         // error to hand back for doing nothing.
         if (self.left) return;
+        switch (event) {
+            .broadcast => |b| try admitBroadcast(b.content, b.scope),
+            .recv_message => |recv| switch (recv.message) {
+                .gossip => |gossip| {
+                    if (gossip.content.len > max_content) return error.MessageTooLarge;
+                    const received: codec.Message = .{ .gossip = recv.message };
+                    if (codec.encodedLen(received) > codec.max_message_size) {
+                        return error.MessageTooLarge;
+                    }
+                },
+                else => {},
+            },
+            else => {},
+        }
         if (!self.started) {
             // Queued before the latch is set, for the reason `onIHave` gives.
             // A refused append is the one event that would leave this tree
@@ -292,7 +316,7 @@ pub const State = struct {
         }
         switch (event) {
             .recv_message => |recv| try self.handleMessage(recv.from, recv.message, now, out),
-            .broadcast => |b| try self.broadcast(b.content, b.scope, now, out),
+            .broadcast => |b| try self.broadcastAdmitted(b.content, b.scope, now, out),
             .timer_expired => |timer| try self.handleTimer(timer, now, out),
             .neighbor_up => |peer| try push.addEager(self, peer),
             .neighbor_down => |peer| control.onNeighborDown(self, peer),
@@ -349,6 +373,9 @@ pub const State = struct {
     /// shares a path with an eager one should get the payload from the eager
     /// peer first and only ask for it if that fails.
     ///
+    /// `MessageTooLarge` rejects the actual outgoing scope and round before
+    /// either cache changes or any output is appended.
+    ///
     /// **Inert on a state that has left**, exactly as `handle` is: it returns
     /// before it touches a cache, a queue or the dispatch latch, so the direct
     /// route into a tree `leave` emptied cannot refill it. A caller that
@@ -364,7 +391,33 @@ pub const State = struct {
         out: *Actions(OutEvent),
     ) (Error || Allocator.Error)!void {
         if (self.left) return;
+        try admitBroadcast(content, scope);
+        try self.broadcastAdmitted(content, scope, now, out);
+    }
+
+    fn admitBroadcast(content: []const u8, scope: Scope) Error!void {
         if (content.len > max_content) return error.MessageTooLarge;
+        // The codec counts a fixed-width id; sizing must not hash rejected input.
+        const candidate: Gossip = .{
+            .id = MessageId.fromBytes([_]u8{0} ** 32),
+            .content = content,
+            .scope = deliveryScope(scope),
+        };
+        if (codec.encodedLen(.{ .gossip = .{ .gossip = candidate } }) >=
+            codec.max_message_size)
+        {
+            return error.MessageTooLarge;
+        }
+    }
+
+    // Both public entry points admit the input before any mutation.
+    fn broadcastAdmitted(
+        self: *State,
+        content: []const u8,
+        scope: Scope,
+        now: Nanos,
+        out: *Actions(OutEvent),
+    ) (Error || Allocator.Error)!void {
         const id = MessageId.fromContent(content);
         const message: Gossip = .{
             .id = id,

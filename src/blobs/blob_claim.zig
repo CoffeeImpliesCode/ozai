@@ -428,6 +428,8 @@ pub fn BlobClaim(comptime capacity: usize) type {
         /// slot it frees is closed with the last entry, so this is the only
         /// place a gap is made.
         fn dropAt(self: *Self, index: usize) void {
+            // ZBC cannot see that every caller establishes index < self.len before dropAt.
+            // zbc-disable-next-line: index-minus-one-without-zero-guard
             self.entries[index] = self.entries[self.len - 1];
             self.len -= 1;
         }
@@ -505,7 +507,7 @@ test "a second caller is refused and is told who holds the blob" {
     // peer and not at the newcomer's — the collision that would truncate the
     // newcomer's own transfer.
     try t.expectEqual(@as(usize, 1), table.count());
-    const seen = table.claimOf(testHash(1)).?;
+    const seen = table.claimOf(testHash(1)) orelse return error.TestUnexpectedResult;
     try t.expect(peer_a.order(seen.peer) == .eq);
     try t.expect(peer_b.order(seen.peer) != .eq);
     try t.expectEqual(owner_a, seen.owner);
@@ -621,7 +623,7 @@ test "a claim past its lifetime is dropped and never handed out" {
     // A clock that moved back ages nothing, so the claim reads as stale rather
     // than as the freshest thing in the table, and `reap` on that clock takes it
     // rather than keeping a claim nobody can age.
-    const held = table.claimOf(testHash(1)).?;
+    const held = table.claimOf(testHash(1)) orelse return error.TestUnexpectedResult;
     try t.expect(isFresh(held, held.since_s));
     try t.expect(!isFresh(held, held.since_s - 1));
     try t.expectEqual(@as(usize, 1), table.reap(held.since_s - 1));

@@ -20,7 +20,7 @@ const router = @import("../router/router.zig");
 const incoming_filter = @import("../endpoint/incoming_filter.zig");
 const endpoint = @import("../endpoint/endpoint.zig");
 
-const Node = node_mod.Node;
+const Self = node_mod.Node;
 const Error = node_config.Error;
 const Conn = bridge_mod.Conn;
 const Instant = bridge_mod.Instant;
@@ -69,7 +69,7 @@ pub const Answer = struct {
 /// already knows who the peer is, which is what `Endpoint::accept` never
 /// returns. So the walk is over server-side connections only, and the
 /// filter sees exactly what a remote peer sent.
-pub fn admit(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!bool {
+pub fn admit(self: *Self, io: std.Io, at: Instant, random: std.Random) Error!bool {
     var moved = false;
     var index: usize = 0;
     while (self.bridge.connectionAt(index)) |conn| : (index += 1) {
@@ -102,7 +102,7 @@ pub fn admit(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!boo
 /// this is the walk: a task is a value, so driving it is one
 /// `router.dispatchStep` and one report, in this pass rather than in a
 /// thread of its own.
-pub fn drive(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!bool {
+pub fn drive(self: *Self, io: std.Io, at: Instant, random: std.Random) Error!bool {
     var moved = false;
     var index: usize = 0;
     while (index < self.accept.live) {
@@ -138,7 +138,7 @@ pub fn drive(self: *Node, io: std.Io, at: Instant, random: std.Random) Error!boo
 /// this node makes itself, so the whole of a task runs inside one pass;
 /// the only thing it waits for between passes is the handshake, and that is
 /// `conn.established()`.
-pub fn runTask(self: *Node, task: *endpoint.Task, conn: Conn) bool {
+pub fn runTask(self: *Self, task: *endpoint.Task, conn: Conn) bool {
     if (!conn.established()) return false;
     var event: router.ConnEvent = .{
         .outcome = .{ .alpn = conn.entry.conn.negotiatedAlpn() },
@@ -198,7 +198,7 @@ pub fn runTask(self: *Node, task: *endpoint.Task, conn: Conn) bool {
 /// answered with. Some actions owe more than one report, which is what
 /// `Answer.count` is for.
 pub fn feed(
-    self: *Node,
+    self: *Self,
     io: ?std.Io,
     first: endpoint.Event,
     at: ?Instant,
@@ -227,7 +227,7 @@ pub fn feed(
 /// operations it deliberately leaves out of its own signature are here:
 /// `spawn` and `cancel_accepts`.
 pub fn perform(
-    self: *Node,
+    self: *Self,
     io: ?std.Io,
     action: endpoint.Action,
     at: ?Instant,
@@ -271,7 +271,7 @@ pub fn perform(
 
 /// The handler the router dispatches to. One handler, registered under the
 /// one ALPN the bridge offers; see `max_alpns`.
-pub fn handler(self: *Node) router.ProtocolHandler {
+pub fn handler(self: *Self) router.ProtocolHandler {
     return .{
         .ptr = @ptrCast(self),
         // Null is upstream's default body: the router awaits the handshake
@@ -288,7 +288,7 @@ pub fn acceptConnection(ptr: *anyopaque, connection: router.Connection) router.A
     // The handle a handler is given is the node itself, and asserting it is
     // what turns "the endpoint mints the handle" into a checked claim.
     std.debug.assert(connection.ptr == ptr);
-    const self: *Node = @ptrCast(@alignCast(ptr));
+    const self: *Self = @ptrCast(@alignCast(ptr));
     self.stats.handler_connections += 1;
 }
 
@@ -300,7 +300,7 @@ pub fn acceptConnection(ptr: *anyopaque, connection: router.Connection) router.A
 /// shutdown while the accepts that might still be using it are still running,
 /// and never after.
 pub fn shutdownHandler(ptr: *anyopaque) void {
-    const self: *Node = @ptrCast(@alignCast(ptr));
+    const self: *Self = @ptrCast(@alignCast(ptr));
     self.stats.handler_shutdowns += 1;
     self.timers.clearRetainingCapacity();
 }

@@ -1161,13 +1161,11 @@ test "Noq native extension parameters source vectors and duplicates" {
     try testing.expectEqual(@as(?u8, 255), parsed.max_remote_nat_traversal_addresses);
     const prefix_len = writer.seek;
     @memcpy(buffer[prefix_len..][0..prefix_len], buffer[0..prefix_len]);
-    try testing.expectError(error.TransportParameterError,
-        TransportParams.decode(buffer[0 .. prefix_len * 2]));
+    try testing.expectError(error.TransportParameterError, TransportParams.decode(buffer[0 .. prefix_len * 2]));
     writer.seek = 0;
     try packet.writeVarInt(&writer, 0x3d7f91120401);
     try writer.writeAll(&.{ 1, 0 });
-    try testing.expectError(error.TransportParameterError,
-        TransportParams.decode(writer.buffered()));
+    try testing.expectError(error.TransportParameterError, TransportParams.decode(writer.buffered()));
 }
 
 test "native transport parameters reject malformed lengths and canonicality" {
@@ -1180,22 +1178,25 @@ test "native transport parameters reject malformed lengths and canonicality" {
         for ([_][]const u8{ &.{0}, &.{ 2, 0x40, 1 }, &.{ 2, 1, 0 } }) |value| {
             writer.seek = start;
             try writer.writeAll(value);
-            try testing.expectError(error.TransportParameterError,
-                TransportParams.decode(writer.buffered()));
+            try testing.expectError(error.TransportParameterError, TransportParams.decode(writer.buffered()));
         }
         writer.seek = start;
         try writer.writeAll(&.{ 1, 1 });
         const length = writer.seek;
         @memcpy(buffer[length..][0..length], buffer[0..length]);
-        try testing.expectError(error.TransportParameterError,
-            TransportParams.decode(buffer[0 .. length * 2]));
+        try testing.expectError(error.TransportParameterError, TransportParams.decode(buffer[0 .. length * 2]));
     }
-    try testing.expectError(error.TransportParameterError,
-        TransportParams.decode(&.{ 0x3e, 8, 0xc0, 0, 0, 1, 0, 0, 0, 0 }));
+    try testing.expectError(error.TransportParameterError, TransportParams.decode(&.{ 0x3e, 8, 0xc0, 0, 0, 1, 0, 0, 0, 0 }));
 }
 
 test "native transport parameter fuzz remains bounded and fails closed" {
-    try testing.fuzz({}, fuzzNativeParams, .{});
+    // Coverage needs fuzz instrumentation, but Zig 0.16.0's fuzz runner has bug #36326.
+    if (comptime @import("builtin").fuzz and @import("coverage_options").coverage) {
+        var smith: testing.Smith = .{ .in = &.{} };
+        try fuzzNativeParams({}, &smith);
+    } else {
+        try testing.fuzz({}, fuzzNativeParams, .{});
+    }
 }
 
 fn fuzzNativeParams(_: void, smith: *testing.Smith) !void {

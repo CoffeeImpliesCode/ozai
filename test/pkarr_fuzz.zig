@@ -56,6 +56,30 @@ test "pkarr packet decode" {
     try t.fuzz(Context{}, testOne, .{ .corpus = &corpus });
 }
 
+test "pkarr oracle permits correct field boundary rejections" {
+    // Only the sign bit is outside y; p and p+1 remain noncanonical for either sign.
+    const prime: u256 = (@as(u256, 1) << 255) - 19;
+    const boundaries = [_]struct { y: u256, canonical: bool }{
+        .{ .y = prime - 1, .canonical = true },
+        .{ .y = prime, .canonical = false },
+        .{ .y = prime + 1, .canonical = false },
+    };
+    for (boundaries) |boundary| {
+        for ([_]u8{ 0, 0x80 }) |sign_bit| {
+            var bytes = [_]u8{0} ** (pkarr.header_length + 1);
+            std.mem.writeInt(u256, bytes[0..32], boundary.y, .little);
+            bytes[31] |= sign_bit;
+            if (boundary.canonical) {
+                const packet = try pkarr.Packet.parse(&bytes);
+                try t.expectEqualSlices(u8, bytes[pkarr.header_length..], packet.dns);
+            } else {
+                try t.expectError(error.BadPublicKey, pkarr.Packet.parse(&bytes));
+            }
+            try check(&bytes);
+        }
+    }
+}
+
 fn testOne(_: Context, smith: *t.Smith) anyerror!void {
     var buffer: [input_buffer_len]u8 = undefined;
     // `in` is the corpus entry verbatim while the corpus is replayed, and null
@@ -175,6 +199,6 @@ fn condemn(bytes: []const u8) ?pkarr.Error {
 fn isCanonicalPoint(key_bytes: []const u8) bool {
     const prime: u256 = (@as(u256, 1) << 255) - 19;
     var y = std.mem.readInt(u256, key_bytes[0..32], .little);
-    y &= prime; // The sign bit of `x` sits above every bit of `y`.
+    y &= (@as(u256, 1) << 255) - 1; // The sign bit of `x` sits above every bit of `y`.
     return y < prime;
 }

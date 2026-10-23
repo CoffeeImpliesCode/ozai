@@ -129,14 +129,14 @@ const priority_names = [_][]const u8{ "high", "low" };
 const scope_names = [_][]const u8{ "swarm", "neighbors" };
 
 comptime {
-    assertOrder(@typeInfo(topic_message).@"union".fields, &layer_names);
-    assertOrder(@typeInfo(swarm_message).@"union".fields, &swarm_names);
-    assertOrder(@typeInfo(tree_message).@"union".fields, &tree_names);
-    assertOrder(@typeInfo(swarm_priority).@"enum".fields, &priority_names);
-    assertOrder(@typeInfo(delivery_scope).@"union".fields, &scope_names);
+    assertOrder(&layer_names, @typeInfo(topic_message).@"union".fields);
+    assertOrder(&swarm_names, @typeInfo(swarm_message).@"union".fields);
+    assertOrder(&tree_names, @typeInfo(tree_message).@"union".fields);
+    assertOrder(&priority_names, @typeInfo(swarm_priority).@"enum".fields);
+    assertOrder(&scope_names, @typeInfo(delivery_scope).@"union".fields);
 }
 
-fn assertOrder(comptime fields: anytype, comptime names: []const []const u8) void {
+fn assertOrder(comptime names: []const []const u8, comptime fields: anytype) void {
     if (fields.len != names.len) {
         @compileError("a message union gained or lost an arm; its tag table is out of date");
     }

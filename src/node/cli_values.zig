@@ -10,25 +10,45 @@
 const std = @import("std");
 
 const ozai = @import("ozai");
-const node_mod = ozai.node;
 
 const NodeId = ozai.NodeId;
-const SocketAddr = ozai.SocketAddr;
-const Peer = node_mod.Peer;
 
 pub const BlobHash = @TypeOf(@as(ozai.blobs_protocol.GetRequest, undefined).hash);
 pub const CliError = ozai.base32.DecodeError || ozai.KeyError ||
     ozai.addr.RelayUrlParseError || error{
-    NotAnOption, FlagWithoutValue, AddressNotReachable,
-    PeerWithoutAddress, PeerAddressUnreachable,
-    TwoRelayRoles, RelayNeedsHost, RelayNeedsServer, InvalidRelayHost,
-    InvalidTopic, TooManyTopics, MessageNeedsTopic, TopicAlpnMismatch, ConflictingProtocols,
-    InvalidBlobRole, InvalidBlobHash, InvalidBlobSize, InvalidBlobRange,
-    BlobNeedsRole, BlobNeedsHash, BlobNeedsDirectory, BlobAlpnMismatch,
-    BlobProviderGetterOptions, BlobGetterDirectory, EmptyPath,
-    TraversalNeedsAddress, TooManyTraversalAddresses,
-    NotASeed, NotMilliseconds,
-    LookupNeedsServer, LookupNeedsPeer, LookupTimingOutOfRange, InvalidDnsOrigin,
+    NotAnOption,
+    FlagWithoutValue,
+    AddressNotReachable,
+    PeerWithoutAddress,
+    PeerAddressUnreachable,
+    TwoRelayRoles,
+    RelayNeedsHost,
+    RelayNeedsServer,
+    InvalidRelayHost,
+    InvalidTopic,
+    TooManyTopics,
+    MessageNeedsTopic,
+    TopicAlpnMismatch,
+    ConflictingProtocols,
+    InvalidBlobRole,
+    InvalidBlobHash,
+    InvalidBlobSize,
+    InvalidBlobRange,
+    BlobNeedsRole,
+    BlobNeedsHash,
+    BlobNeedsDirectory,
+    BlobAlpnMismatch,
+    BlobProviderGetterOptions,
+    BlobGetterDirectory,
+    EmptyPath,
+    TraversalNeedsAddress,
+    TooManyTraversalAddresses,
+    NotASeed,
+    NotMilliseconds,
+    LookupNeedsServer,
+    LookupNeedsPeer,
+    LookupTimingOutOfRange,
+    InvalidDnsOrigin,
     NoClock,
 };
 
@@ -47,7 +67,7 @@ pub fn reject(
 }
 
 /// A pinned inner peer reached through a relay, not the relay's identity.
-pub fn parseRelayPeer(text: []const u8) CliError!Peer {
+pub fn parseRelayPeer(text: []const u8) CliError!ozai.node.Peer {
     const at = std.mem.indexOfScalar(u8, text, '@') orelse
         return error.PeerWithoutAddress;
     return .{
@@ -84,7 +104,7 @@ pub fn parseBlobRange(text: []const u8) CliError!?ozai.blobs_protocol.ChunkRange
 }
 
 /// `ip:port`, with an IPv6 literal written in brackets.
-pub fn parseSocket(text_in: []const u8) CliError!SocketAddr {
+pub fn parseSocket(text_in: []const u8) CliError!ozai.SocketAddr {
     const colon = std.mem.lastIndexOfScalar(u8, text_in, ':') orelse
         return error.AddressNotReachable;
     const port = std.fmt.parseInt(u16, text_in[colon + 1 ..], 10) catch
@@ -104,7 +124,7 @@ pub fn parseSocket(text_in: []const u8) CliError!SocketAddr {
 /// The two halves keep their own refusals: a node id that is not on the curve
 /// and an address with no port are different mistakes, and one name for both
 /// would leave the caller guessing which one it typed.
-pub fn parsePeer(text_in: []const u8) CliError!Peer {
+pub fn parsePeer(text_in: []const u8) CliError!ozai.node.Peer {
     const at = std.mem.indexOfScalar(u8, text_in, '@') orelse return error.PeerWithoutAddress;
     const socket = parseSocket(text_in[at + 1 ..]) catch return error.PeerAddressUnreachable;
     return .{ .id = try NodeId.parseZ32(text_in[0..at]), .addr = .{ .ip = socket } };
@@ -137,10 +157,22 @@ pub fn parseDnsOrigin(text: []const u8) CliError![]const u8 {
 }
 
 test "lookup timing accepts exact bounds and rejects nonnumeric values" {
-    try std.testing.expectEqual(@as(i32, 2147483647), try parseLookupMilliseconds(i32, "2147483647", std.math.maxInt(i32)));
-    try std.testing.expectEqual(max_lookup_interval_ms, try parseLookupMilliseconds(u64, "9223372036854", max_lookup_interval_ms));
-    try std.testing.expectError(error.LookupTimingOutOfRange, parseLookupMilliseconds(i32, "-1", std.math.maxInt(i32)));
-    try std.testing.expectError(error.LookupTimingOutOfRange, parseLookupMilliseconds(u64, "abc", max_lookup_interval_ms));
+    try std.testing.expectEqual(
+        @as(i32, 2147483647),
+        try parseLookupMilliseconds(i32, "2147483647", std.math.maxInt(i32)),
+    );
+    try std.testing.expectEqual(
+        max_lookup_interval_ms,
+        try parseLookupMilliseconds(u64, "9223372036854", max_lookup_interval_ms),
+    );
+    try std.testing.expectError(
+        error.LookupTimingOutOfRange,
+        parseLookupMilliseconds(i32, "-1", std.math.maxInt(i32)),
+    );
+    try std.testing.expectError(
+        error.LookupTimingOutOfRange,
+        parseLookupMilliseconds(u64, "abc", max_lookup_interval_ms),
+    );
 }
 
 test "DNS origins preserve absolute spelling and reject oversized labels" {

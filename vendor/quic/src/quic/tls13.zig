@@ -7100,7 +7100,13 @@ fn parseEncryptedExtensionsTestVerdict(body: []const u8) ?HandshakeError {
 }
 
 test "fuzz raw certificate type negotiation" {
-    try std.testing.fuzz(@as(void, undefined), fuzzRawCertificateTypeNegotiation, .{});
+    // Coverage needs fuzz instrumentation, but Zig 0.16.0's fuzz runner has bug #36326.
+    if (comptime @import("builtin").fuzz and @import("coverage_options").coverage) {
+        var smith: std.testing.Smith = .{ .in = &.{} };
+        try fuzzRawCertificateTypeNegotiation({}, &smith);
+    } else {
+        try std.testing.fuzz(@as(void, undefined), fuzzRawCertificateTypeNegotiation, .{});
+    }
 }
 
 fn fuzzRawCertificateTypeNegotiation(_: void, smith: *std.testing.Smith) !void {

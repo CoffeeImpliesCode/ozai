@@ -358,11 +358,15 @@ pub fn decode(bytes: []const u8) Error!Decoded {
         .v4 => {
             var address: [4]u8 = undefined;
             @memcpy(address[0..], bytes[offset..][0..4]);
+            // Length check and memcpy fill all four bytes; ZBC cannot prove the full write.
+            // zbc-disable-next-line: use-undefined
             ip = .{ .v4 = address };
         },
         .v6 => {
             var address: [16]u8 = undefined;
             @memcpy(address[0..], bytes[offset..][0..16]);
+            // Length check and memcpy fill all sixteen bytes; ZBC cannot prove the full write.
+            // zbc-disable-next-line: use-undefined
             ip = .{ .v6 = address };
         },
     }

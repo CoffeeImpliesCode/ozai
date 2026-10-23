@@ -1,0 +1,3 @@
+noq-proto=1.3.0
+vcs=c1f411562e6078852749b8bcf1190523096a107f
+codec=frame::ObservedAddr::encode/read,address_discovery::Role

@@ -18,8 +18,15 @@ pub const max_streams = max_peers * max_topics;
 pub const max_queued_bytes = 64 * 1024;
 pub const frame_room = codec.max_message_size + 4;
 pub const Outcome = enum {
-    sent, queued, no_route, not_established, no_stream_room, frame_too_large,
-    no_room, unencodable, core_refused,
+    sent,
+    queued,
+    no_route,
+    not_established,
+    no_stream_room,
+    frame_too_large,
+    no_room,
+    unencodable,
+    core_refused,
 };
 pub const Refused = struct {
     no_route: u64 = 0,
@@ -50,36 +57,62 @@ pub const Wire = struct {
     initial_sent: [max_topics]bool = @splat(false),
 };
 
-/// Bind gossip-ALPN connections to the peer ID authenticated by the completed handshake.
+/// Keep one authenticated outbound route per peer until its connection closes or is swept.
+/// Receive assembly and send-stream records belong to connections, not the selected peer route.
 pub fn learn(self: *Node) void {
+    var stream_index: usize = 0;
+    while (stream_index < self.gossip.streams.len) {
+        const id = self.gossip.streams.entries[stream_index].conn;
+        if (node_transport.connFor(self, id)) |conn| {
+            if (!conn.closed()) {
+                stream_index += 1;
+                continue;
+            }
+        }
+        self.gossip.streams.forget(id);
+    }
+    var incoming_index: usize = 0;
+    while (incoming_index < self.gossip.incoming.len) {
+        const id = self.gossip.incoming.entries[incoming_index].conn;
+        if (node_transport.connFor(self, id)) |conn| {
+            if (!conn.closed()) {
+                incoming_index += 1;
+                continue;
+            }
+        }
+        self.gossip.incoming.forget(id);
+    }
     var index: usize = 0;
     while (self.bridge.connectionAt(index)) |conn| : (index += 1) {
         if (!conn.established()) continue;
+        if (conn.closed()) continue;
         if (!std.mem.eql(u8, conn.entry.conn.negotiatedAlpn(), "/iroh-gossip/1")) continue;
         const peer = peerOf(conn) orelse continue;
         if (self.gossip.conns.connFor(peer)) |current| {
-            if (current == conn.id()) continue;
+            if (node_transport.connFor(self, current)) |selected| {
+                if (!selected.closed()) continue;
+            }
         }
+        // A surviving connection replaces a dead route without forgetting that peer.
+        // Live connections retain their independent stream state across every scan.
         const bound = self.gossip.conns.bind(peer, conn.id()) catch continue;
         switch (bound) {
-            .fresh => {},
-            .replaced => |old| {
-                self.gossip.streams.forget(old);
-                self.gossip.incoming.forget(old);
-            },
+            .fresh, .replaced => {},
         }
     }
 }
 
-/// Remove routes whose connection the core swept; the caller feeds these peers to every topic.
+/// Report peers only when no live route survives after learn selects replacement connections.
 pub fn takeStalePeers(self: *Node) StalePeers {
     var stale: StalePeers = .{};
     var index: usize = 0;
     while (index < self.gossip.conns.len) {
         const route = self.gossip.conns.entries[index];
-        if (node_transport.connFor(self, route.conn) != null) {
-            index += 1;
-            continue;
+        if (node_transport.connFor(self, route.conn)) |conn| {
+            if (!conn.closed()) {
+                index += 1;
+                continue;
+            }
         }
         stale.peers[stale.len] = route.peer;
         stale.len += 1;
@@ -100,21 +133,25 @@ pub fn send(self: *Node, topic_index: usize, to: NodeId, message: codec.Message)
     if (self.gossip.pending.contains(to, topic_index)) return queue(self, topic_index, to, message);
     const outcome = trySend(self, topic_index, to, message);
     switch (outcome) {
-        .no_route, .not_established, .no_stream_room, .no_room => return queue(self, topic_index, to, message),
+        .no_route, .not_established, .no_stream_room, .no_room => {
+            return queue(self, topic_index, to, message);
+        },
         else => return outcome,
     }
 }
 
 fn queue(self: *Node, topic_index: usize, to: NodeId, message: codec.Message) Outcome {
-    self.gossip.pending.push(to, topic_index, message) catch |err| return refuse(self, switch (err) {
-        error.FrameTooLarge => .frame_too_large,
-        error.BufferFull => .no_room,
-    });
+    self.gossip.pending.push(to, topic_index, message) catch |err|
+        return refuse(self, switch (err) {
+            error.FrameTooLarge => .frame_too_large,
+            error.BufferFull => .no_room,
+        });
     self.gossip.queued += 1;
     return .queued;
 }
 
-/// Retry eligible pending actions in FIFO order per peer/topic after authentication and credit updates.
+/// Retry eligible pending actions in FIFO order per peer/topic after
+/// authentication and credit updates.
 pub fn flush(self: *Node) bool {
     var moved = false;
     var cursor = self.gossip.pending.head;
@@ -122,7 +159,12 @@ pub fn flush(self: *Node) bool {
         const entry = &self.gossip.pending.entries[index];
         cursor = entry.next;
         if (self.gossip.pending.blockedBefore(index)) continue;
-        const message = codec.decode(entry.bytes[0..entry.len]) catch unreachable;
+        // Queue.push stores only successfully encoded frames in owned, immutable bytes.
+        // Decode failure here is corrupt internal state, never malformed peer input.
+        // ZBC cannot carry successful queue encoding into this decode of owned bytes.
+        // zbc-disable-next-line: catch-error-panic
+        const message = codec.decode(entry.bytes[0..entry.len]) catch |err|
+            std.debug.panic("corrupt encoded pending gossip frame: {s}", .{@errorName(err)});
         const outcome = trySend(self, entry.topic_index, entry.to, message);
         switch (outcome) {
             .no_route, .not_established, .no_stream_room, .no_room => {},
@@ -156,10 +198,11 @@ fn trySend(self: *Node, topic_index: usize, to: NodeId, message: codec.Message) 
     }
     const stream_id = if (existing) |entry| entry.stream_id else blk: {
         if (self.gossip.streams.len == max_streams) return refuse(self, .no_stream_room);
-        const stream = conn.entry.conn.openUniStream() catch |err| return refuse(self, switch (err) {
-            error.StreamLimitError => .no_stream_room,
-            else => .core_refused,
-        });
+        const stream = conn.entry.conn.openUniStream() catch |err|
+            return refuse(self, switch (err) {
+                error.StreamLimitError => .no_stream_room,
+                else => .core_refused,
+            });
         self.gossip.streams.put(conn_id, topic_index, stream.stream_id);
         break :blk stream.stream_id;
     };
@@ -173,7 +216,9 @@ fn trySend(self: *Node, topic_index: usize, to: NodeId, message: codec.Message) 
         return refuse(self, .no_room);
     stream.writeData(self.gossip.frame[0..frame_len]) catch
         return refuse(self, .core_refused);
-    self.gossip.streams.find(conn_id, topic_index).?.header_sent = true;
+    const sent_entry = self.gossip.streams.find(conn_id, topic_index) orelse
+        std.debug.panic("sent gossip stream missing from routing table", .{});
+    sent_entry.header_sent = true;
     self.gossip.sent += 1;
     self.gossip.bytes += frame_len;
     return .sent;
@@ -222,7 +267,11 @@ const Streams = struct {
 
     fn put(self: *Streams, conn: ConnId, topic_index: usize, stream_id: u64) void {
         std.debug.assert(self.len < self.entries.len);
-        self.entries[self.len] = .{ .conn = conn, .topic_index = topic_index, .stream_id = stream_id };
+        self.entries[self.len] = .{
+            .conn = conn,
+            .topic_index = topic_index,
+            .stream_id = stream_id,
+        };
         self.len += 1;
     }
 

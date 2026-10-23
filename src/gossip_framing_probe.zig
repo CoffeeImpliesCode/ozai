@@ -1,4 +1,6 @@
 const std = @import("std");
+const codec = @import("gossip/codec.zig");
+
 test {
-    std.testing.refAllDecls(@import("gossip/codec.zig"));
+    std.testing.refAllDecls(codec);
 }

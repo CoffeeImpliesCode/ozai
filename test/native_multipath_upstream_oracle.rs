@@ -70,8 +70,8 @@ fn ozai_generate_multipath_fixtures() {
         let mut input = full.as_slice();
         while !input.is_empty() {
             let start = input;
-            let parameter: VarInt = input.get().unwrap();
-            let length: VarInt = input.get().unwrap();
+            let parameter: VarInt = BufExt::get(&mut input).unwrap();
+            let length: VarInt = BufExt::get(&mut input).unwrap();
             let length = length.into_inner() as usize;
             assert!(length <= input.len());
             input = &input[length..];

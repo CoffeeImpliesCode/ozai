@@ -78,7 +78,7 @@ const Fields = struct {
             if (!std.ascii.eqlIgnoreCase(field.name, name)) continue;
             var rest = field.value;
             while (true) {
-                const comma = std.mem.indexOfScalar(u8, rest, ',');
+                const comma = std.mem.findScalar(u8, rest, ',');
                 const part = if (comma) |at| rest[0..at] else rest;
                 if (std.ascii.eqlIgnoreCase(trimOws(part), token)) return true;
                 const at = comma orelse return false;

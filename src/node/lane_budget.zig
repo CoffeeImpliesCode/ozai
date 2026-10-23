@@ -242,7 +242,7 @@ const t = std.testing;
 /// string literal's pointer, so a plan reads as the list of names it is and not
 /// as a cast the reader has to make. `relay_alpn` is the second name, used only
 /// to put a configuration one protocol past the ceiling.
-const gossip_alpn: []const u8 = "ozai";
+const application_alpn: []const u8 = "ozai";
 const relay_alpn: []const u8 = "iroh-relay";
 
 test "a protocol the configuration names is registered, and the ceiling is the wire's" {
@@ -260,9 +260,9 @@ test "a protocol the configuration names is registered, and the ceiling is the w
     try t.expectEqual(@as(usize, 0), budget.count());
     try t.expectEqual(@as(usize, 0), budget.offers().len);
 
-    try budget.plan(&.{gossip_alpn});
+    try budget.plan(&.{application_alpn});
     try t.expectEqual(@as(usize, 1), budget.count());
-    try t.expectEqualStrings(gossip_alpn, budget.offers()[0]);
+    try t.expectEqualStrings(application_alpn, budget.offers()[0]);
 
     // The one protocol named is the one registered, and it is offered under the
     // name the configuration wrote rather than a copy of it.
@@ -278,13 +278,13 @@ test "a configuration one protocol past the ceiling is refused whole" {
     // the first protocol would have fitted, and it is not claimed either. A
     // node that came up offering one of two configured protocols would be a
     // node whose offer list disagrees with its configuration.
-    try t.expectError(error.NoFreeLane, budget.plan(&.{ gossip_alpn, relay_alpn }));
+    try t.expectError(error.NoFreeLane, budget.plan(&.{ application_alpn, relay_alpn }));
     try t.expectEqual(@as(usize, 0), budget.count());
     try t.expectEqual(@as(usize, 0), budget.offers().len);
 
     // And the node that did fit is still plannable afterwards, so a refusal
     // cost the configuration nothing and the budget nothing but the call.
-    try budget.plan(&.{gossip_alpn});
+    try budget.plan(&.{application_alpn});
     try t.expectEqual(@as(usize, 1), budget.count());
 }
 
@@ -307,7 +307,7 @@ test "the reserved protocol is refused as a reservation and not as a full table"
 
     // A different protocol at the same budget is admitted, which is what makes
     // the two refusals different facts rather than one fact reported twice.
-    try budget.plan(&.{gossip_alpn});
+    try budget.plan(&.{application_alpn});
     try t.expectEqual(@as(usize, 1), budget.count());
 }
 
@@ -319,14 +319,14 @@ test "a plan is decided once and a second one is refused rather than replacing i
     // zwanzig-disable-next-line: identifier-style
     const Budget = LaneBudget(max_alpns);
     var budget = Budget.init();
-    try budget.plan(&.{gossip_alpn});
+    try budget.plan(&.{application_alpn});
 
     try t.expectError(error.AlreadyPlanned, budget.plan(&.{relay_alpn}));
     try t.expectEqual(@as(usize, 1), budget.count());
-    try t.expectEqualStrings(gossip_alpn, budget.offers()[0]);
+    try t.expectEqualStrings(application_alpn, budget.offers()[0]);
 
     // The second plan is refused even when it is the reserved protocol, because
     // the budget's own state is the first fact and the one that must be loud.
     try t.expectError(error.AlreadyPlanned, budget.plan(&.{reserved_alpn}));
-    try t.expectEqualStrings(gossip_alpn, budget.offers()[0]);
+    try t.expectEqualStrings(application_alpn, budget.offers()[0]);
 }

@@ -133,11 +133,11 @@ pub const TopicPolicy = struct {
         data: ?PeerData,
         peers: Peers,
     ) bounds.PolicyError!Admission {
-        if (self.indexOf(topic) != null) return Admission.already;
+        if (self.indexOf(topic) != null) return .already;
         if (self.len == max_topics) return error.TopicsFull;
         self.entries[self.len] = .{ .topic = topic, .data = data, .peers = peers };
         self.len += 1;
-        return Admission.admitted;
+        return .admitted;
     }
 
     /// Take `topic` out of the policy. Whether it was there.
@@ -149,6 +149,8 @@ pub const TopicPolicy = struct {
     /// shutdown path that runs twice harmless.
     pub fn forget(self: *TopicPolicy, topic: TopicId) bool {
         const index = self.indexOf(topic) orelse return false;
+        // ZBC cannot infer that indexOf returns only a live-prefix index, so self.len is positive.
+        // zbc-disable-next-line: index-minus-one-without-zero-guard
         self.entries[index] = self.entries[self.len - 1];
         self.len -= 1;
         return true;
@@ -194,6 +196,8 @@ pub const TopicPolicy = struct {
 fn takeIntro(list: *Peers, peer: NodeId) bool {
     for (list.items[0..list.count], 0..) |held, index| {
         if (held.order(peer) != .eq) continue;
+        // ZBC cannot infer that entering this live-prefix loop proves list.count is positive.
+        // zbc-disable-next-line: index-minus-one-without-zero-guard
         list.items[index] = list.items[list.count - 1];
         list.count -= 1;
         return true;

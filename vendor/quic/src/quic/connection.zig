@@ -1201,6 +1201,7 @@ pub const Connection = struct {
     challenge_retry_queued: [2]bool = .{ false, false },
     challenge_full_size_sent: [2]bool = .{ false, false },
     last_send_off_path: bool = false,
+    receiving_packet: bool = false,
     local_path_status: [2]native_path.Status = .{ .available, .backup },
     local_path_status_seq: [2]u64 = .{ 0, 0 },
     observed_queued: [2]?u64 = .{ null, null },
@@ -1532,6 +1533,9 @@ pub const Connection = struct {
         pacer: congestion.Pacer = congestion.Pacer.init(),
         mtu: mtu_mod.MtuDiscoverer = .{},
         ecn_state: ecn.EcnValidator = .{},
+        peer_ecn_ect0: u64 = 0,
+        peer_ecn_ect1: u64 = 0,
+        peer_ecn_ce: u64 = 0,
         probe_pending: u2 = 0,
         peer_cids: ConnectionIdPool = .{},
         dcid: [20]u8 = .{0} ** 20,
@@ -1539,6 +1543,7 @@ pub const Connection = struct {
         dcid_seq: u64 = 0,
         peer_retire_prior_to: u64 = 0,
         next_local_cid_seq: u64 = 0,
+        retiring_cids: std.ArrayListUnmanaged(u64) = .empty,
     };
 
     pub const PathSnapshot = struct {
@@ -1635,8 +1640,7 @@ pub const Connection = struct {
         }
         const other = try self.ensurePathTransport();
         if (other.dcid_len == 0) return error.NoPathConnectionId;
-        self.native_paths = try native_path.process(self.native_paths,
-            .{ .open = .{ .id = 1, .is_server = false } });
+        self.native_paths = try native_path.process(self.native_paths, .{ .open = .{ .id = 1, .is_server = false } });
         self.paths[1] = NetworkPath.init(local, peer, false);
         other.ecn_state.start();
         if (!self.disable_pmtud) other.mtu.start();
@@ -1655,7 +1659,8 @@ pub const Connection = struct {
             self.local_path_status[id] = .available;
             self.local_path_status_seq[id] += 1;
             self.pushReliable(.{ .path_status_available = .{
-                .path_id = id, .status_seq_no = self.local_path_status_seq[id],
+                .path_id = id,
+                .status_seq_no = self.local_path_status_seq[id],
             } });
         }
         self.active_path_idx = id;
@@ -1682,10 +1687,15 @@ pub const Connection = struct {
         if (!self.path_initialized) return null;
         const path = &self.paths[id];
         return .{
-            .id = id, .local = path.local_addr, .peer = path.peer_addr,
-            .validated = path.is_validated, .selected = self.active_path_idx == id,
-            .status = self.local_path_status[id], .status_seq = entry.status_seq,
-            .state = path.validator.state, .sent = path.bytes_sent,
+            .id = id,
+            .local = path.local_addr,
+            .peer = path.peer_addr,
+            .validated = path.is_validated,
+            .selected = self.active_path_idx == id,
+            .status = self.local_path_status[id],
+            .status_seq = entry.status_seq,
+            .state = path.validator.state,
+            .sent = path.bytes_sent,
             .received = path.bytes_received,
         };
     }
@@ -1721,7 +1731,6 @@ pub const Connection = struct {
         }
         return 0;
     }
-
 
     /// Builds a server or client connection in `conn`. On success `conn` is
     /// fully built and ready to use; on any failure — `error.PacketError`, an
@@ -2000,9 +2009,10 @@ pub const Connection = struct {
             self.tls13_hs = null;
         }
         self.ack_result.deinit(self.allocator); // its packets are pkt_handler's
-        self.packetHandler().*.deinit();
+        self.pkt_handler.deinit();
         if (self.path1_transport) |other| {
             other.handler.deinit();
+            other.retiring_cids.deinit(self.allocator);
             self.allocator.destroy(other);
         }
         self.streams.deinit();
@@ -2342,8 +2352,19 @@ pub const Connection = struct {
         }
         defer self.activateTransport(0);
         const selected_path = self.active_path_idx;
-        if (mp) self.active_path_idx = incoming_path;
-        defer if (mp) { self.active_path_idx = selected_path; };
+        if (mp) {
+            self.receiving_packet = true;
+            self.active_path_idx = incoming_path;
+        }
+        defer if (mp) {
+            self.receiving_packet = false;
+            // Keep the receiving-path view through PN, byte-credit and ACK
+            // bookkeeping; commit a live replacement only after the packet.
+            self.active_path_idx = if (self.native_paths.entries[selected_path].abandoned)
+                self.native_paths.selected
+            else
+                selected_path;
+        };
         const space = if (mp and incoming_path == 1)
             &self.path1_transport.?.space
         else
@@ -2396,8 +2417,7 @@ pub const Connection = struct {
                 // accepts a new authenticated path.
                 if (!self.is_server) return error.InvalidPath;
                 self.native_paths = native_path.process(self.native_paths, .{ .accept = 1 }) catch |err| {
-                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation),
-                        0, "invalid authenticated multipath path", now);
+                    self.closeWithTransportError(@intFromEnum(TransportError.protocol_violation), 0, "invalid authenticated multipath path", now);
                     return err;
                 };
                 self.paths[1] = NetworkPath.init(info.to, info.from, false);
@@ -2559,8 +2579,10 @@ pub const Connection = struct {
             self.processFrame(&frame, epoch, now, random) catch |err| {
                 if (self.state != .closing) {
                     self.closeWithTransportError(
-                        @intFromEnum(TransportError.protocol_violation), 0,
-                        "invalid authenticated frame", now,
+                        @intFromEnum(TransportError.protocol_violation),
+                        0,
+                        "invalid authenticated frame",
+                        now,
                     );
                 }
                 return err;
@@ -2570,8 +2592,7 @@ pub const Connection = struct {
         }
 
         // Record receipt for ACK generation
-        try self.packetHandler().*.onPacketReceived(enc_level, header.packet_number,
-            ack_eliciting, now, info.ecn);
+        try self.packetHandler().*.onPacketReceived(enc_level, header.packet_number, ack_eliciting, now, info.ecn);
         // Only probing traffic stays off-path. Authenticated ACK/STREAM semantics
         // and largest-PN passive migration remain ordinary QUIC operations.
         const pure_nat_probe = off_path_nat and !has_non_probing;
@@ -2650,7 +2671,8 @@ pub const Connection = struct {
         const cid: @FieldType(frame_mod.PendingControlFrame, "new_connection_id") = .{
             .seq_num = e.seq_num,
             .retire_prior_to = if (e.path_id == 0) self.local_cid_pool.retire_prior_to else 0,
-            .cid_buf = e.cid_buf, .cid_len = e.cid_len,
+            .cid_buf = e.cid_buf,
+            .cid_len = e.cid_len,
             .stateless_reset_token = e.stateless_reset_token,
         };
         return if (self.multipathNegotiated())
@@ -2724,6 +2746,41 @@ pub const Connection = struct {
         };
     }
 
+    fn requeueAbandonedPath(self: *Connection, id: u1, now: i64, random: std.Random) void {
+        const handler = if (id == 0)
+            &self.pkt_handler
+        else if (self.path1_transport) |other|
+            &other.handler
+        else
+            return;
+        const tracker = &handler.sent[@intFromEnum(ack_handler.EncLevel.application)];
+        for (tracker.sent_packets.values()) |pkt| {
+            self.queueStreamRetransmissions(pkt);
+            self.requeueLostControlFrames(pkt, now, random);
+            if (pkt.has_crypto_data) self.queueCryptoRetransmission(pkt.enc_level);
+            if (pkt.has_handshake_done and self.handshake_done_pending) {
+                self.packer.send_handshake_done = true;
+            }
+            if (pkt.in_flight) handler.bytes_in_flight -= pkt.size;
+        }
+        // A following ordinary ACK still refers to this packet-number history.
+        // Only the owned sent records and their recovery deadlines are retired.
+        const largest_sent = tracker.largest_sent;
+        const largest_acked = tracker.largest_acked;
+        tracker.clear();
+        tracker.largest_sent = largest_sent;
+        tracker.largest_acked = largest_acked;
+        handler.pto_count = 0;
+        self.path_control[id].len = 0;
+        self.challenge_queued[id] = false;
+        self.challenge_full_size_sent[id] = false;
+        if (id == 0) {
+            self.pto_probe_pending = 0;
+        } else {
+            self.path1_transport.?.probe_pending = 0;
+        }
+    }
+
     /// Queue retransmission for stream frames that were in a lost packet.
     fn queueStreamRetransmissions(self: *Connection, pkt: *const ack_handler.SentPacket) void {
         for (pkt.getStreamFrames()) |sf| {
@@ -2747,7 +2804,10 @@ pub const Connection = struct {
 
     /// Process a single frame.
     pub const PathError = native_path.Error || error{
-        OutOfMemory, HandshakeNotConfirmed, InvalidAddress, NoPathConnectionId,
+        OutOfMemory,
+        HandshakeNotConfirmed,
+        InvalidAddress,
+        NoPathConnectionId,
     };
     pub const NatTraversalError = native_nat_state.Error || error{NatTraversalNotNegotiated};
 
@@ -2764,12 +2824,11 @@ pub const Connection = struct {
     }
 
     fn processNat(
-        self: *Connection, event: native_nat_state.Event,
+        self: *Connection,
+        event: native_nat_state.Event,
     ) NatTraversalError!native_nat_state.Result {
-        const state = if (self.nat_state) |*value| value else
-            return error.NatTraversalNotNegotiated;
-        const configured = native_nat_state.process(state,
-            .{ .configure = .{ .supported_ipv6 = self.supportedIPv6 } }, state) catch |err| return err;
+        const state = if (self.nat_state) |*value| value else return error.NatTraversalNotNegotiated;
+        const configured = native_nat_state.process(state, .{ .configure = .{ .supported_ipv6 = self.supportedIPv6 } }, state) catch |err| return err;
         _ = configured;
         return native_nat_state.process(state, event, state);
     }
@@ -2782,7 +2841,9 @@ pub const Connection = struct {
 
     fn maxActivePathPto(self: *const Connection) i64 {
         var maximum: i64 = if (self.native_paths.entries[0].abandoned)
-            0 else self.pkt_handler.rtt_stats.pto();
+            0
+        else
+            self.pkt_handler.rtt_stats.pto();
         if (self.path1_transport) |other| {
             if (self.native_paths.entries[1].opened and !self.native_paths.entries[1].abandoned) {
                 maximum = @max(maximum, other.handler.rtt_stats.pto());
@@ -2807,7 +2868,9 @@ pub const Connection = struct {
     }
 
     pub fn initiateNatTraversalRound(
-        self: *Connection, now: i64, random: std.Random,
+        self: *Connection,
+        now: i64,
+        random: std.Random,
     ) NatTraversalError!void {
         _ = random;
         const state = if (self.nat_state) |*s| s else return error.NatTraversalNotNegotiated;
@@ -2817,7 +2880,8 @@ pub const Connection = struct {
         self.direct_ready = null;
         for (state.localCandidates()) |candidate| {
             self.pushReliable(.{ .reach_address = .{
-                .round = state.currentRound(), .address = candidate.address,
+                .round = state.currentRound(),
+                .address = candidate.address,
             } });
         }
     }
@@ -2827,37 +2891,40 @@ pub const Connection = struct {
     }
 
     pub fn remoteTraversalCandidates(
-        self: *const Connection, out: []address.Address,
+        self: *const Connection,
+        out: []address.Address,
     ) []const address.Address {
         return if (self.nat_state) |*state| state.snapshotRemote(out) else out[0..0];
     }
 
     pub fn processFrame(
-        self: *Connection, frame: *const Frame, epoch: packet.Epoch,
-        now: i64, random: std.Random,
+        self: *Connection,
+        frame: *const Frame,
+        epoch: packet.Epoch,
+        now: i64,
+        random: std.Random,
     ) !void {
         const native_frame = switch (frame.*) {
-            .path_ack, .path_ack_ecn, .path_abandon, .path_status_available,
-            .path_status_backup, .path_new_connection_id, .path_retire_connection_id,
-            .max_path_id, .paths_blocked, .path_cids_blocked,
-            .observed_address, .add_address, .remove_address, .reach_address => true,
+            .path_ack, .path_ack_ecn, .path_abandon, .path_status_available, .path_status_backup, .path_new_connection_id, .path_retire_connection_id, .max_path_id, .paths_blocked, .path_cids_blocked, .observed_address, .add_address, .remove_address, .reach_address => true,
             else => false,
         };
         errdefer if (native_frame) {
             self.closeWithTransportError(
-                @intFromEnum(TransportError.protocol_violation), 0,
-                "native frame protocol violation", now,
+                @intFromEnum(TransportError.protocol_violation),
+                0,
+                "native frame protocol violation",
+                now,
             );
         };
         const mp = self.multipathNegotiated();
         switch (frame.*) {
-            .path_ack, .path_ack_ecn, .path_abandon, .path_status_available,
-            .path_status_backup, .path_new_connection_id, .path_retire_connection_id,
-            .max_path_id, .paths_blocked, .path_cids_blocked => {
+            .path_ack, .path_ack_ecn, .path_abandon, .path_status_available, .path_status_backup, .path_new_connection_id, .path_retire_connection_id, .max_path_id, .paths_blocked, .path_cids_blocked => {
                 if (!mp or epoch != .application) {
                     self.closeWithTransportError(
-                        @intFromEnum(TransportError.protocol_violation), 0,
-                        "multipath frame without negotiation", now,
+                        @intFromEnum(TransportError.protocol_violation),
+                        0,
+                        "multipath frame without negotiation",
+                        now,
                     );
                     return error.ProtocolViolation;
                 }
@@ -2898,19 +2965,29 @@ pub const Connection = struct {
             },
             .path_status_available => |value| {
                 self.native_paths = try native_path.process(self.native_paths, .{ .status = .{
-                    .id = value.path_id, .seq = value.status_seq_no, .value = .available,
+                    .id = value.path_id,
+                    .seq = value.status_seq_no,
+                    .value = .available,
                 } });
             },
             .path_status_backup => |value| {
                 self.native_paths = try native_path.process(self.native_paths, .{ .status = .{
-                    .id = value.path_id, .seq = value.status_seq_no, .value = .backup,
+                    .id = value.path_id,
+                    .seq = value.status_seq_no,
+                    .value = .backup,
                 } });
             },
             .path_abandon => |value| {
                 if (value.path_id >= 2) return;
-                self.native_paths = try native_path.process(self.native_paths,
-                    .{ .abandon = value.path_id });
-                self.active_path_idx = self.native_paths.selected;
+                const was_abandoned = self.native_paths.entries[value.path_id].abandoned;
+                self.native_paths = try native_path.process(
+                    self.native_paths,
+                    .{ .abandon = value.path_id },
+                );
+                if (!was_abandoned and self.native_paths.entries[value.path_id].abandoned) {
+                    self.requeueAbandonedPath(@intCast(value.path_id), now, random);
+                }
+                if (!self.receiving_packet) self.active_path_idx = self.native_paths.selected;
             },
             .max_path_id => |value| {
                 const maximum = @min(@as(u32, 1), @min(self.local_params.initial_max_path_id.?, value));
@@ -2926,8 +3003,7 @@ pub const Connection = struct {
                 if (value.path_id > self.local_params.initial_max_path_id.? or value.path_id >= 2)
                     return error.ProtocolViolation;
                 if (self.native_paths.entries[value.path_id].abandoned) return;
-                const next_sequence = if (value.path_id == 0) self.local_cid_pool.next_seq_num else
-                    if (self.path1_transport) |other| other.next_local_cid_seq else 0;
+                const next_sequence = if (value.path_id == 0) self.local_cid_pool.next_seq_num else if (self.path1_transport) |other| other.next_local_cid_seq else 0;
                 if (value.next_seq > next_sequence) return error.ProtocolViolation;
                 // Retry the actual outstanding CID, not an unrelated path's CID.
                 var available = false;
@@ -2975,17 +3051,13 @@ pub const Connection = struct {
                 const floor = @max(other.peer_retire_prior_to, cid.retire_prior_to);
                 for (&other.peer_cids.entries) |*entry| {
                     if (entry.occupied and entry.seq_num < floor) {
-                        self.pushReliable(.{ .path_retire_connection_id = .{
-                            .path_id = 1, .seq_num = entry.seq_num,
-                        } });
+                        try self.retirePeerCid(1, entry.seq_num, now);
                     }
                 }
                 other.peer_cids.retirePriorTo(floor);
                 other.peer_retire_prior_to = floor;
                 if (cid.seq_num < floor) {
-                    self.pushReliable(.{ .path_retire_connection_id = .{
-                        .path_id = 1, .seq_num = cid.seq_num,
-                    } });
+                    try self.retirePeerCid(1, cid.seq_num, now);
                     return;
                 }
                 if (!duplicate) {
@@ -3012,7 +3084,9 @@ pub const Connection = struct {
                         entry.seq_num == value.seq_num)
                     {
                         if (self.received_cid_len == entry.cid_len and std.mem.eql(
-                            u8, self.received_cid[0..self.received_cid_len], entry.getCid(),
+                            u8,
+                            self.received_cid[0..self.received_cid_len],
+                            entry.getCid(),
                         )) return error.ProtocolViolation;
                         entry.occupied = false;
                         entry.retired = true;
@@ -3029,8 +3103,11 @@ pub const Connection = struct {
                 const roles = self.observedRoles();
                 const id = if (self.multipathNegotiated()) self.receive_path else 0;
                 const transition = try observed.receiveTransition(
-                    self.observed_paths[id], report, .{
-                        .local_role = roles.local, .peer_role = roles.peer,
+                    self.observed_paths[id],
+                    report,
+                    .{
+                        .local_role = roles.local,
+                        .peer_role = roles.peer,
                         .data_space = epoch == .application,
                     },
                 );
@@ -3039,7 +3116,8 @@ pub const Connection = struct {
             .add_address => |value| {
                 if (!self.admitCandidate(value.address)) return;
                 const result = try self.processNat(.{ .receiveAdd = .{
-                    .sequence = value.sequence, .address = value.address,
+                    .sequence = value.sequence,
+                    .address = value.address,
                 } });
                 _ = result;
             },
@@ -3050,7 +3128,9 @@ pub const Connection = struct {
             .reach_address => |value| {
                 if (!self.admitCandidate(value.address)) return;
                 const result = try self.processNat(.{ .receiveReach = .{
-                    .round = value.round, .address = value.address, .now = now,
+                    .round = value.round,
+                    .address = value.address,
+                    .now = now,
                 } });
                 _ = result;
             },
@@ -3081,7 +3161,8 @@ pub const Connection = struct {
                 // while bytes_in_flight still reflects the pre-ACK state.
                 // If checked after, bytes_in_flight is already decremented,
                 // making it appear app-limited even when the sender filled cwnd.
-                self.pathCongestion().*.app_limited = self.packetHandler().*.bytes_in_flight < self.pathCongestion().*.sendWindow();
+                const was_app_limited = self.packetHandler().*.bytes_in_flight <
+                    self.pathCongestion().*.sendWindow();
 
                 defer self.ack_result.release(self.allocator);
                 try self.packetHandler().*.onAckReceived(
@@ -3095,6 +3176,8 @@ pub const Connection = struct {
                     &self.ack_result,
                 );
                 const result = &self.ack_result;
+                if (result.acked.count() == 0) return;
+                self.pathCongestion().*.app_limited = was_app_limited;
 
                 // Notify congestion controller, track key update ACKs, and PMTUD
                 var has_non_probe_loss = false;
@@ -3112,7 +3195,11 @@ pub const Connection = struct {
 
                     self.pathCongestion().*.onPacketAcked(pkt.size, pkt.time_sent, now);
                     for (pkt.getControlFrames()) |cf| switch (cf) {
-                        .retire_connection_id => |seq| self.onRetireCidAcked(seq),
+                        .retire_connection_id => |seq| self.onRetireCidAcked(0, seq),
+                        .path_retire_connection_id => |value| {
+                            if (value.path_id < 2)
+                                self.onRetireCidAcked(@intCast(value.path_id), value.seq_num);
+                        },
                         else => {},
                     };
 
@@ -3201,9 +3288,12 @@ pub const Connection = struct {
                 }
                 const space_idx = @intFromEnum(enc_level);
                 const peer_tp = self.peer_params orelse transport_params.TransportParams{};
+                const previous_largest = self.packetHandler().*.sent[space_idx].largest_acked;
+                const new_largest = previous_largest == null or ack.largest_ack > previous_largest.?;
 
                 // RFC 9002 §7.8: snapshot app_limited BEFORE processing ACKs
-                self.pathCongestion().*.app_limited = self.packetHandler().*.bytes_in_flight < self.pathCongestion().*.sendWindow();
+                const was_app_limited = self.packetHandler().*.bytes_in_flight <
+                    self.pathCongestion().*.sendWindow();
 
                 defer self.ack_result.release(self.allocator);
                 try self.packetHandler().*.onAckReceived(
@@ -3217,6 +3307,9 @@ pub const Connection = struct {
                     &self.ack_result,
                 );
                 const result = &self.ack_result;
+                // ACKs covering only off-path packets have no recovery evidence.
+                if (result.acked.count() == 0) return;
+                self.pathCongestion().*.app_limited = was_app_limited;
 
                 // Notify congestion controller, track key update ACKs, and PMTUD
                 var has_non_probe_loss = false;
@@ -3231,7 +3324,11 @@ pub const Connection = struct {
                     }
                     self.pathCongestion().*.onPacketAcked(pkt.size, pkt.time_sent, now);
                     for (pkt.getControlFrames()) |cf| switch (cf) {
-                        .retire_connection_id => |seq| self.onRetireCidAcked(seq),
+                        .retire_connection_id => |seq| self.onRetireCidAcked(0, seq),
+                        .path_retire_connection_id => |value| {
+                            if (value.path_id < 2)
+                                self.onRetireCidAcked(@intCast(value.path_id), value.seq_num);
+                        },
                         else => {},
                     };
 
@@ -3309,29 +3406,46 @@ pub const Connection = struct {
                 // ECN validation (RFC 9000 §13.4.2.1):
                 // Count how many newly-acked packets were ECN-marked
                 var newly_acked_ect0: u64 = 0;
+                var largest_newly_acked_pn: ?u64 = null;
+                var largest_newly_acked_sent_time: i64 = 0;
                 for (result.acked.constSlice()) |pkt| {
                     if (pkt.ecn_marked) newly_acked_ect0 += 1;
+                    if (largest_newly_acked_pn == null or pkt.pn > largest_newly_acked_pn.?) {
+                        largest_newly_acked_pn = pkt.pn;
+                        largest_newly_acked_sent_time = pkt.time_sent;
+                    }
                 }
 
-                // Validate ECN counts from peer
-                const ecn_valid = self.pathECN().*.validate(
-                    ack.ecn_ect0,
-                    ack.ecn_ect1,
-                    ack.ecn_ce,
-                    self.peer_ecn_ect0[space_idx],
-                    self.peer_ecn_ect1[space_idx],
-                    self.peer_ecn_ce[space_idx],
-                    newly_acked_ect0,
-                );
-
-                // If valid and CE count increased, treat as congestion event
-                if (ecn_valid and ack.ecn_ce > self.peer_ecn_ce[space_idx]) {
-                    std.log.info("ECN: CE count increased {d} -> {d}, congestion signal", .{ self.peer_ecn_ce[space_idx], ack.ecn_ce });
-                    self.pathCongestion().*.onCongestionEvent(now, now);
+                // Reordered/equal ACK_ECN does not replace newer path feedback.
+                if (new_largest) {
+                    const previous_ect0 = if (self.transport_path == 1)
+                        &self.path1_transport.?.peer_ecn_ect0
+                    else
+                        &self.peer_ecn_ect0[space_idx];
+                    const previous_ect1 = if (self.transport_path == 1)
+                        &self.path1_transport.?.peer_ecn_ect1
+                    else
+                        &self.peer_ecn_ect1[space_idx];
+                    const previous_ce = if (self.transport_path == 1)
+                        &self.path1_transport.?.peer_ecn_ce
+                    else
+                        &self.peer_ecn_ce[space_idx];
+                    const ecn_valid = self.pathECN().*.validate(
+                        ack.ecn_ect0,
+                        ack.ecn_ect1,
+                        ack.ecn_ce,
+                        previous_ect0.*,
+                        previous_ect1.*,
+                        previous_ce.*,
+                        newly_acked_ect0,
+                    );
+                    if (ecn_valid and ack.ecn_ce > previous_ce.*) {
+                        self.pathCongestion().*.onCongestionEvent(largest_newly_acked_sent_time, now);
+                    }
+                    previous_ect0.* = ack.ecn_ect0;
+                    previous_ect1.* = ack.ecn_ect1;
+                    previous_ce.* = ack.ecn_ce;
                 }
-                self.peer_ecn_ect0[space_idx] = ack.ecn_ect0;
-                self.peer_ecn_ect1[space_idx] = ack.ecn_ect1;
-                self.peer_ecn_ce[space_idx] = ack.ecn_ce;
 
                 self.maybeConfirmHandshake(enc_level, result.acked.count());
 
@@ -3625,7 +3739,7 @@ pub const Connection = struct {
                 // RFC 9000 19.15: a CID arriving already below Retire Prior To
                 // is retired straight away, never used.
                 if (ncid.seq_num < self.active_cid_seq) {
-                    try self.retirePeerCid(ncid.seq_num, now);
+                    try self.retirePeerCid(0, ncid.seq_num, now);
                     return;
                 }
 
@@ -3633,11 +3747,11 @@ pub const Connection = struct {
                 // be as large as 2^62.
                 if (ncid.retire_prior_to > self.active_cid_seq) {
                     if (self.active_cid_seq == 0 and !self.peer_cid_pool.contains(0)) {
-                        try self.retirePeerCid(0, now); // the handshake DCID, never pooled on this side
+                        try self.retirePeerCid(0, 0, now); // the handshake DCID, never pooled
                     }
                     for (&self.peer_cid_pool.entries) |*entry| {
                         if (entry.occupied and entry.seq_num < ncid.retire_prior_to) {
-                            try self.retirePeerCid(entry.seq_num, now);
+                            try self.retirePeerCid(0, entry.seq_num, now);
                         }
                     }
                     self.active_cid_seq = ncid.retire_prior_to;
@@ -3697,8 +3811,10 @@ pub const Connection = struct {
                     var challenge: [8]u8 = undefined;
                     random.bytes(&challenge);
                     self.nat_reply = .{
-                        .peer = self.received_peer, .local = self.received_local,
-                        .response = data, .challenge = challenge,
+                        .peer = self.received_peer,
+                        .local = self.received_local,
+                        .response = data,
+                        .challenge = challenge,
                     };
                     return;
                 }
@@ -3714,7 +3830,8 @@ pub const Connection = struct {
                 self.observed_paths[self.receive_path].schedule(roles.local, roles.peer);
                 if (self.nat_state != null) {
                     const matched = (try self.processNat(.{ .response = .{
-                        .address = self.received_peer, .token = data,
+                        .address = self.received_peer,
+                        .token = data,
                     } })).matched;
                     if (matched) {
                         if (!self.is_server and self.multipathNegotiated() and
@@ -4102,15 +4219,16 @@ pub const Connection = struct {
                             self.local_params.address_discovery_role,
                             peer_tp.address_discovery_role,
                         );
-                        self.native_paths = try native_path.process(self.native_paths,
-                            .{ .negotiate = .{
-                                .local_max = self.local_params.initial_max_path_id,
-                                .peer_max = peer_tp.initial_max_path_id,
-                            } });
+                        self.native_paths = try native_path.process(self.native_paths, .{ .negotiate = .{
+                            .local_max = self.local_params.initial_max_path_id,
+                            .peer_max = peer_tp.initial_max_path_id,
+                        } });
                         if (self.local_params.max_remote_nat_traversal_addresses) |local_limit| {
                             if (peer_tp.max_remote_nat_traversal_addresses) |peer_limit| {
                                 self.nat_state = native_nat_state.State.init(
-                                    self.is_server, local_limit, peer_limit,
+                                    self.is_server,
+                                    local_limit,
+                                    peer_limit,
                                 );
                             }
                         }
@@ -4559,25 +4677,27 @@ pub const Connection = struct {
     /// RFC 9000 5.1.2 lets us bound retirements in flight: past twice our
     /// active_connection_id_limit the peer is closed with
     /// CONNECTION_ID_LIMIT_ERROR, as quic-go and quinn do.
-    fn retirePeerCid(self: *Connection, seq: u64, now: i64) error{ProtocolViolation}!void {
-        if (std.mem.indexOfScalar(u64, self.retiring_cids.items, seq) != null) return;
-        if (self.retiring_cids.items.len >= 2 * self.local_params.active_connection_id_limit) {
+    fn retirePeerCid(self: *Connection, path_id: u1, seq: u64, now: i64) error{ProtocolViolation}!void {
+        const pending = if (path_id == 0) &self.retiring_cids else &self.path1_transport.?.retiring_cids;
+        if (std.mem.indexOfScalar(u64, pending.items, seq) != null) return;
+        if (pending.items.len >= 2 * self.local_params.active_connection_id_limit) {
             self.closeWithTransportError(@intFromEnum(TransportError.connection_id_limit_error), @intFromEnum(FrameType.new_connection_id), "too many connection IDs pending retirement", now);
             return error.ProtocolViolation;
         }
-        self.retiring_cids.append(self.allocator, seq) catch {
+        pending.append(self.allocator, seq) catch {
             self.closeWithTransportError(@intFromEnum(TransportError.internal_error), @intFromEnum(FrameType.new_connection_id), "out of memory", now);
             return error.ProtocolViolation;
         };
         self.pushReliable(if (self.multipathNegotiated())
-            .{ .path_retire_connection_id = .{ .path_id = 0, .seq_num = seq } }
+            .{ .path_retire_connection_id = .{ .path_id = path_id, .seq_num = seq } }
         else
             .{ .retire_connection_id = seq });
     }
 
-    fn onRetireCidAcked(self: *Connection, seq: u64) void {
-        if (std.mem.indexOfScalar(u64, self.retiring_cids.items, seq)) |i| {
-            _ = self.retiring_cids.swapRemove(i);
+    fn onRetireCidAcked(self: *Connection, path_id: u1, seq: u64) void {
+        const pending = if (path_id == 0) &self.retiring_cids else &self.path1_transport.?.retiring_cids;
+        if (std.mem.indexOfScalar(u64, pending.items, seq)) |i| {
+            _ = pending.swapRemove(i);
         }
     }
 
@@ -4625,7 +4745,8 @@ pub const Connection = struct {
                 .retire_connection_id => |seq| if (std.mem.indexOfScalar(u64, self.retiring_cids.items, seq) != null)
                     if (self.multipathNegotiated())
                         .{ .path_retire_connection_id = .{ .path_id = 0, .seq_num = seq } }
-                    else .{ .retire_connection_id = seq }
+                    else
+                        .{ .retire_connection_id = seq }
                 else
                     continue,
                 .new_token => self.newTokenFrame(now, random) orelse continue,
@@ -4667,19 +4788,30 @@ pub const Connection = struct {
                     }
                     continue;
                 },
-                .path_retire_connection_id => |value| .{ .path_retire_connection_id = value },
+                .path_retire_connection_id => |value| blk: {
+                    if (value.path_id >= 2) continue;
+                    const pending = if (value.path_id == 0) &self.retiring_cids else if (self.path1_transport) |other| &other.retiring_cids else continue;
+                    if (std.mem.indexOfScalar(u64, pending.items, value.seq_num) == null) continue;
+                    break :blk .{ .path_retire_connection_id = value };
+                },
                 .path_status => |id| blk: {
                     if (id >= 2 or self.native_paths.entries[id].abandoned) continue;
-                    const value = .{ .path_id = id,
-                        .status_seq_no = self.local_path_status_seq[id] };
                     break :blk if (self.local_path_status[id] == .available)
-                        .{ .path_status_available = value }
+                        .{ .path_status_available = .{
+                            .path_id = id,
+                            .status_seq_no = self.local_path_status_seq[id],
+                        } }
                     else
-                        .{ .path_status_backup = value };
+                        .{ .path_status_backup = .{
+                            .path_id = id,
+                            .status_seq_no = self.local_path_status_seq[id],
+                        } };
                 },
                 .path_abandon => |value| if (value.path_id < 2 and
                     self.native_paths.entries[value.path_id].abandoned)
-                    .{ .path_abandon = value } else continue,
+                    .{ .path_abandon = value }
+                else
+                    continue,
                 .max_path_id => .{ .max_path_id = self.local_params.initial_max_path_id.? },
                 .paths_blocked => |value| .{ .paths_blocked = value },
                 .path_cids_blocked => |value| .{ .path_cids_blocked = value },
@@ -4755,13 +4887,15 @@ pub const Connection = struct {
         if (written != 0) {
             if (reply != null) {
                 const result = try self.processNat(.{ .recordChallenge = .{
-                    .address = peer, .token = token,
+                    .address = peer,
+                    .token = token,
                 } });
                 _ = result;
                 self.nat_reply = null;
             } else {
                 const result = try self.processNat(.{ .recordProbe = .{
-                    .address = peer, .token = token,
+                    .address = peer,
+                    .token = token,
                 } });
                 _ = result;
             }
@@ -4787,7 +4921,9 @@ pub const Connection = struct {
         if (!self.admitCandidate(peer)) return;
         const roles = self.observedRoles();
         if (try self.observed_paths[id].prepare(
-            roles.local, roles.peer, peer,
+            roles.local,
+            roles.peer,
+            peer,
             self.observed_next_sequence,
         )) |report| {
             if (self.path_control[path_index].tryPush(.{ .observed_address = report })) {
@@ -4860,7 +4996,8 @@ pub const Connection = struct {
         }
         const id = try self.openPath(ready.local, ready.peer, now, random);
         self.pushReliable(.{ .path_status_backup = .{
-            .path_id = id, .status_seq_no = self.local_path_status_seq[id],
+            .path_id = id,
+            .status_seq_no = self.local_path_status_seq[id],
         } });
         self.direct_ready = null;
     }
@@ -4877,12 +5014,10 @@ pub const Connection = struct {
         self.send_path = self.active_path_idx;
         if (mp) {
             for (0..2) |id| {
-                const handler = if (id == 0) &self.pkt_handler else
-                    if (self.path1_transport) |other| &other.handler else continue;
+                const handler = if (id == 0) &self.pkt_handler else if (self.path1_transport) |other| &other.handler else continue;
                 const ack_ready = handler.recv[2].ack_queued or
                     (handler.recv[2].ack_alarm != null and handler.recv[2].ack_alarm.? <= now);
-                const pending_probe = if (id == 0) self.pto_probe_pending else
-                    self.path1_transport.?.probe_pending;
+                const pending_probe = if (id == 0) self.pto_probe_pending else self.path1_transport.?.probe_pending;
                 if ((self.path_control[id].len != 0 or ack_ready or pending_probe != 0) and
                     !self.native_paths.entries[id].abandoned)
                 {
@@ -4925,11 +5060,24 @@ pub const Connection = struct {
                 const available = (3 * path.bytes_received) -| path.bytes_sent;
                 budget = out_buf[0..@intCast(@min(available, out_buf.len))];
             }
-            const written = try self.packer.packCoalesced(
-                budget, self.packetHandler(), &self.crypto_streams, &empty_streams,
-                &self.path_control[self.send_path], null, null, null,
-                self.appSeal(), now, null, false, random,
-            );
+            const written = self.packer.packCoalesced(
+                budget,
+                self.packetHandler(),
+                &self.crypto_streams,
+                &empty_streams,
+                &self.path_control[self.send_path],
+                null,
+                null,
+                null,
+                self.appSeal(),
+                now,
+                null,
+                false,
+                random,
+            ) catch |err| {
+                self.failAssembly(now);
+                return err;
+            };
             path.bytes_sent += written;
             if (written != 0) self.last_packet_sent_time = now;
             self.pathProbePending().* -|= 1;
@@ -5168,7 +5316,6 @@ pub const Connection = struct {
                     }
                 }
             }
-
 
             // Track ECN marking for sent packets
             if (self.pathECN().*.shouldMark() and app_seal != null) {
@@ -6045,7 +6192,9 @@ pub const Connection = struct {
                 (!self.native_paths.entries[id].opened or self.native_paths.entries[id].abandoned))
                 continue;
             const handler = if (id == 1 and self.multipathNegotiated())
-                &self.path1_transport.?.handler else &self.pkt_handler;
+                &self.path1_transport.?.handler
+            else
+                &self.pkt_handler;
             const at = path.validator.challenge_sent_time + handler.rtt_stats.pto() + 1;
             earliest = if (earliest) |old| @min(old, at) else at;
         }
@@ -7447,11 +7596,16 @@ test "DatagramQueue: peekDataSkipExpired with no max age" {
 // --- Connection state and method tests ---
 
 fn testConnection(allocator: std.mem.Allocator) Connection {
+    return testConnectionForRole(allocator, true);
+}
+
+/// State-only fixture without TLS; packet and stream roles match the connection.
+fn testConnectionForRole(allocator: std.mem.Allocator, is_server: bool) Connection {
     const dcid_val = "dest1234" ++ ([_]u8{0} ** 12);
     const scid_val = "src12345" ++ ([_]u8{0} ** 12);
     return Connection{
         .allocator = allocator,
-        .is_server = true,
+        .is_server = is_server,
         .dcid = dcid_val.*,
         .dcid_len = 8,
         .scid = scid_val.*,
@@ -7459,10 +7613,10 @@ fn testConnection(allocator: std.mem.Allocator) Connection {
         .version = protocol.SUPPORTED_VERSIONS[0],
         .pkt_handler = ack_handler.PacketHandler.init(allocator),
         .conn_flow_ctrl = flow_control.ConnectionFlowController.init(1048576, 6 * 1024 * 1024),
-        .streams = stream_mod.StreamsMap.init(allocator, true),
+        .streams = stream_mod.StreamsMap.init(allocator, is_server),
         .crypto_streams = crypto_stream.CryptoStreamManager.init(allocator),
         .packer = packet_packer.PacketPacker.init(
-            true,
+            is_server,
             dcid_val[0..8],
             scid_val[0..8],
             protocol.SUPPORTED_VERSIONS[0],
@@ -9085,25 +9239,34 @@ test "NEW_CONNECTION_ID: unacked retirements past twice the limit close the conn
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
     var cid = [_]u8{0xab} ** 8;
+    var token = [_]u8{0} ** 16;
     const limit = conn.local_params.active_connection_id_limit;
     try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 100, .retire_prior_to = 100, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0, rng.random());
     // Late CIDs below Retire Prior To are retired on arrival; a retransmit
     // of one is not retired twice.
     var seq: u64 = 1;
     while (seq < 2 * limit) : (seq += 1) {
-        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0, rng.random());
-        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0, rng.random());
+        std.mem.writeInt(u64, &cid, seq, .big);
+        std.mem.writeInt(u64, token[8..16], seq, .big);
+        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = token } }, .application, 0, rng.random());
+        try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = seq, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = token } }, .application, 0, rng.random());
     }
     try std.testing.expect(conn.local_err == null);
     try std.testing.expectEqual(@as(usize, @intCast(2 * limit)), conn.retiring_cids.items.len);
 
     // An ACK frees a slot.
-    conn.onRetireCidAcked(0);
-    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 50, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0, rng.random());
+    conn.onRetireCidAcked(0, 0);
+    std.mem.writeInt(u64, &cid, 50, .big);
+    std.mem.writeInt(u64, token[8..16], 50, .big);
+    try conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 50, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = token } }, .application, 0, rng.random());
     try std.testing.expect(conn.local_err == null);
+    try std.testing.expectEqual(@as(usize, @intCast(2 * limit)), conn.retiring_cids.items.len);
 
-    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 51, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = .{0} ** 16 } }, .application, 0, rng.random()));
+    std.mem.writeInt(u64, &cid, 51, .big);
+    std.mem.writeInt(u64, token[8..16], 51, .big);
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&.{ .new_connection_id = .{ .seq_num = 51, .retire_prior_to = 0, .conn_id = &cid, .stateless_reset_token = token } }, .application, 0, rng.random()));
     try std.testing.expectEqual(@as(u64, @intFromEnum(TransportError.connection_id_limit_error)), conn.local_err.?.code);
+    try std.testing.expectEqual(State.closing, conn.state);
 }
 
 test "connection flow control: the window bounds the sum over streams" {
@@ -9536,7 +9699,7 @@ test "native path opening rejects absent multipath before touching packet state"
 }
 
 test "native MP control bytes fail closed without negotiation" {
-    const bytes = [_]u8{ 0x7e, 0x7a, 0x01 };
+    var bytes = [_]u8{ 0x7e, 0x7a, 0x01 };
     var used: usize = 0;
     const parsed = try Frame.parseSized(&bytes, &used);
     var conn = testConnection(std.testing.allocator);
@@ -9565,15 +9728,23 @@ test "native path packet numbers and source decoded ACK route independently" {
     const pn1 = other.handler.nextPacketNumber(.application, random.random());
     try std.testing.expectEqual(pn0, pn1);
     try conn.pkt_handler.onPacketSent(.{
-        .pn = pn0, .time_sent = 1, .size = 100, .enc_level = .application,
-        .ack_eliciting = true, .in_flight = true,
+        .pn = pn0,
+        .time_sent = 1,
+        .size = 100,
+        .enc_level = .application,
+        .ack_eliciting = true,
+        .in_flight = true,
     });
     try other.handler.onPacketSent(.{
-        .pn = pn1, .time_sent = 1, .size = 100, .enc_level = .application,
-        .ack_eliciting = true, .in_flight = true,
+        .pn = pn1,
+        .time_sent = 1,
+        .size = 100,
+        .enc_level = .application,
+        .ack_eliciting = true,
+        .in_flight = true,
     });
     // Noq PATH_ACK type 0x3e, path 1, PN 0, delay 0, ranges 0, first 0.
-    const bytes = [_]u8{ 0x3e, 1, 0, 0, 0, 0 };
+    var bytes = [_]u8{ 0x3e, 1, 0, 0, 0, 0 };
     const parsed = try Frame.parse(&bytes);
     try conn.processFrame(&parsed, .application, 100_000, random.random());
     try std.testing.expectEqual(@as(usize, 1), conn.pkt_handler.sent[2].sent_packets.count());
@@ -9581,40 +9752,49 @@ test "native path packet numbers and source decoded ACK route independently" {
     try std.testing.expectEqual(@as(u8, 0), conn.transport_path);
     conn.receive_path = 1;
     conn.activateTransport(1);
-    const ordinary = try Frame.parse(&.{ 0x02, 0, 0, 0, 0 });
+    var ordinary_bytes = [_]u8{ 0x02, 0, 0, 0, 0 };
+    const ordinary = try Frame.parse(&ordinary_bytes);
     try conn.processFrame(&ordinary, .application, 100_001, random.random());
     try std.testing.expectEqual(@as(usize, 0), conn.pkt_handler.sent[2].sent_packets.count());
     try std.testing.expectEqual(@as(u8, 1), conn.transport_path);
-    const ordinary_ecn = try Frame.parse(&.{ 0x03, 0, 0, 0, 0, 0, 0, 0 });
+    var ordinary_ecn_bytes = [_]u8{ 0x03, 0, 0, 0, 0, 0, 0, 0 };
+    const ordinary_ecn = try Frame.parse(&ordinary_ecn_bytes);
     try conn.processFrame(&ordinary_ecn, .application, 100_002, random.random());
     conn.activateTransport(0);
 }
 
 test "native path CID duplicate changes and unvalidated selection are rejected" {
-    var conn = testConnection(std.testing.allocator);
+    var cid_bytes: [8]u8 = "native01".*;
+    var changed_cid_bytes: [8]u8 = "native02".*;
+    var conn = testConnectionForRole(std.testing.allocator, false);
     defer conn.deinit();
-    conn.is_server = false;
+    conn.state = .connected;
     conn.local_params.initial_max_path_id = 1;
     conn.peer_params = .{ .initial_max_path_id = 8 };
     conn.handshake_confirmed = true;
     var random = std.Random.DefaultPrng.init(43);
     const cid: Frame = .{ .path_new_connection_id = .{
-        .path_id = 1, .cid = .{
-            .seq_num = 0, .retire_prior_to = 0, .conn_id = "native01",
+        .path_id = 1,
+        .cid = .{
+            .seq_num = 0,
+            .retire_prior_to = 0,
+            .conn_id = cid_bytes[0..],
             .stateless_reset_token = .{1} ** 16,
         },
     } };
     try conn.processFrame(&cid, .application, 0, random.random());
-    var changed = cid;
-    changed.path_new_connection_id.cid.conn_id = "native02";
-    try std.testing.expectError(error.ProtocolViolation,
-        conn.processFrame(&changed, .application, 0, random.random()));
     const local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1234);
     const peer = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 5678);
     const id = try conn.openPath(local, peer, 0, random.random());
     try std.testing.expectError(error.PathNotValidated, conn.selectPath(id));
     try std.testing.expectEqual(@as(u8, 0), conn.active_path_idx);
     try std.testing.expectError(error.AlreadyOpen, conn.openPath(local, peer, 1, random.random()));
+    var changed = cid;
+    changed.path_new_connection_id.cid.conn_id = changed_cid_bytes[0..];
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&changed, .application, 0, random.random()));
+    try std.testing.expectEqual(State.closing, conn.state);
+    try std.testing.expectEqual(@as(u64, 0x0a), conn.local_err.?.code);
+    try std.testing.expectError(error.ClosedPath, conn.openPath(local, peer, 2, random.random()));
 }
 
 test "native NAT probe offer commits only real packet and preserves primary route" {
@@ -9633,7 +9813,8 @@ test "native NAT probe offer commits only real packet and preserves primary rout
     conn.path_initialized = true;
     try conn.addNatTraversalAddress(local);
     const added = try conn.processNat(.{ .receiveAdd = .{
-        .sequence = 0, .address = direct,
+        .sequence = 0,
+        .address = direct,
     } });
     _ = added;
     var random = std.Random.DefaultPrng.init(47);
@@ -9644,8 +9825,7 @@ test "native NAT probe offer commits only real packet and preserves primary rout
     try std.testing.expectEqual(@as(u16, 0), conn.nat_state.?.challenge_count);
     const keys = try quic_crypto.deriveInitialKeyMaterial("probe-connection", conn.version, false);
     conn.installAppKeys(keys[0], keys[1]);
-    conn.key_update = quic_crypto.KeyUpdateManager.init(
-        .{1} ** 32, .{2} ** 32, keys[0].hp_key, keys[1].hp_key);
+    conn.key_update = quic_crypto.KeyUpdateManager.init(.{1} ** 32, .{2} ** 32, keys[0].hp_key, keys[1].hp_key);
     conn.key_update.?.onPeerKeyUpdate(0, conn.maxActivePathPto());
     conn.packer.key_phase = conn.key_update.?.key_phase;
     conn.pkt_handler.recv[2].ack_queued = true;
@@ -9666,6 +9846,7 @@ test "native NAT probe offer commits only real packet and preserves primary rout
 }
 
 test "native direct validation uses authenticated path1 packets and preserves primary connection" {
+    var cid_bytes: [8]u8 = "path-one".*;
     var client = testConnection(std.testing.allocator);
     defer client.deinit();
     client.is_server = false;
@@ -9684,16 +9865,18 @@ test "native direct validation uses authenticated path1 packets and preserves pr
     client.installAppKeys(keys[0], keys[1]);
     var random = std.Random.DefaultPrng.init(53);
     const cid: Frame = .{ .path_new_connection_id = .{
-        .path_id = 1, .cid = .{
-            .seq_num = 0, .retire_prior_to = 0, .conn_id = "path-one",
+        .path_id = 1,
+        .cid = .{
+            .seq_num = 0,
+            .retire_prior_to = 0,
+            .conn_id = cid_bytes[0..],
             .stateless_reset_token = .{3} ** 16,
         },
     } };
     try client.processFrame(&cid, .application, 0, random.random());
     const id = try client.openPath(local, direct, 0, random.random());
     var small: [1199]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 0),
-        try client.sendAt(&small, 0, random.random()));
+    try std.testing.expectEqual(@as(usize, 0), try client.sendAt(&small, 0, random.random()));
     try std.testing.expectEqual(@as(u64, 0), client.path1_transport.?.handler.next_pn[2]);
     var wire: [1500]u8 = undefined;
     const length = try client.sendAt(&wire, 0, random.random());
@@ -9704,7 +9887,8 @@ test "native direct validation uses authenticated path1 packets and preserves pr
     try std.testing.expect(client.path1_transport.?.handler.next_pn[2] != 0);
     const peer_keys = try quic_crypto.deriveInitialKeyMaterial("same-connection", client.version, true);
     var read_space: packet.PacketNumSpace = .{
-        .crypto_open = peer_keys[0], .crypto_seal = peer_keys[1],
+        .crypto_open = peer_keys[0],
+        .crypto_seal = peer_keys[1],
     };
     var reader = io.fixedBufferStream(wire[0..length]);
     var header = try packet.Header.parse(&reader, 8);
@@ -9721,7 +9905,7 @@ test "native direct validation uses authenticated path1 packets and preserves pr
     try client.selectPath(id);
     try std.testing.expect(client.peerAddress().eql(direct));
     try std.testing.expect(client.paths[0].peer_addr.eql(relay));
-    try std.testing.expectEqual(PathStatus.available, client.pathSnapshot(id).?.status);
+    try std.testing.expectEqual(native_path.Status.available, client.pathSnapshot(id).?.status);
 }
 
 test "native observed report is a real packet with post-send sequence and loss rescheduling" {
@@ -9752,7 +9936,8 @@ test "native observed report is a real packet with post-send sequence and loss r
     try std.testing.expect(!conn.observed_paths[0].pending);
     const peer_keys = try quic_crypto.deriveInitialKeyMaterial("observed-real", conn.version, true);
     var space: packet.PacketNumSpace = .{
-        .crypto_open = peer_keys[0], .crypto_seal = peer_keys[1],
+        .crypto_open = peer_keys[0],
+        .crypto_seal = peer_keys[1],
     };
     var reader = io.fixedBufferStream(wire[0..length]);
     var header = try packet.Header.parse(&reader, 8);
@@ -9772,19 +9957,16 @@ test "native frame failures close and never opened PATH_ACK differs from abandon
     defer conn.deinit();
     conn.state = .connected;
     const add: Frame = .{ .add_address = .{
-        .sequence = 0, .address = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1000),
+        .sequence = 0,
+        .address = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1000),
     } };
-    try std.testing.expectError(error.ProtocolViolation,
-        conn.processFrame(&add, .application, 10, random.random()));
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&add, .application, 10, random.random()));
     try std.testing.expectEqual(State.closing, conn.state);
     conn.state = .connected;
     conn.local_params.initial_max_path_id = 1;
     conn.peer_params = .{ .initial_max_path_id = 1 };
-    const ack: Frame = .{ .path_ack = .{ .path_id = 1,
-        .ack = .{ .largest_ack = 0, .ack_delay = 0, .first_ack_range = 0,
-            .ack_range_count = 0, .ack_ranges = undefined } } };
-    try std.testing.expectError(error.ProtocolViolation,
-        conn.processFrame(&ack, .application, 11, random.random()));
+    const ack: Frame = .{ .path_ack = .{ .path_id = 1, .ack = .{ .largest_ack = 0, .ack_delay = 0, .first_ack_range = 0, .ack_range_count = 0, .ack_ranges = undefined } } };
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&ack, .application, 11, random.random()));
     try std.testing.expectEqual(State.closing, conn.state);
     conn.native_paths.entries[1] = .{ .opened = true, .abandoned = true };
     conn.state = .connected;
@@ -9808,8 +9990,8 @@ test "native credit increase issues CID once within bounded ceiling" {
     other.dcid_len = 8;
     @memcpy(other.dcid[0..8], "peerpath");
     conn.direct_ready = .{
-        .local = address.Address.initIpv4(.{127, 0, 0, 1}, 1000),
-        .peer = address.Address.initIpv4(.{127, 0, 0, 1}, 2000),
+        .local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1000),
+        .peer = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 2000),
     };
     const credit: Frame = .{ .max_path_id = 9 };
     try conn.processFrame(&credit, .application, 10, random.random());
@@ -9841,20 +10023,39 @@ test "shared key retention PTO includes slow active path but excludes abandoned"
 }
 
 test "native queued challenge retry is not consumed by timeout" {
-    var conn = testConnection(std.testing.allocator);
+    var conn = testConnectionForRole(std.testing.allocator, false);
     defer conn.deinit();
+    conn.state = .connected;
+    conn.handshake_confirmed = true;
     conn.local_params.initial_max_path_id = 1;
     conn.peer_params = .{ .initial_max_path_id = 1 };
-    conn.native_paths.entries[1].opened = true;
     var random = std.Random.DefaultPrng.init(93);
-    try conn.probePath(1, 0, random.random());
+    var cid_bytes: [8]u8 = "retrycid".*;
+    const cid: Frame = .{ .path_new_connection_id = .{ .path_id = 1, .cid = .{
+        .seq_num = 0,
+        .retire_prior_to = 0,
+        .conn_id = &cid_bytes,
+        .stateless_reset_token = .{9} ** 16,
+    } } };
+    try conn.processFrame(&cid, .application, 0, random.random());
+    const local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1234);
+    const peer = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 5678);
+    try std.testing.expectEqual(@as(u8, 1), try conn.openPath(local, peer, 0, random.random()));
     const before = conn.paths[1].validator.retries;
     conn.activateTransport(1);
-    try conn.onPathTimeout(1, random.random());
+    const pto = conn.packetHandler().*.rtt_stats.pto();
+    const timeout_at = pto + 1;
+    try std.testing.expect(conn.paths[1].validator.needsRetry(timeout_at, pto));
+    const queued = conn.path_control[1].len;
+    try conn.onPathTimeout(timeout_at, random.random());
     try std.testing.expectEqual(before, conn.paths[1].validator.retries);
+    try std.testing.expectEqual(PathValidationState.pending, conn.paths[1].validator.state);
+    try std.testing.expect(conn.challenge_queued[1]);
+    try std.testing.expectEqual(queued, conn.path_control[1].len);
 }
 
 test "native path zero CID conflicts and current CID retirement close" {
+    var cid_bytes: [8]u8 = "samecid1".*;
     var conn = testConnection(std.testing.allocator);
     defer conn.deinit();
     conn.state = .connected;
@@ -9864,19 +10065,19 @@ test "native path zero CID conflicts and current CID retirement close" {
     const other = try conn.ensurePathTransport();
     other.peer_cids.addPeerCid(0, "samecid1", .{1} ** 16);
     const cid: Frame = .{ .path_new_connection_id = .{ .path_id = 0, .cid = .{
-        .seq_num = 1, .retire_prior_to = 0, .conn_id = "samecid1",
+        .seq_num = 1,
+        .retire_prior_to = 0,
+        .conn_id = cid_bytes[0..],
         .stateless_reset_token = .{1} ** 16,
     } } };
-    try std.testing.expectError(error.ProtocolViolation,
-        conn.processFrame(&cid, .application, 1, random.random()));
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&cid, .application, 1, random.random()));
     try std.testing.expectEqual(State.closing, conn.state);
     conn.state = .connected;
     conn.local_cid_pool.registerInitialCid("current0", null, random.random());
     conn.received_cid_len = 8;
     @memcpy(conn.received_cid[0..8], "current0");
     const retire: Frame = .{ .path_retire_connection_id = .{ .path_id = 0, .seq_num = 0 } };
-    try std.testing.expectError(error.ProtocolViolation,
-        conn.processFrame(&retire, .application, 2, random.random()));
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&retire, .application, 2, random.random()));
     try std.testing.expectEqual(State.closing, conn.state);
 }
 
@@ -9888,8 +10089,7 @@ test "native blocked CID requests reject impossible identifiers and sequence cre
     conn.state = .connected;
     var random = std.Random.DefaultPrng.init(95);
     const blocked: Frame = .{ .path_cids_blocked = .{ .path_id = 2, .next_seq = 0 } };
-    try std.testing.expectError(error.ProtocolViolation,
-        conn.processFrame(&blocked, .application, 1, random.random()));
+    try std.testing.expectError(error.ProtocolViolation, conn.processFrame(&blocked, .application, 1, random.random()));
     try std.testing.expectEqual(State.closing, conn.state);
 }
 
@@ -9900,7 +10100,7 @@ test "native reciprocal probe rejects lifted candidate policy before scheduling"
     conn.supportedIPv6 = false;
     conn.receive_path = 0;
     conn.received_peer = address.Address.initIpv6(.{0} ** 16, 1234, 0);
-    conn.received_local = address.Address.initIpv4(.{127, 0, 0, 1}, 4321);
+    conn.received_local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 4321);
     var random = std.Random.DefaultPrng.init(96);
     const challenge: Frame = .{ .path_challenge = .{1} ** 8 };
     try conn.processFrame(&challenge, .application, 1, random.random());
@@ -9914,8 +10114,8 @@ test "native matching response cannot validate an unsent direct challenge" {
     conn.peer_params = .{ .initial_max_path_id = 1 };
     conn.native_paths.entries[1].opened = true;
     conn.receive_path = 1;
-    const local = address.Address.initIpv4(.{127, 0, 0, 1}, 1000);
-    const peer = address.Address.initIpv4(.{127, 0, 0, 1}, 2000);
+    const local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1000);
+    const peer = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 2000);
     conn.paths[1] = NetworkPath.init(local, peer, false);
     conn.received_local = local;
     conn.received_peer = peer;
@@ -9931,7 +10131,7 @@ test "native IPv4 socket admits mapped candidates canonically" {
     defer conn.deinit();
     conn.supportedIPv6 = false;
     conn.nat_state = .init(false, 32, 32);
-    const mapped = address.Address.initIpv6([_]u8{0} ** 10 ++ [_]u8{0xff, 0xff, 127, 0, 0, 1}, 1000, 0);
+    const mapped = address.Address.initIpv6([_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 }, 1000, 0);
     try std.testing.expect(conn.admitCandidate(mapped));
     try conn.addNatTraversalAddress(mapped);
     try std.testing.expectEqual(@as(usize, 1), conn.nat_state.?.localCandidates().len);
@@ -9941,8 +10141,7 @@ test "native IPv4 socket admits mapped candidates canonically" {
     conn.handshake_confirmed = true;
     conn.local_params.initial_max_path_id = 1;
     conn.peer_params = .{ .initial_max_path_id = 1 };
-    conn.paths[0] = NetworkPath.init(address.Address.initIpv4(.{127, 0, 0, 1}, 2000),
-        address.Address.initIpv4(.{127, 0, 0, 1}, 3000), true);
+    conn.paths[0] = NetworkPath.init(address.Address.initIpv4(.{ 127, 0, 0, 1 }, 2000), address.Address.initIpv4(.{ 127, 0, 0, 1 }, 3000), true);
     conn.path_initialized = true;
     _ = try conn.processNat(.{ .receiveAdd = .{ .sequence = 0, .address = mapped } });
     var random = std.Random.DefaultPrng.init(98);
@@ -9951,21 +10150,20 @@ test "native IPv4 socket admits mapped candidates canonically" {
     conn.installAppKeys(keys[0], keys[1]);
     var wire: [1500]u8 = undefined;
     try std.testing.expect(try conn.sendAt(&wire, 1, random.random()) > 0);
-    try std.testing.expect(conn.lastSendPeer() == .ipv4);
+    try std.testing.expect(conn.lastSendPeer().* == .ipv4);
     try std.testing.expect(conn.pkt_handler.next_pn[2] > 0);
 }
 
 test "native wrong-side NAT and forbidden observed reports close transport" {
     var random = std.Random.DefaultPrng.init(99);
-    const candidate = address.Address.initIpv4(.{127, 0, 0, 1}, 1000);
+    const candidate = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1000);
     var server = testConnection(std.testing.allocator);
     defer server.deinit();
     server.is_server = true;
     server.state = .connected;
     server.nat_state = .init(true, 32, 32);
     const add: Frame = .{ .add_address = .{ .sequence = 0, .address = candidate } };
-    try std.testing.expectError(error.ProtocolViolation,
-        server.processFrame(&add, .application, 1, random.random()));
+    try std.testing.expectError(error.ProtocolViolation, server.processFrame(&add, .application, 1, random.random()));
     try std.testing.expectEqual(State.closing, server.state);
     var client = testConnection(std.testing.allocator);
     defer client.deinit();
@@ -9973,22 +10171,19 @@ test "native wrong-side NAT and forbidden observed reports close transport" {
     client.state = .connected;
     client.nat_state = .init(false, 32, 32);
     const reach: Frame = .{ .reach_address = .{ .round = 0, .address = candidate } };
-    try std.testing.expectError(error.ProtocolViolation,
-        client.processFrame(&reach, .application, 1, random.random()));
+    try std.testing.expectError(error.ProtocolViolation, client.processFrame(&reach, .application, 1, random.random()));
     try std.testing.expectEqual(State.closing, client.state);
     var receiver = testConnection(std.testing.allocator);
     defer receiver.deinit();
     receiver.state = .connected;
     const report: Frame = .{ .observed_address = .{ .sequence = 0, .address = candidate } };
-    try std.testing.expectError(error.ProtocolViolation,
-        receiver.processFrame(&report, .application, 1, random.random()));
+    try std.testing.expectError(error.ProtocolViolation, receiver.processFrame(&report, .application, 1, random.random()));
     try std.testing.expectEqual(State.closing, receiver.state);
 }
 
 test "authenticated pure NAT probe preserves virtual route but nonprobing packet migrates" {
-    var receiver = testConnection(std.testing.allocator);
+    var receiver = testConnectionForRole(std.testing.allocator, false);
     defer receiver.deinit();
-    receiver.is_server = false;
     receiver.state = .connected;
     receiver.handshake_confirmed = true;
     receiver.local_params.initial_max_path_id = 1;
@@ -9997,68 +10192,185 @@ test "authenticated pure NAT probe preserves virtual route but nonprobing packet
         .negotiate = .{ .local_max = 1, .peer_max = 1 },
     });
     receiver.nat_state = .init(false, 32, 32);
-    const local = address.Address.initIpv4(.{127, 0, 0, 1}, 1000);
-    const relay = address.Address.initIpv4(.{127, 0, 0, 1}, 2000);
-    const direct = address.Address.initIpv4(.{127, 0, 0, 1}, 3000);
+    const local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1000);
+    const relay = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 2000);
+    const direct = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 3000);
     receiver.paths[0] = NetworkPath.init(local, relay, true);
+    receiver.paths[0].is_validated = true;
     receiver.path_initialized = true;
     const receiver_keys = try quic_crypto.deriveInitialKeyMaterial("offpath-receive", receiver.version, false);
     receiver.installAppKeys(receiver_keys[0], receiver_keys[1]);
-    var sender = testConnection(std.testing.allocator);
+    var sender = testConnectionForRole(std.testing.allocator, true);
     defer sender.deinit();
-    sender.is_server = true;
     sender.state = .connected;
     sender.handshake_confirmed = true;
     sender.local_params.initial_max_path_id = 1;
     sender.peer_params = .{ .initial_max_path_id = 1 };
     sender.paths[0] = NetworkPath.init(direct, local, true);
+    sender.paths[0].is_validated = true;
     sender.path_initialized = true;
     const sender_keys = try quic_crypto.deriveInitialKeyMaterial("offpath-receive", sender.version, true);
     sender.installAppKeys(sender_keys[0], sender_keys[1]);
     sender.packer.application_path_id = 0;
     var random = std.Random.DefaultPrng.init(100);
     var wire: [1500]u8 = undefined;
-    const probe_length = try sender.packer.packOffPath(&wire, &sender.pkt_handler,
-        sender.appSeal().?, .{ .challenge = .{1} ** 8 }, random.random());
+    const probe_length = try sender.packer.packOffPath(&wire, &sender.pkt_handler, sender.appSeal().?, .{ .challenge = .{1} ** 8 }, random.random());
+    // Inspect a copy: decryption mutates the packet, while recv must consume
+    // the original ciphertext with its own packet-number state.
+    var inspected_wire: [1500]u8 = undefined;
+    @memcpy(inspected_wire[0..probe_length], wire[0..probe_length]);
+    var inspect_space: packet.PacketNumSpace = .{
+        .crypto_open = receiver_keys[0],
+        .crypto_seal = receiver_keys[1],
+    };
+    var inspect_reader = io.fixedBufferStream(inspected_wire[0..probe_length]);
+    var inspect_header = try packet.Header.parse(&inspect_reader, sender.packer.dcid_len);
+    var remaining = try packet.decrypt(&inspect_header, &inspect_reader, &inspect_space);
+    const probe_pn = inspect_header.packet_number;
+    var found_challenge = false;
+    while (remaining.len > 0) {
+        var consumed: usize = undefined;
+        const frame = try Frame.parseSized(remaining, &consumed);
+        try std.testing.expect(consumed > 0);
+        try std.testing.expect(frame.isProbing());
+        if (frame == .path_challenge) {
+            try std.testing.expectEqualSlices(u8, &([_]u8{1} ** 8), &frame.path_challenge);
+            found_challenge = true;
+        }
+        remaining = remaining[consumed..];
+    }
+    try std.testing.expect(found_challenge);
     var probe_reader = io.fixedBufferStream(wire[0..probe_length]);
     var probe_header = try packet.Header.parse(&probe_reader, sender.packer.dcid_len);
-    try receiver.recv(&probe_header, &probe_reader,
-        .{ .from = direct, .to = local, .datagram_size = probe_length }, 1, random.random());
+    try receiver.recv(&probe_header, &probe_reader, .{ .from = direct, .to = local, .datagram_size = probe_length }, 1, random.random());
     try std.testing.expect(receiver.paths[0].peer_addr.eql(relay));
     try std.testing.expectEqual(@as(u64, 0), receiver.paths[0].bytes_received);
+    try std.testing.expect(receiver.paths[0].is_validated);
     try std.testing.expect(receiver.nat_reply != null);
-    try std.testing.expect(receiver.pkt_handler.recv[2].largest_received != null);
+    try std.testing.expectEqual(@as(?u64, probe_pn), receiver.pkt_handler.recv[2].largest_received);
     sender.pending_frames.push(.{ .ping = {} });
     const length = try sender.sendAt(&wire, 2, random.random());
     try std.testing.expect(length > 0);
+    @memcpy(inspected_wire[0..length], wire[0..length]);
+    inspect_reader = io.fixedBufferStream(inspected_wire[0..length]);
+    inspect_header = try packet.Header.parse(&inspect_reader, sender.packer.dcid_len);
+    remaining = try packet.decrypt(&inspect_header, &inspect_reader, &inspect_space);
+    try std.testing.expect(inspect_header.packet_number > probe_pn);
+    const ping_pn = inspect_header.packet_number;
+    var found_ping = false;
+    while (remaining.len > 0) {
+        var consumed: usize = undefined;
+        const frame = try Frame.parseSized(remaining, &consumed);
+        try std.testing.expect(consumed > 0);
+        if (frame == .ping) found_ping = true;
+        remaining = remaining[consumed..];
+    }
+    try std.testing.expect(found_ping);
     var reader = io.fixedBufferStream(wire[0..length]);
     var header = try packet.Header.parse(&reader, sender.packer.dcid_len);
-    try receiver.recv(&header, &reader,
-        .{ .from = direct, .to = local, .datagram_size = length }, 2, random.random());
+    try receiver.recv(&header, &reader, .{ .from = direct, .to = local, .datagram_size = length }, 2, random.random());
+    try std.testing.expectEqual(@as(?u64, ping_pn), receiver.pkt_handler.recv[2].largest_received);
     try std.testing.expect(receiver.paths[0].peer_addr.eql(direct));
     try std.testing.expect(!receiver.paths[0].is_validated);
     try std.testing.expect(receiver.paths[0].bytes_received > 0);
 }
 
-fn keyGuardTestWire(
-    out: []u8, seal: *const quic_crypto.Seal, path_id: u32, pn: u64, phase: bool,
+fn nativeTestWire(
+    out: []u8,
+    seal: *const quic_crypto.Seal,
+    path_id: u32,
+    pn: u64,
+    phase: bool,
+    plaintext: []const u8,
+    cid: []const u8,
 ) []u8 {
     out[0] = packet.FIXED_BIT | 3 | (if (phase) packet.KEY_PHASE_BIT else @as(u8, 0));
-    @memcpy(out[1..9], "keyguard");
+    @memcpy(out[1..9], cid);
     std.mem.writeInt(u32, out[9..13], @truncate(pn), .big);
-    const length = seal.encryptPayloadForPath(path_id, pn, out[0..13],
-        &.{ 0x01, 0x00, 0x00, 0x00 }, out[13..]);
+    const length = seal.encryptPayloadForPath(path_id, pn, out[0..13], plaintext, out[13..]);
     const mask = seal.newMask(out[13..][0..quic_crypto.SAMPLE_LEN]);
     out[0] ^= mask[0] & 0x1f;
     for (0..4) |i| out[9 + i] ^= mask[1 + i];
     return out[0 .. 13 + length];
 }
 
+fn configureNativeTestIngress(conn: *Connection, peer_cid_bytes: *[8]u8, random: std.Random) !void {
+    conn.handshake_confirmed = true;
+    conn.state = .connected;
+    const local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1000);
+    const peer = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 2000);
+    conn.paths[0] = NetworkPath.init(local, peer, true);
+    conn.paths[1] = NetworkPath.init(local, peer, true);
+    conn.path_initialized = true;
+    conn.paths[0].is_validated = true;
+    conn.paths[1].is_validated = true;
+    if (!conn.native_paths.negotiated) {
+        conn.native_paths = try native_path.process(conn.native_paths, .{ .negotiate = .{
+            .local_max = conn.local_params.initial_max_path_id,
+            .peer_max = conn.peer_params.?.initial_max_path_id,
+        } });
+    }
+    conn.local_cid_pool.registerInitialCid("keyguard", null, random);
+    try conn.issuePathCid(random);
+    const peer_cid: Frame = .{ .path_new_connection_id = .{ .path_id = 1, .cid = .{
+        .seq_num = 0,
+        .retire_prior_to = 0,
+        .conn_id = peer_cid_bytes[0..],
+        .stateless_reset_token = .{3} ** 16,
+    } } };
+    try conn.processFrame(&peer_cid, .application, 0, random);
+    const keys = quic_crypto.KeyUpdateManager.init(.{0x31} ** 32, .{0x31} ** 32, .{0x42} ** quic_crypto.max_key_len, .{0x42} ** quic_crypto.max_key_len);
+    conn.installAppKeys(keys.current_open, keys.current_seal);
+}
+
+fn recvNativeTestFrame(
+    conn: *Connection,
+    frame: Frame,
+    carrying_path: u1,
+    now: i64,
+    random: std.Random,
+) !void {
+    var cid: ?[]const u8 = null;
+    for (&conn.local_cid_pool.entries) |*entry| {
+        if (entry.occupied and entry.path_id == carrying_path) {
+            cid = entry.getCid();
+            break;
+        }
+    }
+    const destination_cid = cid orelse return error.TestMissingPathConnectionId;
+    const pn = if (carrying_path == 1) conn.path1_transport.?.space.next_packet_number else conn.pkt_num_spaces[2].next_packet_number;
+    var plaintext: [128]u8 = undefined;
+    var writer = io.fixedBufferStream(&plaintext);
+    try frame.write(&writer);
+    var bytes: [256]u8 = undefined;
+    const wire = nativeTestWire(&bytes, conn.appSeal().?, carrying_path, pn, false, plaintext[0..writer.seek], destination_cid);
+    var reader = io.fixedBufferStream(wire);
+    var header = try packet.Header.parse(&reader, 8);
+    try conn.recv(&header, &reader, .{
+        .from = conn.paths[carrying_path].peer_addr,
+        .to = conn.paths[carrying_path].local_addr,
+        .datagram_size = wire.len,
+    }, now, random);
+}
+
+fn sendNativeTestPing(conn: *Connection, path_id: u1, now: i64, random: std.Random) !u64 {
+    try conn.selectPath(path_id);
+    conn.pending_frames.push(.{ .ping = {} });
+    var wire: [1500]u8 = undefined;
+    try std.testing.expect(try conn.sendAt(&wire, now, random) > 0);
+    try std.testing.expectEqual(@as(u8, path_id), conn.send_path);
+    const handler = if (path_id == 0) &conn.pkt_handler else &conn.path1_transport.?.handler;
+    const pn = handler.next_pn[2] - 1;
+    const sent = handler.sent[2].sent_packets.get(pn).?;
+    try std.testing.expect(sent.ecn_marked);
+    return pn;
+}
+
 test "recv authenticated invalid next keys closes before rotating shared keys on either path" {
     const secret = [_]u8{0x31} ** 32;
     const hp = [_]u8{0x42} ** quic_crypto.max_key_len;
-    const local = address.Address.initIpv4(.{127, 0, 0, 1}, 1000);
-    const peer = address.Address.initIpv4(.{127, 0, 0, 1}, 2000);
+    const local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1000);
+    const peer = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 2000);
     var random = std.Random.DefaultPrng.init(101);
     for ([_]u8{ 0, 1 }) |path_id| {
         // Lower PN, equal PN, and increasing PN for a second unacknowledged update.
@@ -10097,13 +10409,10 @@ test "recv authenticated invalid next keys closes before rotating shared keys on
                 conn.pkt_num_spaces[2].next_packet_number, other.space.next_packet_number,
             };
             var bytes: [128]u8 = undefined;
-            const wire = keyGuardTestWire(&bytes, &sender.current_seal,
-                path_id, pn, sender.key_phase);
+            const wire = nativeTestWire(&bytes, &sender.current_seal, path_id, pn, sender.key_phase, &.{ 0x01, 0x00, 0x00, 0x00 }, "keyguard");
             var reader = io.fixedBufferStream(wire);
             var header = try packet.Header.parse(&reader, 8);
-            try std.testing.expectError(error.KeyUpdateError,
-                conn.recv(&header, &reader,
-                    .{ .from = peer, .to = local, .datagram_size = wire.len }, 2, random.random()));
+            try std.testing.expectError(error.KeyUpdateError, conn.recv(&header, &reader, .{ .from = peer, .to = local, .datagram_size = wire.len }, 2, random.random()));
             try std.testing.expectEqual(State.closing, conn.state);
             try std.testing.expectEqual(@as(u64, 0x0e), conn.local_err.?.code);
             try std.testing.expect(!header.key_update_authenticated);
@@ -10118,8 +10427,8 @@ test "recv authenticated invalid next keys closes before rotating shared keys on
 test "recv current and previous generation duplicates remain connected on either path" {
     const secret = [_]u8{0x31} ** 32;
     const hp = [_]u8{0x42} ** quic_crypto.max_key_len;
-    const local = address.Address.initIpv4(.{127, 0, 0, 1}, 1000);
-    const peer = address.Address.initIpv4(.{127, 0, 0, 1}, 2000);
+    const local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1000);
+    const peer = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 2000);
     var random = std.Random.DefaultPrng.init(102);
     for ([_]u8{ 0, 1 }) |path_id| {
         var conn = testConnection(std.testing.allocator);
@@ -10153,13 +10462,10 @@ test "recv current and previous generation duplicates remain connected on either
         const original_keys = conn.key_update.?;
         for ([_]bool{ false, true }) |previous| {
             var bytes: [128]u8 = undefined;
-            const wire = keyGuardTestWire(&bytes,
-                if (previous) &previous_seal else &sender.current_seal,
-                path_id, 10, !previous);
+            const wire = nativeTestWire(&bytes, if (previous) &previous_seal else &sender.current_seal, path_id, 10, !previous, &.{ 0x01, 0x00, 0x00, 0x00 }, "keyguard");
             var reader = io.fixedBufferStream(wire);
             var header = try packet.Header.parse(&reader, 8);
-            try conn.recv(&header, &reader,
-                .{ .from = peer, .to = local, .datagram_size = wire.len }, 2, random.random());
+            try conn.recv(&header, &reader, .{ .from = peer, .to = local, .datagram_size = wire.len }, 2, random.random());
             try std.testing.expectEqual(State.connected, conn.state);
             try std.testing.expect(conn.local_err == null);
             try std.testing.expectEqualDeep(original_keys, conn.key_update.?);
@@ -10173,21 +10479,19 @@ test "recv current and previous generation duplicates remain connected on either
 test "lifted physical policy omits virtual observed report but emits configured WAN report" {
     const Admission = struct {
         fn admit(candidate: address.Address) bool {
-            return candidate.eql(address.Address.initIpv4(.{203, 0, 113, 7}, 2000));
+            return candidate.eql(address.Address.initIpv4(.{ 203, 0, 113, 7 }, 2000));
         }
     };
-    var conn = testConnection(std.testing.allocator);
+    var conn = testConnectionForRole(std.testing.allocator, false);
     defer conn.deinit();
-    conn.is_server = false;
-    conn.packer.is_server = false;
     conn.state = .connected;
     conn.handshake_confirmed = true;
     conn.local_params.address_discovery_role = .send_only;
     conn.peer_params = .{ .address_discovery_role = .receive_only };
     conn.candidateAdmission = Admission.admit;
-    const local = address.Address.initIpv4(.{127, 0, 0, 1}, 1000);
-    const virtual = address.Address.initIpv6([_]u8{0xfd, 0x15} ++ [_]u8{0} ** 14, 2000, 0);
-    const wan = address.Address.initIpv4(.{203, 0, 113, 7}, 2000);
+    const local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1000);
+    const virtual = address.Address.initIpv6([_]u8{ 0xfd, 0x15 } ++ [_]u8{0} ** 14, 2000, 0);
+    const wan = address.Address.initIpv4(.{ 203, 0, 113, 7 }, 2000);
     conn.paths[0] = NetworkPath.init(local, virtual, true);
     conn.path_initialized = true;
     conn.observed_paths[0].schedule(.send_only, .receive_only);
@@ -10195,24 +10499,670 @@ test "lifted physical policy omits virtual observed report but emits configured 
     conn.installAppKeys(keys[0], keys[1]);
     var random = std.Random.DefaultPrng.init(103);
     var wire: [1500]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 0), try conn.sendAt(&wire, 0, random.random()));
-    try std.testing.expectEqual(@as(usize, 0), conn.path_control[0].len);
+    const peer_keys = try quic_crypto.deriveInitialKeyMaterial("observed-physical", conn.version, true);
+    var space: packet.PacketNumSpace = .{ .crypto_open = peer_keys[0], .crypto_seal = peer_keys[1] };
+    const virtual_length = try conn.sendAt(&wire, 0, random.random());
+    try std.testing.expect(virtual_length > 0);
+    var virtual_reader = io.fixedBufferStream(wire[0..virtual_length]);
+    var virtual_header = try packet.Header.parse(&virtual_reader, 8);
+    var remaining = try packet.decrypt(&virtual_header, &virtual_reader, &space);
+    while (remaining.len > 0) {
+        var consumed: usize = undefined;
+        const frame = try Frame.parseSized(remaining, &consumed);
+        try std.testing.expect(consumed > 0);
+        try std.testing.expect(frame != .observed_address);
+        remaining = remaining[consumed..];
+    }
+    var sent_packets = conn.pkt_handler.sent[2].sent_packets.iterator();
+    while (sent_packets.next()) |entry| {
+        for (entry.value_ptr.*.getControlFrames()) |control| {
+            try std.testing.expect(control != .observed_address);
+        }
+    }
     try std.testing.expect(conn.observed_queued[0] == null);
     try std.testing.expectEqual(@as(u64, 0), conn.observed_next_sequence);
-    try std.testing.expectEqual(@as(u64, 0), conn.pkt_handler.next_pn[2]);
     try std.testing.expect(conn.paths[0].peer_addr.eql(virtual));
     conn.paths[0].peer_addr = wan;
     const length = try conn.sendAt(&wire, 1, random.random());
     try std.testing.expect(length > 0);
-    const peer_keys = try quic_crypto.deriveInitialKeyMaterial("observed-physical", conn.version, true);
-    var space: packet.PacketNumSpace = .{ .crypto_open = peer_keys[0], .crypto_seal = peer_keys[1] };
     var reader = io.fixedBufferStream(wire[0..length]);
     var header = try packet.Header.parse(&reader, 8);
-    const payload = try packet.decrypt(&header, &reader, &space);
-    const report = (try Frame.parse(payload)).observed_address;
-    try std.testing.expect(report.address.eql(wan));
-    try std.testing.expectEqual(@as(u64, 0), report.sequence);
+    remaining = try packet.decrypt(&header, &reader, &space);
+    var found_report = false;
+    while (remaining.len > 0) {
+        var consumed: usize = undefined;
+        const frame = try Frame.parseSized(remaining, &consumed);
+        try std.testing.expect(consumed > 0);
+        if (frame == .observed_address) {
+            try std.testing.expect(frame.observed_address.address.eql(wan));
+            try std.testing.expectEqual(@as(u64, 0), frame.observed_address.sequence);
+            found_report = true;
+        }
+        remaining = remaining[consumed..];
+    }
+    try std.testing.expect(found_report);
     try std.testing.expectEqual(@as(u64, 1), conn.observed_next_sequence);
-    try std.testing.expectEqual(observed.Role.send_only, conn.observedRoles().local);
-    try std.testing.expectEqual(observed.Role.receive_only, conn.observedRoles().peer);
+}
+
+test "native retirement ACK and ACK_ECN release only matching path credit repeatedly" {
+    var peer_cid_bytes: [8]u8 = "peerpath".*;
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.state = .connected;
+    conn.local_params.initial_max_path_id = 1;
+    conn.peer_params = .{ .initial_max_path_id = 1 };
+    conn.native_paths.entries[1].opened = true;
+    const other = try conn.ensurePathTransport();
+    var random = std.Random.DefaultPrng.init(104);
+    try configureNativeTestIngress(&conn, &peer_cid_bytes, random.random());
+    other.handler.next_pn[2] = 50;
+    for (0..12) |sequence| {
+        const sent_at: i64 = @intCast((sequence + 1) * 1_000_000_000);
+        for ([_]u1{ 0, 1 }) |id| {
+            try conn.retirePeerCid(id, sequence, sent_at);
+            try conn.selectPath(id);
+            var outgoing: [1500]u8 = undefined;
+            try std.testing.expect(try conn.sendAt(&outgoing, sent_at + @as(i64, id) * 1_000_000, random.random()) > 0);
+            try std.testing.expectEqual(@as(u8, id), conn.send_path);
+            const handler = if (id == 0) &conn.pkt_handler else &other.handler;
+            const sent = handler.sent[2].sent_packets.get(handler.next_pn[2] - 1).?;
+            var found_retirement = false;
+            for (sent.getControlFrames()) |control| {
+                if (control == .path_retire_connection_id and
+                    control.path_retire_connection_id.path_id == id and
+                    control.path_retire_connection_id.seq_num == sequence)
+                    found_retirement = true;
+            }
+            try std.testing.expect(found_retirement);
+        }
+        const ack1: Frame = if (sequence % 2 == 0) .{ .path_ack = .{ .path_id = 1, .ack = .{
+            .largest_ack = other.handler.next_pn[2] - 1,
+            .ack_delay = 0,
+            .first_ack_range = 0,
+            .ack_range_count = 0,
+            .ack_ranges = undefined,
+        } } } else .{ .path_ack_ecn = .{ .path_id = 1, .ack = .{
+            .largest_ack = other.handler.next_pn[2] - 1,
+            .ack_delay = 0,
+            .first_ack_range = 0,
+            .ack_range_count = 0,
+            .ack_ranges = undefined,
+            .ecn_ect0 = 0,
+            .ecn_ect1 = 0,
+            .ecn_ce = 0,
+        } } };
+        try recvNativeTestFrame(&conn, ack1, @intCast(sequence % 2), sent_at + 2_000_000, random.random());
+        try std.testing.expectEqual(@as(usize, 0), other.retiring_cids.items.len);
+        try std.testing.expectEqual(@as(usize, 1), conn.retiring_cids.items.len);
+        const ack0: Frame = if (sequence % 2 == 0) .{ .ack = .{
+            .largest_ack = conn.pkt_handler.next_pn[2] - 1,
+            .ack_delay = 0,
+            .first_ack_range = 0,
+            .ack_range_count = 0,
+            .ack_ranges = undefined,
+        } } else .{ .ack_ecn = .{
+            .largest_ack = conn.pkt_handler.next_pn[2] - 1,
+            .ack_delay = 0,
+            .first_ack_range = 0,
+            .ack_range_count = 0,
+            .ack_ranges = undefined,
+            .ecn_ect0 = 0,
+            .ecn_ect1 = 0,
+            .ecn_ce = 0,
+        } };
+        try recvNativeTestFrame(&conn, ack0, @intCast((sequence + 1) % 2), sent_at + 2_000_000, random.random());
+        try std.testing.expectEqual(@as(usize, 0), conn.retiring_cids.items.len);
+        try std.testing.expectEqual(State.connected, conn.state);
+    }
+}
+
+test "recv abandon retains live replacement and receiving path through following ordinary ACK" {
+    const secret = [_]u8{0x31} ** 32;
+    const hp = [_]u8{0x42} ** quic_crypto.max_key_len;
+    const local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1000);
+    const peer = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 2000);
+    var random = std.Random.DefaultPrng.init(105);
+    for ([_]u8{ 0, 1 }) |carrying_path| {
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        conn.is_server = true;
+        conn.state = .connected;
+        conn.handshake_confirmed = true;
+        conn.local_params.initial_max_path_id = 1;
+        conn.peer_params = .{ .initial_max_path_id = 1, .initial_max_streams_uni = 1, .initial_max_stream_data_uni = 4096, .initial_max_data = 4096 };
+        conn.native_paths = try native_path.process(.{}, .{
+            .negotiate = .{ .local_max = 1, .peer_max = 1 },
+        });
+        conn.native_paths.entries[1] = .{ .opened = true, .validated = true };
+        conn.native_paths.selected = 1;
+        conn.active_path_idx = 1;
+        conn.paths[0] = NetworkPath.init(local, peer, true);
+        const direct_peer = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 3000);
+        conn.paths[1] = NetworkPath.init(local, direct_peer, false);
+        conn.paths[0].is_validated = true;
+        conn.paths[1].is_validated = true;
+        conn.path_initialized = true;
+        conn.local_cid_pool.registerInitialCid("keyguard", null, random.random());
+        conn.local_cid_pool.entries[0].path_id = carrying_path;
+        const keys = quic_crypto.KeyUpdateManager.init(secret, secret, hp, hp);
+        conn.installAppKeys(keys.current_open, keys.current_seal);
+        const other = try conn.ensurePathTransport();
+        other.handler.next_pn[2] = 50;
+        const pn0 = conn.pkt_handler.nextPacketNumber(.application, random.random());
+        const pn1 = other.handler.nextPacketNumber(.application, random.random());
+        try std.testing.expectEqual(@as(u64, 0), pn0);
+        try std.testing.expectEqual(@as(u64, 50), pn1);
+        try conn.pkt_handler.onPacketSent(.{ .pn = pn0, .time_sent = 1, .size = 100, .enc_level = .application, .ack_eliciting = true, .in_flight = true });
+        try other.handler.onPacketSent(.{ .pn = pn1, .time_sent = 1, .size = 100, .enc_level = .application, .ack_eliciting = true, .in_flight = true });
+        var payload: [64]u8 = undefined;
+        var writer = io.fixedBufferStream(&payload);
+        try (Frame{ .path_abandon = .{ .path_id = 1, .error_code = 0 } }).write(&writer);
+        try (Frame{ .ack = .{ .largest_ack = pn0, .ack_delay = 0, .first_ack_range = 0, .ack_range_count = 0, .ack_ranges = undefined } }).write(&writer);
+        var bytes: [128]u8 = undefined;
+        const wire = nativeTestWire(&bytes, &keys.current_seal, carrying_path, 7, false, payload[0..writer.seek], "keyguard");
+        var reader = io.fixedBufferStream(wire);
+        var header = try packet.Header.parse(&reader, 8);
+        try conn.recv(&header, &reader, .{ .from = if (carrying_path == 0) peer else direct_peer, .to = local, .datagram_size = wire.len }, 100, random.random());
+        try std.testing.expectEqual(State.connected, conn.state);
+        try std.testing.expect(conn.native_paths.entries[1].abandoned);
+        try std.testing.expectEqual(@as(u8, 0), conn.active_path_idx);
+        try std.testing.expectEqual(@as(u8, 0), conn.native_paths.selected);
+        try std.testing.expectEqual(@as(u8, 0), conn.transport_path);
+        try std.testing.expectEqual(@as(usize, 0), conn.pkt_handler.sent[2].sent_packets.count());
+        try std.testing.expectEqual(@as(usize, 0), other.handler.sent[2].sent_packets.count());
+        try std.testing.expectEqual(if (carrying_path == 0) @as(?u64, 7) else null, conn.pkt_handler.recv[2].largest_received);
+        try std.testing.expectEqual(if (carrying_path == 1) @as(?u64, 7) else null, other.handler.recv[2].largest_received);
+        try std.testing.expectEqual(if (carrying_path == 0) @as(u64, wire.len) else 0, conn.paths[0].bytes_received);
+        try std.testing.expectEqual(if (carrying_path == 1) @as(u64, wire.len) else 0, conn.paths[1].bytes_received);
+        try std.testing.expect(conn.paths[0].is_validated);
+        try std.testing.expect(conn.paths[1].is_validated);
+        try std.testing.expect(conn.paths[0].is_initial);
+        try std.testing.expect(!conn.paths[1].is_initial);
+        conn.streams.setMaxStreams(0, 1);
+        conn.streams.setPeerInitialMaxStreamData(0, 0, 4096);
+        conn.conn_flow_ctrl.base.send_window = 4096;
+        const stream = try conn.openUniStream();
+        const application = "application survives native path abandonment";
+        try stream.writeData(application);
+        stream.close();
+        var outgoing: [1500]u8 = undefined;
+        const length = try conn.sendAt(&outgoing, 200, random.random());
+        try std.testing.expect(length > 0);
+        try std.testing.expectEqual(@as(u8, 0), conn.send_path);
+        try std.testing.expect(conn.lastSendPeer().eql(peer));
+        try std.testing.expect(!conn.lastSendPeer().eql(direct_peer));
+        const peer_space: packet.PacketNumSpace = .{
+            .crypto_open = keys.current_open,
+            .crypto_seal = keys.current_seal,
+        };
+        var outgoing_reader = io.fixedBufferStream(outgoing[0..length]);
+        var outgoing_header = try packet.Header.parse(&outgoing_reader, 8);
+        const plaintext = try packet.decryptForPath(&outgoing_header, &outgoing_reader, &peer_space, 0);
+        var remaining = plaintext;
+        var found_application = false;
+        while (remaining.len > 0) {
+            var consumed: usize = undefined;
+            const frame = try Frame.parseSized(remaining, &consumed);
+            try std.testing.expect(consumed > 0);
+            if (frame == .stream and frame.stream.stream_id == stream.stream_id) {
+                try std.testing.expectEqual(@as(u64, 0), frame.stream.offset);
+                try std.testing.expectEqualStrings(application, frame.stream.data);
+                try std.testing.expect(frame.stream.fin);
+                found_application = true;
+            }
+            remaining = remaining[consumed..];
+        }
+        try std.testing.expect(found_application);
+    }
+}
+
+test "PATH_ACK_ECN keeps per-path CE baselines and ignores duplicate or offpath-only feedback" {
+    var peer_cid_bytes: [8]u8 = "peerpath".*;
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.state = .connected;
+    conn.handshake_confirmed = true;
+    conn.local_params.initial_max_path_id = 1;
+    conn.peer_params = .{ .initial_max_path_id = 1 };
+    conn.native_paths.entries[1].opened = true;
+    const other = try conn.ensurePathTransport();
+    conn.ecn_validator.start();
+    other.ecn_state.start();
+    var random = std.Random.DefaultPrng.init(106);
+    try configureNativeTestIngress(&conn, &peer_cid_bytes, random.random());
+    other.handler.next_pn[2] = 50;
+    const before0 = conn.cc.congestion_window;
+    const before1 = other.cc.congestion_window;
+    for ([_]u1{ 0, 1 }) |id| {
+        const pn = try sendNativeTestPing(&conn, id, 1, random.random());
+        try std.testing.expectEqual(if (id == 0) @as(u64, 0) else 50, pn);
+        const ack: Frame = .{ .path_ack_ecn = .{ .path_id = id, .ack = .{
+            .largest_ack = pn,
+            .ack_delay = 0,
+            .first_ack_range = 0,
+            .ack_range_count = 0,
+            .ack_ranges = undefined,
+            .ecn_ect0 = 0,
+            .ecn_ect1 = 0,
+            .ecn_ce = 1,
+        } } };
+        try recvNativeTestFrame(&conn, ack, id ^ 1, 100 + @as(i64, id), random.random());
+    }
+    try std.testing.expectEqual(@as(u64, 1), conn.peer_ecn_ce[2]);
+    try std.testing.expectEqual(@as(u64, 1), other.peer_ecn_ce);
+    try std.testing.expect(conn.cc.congestion_window < before0);
+    try std.testing.expect(other.cc.congestion_window < before1);
+    try std.testing.expectEqual(@as(u64, 1), conn.ecn_validator.acked_ect0_count);
+    try std.testing.expectEqual(@as(u64, 1), other.ecn_state.acked_ect0_count);
+    const original0 = conn.cc;
+    const original1 = other.cc;
+    const original_ecn1 = other.ecn_state;
+    const original_ecn0 = conn.ecn_validator;
+    for ([_]bool{ false, true }) |off_path_only| {
+        if (off_path_only) {
+            var wire: [1500]u8 = undefined;
+            conn.packer.application_path_id = 0;
+            try std.testing.expect(try conn.packer.packOffPath(&wire, &conn.pkt_handler, conn.appSeal().?, .{ .challenge = .{1} ** 8 }, random.random()) > 0);
+        }
+        const target_path: u1 = if (off_path_only) 0 else 1;
+        const pn = if (target_path == 0) conn.pkt_handler.next_pn[2] - 1 else other.handler.next_pn[2] - 1;
+        const ack: Frame = .{ .path_ack_ecn = .{ .path_id = target_path, .ack = .{
+            .largest_ack = pn,
+            .ack_delay = 0,
+            .first_ack_range = 0,
+            .ack_range_count = 0,
+            .ack_ranges = undefined,
+            .ecn_ect0 = 0,
+            .ecn_ect1 = 0,
+            .ecn_ce = 99,
+        } } };
+        try recvNativeTestFrame(&conn, ack, if (off_path_only) 1 else 0, 200, random.random());
+        try std.testing.expectEqual(@as(u64, 1), other.peer_ecn_ce);
+        try std.testing.expectEqual(@as(u64, 1), conn.peer_ecn_ce[2]);
+        try std.testing.expectEqualDeep(original0, conn.cc);
+        try std.testing.expectEqualDeep(original1, other.cc);
+        try std.testing.expectEqualDeep(original_ecn1, other.ecn_state);
+        try std.testing.expectEqualDeep(original_ecn0, conn.ecn_validator);
+    }
+    const lower = try sendNativeTestPing(&conn, 1, 300, random.random());
+    const higher = try sendNativeTestPing(&conn, 1, 301, random.random());
+    const higher_ack: Frame = .{ .path_ack_ecn = .{ .path_id = 1, .ack = .{
+        .largest_ack = higher,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_range_count = 0,
+        .ack_ranges = undefined,
+        .ecn_ect0 = 0,
+        .ecn_ect1 = 0,
+        .ecn_ce = 2,
+    } } };
+    try recvNativeTestFrame(&conn, higher_ack, 0, 400, random.random());
+    try std.testing.expectEqual(@as(usize, 1), other.handler.sent[2].sent_packets.count());
+    const newest_validator = other.ecn_state;
+    const lower_ack: Frame = .{ .path_ack_ecn = .{ .path_id = 1, .ack = .{
+        .largest_ack = lower,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_range_count = 0,
+        .ack_ranges = undefined,
+        .ecn_ect0 = 0,
+        .ecn_ect1 = 0,
+        .ecn_ce = 0,
+    } } };
+    try recvNativeTestFrame(&conn, lower_ack, 1, 401, random.random());
+    try std.testing.expectEqual(@as(usize, 0), other.handler.sent[2].sent_packets.count());
+    try std.testing.expectEqual(@as(u64, 2), other.peer_ecn_ce);
+    try std.testing.expectEqualDeep(newest_validator, other.ecn_state);
+    const pn0 = try sendNativeTestPing(&conn, 0, 500, random.random());
+    const ordinary: Frame = .{ .ack_ecn = .{
+        .largest_ack = pn0,
+        .ack_delay = 0,
+        .first_ack_range = 0,
+        .ack_range_count = 0,
+        .ack_ranges = undefined,
+        .ecn_ect0 = 0,
+        .ecn_ect1 = 0,
+        .ecn_ce = 2,
+    } };
+    const direct_cc = other.cc;
+    try recvNativeTestFrame(&conn, ordinary, 1, 600, random.random());
+    try std.testing.expectEqual(@as(u8, 0), conn.transport_path);
+    try std.testing.expectEqual(@as(u64, 2), conn.peer_ecn_ce[2]);
+    try std.testing.expectEqual(@as(u64, 2), other.peer_ecn_ce);
+    try std.testing.expectEqualDeep(direct_cc, other.cc);
+}
+
+test "native remote PATH_ABANDON unknown and duplicate closed paths never close connection" {
+    var peer_cid_bytes: [8]u8 = "peerpath".*;
+    var conn = testConnection(std.testing.allocator);
+    defer conn.deinit();
+    conn.state = .connected;
+    conn.local_params.initial_max_path_id = 1;
+    conn.peer_params = .{ .initial_max_path_id = 0 };
+    conn.native_paths = try native_path.process(.{}, .{
+        .negotiate = .{ .local_max = 1, .peer_max = 0 },
+    });
+    var random = std.Random.DefaultPrng.init(107);
+    try configureNativeTestIngress(&conn, &peer_cid_bytes, random.random());
+    const abandon: Frame = .{ .path_abandon = .{ .path_id = 1, .error_code = 0 } };
+    try recvNativeTestFrame(&conn, abandon, 0, 1, random.random());
+    try std.testing.expectEqual(State.connected, conn.state);
+    const unknown: Frame = .{ .path_abandon = .{ .path_id = 7, .error_code = 0 } };
+    try recvNativeTestFrame(&conn, unknown, 0, 1, random.random());
+    conn.local_params.initial_max_path_id = 0;
+    conn.native_paths.local_max_path_id = 0;
+    const bounded = conn.native_paths;
+    try recvNativeTestFrame(&conn, abandon, 0, 1, random.random());
+    try std.testing.expectEqualDeep(bounded, conn.native_paths);
+    try std.testing.expectEqual(State.connected, conn.state);
+    conn.local_params.initial_max_path_id = 1;
+    conn.native_paths.local_max_path_id = 1;
+    conn.native_paths.peer_max_path_id = 1;
+    conn.native_paths.entries[1] = .{ .opened = true, .validated = true };
+    conn.native_paths.selected = 1;
+    conn.active_path_idx = 1;
+    try recvNativeTestFrame(&conn, abandon, 1, 2, random.random());
+    const closed = conn.native_paths;
+    try recvNativeTestFrame(&conn, abandon, 0, 3, random.random());
+    try std.testing.expectEqualDeep(closed, conn.native_paths);
+    try std.testing.expectEqual(State.connected, conn.state);
+    try std.testing.expect(conn.local_err == null);
+    try std.testing.expectEqual(@as(u8, 0), conn.active_path_idx);
+}
+
+test "ordered CE feedback for already in-flight packet does not restart native path recovery" {
+    var random = std.Random.DefaultPrng.init(108);
+    for ([_]u1{ 0, 1 }) |path_id| {
+        var peer_cid_bytes: [8]u8 = "peerpath".*;
+        var conn = testConnection(std.testing.allocator);
+        defer conn.deinit();
+        conn.local_params.initial_max_path_id = 1;
+        conn.peer_params = .{ .initial_max_path_id = 1 };
+        conn.native_paths.entries[1].opened = true;
+        const other = try conn.ensurePathTransport();
+        try configureNativeTestIngress(&conn, &peer_cid_bytes, random.random());
+        conn.paths[1].is_initial = false;
+        conn.ecn_validator.start();
+        other.ecn_state.start();
+        other.handler.next_pn[2] = 50;
+        const first = try sendNativeTestPing(&conn, path_id, 0, random.random());
+        const second = try sendNativeTestPing(&conn, path_id, 50, random.random());
+        const handler = if (path_id == 0) &conn.pkt_handler else &other.handler;
+        try std.testing.expectEqual(@as(i64, 0), handler.sent[2].sent_packets.get(first).?.time_sent);
+        try std.testing.expectEqual(@as(i64, 50), handler.sent[2].sent_packets.get(second).?.time_sent);
+        const cc = if (path_id == 0) &conn.cc else &other.cc;
+        const original_window = cc.congestion_window;
+        const first_ack: Frame = .{ .path_ack_ecn = .{ .path_id = path_id, .ack = .{
+            .largest_ack = first,
+            .ack_delay = 0,
+            .first_ack_range = 0,
+            .ack_range_count = 0,
+            .ack_ranges = undefined,
+            .ecn_ect0 = 0,
+            .ecn_ect1 = 0,
+            .ecn_ce = 1,
+        } } };
+        try recvNativeTestFrame(&conn, first_ack, path_id ^ 1, 100, random.random());
+        try std.testing.expect(cc.congestion_window < original_window);
+        try std.testing.expectEqual(@as(?i64, 100), cc.congestion_recovery_start_time);
+        try std.testing.expectEqual(@as(usize, 1), handler.sent[2].sent_packets.count());
+        const recovery_window = cc.congestion_window;
+        const recovery_start = cc.congestion_recovery_start_time;
+        const cubic_epoch = cc.epoch_start;
+        const second_ack: Frame = .{ .path_ack_ecn = .{ .path_id = path_id, .ack = .{
+            .largest_ack = second,
+            .ack_delay = 0,
+            .first_ack_range = 0,
+            .ack_range_count = 0,
+            .ack_ranges = undefined,
+            .ecn_ect0 = 0,
+            .ecn_ect1 = 0,
+            .ecn_ce = 2,
+        } } };
+        try recvNativeTestFrame(&conn, second_ack, path_id, 200, random.random());
+        try std.testing.expectEqual(@as(usize, 0), handler.sent[2].sent_packets.count());
+        const peer_ce = if (path_id == 0) conn.peer_ecn_ce[2] else other.peer_ecn_ce;
+        const validator = if (path_id == 0) &conn.ecn_validator else &other.ecn_state;
+        try std.testing.expectEqual(@as(u64, 2), peer_ce);
+        try std.testing.expectEqual(@as(u64, 2), validator.acked_ect0_count);
+        try std.testing.expectEqual(recovery_window, cc.congestion_window);
+        try std.testing.expectEqual(recovery_start, cc.congestion_recovery_start_time);
+        try std.testing.expectEqual(cubic_epoch, cc.epoch_start);
+    }
+}
+
+test "native teardown releases both owned packet handlers regardless of active transport" {
+    var random = std.Random.DefaultPrng.init(109);
+    for ([_]u8{ 0, 1 }) |active| {
+        var conn = testConnectionForRole(std.testing.allocator, false);
+        defer conn.deinit();
+        const other = try conn.ensurePathTransport();
+        for ([_]*ack_handler.PacketHandler{ &conn.pkt_handler, &other.handler }) |handler| {
+            const pn = handler.nextPacketNumber(.application, random.random());
+            try handler.onPacketSent(.{
+                .pn = pn,
+                .time_sent = 1,
+                .size = 100,
+                .enc_level = .application,
+                .ack_eliciting = true,
+                .in_flight = true,
+            });
+            try std.testing.expectEqual(@as(usize, 1), handler.sent[2].sent_packets.count());
+        }
+        conn.activateTransport(active);
+    }
+}
+
+test "native control recording OOM finishes the connection and discards the output" {
+    // Both the packet pool and its index allocate after the challenge was consumed.
+    for (0..2) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        var conn = testConnectionForRole(failing.allocator(), false);
+        defer conn.deinit();
+        conn.state = .connected;
+        conn.handshake_confirmed = true;
+        const keys = try quic_crypto.deriveInitialKeyMaterial(
+            "control-recording",
+            conn.version,
+            false,
+        );
+        conn.installAppKeys(keys[0], keys[1]);
+        conn.path_control[0].push(.{ .path_challenge = .{0x5a} ** 8 });
+        var random = std.Random.DefaultPrng.init(110);
+        var output: [1500]u8 = undefined;
+        var accepted_length: usize = 0;
+        if (conn.sendAt(&output, 1, random.random())) |written| {
+            accepted_length = written;
+            return error.TestExpectedControlRecordingRefusal;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        // An error publishes no prefix; the buffer is deliberately not inspected.
+        try std.testing.expectEqual(@as(usize, 0), accepted_length);
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), conn.path_control[0].len);
+        try std.testing.expectEqual(@as(usize, 0), conn.pkt_handler.sent[2].sent_packets.count());
+        try std.testing.expectEqual(@as(u64, 0), conn.pkt_handler.bytes_in_flight);
+        try std.testing.expectEqual(State.closing, conn.state);
+        try std.testing.expect(!conn.local_err.?.is_app);
+        try std.testing.expectEqual(
+            @as(u64, @intFromEnum(TransportError.internal_error)),
+            conn.local_err.?.code,
+        );
+    }
+}
+
+fn deliverNativeReliabilityPacket(
+    receiver: *Connection,
+    output: []u8,
+    open: quic_crypto.Open,
+    stream_id: u64,
+    application: []const u8,
+    now: i64,
+    random: std.Random,
+) !bool {
+    const space: packet.PacketNumSpace = .{ .crypto_open = open };
+    var reader = io.fixedBufferStream(output);
+    var header = try packet.Header.parse(&reader, 8);
+    const plaintext = try packet.decryptForPath(&header, &reader, &space, 0);
+    var remaining = plaintext;
+    var delivered = false;
+    for (0..1500) |_| {
+        if (remaining.len == 0) break;
+        var consumed: usize = undefined;
+        const frame = try Frame.parseSized(remaining, &consumed);
+        try std.testing.expect(consumed > 0);
+        if (frame == .stream and frame.stream.stream_id == stream_id) {
+            try std.testing.expectEqual(@as(u64, 0), frame.stream.offset);
+            try std.testing.expectEqualStrings(application, frame.stream.data);
+            try std.testing.expect(frame.stream.fin);
+            try receiver.processFrame(&frame, .application, now, random);
+            delivered = true;
+        }
+        remaining = remaining[consumed..];
+    }
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+    return delivered;
+}
+
+test "native abandoned path retransmits outstanding STREAM FIN and surviving PTO completes" {
+    // Lose path1's only flight; path0 is idle, so no unrelated PTO can rescue it.
+    var random = std.Random.DefaultPrng.init(111);
+    var conn = testConnectionForRole(std.testing.allocator, false);
+    defer conn.deinit();
+    conn.state = .connected;
+    conn.handshake_confirmed = true;
+    conn.local_params.initial_max_path_id = 1;
+    conn.peer_params = .{
+        .initial_max_path_id = 1,
+        .initial_max_streams_uni = 1,
+        .initial_max_stream_data_uni = 4096,
+        .initial_max_data = 4096,
+    };
+    conn.native_paths = try native_path.process(.{}, .{
+        .negotiate = .{ .local_max = 1, .peer_max = 1 },
+    });
+    conn.native_paths.entries[1] = .{ .opened = true, .validated = true };
+    const local = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 1000);
+    const relay = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 2000);
+    const direct = address.Address.initIpv4(.{ 127, 0, 0, 1 }, 3000);
+    conn.paths[0] = NetworkPath.init(local, relay, true);
+    conn.paths[1] = NetworkPath.init(local, direct, false);
+    conn.paths[0].is_validated = true;
+    conn.paths[1].is_validated = true;
+    conn.path_initialized = true;
+    const other = try conn.ensurePathTransport();
+    @memcpy(other.dcid[0..8], "path-one");
+    other.dcid_len = 8;
+    const keys = try quic_crypto.deriveInitialKeyMaterial("path-reliability", conn.version, false);
+    conn.installAppKeys(keys[0], keys[1]);
+    const peer_keys = try quic_crypto.deriveInitialKeyMaterial(
+        "path-reliability",
+        conn.version,
+        true,
+    );
+    conn.streams.setMaxStreams(0, 1);
+    conn.streams.setPeerInitialMaxStreamData(0, 0, 4096);
+    conn.conn_flow_ctrl.base.send_window = 4096;
+    const stream = try conn.openUniStream();
+    const stream_id = stream.stream_id;
+    const application = "outstanding path1 bytes and FIN survive";
+    try stream.writeData(application);
+    stream.close();
+    try conn.selectPath(1);
+    var output: [1500]u8 = undefined;
+    try std.testing.expect(try conn.sendAt(&output, 1, random.random()) > 0);
+    try std.testing.expectEqual(@as(u8, 1), conn.send_path);
+    try std.testing.expectEqual(@as(u64, 0), conn.pkt_handler.bytes_in_flight);
+    try std.testing.expectEqual(@as(u64, 0), conn.pkt_handler.sent[2].ack_eliciting_in_flight);
+    try std.testing.expect(conn.pkt_handler.getPtoTimeout() == null);
+    try std.testing.expect(!stream.hasData());
+    const abandoned_deadline = other.handler.getPtoTimeout().?;
+    try conn.processFrame(&.{ .path_abandon = .{
+        .path_id = 1,
+        .error_code = 0,
+    } }, .application, 2, random.random());
+    try std.testing.expectEqual(State.connected, conn.state);
+    try std.testing.expectEqual(@as(u8, 0), conn.active_path_idx);
+    try std.testing.expect(stream.hasRetransmitData());
+    try std.testing.expectEqual(@as(usize, 0), other.handler.sent[2].sent_packets.count());
+    try std.testing.expectEqual(@as(usize, 0), other.handler.sent[2].live);
+    try std.testing.expectEqual(@as(u64, 0), other.handler.bytes_in_flight);
+    try std.testing.expect(other.handler.getPtoTimeout() == null);
+    try conn.onTimeout(abandoned_deadline, random.random());
+    // This retry is lost too: recovery must now be driven by path0's own PTO.
+    const retried = try conn.sendAt(&output, abandoned_deadline, random.random());
+    try std.testing.expect(retried > 0);
+    try std.testing.expectEqual(@as(u8, 0), conn.send_path);
+    try std.testing.expect(conn.lastSendPeer().eql(relay));
+    try std.testing.expect(!stream.hasRetransmitData());
+    try conn.processFrame(&.{ .path_abandon = .{
+        .path_id = 1,
+        .error_code = 0,
+    } }, .application, abandoned_deadline + 1, random.random());
+    try conn.processFrame(&.{ .path_ack = .{
+        .path_id = 1,
+        .ack = .{
+            .largest_ack = other.handler.next_pn[2] - 1,
+            .ack_delay = 0,
+            .first_ack_range = 0,
+        },
+    } }, .application, abandoned_deadline + 1, random.random());
+    try std.testing.expect(!stream.hasRetransmitData());
+    try std.testing.expectEqual(@as(usize, 0), other.handler.sent[2].live);
+    var receiver = testConnection(std.testing.allocator);
+    defer receiver.deinit();
+    receiver.streams.setMaxIncomingStreams(0, 1);
+    try std.testing.expect(try deliverNativeReliabilityPacket(
+        &receiver,
+        output[0..retried],
+        peer_keys[0],
+        stream_id,
+        application,
+        abandoned_deadline,
+        random.random(),
+    ));
+    // Use a new receiver so the retry above remains lost to the actual consumer.
+    var final_receiver = testConnection(std.testing.allocator);
+    defer final_receiver.deinit();
+    final_receiver.streams.setMaxIncomingStreams(0, 1);
+    const surviving_deadline = conn.pkt_handler.getPtoTimeout().?;
+    try conn.onTimeout(surviving_deadline, random.random());
+    var delivered = false;
+    for (0..4) |_| {
+        const length = try conn.sendAt(&output, surviving_deadline, random.random());
+        if (length == 0) break;
+        try std.testing.expectEqual(@as(u8, 0), conn.send_path);
+        if (try deliverNativeReliabilityPacket(
+            &final_receiver,
+            output[0..length],
+            peer_keys[0],
+            stream_id,
+            application,
+            surviving_deadline,
+            random.random(),
+        )) {
+            delivered = true;
+            const pn = conn.pkt_handler.next_pn[2] - 1;
+            try conn.processFrame(&.{ .ack = .{
+                .largest_ack = pn,
+                .ack_delay = 0,
+                .first_ack_range = 0,
+            } }, .application, surviving_deadline + 1, random.random());
+            break;
+        }
+    }
+    try std.testing.expect(delivered);
+    const received = final_receiver.streams.getRecvStream(stream_id).?;
+    const data = received.read().?;
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings(application, data);
+    try std.testing.expectEqual(@as(?u64, application.len), received.sorter.fin_offset);
+    try std.testing.expect(received.read() == null);
+    try std.testing.expect(received.finished);
+    conn.streams.drainDisposalQueue();
+    try std.testing.expect(conn.streams.send_streams.get(stream_id) == null);
 }

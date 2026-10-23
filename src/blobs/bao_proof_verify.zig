@@ -54,14 +54,7 @@ pub const Plan = plan_mod.Plan;
 pub const pair_length = tree_mod.pair_length;
 
 comptime {
-    // The one place this file's `catch unreachable` on `Hasher.init` rests on.
-    // `Node.bytes` starts a node at `start_chunk * ranges.chunk_size`, and
-    // `Hasher.init` refuses any offset that is not a multiple of
-    // `core.chunk_length` — so while the two constants are the same number, no
-    // node this file can be handed names an offset the hasher will take. Both
-    // are declared in other modules and either could be edited alone; this is
-    // where that edit stops at the build instead of turning into a `catch
-    // unreachable` in Debug and a misaligned hash in ReleaseFast.
+    // Node byte offsets are multiples of the BLAKE3 chunk length.
     std.debug.assert(ranges.chunk_size == core.chunk_length);
 }
 
@@ -184,12 +177,9 @@ pub const Verifier = struct {
     /// compress, ROOT clear.
     fn hash(self: *const Verifier, node: Node, bytes: []const u8) core.CvBytes {
         const range = node.bytes(self.tree);
-        // Chunk-aligned by construction, and `chunk_identity` below is what
-        // makes that a fact about the two constants rather than about this
-        // line: `Node.bytes` starts a node at `start_chunk * ranges.chunk_size`
-        // and `Hasher.init` refuses an offset that is not a multiple of
-        // `core.chunk_length`, so the two agreeing is the whole proof.
-        var hasher = subtree.Hasher.init(range.start) catch unreachable;
+        // Alignment follows from Node.bytes and the chunk-size assertion above.
+        var hasher = subtree.Hasher.init(range.start) catch
+            @panic("Bao node offset must be chunk-aligned");
         hasher.update(bytes[0..@intCast(range.end - range.start)]);
         return if (self.depth == 0) hasher.final() else hasher.finalChainingValue();
     }
@@ -395,7 +385,7 @@ test "every request of an uneven blob verifies" {
         var start: u64 = 0;
         while (start < tree.chunks()) : (start += 1) {
             for ([_]u64{ 1, 16, 17 }) |length| {
-                const request = ranges.ChunkRange{ .start = start, .end = start + length };
+                const request: ranges.ChunkRange = .{ .start = start, .end = start + length };
                 const built = try Proof.make(size, request);
                 defer built.free();
                 try built.verifySelf(request);
@@ -409,7 +399,7 @@ test "every request of an uneven blob verifies" {
 // request is one chunk at 20 of a 49153-byte blob: the walk to it crosses six
 // parents and the chunk is the seventh item.
 test "a flipped byte in the data is a child mismatch" {
-    const request = ranges.ChunkRange{ .start = 20, .end = 21 };
+    const request: ranges.ChunkRange = .{ .start = 20, .end = 21 };
     var built = try Proof.make(49153, request);
     defer built.free();
 
@@ -428,7 +418,7 @@ test "a flipped byte in the data is a child mismatch" {
 // moment of comparison a wrong claimed value and a wrong computed value are one
 // disagreement, and the walk cannot honestly tell which is which.
 test "a flipped byte in a proved half of a pair is a child mismatch" {
-    const request = ranges.ChunkRange{ .start = 20, .end = 21 };
+    const request: ranges.ChunkRange = .{ .start = 20, .end = 21 };
     var built = try Proof.make(49153, request);
     defer built.free();
 
@@ -443,7 +433,7 @@ test "a flipped byte in a proved half of a pair is a child mismatch" {
 // that does not match. Two errors for one corruption is the honest outcome: the
 // walk reports where it found out, not where the byte was.
 test "a flipped byte in a skipped half of a pair is a root mismatch" {
-    const request = ranges.ChunkRange{ .start = 20, .end = 21 };
+    const request: ranges.ChunkRange = .{ .start = 20, .end = 21 };
     var built = try Proof.make(49153, request);
     defer built.free();
 
@@ -457,7 +447,7 @@ test "a flipped byte in a skipped half of a pair is a root mismatch" {
 // A response that stops inside an item is `ResponseTruncated`, refused while
 // the walk is still on that item: never finished, never compared.
 test "a truncated response is refused" {
-    const request = ranges.ChunkRange{ .start = 20, .end = 21 };
+    const request: ranges.ChunkRange = .{ .start = 20, .end = 21 };
     const built = try Proof.make(49153, request);
     defer built.free();
 
@@ -477,7 +467,7 @@ test "a truncated response is refused" {
 // success: it is the one an "end of response is end of proof" reader gets
 // wrong.
 test "a response that stops before the tree is spanned is refused" {
-    const request = ranges.ChunkRange{ .start = 20, .end = 21 };
+    const request: ranges.ChunkRange = .{ .start = 20, .end = 21 };
     const built = try Proof.make(49153, request);
     defer built.free();
 
@@ -493,7 +483,7 @@ test "a response that stops before the tree is spanned is refused" {
 // perfect. Driven a step at a time as well as in one call, so the flag the
 // caller can ask about is shown to be false.
 test "a wrong trusted root is a root mismatch" {
-    const request = ranges.ChunkRange{ .start = 20, .end = 21 };
+    const request: ranges.ChunkRange = .{ .start = 20, .end = 21 };
     const built = try Proof.make(49153, request);
     defer built.free();
 
@@ -505,7 +495,8 @@ test "a wrong trusted root is a root mismatch" {
     try t.expect(built.tree.root().eql(built.plan.items[0].node()));
     while (machine.next < built.plan.len) {
         const at = offsetOf(built.tree, built.plan, machine.next);
-        try machine.take(built.bytes[at..][0..machine.want().?]);
+        const needed = machine.want() orelse return error.TestUnexpectedResult;
+        try machine.take(built.bytes[at..][0..needed]);
     }
     try t.expect(!machine.root_verified);
     try t.expectError(error.RootMismatch, machine.finish());
@@ -516,14 +507,15 @@ test "a wrong trusted root is a root mismatch" {
 // `root_verified` is a statement about the walk rather than about the absence
 // of an error.
 test "a walk that reaches the trusted root says so" {
-    const request = ranges.ChunkRange{ .start = 20, .end = 21 };
+    const request: ranges.ChunkRange = .{ .start = 20, .end = 21 };
     const built = try Proof.make(49153, request);
     defer built.free();
 
     var machine = try Verifier.init(built.tree, built.plan, built.root);
     while (machine.next < built.plan.len) {
         const at = offsetOf(built.tree, built.plan, machine.next);
-        try machine.take(built.bytes[at..][0..machine.want().?]);
+        const needed = machine.want() orelse return error.TestUnexpectedResult;
+        try machine.take(built.bytes[at..][0..needed]);
     }
     try t.expectEqual(@as(?usize, null), machine.want());
     try machine.finish();
@@ -533,7 +525,7 @@ test "a walk that reaches the trusted root says so" {
 // Bytes the plan cannot use are refused rather than ignored. A peer that
 // appends whatever it likes has a reading this walk does not have.
 test "a response longer than the plan is refused" {
-    const request = ranges.ChunkRange{ .start = 0, .end = 49 };
+    const request: ranges.ChunkRange = .{ .start = 0, .end = 49 };
     const built = try Proof.make(49153, request);
     defer built.free();
 
@@ -571,7 +563,7 @@ test "a plan that cannot be walked is refused" {
 
     const tree = BaoTree.init(data.len);
     const root = try tree.rootHash(data);
-    const request = ranges.ChunkRange{ .start = 0, .end = 16 };
+    const request: ranges.ChunkRange = .{ .start = 0, .end = 16 };
 
     var outside: plan_mod.Plan = plan_mod.planOf(tree, request);
     outside.items[0] = .{ .pair = .{ .start_chunk = tree.chunks(), .span = 2 } };

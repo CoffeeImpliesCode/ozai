@@ -1,16 +1,7 @@
-//! The gossip codec, exercised over bytes.
+//! Declared vectors pin field order. Captured upstream outputs have fixture provenance.
+//! The captures are serializer and state-machine outputs, not packet captures.
 //!
-//! **Every byte sequence asserted below is a declared vector, not a captured
-//! one.** They are what the upstream declarations in `codec/tags.zig` have to
-//! produce, written out so that a later edit to a table or a field order cannot
-//! move them silently. `AGENTS.md` §2 asks for bytes captured from the Rust
-//! implementation before any interoperability claim, `codec.zig` says what is
-//! still missing, and this file is where those vectors go when they exist.
-//!
-//! The oracle for a round trip is the fixed point: `encode(decode(bytes))` is
-//! `bytes` again. It is stronger than comparing fields, because a field that was
-//! dropped, reordered or defaulted cannot produce the same bytes back, and it is
-//! what `AGENTS.md` §2 asks of a decoder boundary.
+//! Round trips check a fixed point. Captured-byte comparisons check upstream compatibility.
 
 const std = @import("std");
 
@@ -18,6 +9,7 @@ const codec = @import("codec.zig");
 const gossip = @import("hyparview.zig");
 const key = @import("../base/key.zig");
 const limits = @import("codec/limits.zig");
+const peer_data = @import("hyparview/peer_data.zig");
 const plumtree = @import("plumtree.zig");
 const postcard = @import("../wire/postcard.zig");
 const test_node_id = @import("plumtree/test_node_id.zig");
@@ -26,8 +18,7 @@ const NodeId = key.NodeId;
 const testNodeId = test_node_id.testNodeId;
 const t = std.testing;
 
-/// A buffer every frame in these tests fits in: the body is at most the byte
-/// budget and the prefix in front of it is at most `max_prefix_size`.
+/// A buffer for frames within the body budget, plus their fixed length prefix.
 const room = limits.max_message_size + limits.max_prefix_size;
 
 /// One declared byte sequence, and the message that has to produce it.
@@ -358,9 +349,8 @@ test "upstream write rejects the exact budget while read admits it" {
     // tag and three bytes of round.
     const overhead = 1 + 1 + plumtree.id_length + 2 + 1 + 3;
     const content_len = codec.max_message_size - overhead;
-    const content = try t.allocator.alloc(u8, content_len + 1);
-    defer t.allocator.free(content);
-    @memset(content, 0x61);
+    var content: [content_len + 1]u8 = undefined;
+    @memset(&content, 0x61);
     const at_budget: codec.Message = .{ .gossip = .{ .gossip = .{
         .id = id,
         .content = content[0..content_len],
@@ -368,7 +358,7 @@ test "upstream write rejects the exact budget while read admits it" {
     } } };
     const over_budget: codec.Message = .{ .gossip = .{ .gossip = .{
         .id = id,
-        .content = content,
+        .content = &content,
         .scope = .{ .swarm = .{ .value = round } },
     } } };
     try t.expectEqual(codec.max_message_size, codec.encodedLen(at_budget));
@@ -379,7 +369,9 @@ test "upstream write rejects the exact budget while read admits it" {
     try t.expectError(error.FrameTooLarge, codec.encode(at_budget, &frame_buf));
     var at_writer = postcard.Writer.init(frame_buf[4..]);
     try codec.encodeBody(at_budget, &at_writer);
+    try t.expectEqual(codec.max_message_size, at_writer.finish().len);
     std.mem.writeInt(u32, frame_buf[0..4], codec.max_message_size, .big);
+    try t.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x10, 0x00 }, frame_buf[0..4]);
     const decoded = (try codec.decode(frame_buf[0 .. 4 + at_writer.finish().len])).gossip.gossip;
     try t.expectEqual(content_len, decoded.content.len);
     try t.expectEqualSlices(u8, content[0..content_len], decoded.content);
@@ -393,8 +385,10 @@ test "upstream write rejects the exact budget while read admits it" {
     try t.expectEqual(codec.max_message_size + 1, body.len);
     const read = (try codec.decodeBody(body)).gossip.gossip;
     try t.expectEqual(content.len, read.content.len);
-    var framed: [room]u8 = undefined;
+    // This deliberately oversized body needs 4097 + 4 bytes, not `room`'s 4100.
+    var framed: [body_buf.len + limits.max_prefix_size]u8 = undefined;
     std.mem.writeInt(u32, framed[0..4], @intCast(body.len), .big);
+    try t.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x10, 0x01 }, framed[0..4]);
     @memcpy(framed[4..][0..body.len], body);
     try t.expectError(error.FrameTooLarge, codec.decode(framed[0 .. 4 + body.len]));
 }
@@ -491,7 +485,11 @@ test "pinned upstream frames use fixed four-byte big-endian lengths" {
     var header: [36]u8 = @splat(0);
     header[3] = 32;
     const topic = gossip.TopicId.fromBytes(@splat(0));
-    try t.expectEqualSlices(u8, &header, try codec.encodeStreamHeader(.{ .topic_id = topic }, &out));
+    try t.expectEqualSlices(
+        u8,
+        &header,
+        try codec.encodeStreamHeader(.{ .topic_id = topic }, &out),
+    );
     try t.expect((try codec.decodeStreamHeader(&header)).topic_id.eql(topic));
 }
 
@@ -575,8 +573,9 @@ test "decoded PeerData is copied before receive storage is reused" {
     const original = [_]u8{0x42} ** 300;
     var frame: [room]u8 = undefined;
     const encoded = try codec.encode(.{ .swarm = .{ .join = &original } }, &frame);
-    const borrowed = (try codec.decode(encoded)).swarm.join.?;
-    var contacts: @import("hyparview/peer_data.zig").PeerDataMap = .{};
+    // Encoding a populated Join must preserve its borrowed PeerData on decode.
+    const borrowed = (try codec.decode(encoded)).swarm.join orelse return error.MissingPeerData;
+    var contacts: peer_data.PeerDataMap = .{};
     const peer = try testNodeId(6);
     try contacts.put(peer, borrowed);
     @memset(&frame, 0xa5);

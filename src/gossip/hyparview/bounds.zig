@@ -46,6 +46,8 @@ pub const Error = error{
     PeerDataFull,
     /// Contact data longer than `peer_data_max`.
     PeerDataTooLong,
+    /// An outgoing membership message reaches the strict wire-body limit.
+    MessageTooLarge,
     /// A shuffle node list longer than `max_shuffle_nodes`.
     ShuffleNodeListTooLong,
     /// A bootstrap list longer than `max_bootstrap`.

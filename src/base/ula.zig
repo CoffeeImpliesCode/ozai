@@ -111,6 +111,8 @@ pub fn ulaFor(path: Path, host: HostBits) Ula {
     var octets: [16]u8 = undefined;
     @memcpy(octets[0..8], &prefixFor(path));
     @memcpy(octets[8..16], &host);
+    // ZBC cannot combine the prefix and host copies to prove all octets are initialized.
+    // zbc-disable-next-line: use-undefined
     return octets;
 }
 
@@ -311,21 +313,19 @@ test "every transport variant maps to a socket address" {
     // `TransportAddr` is `union(enum) { relay, ip, custom }` and `per_variant`
     // is in that order. A fourth variant stops the build here rather than
     // slipping through unmapped.
-    const transport_tag = @typeInfo(TransportAddr).@"union".tag_type.?;
     const transports = [_]TransportAddr{
         .{ .relay = try addr.RelayUrl.parse("https://use1-1.relay.iroh.network./") },
         .{ .ip = .{ .ip = .{ .v4 = .{ 192, 0, 2, 7 } }, .port = 7842 } },
         .{ .custom = .{ .id = 0x2a, .data = &.{} } },
     };
     comptime {
-        if (transports.len != @typeInfo(transport_tag).@"enum".fields.len) {
+        if (transports.len != @typeInfo(TransportAddr).@"union".fields.len) {
             @compileError("a TransportAddr variant has no captured address");
         }
     }
-    inline for (@typeInfo(transport_tag).@"enum".fields) |field| {
-        const transport = transports[field.value];
-        try t.expectEqual(field.value, @intFromEnum(std.meta.activeTag(transport)));
-        try t.expectEqual(per_variant[field.value], syntheticSocketAddr(transport, test_host));
+    inline for (transports, 0..) |transport, index| {
+        try t.expectEqual(index, @intFromEnum(std.meta.activeTag(transport)));
+        try t.expectEqual(per_variant[index], syntheticSocketAddr(transport, test_host));
     }
 }
 

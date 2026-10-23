@@ -2,18 +2,22 @@
 const std = @import("std");
 const ozai = @import("ozai");
 const rust_peer = @import("rust_interop_child.zig");
+const child_cleanup = @import("child_cleanup.zig");
+const child_exit_probe = @import("child_exit_probe.zig");
+const child_constructor_safety = @import("child_constructor_safety.zig");
 const t = std.testing;
 const Node = ozai.node.Node;
 const NodeId = ozai.NodeId;
 const TopicId = ozai.gossip_hyparview.TopicId;
 
-const topic: TopicId = .{
+const topic = TopicId.fromBytes(.{
     0x91, 0x27, 0x43, 0x05, 0xa6, 0xb8, 0xc9, 0xda,
     0xeb, 0xfc, 0x1d, 0x2e, 0x3f, 0x40, 0x51, 0x62,
     0x73, 0x84, 0x95, 0xa6, 0xb7, 0xc8, 0xd9, 0xea,
     0xfb, 0x0c, 0x1d, 0x2e, 0x3f, 0x50, 0x61, 0x72,
-};
+});
 const topics = [_]TopicId{topic};
+const repeated_topics = [_]TopicId{ topic, TopicId.fromBytes(@splat(0x75)) };
 const message = "ozai-node-gossip-mixed-role-exact-927";
 const ack_prefix = "ozai-gossip-ack:";
 const acknowledgement = ack_prefix ++ message;
@@ -26,14 +30,33 @@ const poll_ns = std.time.ns_per_ms;
 
 const Role = enum { server, client };
 
-const Consumer = struct {
-    expected_peer: NodeId,
+const TopicState = struct {
     message_received: bool = false,
     acknowledgement_received: bool = false,
     acknowledgement_pending: bool = false,
     acknowledgement_sent: bool = false,
+};
+
+const Consumer = struct {
+    expected_peer: NodeId,
+    configured_topics: []const TopicId = &topics,
+    state: [repeated_topics.len]TopicState = @splat(.{}),
+    message_received: bool = false,
+    acknowledgement_received: bool = false,
+    acknowledgement_sent: bool = false,
     unexpected: bool = false,
-    acknowledgement_bytes: [acknowledgement.len]u8 = undefined,
+
+    fn updateCompletion(self: *Consumer) void {
+        self.message_received = true;
+        self.acknowledgement_received = true;
+        self.acknowledgement_sent = true;
+        for (self.state[0..self.configured_topics.len]) |state| {
+            self.message_received = self.message_received and state.message_received;
+            self.acknowledgement_received =
+                self.acknowledgement_received and state.acknowledgement_received;
+            self.acknowledgement_sent = self.acknowledgement_sent and state.acknowledgement_sent;
+        }
+    }
 
     fn onGossip(
         context: ?*anyopaque,
@@ -41,50 +64,59 @@ const Consumer = struct {
         delivered_from: NodeId,
         content: []const u8,
     ) void {
-        const self: *Consumer = @ptrCast(@alignCast(context.?));
-        if (!std.mem.eql(u8, &topic, &received_topic) or
-            !std.mem.eql(u8, &self.expected_peer.toBytes(), &delivered_from.toBytes()))
-        {
+        const supplied = context orelse @panic("gossip callback requires a Consumer");
+        const self: *Consumer = @ptrCast(@alignCast(supplied));
+        if (!std.mem.eql(u8, &self.expected_peer.toBytes(), &delivered_from.toBytes())) {
             self.unexpected = true;
             return;
         }
-        if (std.mem.eql(u8, message, content)) {
-            self.message_received = true;
-            if (!self.acknowledgement_sent) {
-                @memcpy(self.acknowledgement_bytes[0..ack_prefix.len], ack_prefix);
-                @memcpy(self.acknowledgement_bytes[ack_prefix.len..], content);
-                self.acknowledgement_pending = true;
+        for (self.configured_topics, 0..) |configured, index| {
+            if (!configured.eql(received_topic)) continue;
+            const state = &self.state[index];
+            if (std.mem.eql(u8, message, content)) {
+                state.message_received = true;
+                if (!state.acknowledgement_sent) state.acknowledgement_pending = true;
+            } else if (std.mem.eql(u8, acknowledgement, content)) {
+                state.acknowledgement_received = true;
+            } else {
+                self.unexpected = true;
             }
-        } else if (std.mem.eql(u8, acknowledgement, content)) {
-            self.acknowledgement_received = true;
-        } else {
-            self.unexpected = true;
+            self.updateCompletion();
+            return;
         }
+        self.unexpected = true;
     }
 };
 
 comptime {
     std.debug.assert(ack_prefix.len == 16);
-    std.debug.assert(topic.len == 32);
 }
 
 test "actual Node gossip consumer exchanges exact topic and ACK with Rust server" {
-    try exchange(.server, false);
+    try exchange(.server, false, &topics);
 }
 
 test "actual Node gossip consumer exchanges exact topic and ACK with Rust client" {
-    try exchange(.client, false);
+    try exchange(.client, false, &topics);
 }
 
 test "Rust gossip server rejects mismatched authenticated Node pin before delivery" {
-    try exchange(.server, true);
+    try exchange(.server, true, &topics);
 }
 
 test "Rust gossip client rejects mismatched authenticated Node pin before delivery" {
-    try exchange(.client, true);
+    try exchange(.client, true, &topics);
 }
 
-fn exchange(role: Role, wrong_pin: bool) !void {
+test "repeated topic memberships receive exact payload and ACK with Rust server" {
+    try exchange(.server, false, &repeated_topics);
+}
+
+test "repeated topic memberships receive exact payload and ACK with Rust client" {
+    try exchange(.client, false, &repeated_topics);
+}
+
+fn exchange(role: Role, wrong_pin: bool, selected_topics: []const TopicId) !void {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     var zig_secret = try ozai.SecretKey.fromSeed(zig_seed);
@@ -96,9 +128,15 @@ fn exchange(role: Role, wrong_pin: bool) !void {
     const zig_id = zig_secret.nodeId();
     const rust_id = rust_secret.nodeId();
     const expected_hex = rust_peer.hexId(if (wrong_pin) wrong_secret.nodeId() else zig_id);
-    const topic_hex = std.fmt.bytesToHex(topic, .lower);
-    const topics_hex = [_][]const u8{&topic_hex};
-    var consumer: Consumer = .{ .expected_peer = rust_id };
+    std.debug.assert(selected_topics.len > 0);
+    std.debug.assert(selected_topics.len <= repeated_topics.len);
+    var topic_hex: [repeated_topics.len][64]u8 = undefined;
+    var topics_hex: [repeated_topics.len][]const u8 = undefined;
+    for (selected_topics, 0..) |selected, index| {
+        topic_hex[index] = std.fmt.bytesToHex(selected.toBytes(), .lower);
+        topics_hex[index] = &topic_hex[index];
+    }
+    var consumer: Consumer = .{ .expected_peer = rust_id, .configured_topics = selected_topics };
     var peers: [1]ozai.node.Peer = undefined;
     var node: ?*Node = null;
     defer if (node) |live| {
@@ -110,35 +148,62 @@ fn exchange(role: Role, wrong_pin: bool) !void {
     if (role == .client) {
         node = try createNode(zig_secret, &consumer, &.{});
     }
-    const child = try rust_peer.Process.start(t.allocator, arena.allocator(), t.io,
-        @tagName(role), .{
-            .tls = "iroh",
-            .protocol = "gossip",
-            .role = @tagName(role),
-            .seed_hex = rust_seed_hex,
-            .expect_peer_hex = &expected_hex,
-            .topics_hex = &topics_hex,
-            .message = message,
-            .connect_address = if (node) |live| live.address() else null,
-            .run_ms = rust_peer.budget_ms,
-        });
+    const argv = try rust_peer.flags(arena.allocator(), .{
+        .tls = "iroh",
+        .protocol = "gossip",
+        .role = @tagName(role),
+        .seed_hex = rust_seed_hex,
+        .expect_peer_hex = &expected_hex,
+        .topics_hex = topics_hex[0..selected_topics.len],
+        .message = message,
+        .connect_address = if (node) |live| live.address() else null,
+        .run_ms = rust_peer.budget_ms,
+    });
+    const started = try rust_peer.Process.start(t.allocator, t.io, .{
+        .name = @tagName(role),
+        .argv = argv,
+        .final_argv = argv,
+        .run_ms = rust_peer.budget_ms,
+    });
+    const child = switch (started) {
+        .ready => |process| process,
+        .failed => |failure| {
+            failure.process.deinit(t.io);
+            return failure.cause;
+        },
+    };
     defer child.deinit(t.io);
     const address = try awaitBanner(child, rust_id);
     if (role == .server) {
         peers[0] = .{ .id = rust_id, .addr = .{ .ip = address } };
         node = try createNode(zig_secret, &consumer, &peers);
     }
-    const live = node.?;
+    const live = node orelse return error.TestUnexpectedResult;
     try live.start(nowNs(), live.generator());
     const started_ms = nowMs();
+    var consumer_closed = false;
     for (0..max_passes) |_| {
         const at = nowNs();
-        _ = try live.step(t.io, at, live.generator());
-        // Callback data is borrowed; this buffer is owned and broadcasting cannot reenter step.
-        if (consumer.acknowledgement_pending) {
-            try live.broadcastNeighbors(topic, &consumer.acknowledgement_bytes, at);
-            consumer.acknowledgement_pending = false;
-            consumer.acknowledgement_sent = true;
+        if (!consumer_closed) {
+            _ = try live.step(t.io, at, live.generator());
+            // Each topic owns its ACK state; the callback's input is borrowed.
+            for (selected_topics, 0..) |selected, index| {
+                const state = &consumer.state[index];
+                if (state.acknowledgement_pending) {
+                    try live.broadcastNeighbors(selected, acknowledgement, at);
+                    state.acknowledgement_pending = false;
+                    state.acknowledgement_sent = true;
+                }
+            }
+            consumer.updateCompletion();
+            if (!wrong_pin and consumer.message_received and
+                consumer.acknowledgement_received and consumer.acknowledgement_sent)
+            {
+                // Receipt of Rust's final ACK is the barrier, not child exit.
+                // Closing here lets Rust keep its actor alive until this proof.
+                try live.close(t.io, at, live.generator());
+                consumer_closed = true;
+            }
         }
         try child.pump(t.io);
         if (child.finished()) {
@@ -161,8 +226,18 @@ fn exchange(role: Role, wrong_pin: bool) !void {
         try t.expect(consumer.message_received);
         try t.expect(consumer.acknowledgement_received);
         try t.expect(consumer.acknowledgement_sent);
-        try assertProof(arena.allocator(), child, zig_id, "gossip-proof:", message);
-        try assertProof(arena.allocator(), child, zig_id, "gossip-ack-proof:", acknowledgement);
+        try t.expect(consumer_closed);
+        for (selected_topics) |selected| {
+            try assertProof(arena.allocator(), child, selected, zig_id, "gossip-proof:", message);
+            try assertProof(
+                arena.allocator(),
+                child,
+                selected,
+                zig_id,
+                "gossip-ack-proof:",
+                acknowledgement,
+            );
+        }
     }
 }
 
@@ -172,7 +247,7 @@ fn createNode(secret: ozai.SecretKey, consumer: *Consumer, peers: []const ozai.n
         .peers = peers,
         .expect_peer = consumer.expected_peer,
         .alpn = ozai.node.gossip_alpn,
-        .gossip_topics = &topics,
+        .gossip_topics = consumer.configured_topics,
         .gossip_message = message,
         .on_gossip = Consumer.onGossip,
         .on_gossip_context = consumer,
@@ -201,16 +276,30 @@ fn awaitBanner(child: *rust_peer.Process, expected_peer: NodeId) !ozai.SocketAdd
 fn assertProof(
     arena: std.mem.Allocator,
     child: *rust_peer.Process,
+    expected_topic: TopicId,
     expected_sender: NodeId,
     prefix: []const u8,
     payload: []const u8,
 ) !void {
-    const expected = try std.fmt.allocPrint(arena,
+    const expected = try std.fmt.allocPrint(
+        arena,
         "{s} scope neighbors, topic {s}, sender {s}, payload {x}, received {d}, broadcast {d}",
-        .{ prefix, &std.fmt.bytesToHex(topic, .lower), &rust_peer.hexId(expected_sender),
-            payload, payload.len, payload.len });
-    const observed = child.line(prefix) orelse child.gaveUp("missing {s}", .{prefix});
-    try t.expectEqualStrings(expected, observed);
+        .{
+            prefix,
+            &std.fmt.bytesToHex(expected_topic.toBytes(), .lower),
+            &rust_peer.hexId(expected_sender),
+            payload,
+            payload.len,
+            payload.len,
+        },
+    );
+    defer arena.free(expected);
+    const observed = try child.lines(arena, prefix);
+    defer arena.free(observed);
+    for (observed) |line| {
+        if (std.mem.eql(u8, expected, line)) return;
+    }
+    child.gaveUp("missing exact topic proof {s}", .{expected});
 }
 
 fn assertPinRejected(child: *rust_peer.Process, consumer: *const Consumer, failed: bool) !void {
@@ -229,4 +318,10 @@ fn nowMs() i64 {
 
 fn nowNs() i64 {
     return nowMs() * std.time.ns_per_ms;
+}
+
+test {
+    t.refAllDecls(child_cleanup);
+    t.refAllDecls(child_exit_probe);
+    t.refAllDecls(child_constructor_safety);
 }

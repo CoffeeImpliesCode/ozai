@@ -37,6 +37,12 @@ let
   # `zig`; the build commands belong to a direnv shell, which keeps the PATH
   # the user already had.
   pinnedToolPath = ''export PATH="$HOME/.local/bin:$PATH"'';
+  # The installed x86_64 ZBC ELF requires GLIBC_2.36. Invoke its loader
+  # explicitly on Nix hosts without /lib64, with libc from the same package.
+  zbcRuntime =
+    assert pkgs.stdenv.hostPlatform.system == "x86_64-linux";
+    assert lib.versionAtLeast pkgs.glibc.version "2.36";
+    lib.getLib pkgs.glibc;
 in
 {
   inherit packages;
@@ -44,6 +50,9 @@ in
   env = {
     LD_LIBRARY_PATH = lib.makeLibraryPath packages;
     INCLUDE_DIRECTORIES = lib.makeIncludePath packages;
+    OZAI_ZBC_LOADER = "${zbcRuntime}/lib/ld-linux-x86-64.so.2";
+    OZAI_ZBC_LIBRARY_PATH = "${zbcRuntime}/lib";
+    ZWANZIG_ARGS = "--max-states-per-point 200";
   };
 
   # https://devenv.sh/basics/

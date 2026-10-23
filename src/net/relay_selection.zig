@@ -447,7 +447,7 @@ const Measured = struct { RelayUrl, Nanos };
 
 /// The relay the fold names, with a per-relay latency table.
 fn homeOn(wanted: RelayUrl, latencies: []const Measured) report_mod.Report {
-    var table = report_mod.RelayLatencies{};
+    var table: report_mod.RelayLatencies = .{};
     for (latencies) |entry| {
         _ = table.update(entry[0], entry[1], .https);
     }
@@ -598,7 +598,7 @@ test "a pool longer than the bound is refused, and nothing already in it is drop
     // global is exactly what `base` forbids.
     var scratch: [64]u8 = undefined;
     var pool: [max_attempts + 3]RelayUrl = undefined;
-    var latencies = report_mod.RelayLatencies{};
+    var latencies: report_mod.RelayLatencies = .{};
     // Latency in milliseconds for pool entry `index`, ascending. The five kept
     // are then the five fastest and the three refused are the three slowest,
     // which is what the assertions below claim about them; the fastest relay

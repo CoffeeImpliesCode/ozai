@@ -49,6 +49,8 @@ pub const Route = struct {
     /// has none. This and `key` are both null exactly when `socket` is one of
     /// the caller's own.
     subnet: ?base_ula.Path,
+    /// The requested physical carrier, independent of the canonical peer key.
+    relay_target: ?base_addr.RelayUrl = null,
 };
 
 /// What a target becomes: one address the core is told, and one key the caller
@@ -69,13 +71,16 @@ pub fn resolveRoute(
 ) Error!Route {
     switch (transport) {
         .ip => |socket| return .{ .socket = socket, .key = null, .subnet = null },
-        .relay => return routeThrough(
-            gpa,
-            map,
-            .{ .any_path = peer orelse return error.NoPeerId },
-            .any_path,
-            random,
-        ),
+        .relay => |target| {
+            const key: addr_map.Key = .{ .any_path = peer orelse return error.NoPeerId };
+            const octets = try map.getRelay(gpa, key.any_path, target, random);
+            return .{
+                .socket = base_ula.socketAddrFor(.any_path, addr_map.hostBitsOf(octets)),
+                .key = key,
+                .subnet = .any_path,
+                .relay_target = target,
+            };
+        },
         .custom => |custom| return routeThrough(
             gpa,
             map,
@@ -181,13 +186,32 @@ test "a relay target becomes one address the core is told, and the map says whos
         again_engine.random(),
     );
     try t.expectEqual(route.socket, again.socket);
-    const ingress = try pair.map.get(t.allocator, .{ .any_path = peer }, again_engine.random());
-    try t.expectEqual(route.socket,
-        base_ula.socketAddrFor(.any_path, addr_map.hostBitsOf(ingress)));
-    const other_relay = try resolveRoute(t.allocator, &pair.map,
+    const ingress = try pair.map.get(
+        t.allocator,
+        .{ .any_path = peer },
+        again_engine.random(),
+    );
+    try t.expectEqual(
+        route.socket,
+        base_ula.socketAddrFor(.any_path, addr_map.hostBitsOf(ingress)),
+    );
+    const other_relay = try resolveRoute(
+        t.allocator,
+        &pair.map,
         .{ .relay = try base_addr.RelayUrl.parse("http://another-relay.example/") },
-        peer, again_engine.random());
+        peer,
+        again_engine.random(),
+    );
     try t.expectEqual(route.socket, other_relay.socket);
+    try t.expectEqual(
+        std.math.Order.eq,
+        route.relay_target.?.order((try relayTarget()).relay),
+    );
+    try t.expectEqual(
+        std.math.Order.eq,
+        other_relay.relay_target.?.order(pair.map.relayTarget(other_relay.socket.ip.v6).?.*),
+    );
+    try t.expect(route.relay_target.?.order(other_relay.relay_target.?) != .eq);
     try t.expectEqual(@as(usize, 1), pair.map.by_key.count());
 }
 

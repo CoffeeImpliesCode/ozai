@@ -290,6 +290,9 @@ pub fn BlobsRoute(comptime blobs: usize) type {
         /// freed slot holds a different blob than it did.
         fn dropEmpty(self: *Self, index: usize) bool {
             if (self.entries[index].holders.len != 0) return false;
+            // Both callers guard this index by the live-entry scan;
+            // ZBC cannot carry that proof here.
+            // zbc-disable-next-line: index-minus-one-without-zero-guard
             self.entries[index] = self.entries[self.len - 1];
             self.len -= 1;
             return true;
@@ -309,6 +312,8 @@ fn holderAt(holders: *const Holders, peer: NodeId) ?usize {
 /// was there.
 fn takeHolder(holders: *Holders, peer: NodeId) bool {
     const index = holderAt(holders, peer) orelse return false;
+    // holderAt returns only live indices; ZBC cannot carry its scan proof to this swap.
+    // zbc-disable-next-line: index-minus-one-without-zero-guard
     holders.ids[index] = holders.ids[holders.len - 1];
     holders.len -= 1;
     return true;

@@ -19,6 +19,21 @@ role processes. It verifies pinned relay carrier identities and exact payloads,
 not an inner authenticated endpoint connection. Exercise both --zig-role values.
 The default Alice/Bob identity pins match the fixed 5a/6c test seeds.
 Override --alice-id or --bob-id only to exercise pin rejection.
+
+The outer driver snapshots its own net/user namespace IDs and non-root UID
+before unshare. Its --inside child consumes the reserved
+_OZAI_RELAY_SMOKE_OUTER_NET_NS, _OZAI_RELAY_SMOKE_OUTER_USER_NS, and
+_OZAI_RELAY_SMOKE_OUTER_UID environment metadata before any network setup.
+These are internal handoff values, not user options; inherited values are
+overwritten by the outer driver, and a missing or malformed handoff is fatal.
+Each tracked direct child retains its complete proc identity and exact wrapper
+and target argv. Cleanup rereads all UID fields, the full binary cmdline, and
+the proc start identity before TERM and again before KILL, excludes the
+driver's ancestor chain, and bounds both exit waits. Unverifiable running
+children are left untouched with proc evidence reported; cleanup failures do
+not replace an existing smoke exception.
+Namespace and child-signal safety regressions run without network operations:
+    python3 -m unittest discover -s test -p relay_endpoint_smoke.py
 """
 import argparse
 import os
@@ -28,9 +43,152 @@ import shutil
 import subprocess
 import sys
 import time
+import unittest
 
 PHASE = re.compile(r"relay-phase([12]): stable_id (\d+) remote_id ([0-9a-f]{64}) selected (relay|direct) bytes (\d+).*payload_hex ([0-9a-f]+)")
 CARRIER = re.compile(r"relay-carrier: remote_id ([0-9a-f]{64}) payload_hex ([0-9a-f]+)")
+
+OUTER_NAMESPACE_ENV = {
+    "net": "_OZAI_RELAY_SMOKE_OUTER_NET_NS",
+    "user": "_OZAI_RELAY_SMOKE_OUTER_USER_NS",
+    "uid": "_OZAI_RELAY_SMOKE_OUTER_UID",
+}
+
+
+def validate_namespace_metadata(baseline, current, uid, euid, uid_map_text):
+    """Fail closed using caller snapshots and actual inner kernel metadata."""
+    for namespace in ("net", "user"):
+        expected = baseline.get(namespace)
+        if not isinstance(expected, str) or not re.fullmatch(
+                rf"{namespace}:\[[1-9][0-9]*\]", expected):
+            raise RuntimeError("requires a complete, valid outer namespace baseline")
+    outer_uid = baseline.get("uid")
+    if not isinstance(outer_uid, str) or not re.fullmatch(r"[1-9][0-9]*", outer_uid):
+        raise RuntimeError("requires a complete, valid non-root outer namespace baseline")
+    for namespace in ("net", "user"):
+        actual = current.get(namespace)
+        if not isinstance(actual, str) or not re.fullmatch(
+                rf"{namespace}:\[[1-9][0-9]*\]", actual):
+            raise RuntimeError(f"invalid current {namespace} namespace metadata")
+        if actual == baseline[namespace]:
+            raise RuntimeError(f"refusing to run in the caller's {namespace} namespace")
+    try:
+        uid_map = [tuple(map(int, line.split())) for line in uid_map_text.splitlines()]
+    except ValueError as error:
+        raise RuntimeError("requires a private user namespace with a valid UID mapping") from error
+    if uid != 0 or euid != 0 or uid_map != [(0, int(outer_uid), 1)]:
+        raise RuntimeError("requires a private user namespace mapping the non-root caller to root")
+
+
+
+def validate_child_signal(captured, current, commands, uid, parent_pid, ancestors):
+    """Pure, exact decision boundary shared by capture and each signal."""
+    if captured is None or current is None:
+        raise RuntimeError("unverifiable child proc identity")
+    if current["pid"] in ancestors:
+        raise RuntimeError("refusing to signal own ancestor chain")
+    if current["uids"] != (uid, uid, uid, uid):
+        raise RuntimeError("child UID does not exactly match caller")
+    if (current["pid"], current["ppid"], current["start"]) != (
+            captured["pid"], parent_pid, captured["start"]):
+        raise RuntimeError("child proc identity changed")
+    if (captured["ppid"] != parent_pid or captured["uids"] != (uid, uid, uid, uid)
+            or captured["cmdline"] not in commands or current["cmdline"] not in commands):
+        raise RuntimeError("child complete command or captured identity is not authorized")
+
+
+def read_proc_stat(pid):
+    with open(f"/proc/{pid}/stat", "rb") as stream:
+        text = stream.read()
+    prefix, separator, suffix = text.rpartition(b") ")
+    fields = suffix.split()
+    if not separator or len(fields) < 20 or int(prefix.split(b" ", 1)[0]) != pid:
+        raise RuntimeError(f"invalid proc stat for child {pid}")
+    return int(fields[1]), int(fields[19])
+
+
+def own_ancestor_pids():
+    ancestors = set()
+    pid = os.getpid()
+    for _ in range(128):
+        if pid == 0:
+            return ancestors
+        if pid in ancestors:
+            raise RuntimeError("unverifiable own ancestor chain")
+        ancestors.add(pid)
+        pid, _ = read_proc_stat(pid)
+    raise RuntimeError("own ancestor chain exceeds safety bound")
+
+
+def read_child_identity(pid):
+    parent, start = read_proc_stat(pid)
+    with open(f"/proc/{pid}/status", "rb") as stream:
+        uid_lines = [line.split()[1:] for line in stream.read().splitlines()
+                     if line.startswith(b"Uid:")]
+    if len(uid_lines) != 1 or len(uid_lines[0]) != 4:
+        raise RuntimeError(f"unverifiable child UID for {pid}")
+    # A full binary read preserves every argument, including empty arguments.
+    with open(f"/proc/{pid}/cmdline", "rb") as stream:
+        cmdline = stream.read()
+    if read_proc_stat(pid) != (parent, start):
+        raise RuntimeError(f"child proc identity changed while reading {pid}")
+    return {"pid": pid, "ppid": parent, "start": start,
+            "uids": tuple(map(int, uid_lines[0])), "cmdline": cmdline}
+
+
+class OwnedChild:
+    """An unreaped Popen child pins its PID across wrapper-to-target exec."""
+
+    def __init__(self, child, argv, target_argv):
+        self.child = child
+        self.uid = os.getuid()
+        self.parent_pid = os.getpid()
+        self.commands = tuple(b"\0".join(os.fsencode(arg) for arg in command) + b"\0"
+                              for command in (argv, target_argv))
+        self.captured = None
+        self.last_identity = None
+
+    def capture(self):
+        if self.child.poll() is not None:
+            return
+        identity = read_child_identity(self.child.pid)
+        self.last_identity = identity
+        validate_child_signal(identity, identity, self.commands, self.uid,
+                              self.parent_pid, own_ancestor_pids())
+        self.captured = identity
+
+    def validate_signal(self):
+        ancestors = own_ancestor_pids()
+        current = read_child_identity(self.child.pid)
+        self.last_identity = current
+        validate_child_signal(self.captured, current, self.commands, self.uid,
+                              self.parent_pid, ancestors)
+
+    def cleanup(self):
+        if self.child.poll() is not None:
+            self.child.wait(timeout=3)
+            return
+        try:
+            self.validate_signal()
+            self.child.terminate()
+            try:
+                self.child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                # Never reuse TERM's proc evidence at the second point of risk.
+                self.validate_signal()
+                self.child.kill()
+                self.child.wait(timeout=3)
+            if self.child.returncode is None:
+                raise RuntimeError("child exit was not proved")
+        except Exception as error:
+            # A concurrently exited child can be reaped without any signal.
+            if self.child.poll() is not None:
+                self.child.wait(timeout=3)
+                return
+            raise RuntimeError(
+                f"cleanup failed closed for child {self.child.pid}: {error}; "
+                f"captured={self.captured!r}; last_proc={self.last_identity!r}; "
+                f"allowed_commands={self.commands!r}") from error
 
 
 def command(*args, input=None):
@@ -59,18 +217,33 @@ def main():
     if args.mode == "nat" and (not args.qad_cert or not args.qad_key):
         parser.error("nat mode requires --qad-cert and --qad-key")
     if not args.inside:
+        outer_uid = os.getuid()
+        if outer_uid == 0 or os.geteuid() == 0:
+            raise RuntimeError("requires a non-root outer caller")
+        # Read only caller-owned handles; PID 1 can be inaccessible after unshare.
+        baseline = {namespace: os.readlink(f"/proc/self/ns/{namespace}")
+                    for namespace in ("net", "user")}
+        baseline["uid"] = str(outer_uid)
+        child_env = os.environ.copy()
+        child_env.update({name: baseline[key] for key, name in OUTER_NAMESPACE_ENV.items()})
         argv = ["unshare", "--user", "--map-root-user", "--net", sys.executable,
                 os.path.abspath(__file__), *sys.argv[1:], "--inside"]
-        return subprocess.call(argv)
-    for namespace in ("net", "user"):
-        if os.readlink(f"/proc/self/ns/{namespace}") == os.readlink(f"/proc/1/ns/{namespace}"):
-            raise RuntimeError(f"refusing to run in PID 1's {namespace} namespace")
+        return subprocess.call(argv, env=child_env)
+    # Consume the handoff so spawned peers do not inherit private safety metadata.
+    baseline = {key: os.environ.pop(name, None) for key, name in OUTER_NAMESPACE_ENV.items()}
+    current = {namespace: os.readlink(f"/proc/self/ns/{namespace}")
+               for namespace in ("net", "user")}
     with open("/proc/self/uid_map", encoding="ascii") as mapping:
-        uid_map = [tuple(map(int, line.split())) for line in mapping]
-    if (os.getuid() != 0 or os.geteuid() != 0 or len(uid_map) != 1
-            or uid_map[0][0] != 0 or uid_map[0][1] == 0 or uid_map[0][2] != 1):
-        raise RuntimeError("requires a private user namespace mapping a non-root caller to root")
+        uid_map_text = mapping.read()
+    validate_namespace_metadata(baseline, current, os.getuid(), os.geteuid(), uid_map_text)
     children = []
+
+    def track_child(child, argv, target_argv):
+        owned = OwnedChild(child, argv, target_argv)
+        children.append(owned)
+        owned.capture()
+        return child
+
     selector = selectors.DefaultSelector()
     buffers = {}
     output_bytes = {}
@@ -81,8 +254,9 @@ def main():
         # Every namespace keeper is a direct child; namespace handles are its PID,
         # never a host-global /run/netns name.
         for name in ("alice", "bob", "router-a", "router-b"):
-            child = subprocess.Popen(["unshare", "--net", "sleep", str(args.timeout + 20)])
-            children.append(child)
+            target_argv = ["sleep", str(args.timeout + 20)]
+            argv = ["unshare", "--net", *target_argv]
+            child = track_child(subprocess.Popen(argv), argv, target_argv)
             spaces[name] = child.pid
             for _ in range(100):
                 if child.poll() is not None:
@@ -126,11 +300,12 @@ def main():
         command("sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
 
         def launch(name, argv, namespace=None):
+            target_argv = argv
             if namespace:
                 argv = ["nsenter", "-t", str(spaces[namespace]), "-n", *argv]
             child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      bufsize=0)
-            children.append(child)
+            track_child(child, argv, target_argv)
             os.set_blocking(child.stdout.fileno(), False)
             buffers[name] = bytearray()
             output_bytes[name] = 0
@@ -330,15 +505,132 @@ def main():
                     return 0
         raise TimeoutError("authenticated relay/direct exchange")
     finally:
+        original_error = sys.exc_info()[1]
         selector.close()
-        for child in reversed(children):
-            if child.poll() is None:
-                child.terminate()
+        cleanup_errors = []
+        for owned in reversed(children):
             try:
-                child.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait()
+                owned.cleanup()
+            except Exception as error:
+                cleanup_errors.append(str(error))
+        if cleanup_errors:
+            message = "relay smoke cleanup failure:\n" + "\n".join(cleanup_errors)
+            if original_error is not None:
+                # Keep the original smoke failure and attach retained proc evidence.
+                print(message, file=sys.stderr, flush=True)
+            else:
+                raise RuntimeError(message)
+
+class NamespaceSafetyTests(unittest.TestCase):
+    """Pure metadata regressions; discovery never enters the network driver."""
+
+    def setUp(self):
+        self.baseline = {"net": "net:[100]", "user": "user:[200]", "uid": "1000"}
+        self.current = {"net": "net:[101]", "user": "user:[201]"}
+
+    def validate(self, baseline=None, current=None, uid=0, euid=0, uid_map="0 1000 1\n"):
+        return validate_namespace_metadata(
+            self.baseline if baseline is None else baseline,
+            self.current if current is None else current, uid, euid, uid_map)
+
+    def test_separate_namespaces_and_exact_nonroot_mapping(self):
+        self.assertIsNone(self.validate())
+
+    def test_missing_outer_baseline_fails_closed(self):
+        for key in self.baseline:
+            with self.subTest(key=key):
+                baseline = self.baseline.copy()
+                del baseline[key]
+                with self.assertRaisesRegex(RuntimeError, "outer namespace baseline"):
+                    self.validate(baseline=baseline)
+        with self.assertRaisesRegex(RuntimeError, "outer namespace baseline"):
+            self.validate(baseline={})
+
+    def test_malformed_outer_baseline_fails_closed(self):
+        for key, value in (("net", "user:[100]"), ("user", ""),
+                           ("uid", "0"), ("uid", "-1"), ("uid", "not-a-uid")):
+            with self.subTest(key=key, value=value):
+                baseline = {**self.baseline, key: value}
+                with self.assertRaisesRegex(RuntimeError, "outer namespace baseline"):
+                    self.validate(baseline=baseline)
+
+    def test_same_network_namespace_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "caller's net namespace"):
+            self.validate(current={**self.current, "net": self.baseline["net"]})
+
+    def test_same_user_namespace_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "caller's user namespace"):
+            self.validate(current={**self.current, "user": self.baseline["user"]})
+
+    def test_wrong_uid_mapping_is_rejected(self):
+        for uid_map in ("", "0 0 1\n", "0 1001 1\n", "1 1000 1\n",
+                        "0 1000 2\n", "0 1000 1\n1 1001 1\n",
+                        "0 1000\n", "not a mapping\n"):
+            with self.subTest(uid_map=uid_map):
+                with self.assertRaisesRegex(RuntimeError, "private user namespace"):
+                    self.validate(uid_map=uid_map)
+
+    def test_nonroot_inner_credentials_are_rejected(self):
+        for uid, euid in ((1000, 0), (0, 1000), (1000, 1000)):
+            with self.subTest(uid=uid, euid=euid):
+                with self.assertRaisesRegex(RuntimeError, "private user namespace"):
+                    self.validate(uid=uid, euid=euid)
+
+
+class ChildSignalSafetyTests(unittest.TestCase):
+    """Signal decisions use complete identities, never command-name patterns."""
+
+    def setUp(self):
+        self.identity = {"pid": 123, "ppid": 99, "start": 456, "uids": (0, 0, 0, 0),
+                         "cmdline": b"unshare\x00--net\x00sleep\x0080\x00"}
+        self.commands = (self.identity["cmdline"], b"sleep\x0080\x00")
+
+    def validate(self, current=None, ancestors=(99, 98), captured=None):
+        return validate_child_signal(
+            self.identity if captured is None else captured,
+            self.identity if current is None else current, self.commands, 0, 99, ancestors)
+
+    def test_exact_owned_child_and_expected_exec_are_allowed(self):
+        self.assertIsNone(self.validate())
+        self.assertIsNone(self.validate(current={**self.identity, "cmdline": self.commands[1]}))
+
+    def test_any_foreign_uid_is_rejected(self):
+        for index in range(4):
+            uids = [0, 0, 0, 0]
+            uids[index] = 1000
+            with self.subTest(index=index):
+                with self.assertRaisesRegex(RuntimeError, "UID"):
+                    self.validate(current={**self.identity, "uids": tuple(uids)})
+
+    def test_complete_command_not_just_prefix_is_required(self):
+        for command in (b"sleep\x0081\x00", b"sleep\x0080\x00extra\x00", b"", b"sleep\x0080"):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(RuntimeError, "command"):
+                    self.validate(current={**self.identity, "cmdline": command})
+
+    def test_own_ancestor_chain_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "ancestor"):
+            self.validate(ancestors=(99, 123, 98))
+
+    def test_reused_pid_and_changed_parent_are_rejected(self):
+        for field, value in (("pid", 124), ("start", 457), ("ppid", 98)):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(RuntimeError, "identity"):
+                    self.validate(current={**self.identity, field: value})
+
+    def test_missing_proc_identity_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "unverifiable"):
+            validate_child_signal(self.identity, None, self.commands, 0, 99, (99, 98))
+
+    def test_unverified_capture_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "unverifiable"):
+            validate_child_signal(None, self.identity, self.commands, 0, 99, (99, 98))
+
+    def test_unapproved_original_capture_is_rejected(self):
+        captured = {**self.identity, "cmdline": b"sleep\x0081\x00"}
+        with self.assertRaisesRegex(RuntimeError, "captured identity"):
+            self.validate(captured=captured)
+
 
 
 if __name__ == "__main__":

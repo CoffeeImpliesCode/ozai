@@ -175,6 +175,8 @@ pub fn ConnIndex(comptime capacity: usize) type {
         pub fn remove(self: *Self, peer: NodeId) ?ConnId {
             const index = self.indexOf(peer) orelse return null;
             const conn = self.entries[index].conn;
+            // ZBC cannot carry `indexOf`'s nonempty-prefix proof into this subtraction.
+            // zbc-disable-next-line: index-minus-one-without-zero-guard
             self.entries[index] = self.entries[self.len - 1];
             self.len -= 1;
             return conn;

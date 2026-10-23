@@ -1,6 +1,8 @@
 //! Noq 1.3.0 native NAT wire, c1f41156 frame.rs:2284-2493.
 //! This is NAT traversal, not the unrelated Number-Time extension.
 const std = @import("std");
+const builtin = @import("builtin");
+const coverage_options = @import("coverage_options");
 const varint = @import("../wire/quic_varint.zig");
 pub const SocketAddr = @import("../base/addr.zig").SocketAddr;
 pub const transport_parameter_id: u64 = 0x3d7f91120401;
@@ -25,7 +27,7 @@ pub fn decodeParameter(bytes: []const u8) error{InvalidParameter}!u8 {
     return bytes[0];
 }
 
-pub fn encodeParameter(limit: u8, out: []u8) error{InvalidParameter, NoRoom}!usize {
+pub fn encodeParameter(limit: u8, out: []u8) error{ InvalidParameter, NoRoom }!usize {
     if (limit == 0) return error.InvalidParameter;
     if (out.len == 0) return error.NoRoom;
     out[0] = limit;
@@ -123,14 +125,15 @@ test "source-derived Noq ADD_ADDRESS vector and all truncations" {
     var out: [max_frame_length]u8 = undefined;
     const length = try encode(decoded.frame, &out);
     try t.expectEqualSlices(u8, &vector, out[0..length]);
-    for (0..vector.len) |length_short| try t.expectError(error.Truncated, decode(vector[0..length_short]));
+    for (0..vector.len) |length_short|
+        try t.expectError(error.Truncated, decode(vector[0..length_short]));
 }
 
 test "native NAT parameter strictly one nonzero byte" {
     try t.expectEqual(@as(u8, 32), try decodeParameter(&.{32}));
     try t.expectError(error.InvalidParameter, decodeParameter(&.{}));
     try t.expectError(error.InvalidParameter, decodeParameter(&.{0}));
-    try t.expectError(error.InvalidParameter, decodeParameter(&.{1, 0}));
+    try t.expectError(error.InvalidParameter, decodeParameter(&.{ 1, 0 }));
 }
 
 test "native codec arbitrary bytes never escape input and roundtrip" {
@@ -150,9 +153,16 @@ test "native codec arbitrary bytes never escape input and roundtrip" {
 
 test "all native frame kinds and varint boundaries preserve fields" {
     const addresses = [_]SocketAddr{
-        .{ .ip = .{ .v4 = .{192, 0, 2, 1} }, .port = 0x1234 },
-        .{ .ip = .{ .v6 = .{32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1} },
-            .port = 0x1234 },
+        .{ .ip = .{ .v4 = .{ 192, 0, 2, 1 } }, .port = 0x1234 },
+        .{
+            .ip = .{
+                .v6 = .{
+                    32, 1, 13, 184, 0, 0, 0, 0,
+                    0,  0, 0,  0,   0, 0, 0, 1,
+                },
+            },
+            .port = 0x1234,
+        },
     };
     var output: [max_frame_length]u8 = undefined;
     for (varint.boundaries) |sequence| {
@@ -181,20 +191,26 @@ test "all native frame kinds and varint boundaries preserve fields" {
 }
 
 test "native NAT decoder Smith fuzz" {
-    try t.fuzz({}, struct {
-        fn one(_: void, smith: *t.Smith) !void {
-            var input: [64]u8 = undefined;
-            const length = smith.sliceWithHash(&input, 0xc1f41156);
-            if (decodeParameter(input[0..length])) |limit| {
-                var parameter: [1]u8 = undefined;
-                _ = try encodeParameter(limit, &parameter);
-                try t.expectEqualSlices(u8, input[0..length], &parameter);
-            } else |_| {}
-            const decoded = decode(input[0..length]) catch return;
-            try t.expect(decoded.length <= length);
-            var output: [max_frame_length]u8 = undefined;
-            const encoded_length = try encode(decoded.frame, &output);
-            try t.expectEqualDeep(decoded.frame, (try decode(output[0..encoded_length])).frame);
-        }
-    }.one, .{});
+    // Coverage needs fuzz instrumentation, but Zig 0.16.0's fuzz runner has bug #36326.
+    if (comptime builtin.fuzz and coverage_options.coverage) {
+        var smith: t.Smith = .{ .in = &.{} };
+        try fuzzNativeNatDecoder({}, &smith);
+    } else {
+        try t.fuzz({}, fuzzNativeNatDecoder, .{});
+    }
+}
+
+fn fuzzNativeNatDecoder(_: void, smith: *t.Smith) !void {
+    var input: [64]u8 = undefined;
+    const length = smith.sliceWithHash(&input, 0xc1f41156);
+    if (decodeParameter(input[0..length])) |limit| {
+        var parameter: [1]u8 = undefined;
+        _ = try encodeParameter(limit, &parameter);
+        try t.expectEqualSlices(u8, input[0..length], &parameter);
+    } else |_| {}
+    const decoded = decode(input[0..length]) catch return;
+    try t.expect(decoded.length <= length);
+    var output: [max_frame_length]u8 = undefined;
+    const encoded_length = try encode(decoded.frame, &output);
+    try t.expectEqualDeep(decoded.frame, (try decode(output[0..encoded_length])).frame);
 }

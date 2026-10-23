@@ -52,38 +52,16 @@
 //!
 //! # Nothing calls this, and that is the decision
 //!
-//! **The route exists, is tested, and is deliberately not registered.** The
-//! reason is not `max_alpns`. That bound is one this tree chose: `TlsConfig.alpn`
-//! is `[]const []const u8` and the server matcher walks every entry
-//! (`vendor/quic/src/quic/tls13.zig:1280`, `:2867`), so `alpn_list` in
-//! `transport/bridge_manager.zig:82` and `transport/dial_client.zig:82` could
-//! each be `[2][]const u8` and the core would carry both names. The reason is
-//! that the vendored core has nowhere to put the protocol's two halves:
-//!
-//! - **No OBSERVED_ADDRESS frame.** `FrameType` names no type in
-//!   `0x9f81a6..0x9f81a7` (`vendor/quic/src/quic/frame.zig:45-75`), and
-//!   `Frame.parseSized` answers `error.FrameEncodingError` for a type it has no
-//!   arm for (`frame.zig:670`). There is no arm to build an outbound frame
-//!   from, and an inbound one fails the connection.
-//! - **No `address_discovery` transport parameter.** `ParamId` carries no
-//!   `0x9f81a176` (`vendor/quic/src/quic/transport_params.zig:24-46`), and
-//!   `decode` skips an unknown id by its declared length
-//!   (`transport_params.zig:609-612`), so a peer that sent the parameter reads
-//!   as one that never asked for QAD.
-//!
-//! `vendor/quic/` is read-only here, so neither is this tree's to add. A node
-//! that registered this route would offer `/iroh-qad/0`, negotiate it, and be
-//! unable to report one observed address — the whole service — with
-//! `net/qad.zig`'s `Role.shouldReport` gate answerable by nothing. A peer that
-//! negotiated QAD and received silence would be worse served than by today's
-//! drop, which names itself (`conn_dispatch.zig:303-304`). **So the reservation
-//! is the honest state: the ALPN is refused at `Builder.accept`, a table in
-//! this tree never offers it, and a peer that negotiates it is dropped.**
-//!
-//! What closes it, and only then: both vendored-core additions named above; a
-//! transport seam on the connection handle, which is an opaque `*anyopaque`
-//! the router never dereferences, so a body can neither read a peer's role nor
-//! write a frame; and `max_alpns` at 2 with the two `alpn_list` widenings.
+//! The route remains deliberately unregistered. It is a separate ALPN service,
+//! not the native in-connection observed-address extension.
+//! The vendor now negotiates observed-address roles and handles their frames.
+//! `Conn.observedRoles` and `Conn.observedAddress` expose those reports.
+//! No production node consumer turns them into candidates or publications.
+//! The Zig production route has no strict X.509 QAD client or mapping learner.
+//! Caller-configured local candidates do not prove an observed mapping.
+//! Native codec support therefore does not justify offering this service.
+//! `Builder.accept` still refuses the reserved ALPN, and the node does not
+//! register this route.
 //!
 //! # What the handler can and cannot do here
 //!

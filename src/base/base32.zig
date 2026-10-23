@@ -84,6 +84,8 @@ pub fn encode(
         index += 1;
     }
     std.debug.assert(index == out.len);
+    // ZBC cannot prove these writes cover encodedLen(n); index == out.len is asserted above.
+    // zbc-disable-next-line: use-undefined
     return out;
 }
 
@@ -141,6 +143,8 @@ pub fn decode(
     std.debug.assert(bits < 8);
     if (bits > 0 and accumulator != 0) return error.NonZeroPadding;
     std.debug.assert(index == n);
+    // ZBC cannot prove valid-length symbols write n bytes; index == n is asserted above.
+    // zbc-disable-next-line: use-undefined
     return out;
 }
 

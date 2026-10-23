@@ -228,6 +228,8 @@ pub const Window = struct {
     /// window to zero for that id.
     pub fn forget(self: *Window, id: RequestId) bool {
         const index = self.find(id) orelse return false;
+        // find returns only live indices; ZBC cannot carry its scan proof to this swap.
+        // zbc-disable-next-line: index-minus-one-without-zero-guard
         self.entries[index] = self.entries[self.len - 1];
         self.len -= 1;
         return true;

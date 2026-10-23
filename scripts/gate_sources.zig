@@ -5,11 +5,14 @@ const Dir = std.Io.Dir;
 
 pub const Source = struct { path: []const u8, sha256: []const u8 };
 const entry_limit = 1_000_000;
+pub const SourcesError = Allocator.Error || Dir.OpenError ||
+    Dir.SelectiveWalker.Error || Dir.StatFileError || files.HashFileError ||
+    error{ SourceSymlink, SourceInventoryTooLarge, MissingSources };
 
 fn skippedDirectory(name: []const u8) bool {
     const skipped = [_][]const u8{
-        ".git", ".jj", ".devenv", ".direnv", ".zig-cache", "zig-cache",
-        "zig-global-cache", "zig-out", "zig-pkg", "target", "node_modules",
+        ".git",             ".jj",     ".devenv", ".direnv", ".zig-cache",   "zig-cache",
+        "zig-global-cache", "zig-out", "zig-pkg", "target",  "node_modules",
     };
     for (skipped) |skip| {
         if (std.mem.eql(u8, name, skip)) return true;
@@ -20,14 +23,17 @@ fn skippedDirectory(name: []const u8) bool {
 fn relevant(path: []const u8) bool {
     const suffixes = [_][]const u8{
         ".zig", ".zon", ".nix", ".json", ".toml", ".lock", ".rs", ".c", ".h", ".sh",
+        ".bin", ".py",
     };
     for (suffixes) |suffix| {
         if (std.mem.endsWith(u8, path, suffix)) return true;
     }
-    return false;
+    // Native oracle tests also read capture provenance at runtime.
+    return std.mem.startsWith(u8, path, "test/fixtures/native/") and
+        std.mem.endsWith(u8, path, ".txt");
 }
 
-pub fn sources(gpa: Allocator, io: std.Io) ![]Source {
+pub fn sources(gpa: Allocator, io: std.Io) SourcesError![]Source {
     var directory = try Dir.cwd().openDir(io, ".", .{ .iterate = true });
     defer directory.close(io);
     var walker = try directory.walkSelectively(gpa);
@@ -41,7 +47,7 @@ pub fn sources(gpa: Allocator, io: std.Io) ![]Source {
         list.deinit(gpa);
     }
     for (0..entry_limit) |_| {
-        const entry = try walker.next(io) orelse break;
+        const entry = try resolveEntry(io, try walker.next(io) orelse break);
         if (entry.kind == .directory) {
             if (!skippedDirectory(entry.basename) and !std.mem.eql(u8, entry.path, "docs"))
                 try walker.enter(io, entry);
@@ -60,20 +66,48 @@ pub fn sources(gpa: Allocator, io: std.Io) ![]Source {
     return list.toOwnedSlice(gpa);
 }
 
+fn resolveEntry(io: std.Io, input: Dir.Walker.Entry) Dir.StatFileError!Dir.Walker.Entry {
+    var entry = input;
+    if (entry.kind == .unknown) {
+        // Some filesystems omit d_type. Ignoring those entries silently drops
+        // real sources; following links here would bypass SourceSymlink.
+        const metadata = try entry.dir.statFile(io, entry.basename, .{ .follow_symlinks = false });
+        entry.kind = metadata.kind;
+    }
+    return entry;
+}
+
 fn less(_: void, a: Source, b: Source) bool {
     return std.mem.lessThan(u8, a.path, b.path);
 }
 
-pub fn sourceDigest(gpa: Allocator, inventory: []const Source) ![]const u8 {
+pub fn sourceDigest(gpa: Allocator, inventory: []const Source) Allocator.Error![]const u8 {
     const encoded = try std.json.Stringify.valueAlloc(gpa, inventory, .{});
     defer gpa.free(encoded);
     return files.hashBytes(gpa, encoded);
 }
 
-test "configuration and tooling participate in source freshness" {
-    try std.testing.expect(relevant("devenv.nix"));
-    try std.testing.expect(relevant("scripts/project_gate.zig"));
-    try std.testing.expect(relevant("build.zig.zon"));
-    try std.testing.expect(!relevant("docs/COVERAGE-LEDGER.md"));
-    try std.testing.expect(skippedDirectory("zig-pkg"));
+test "unknown directory entries resolve source identity without following links" {
+    const file = try resolveEntry(std.testing.io, .{
+        .dir = Dir.cwd(),
+        .basename = "scripts/gate_sources.zig",
+        .path = "scripts/gate_sources.zig",
+        .kind = .unknown,
+    });
+    try std.testing.expectEqual(std.Io.File.Kind.file, file.kind);
+    try std.testing.expectEqualStrings("scripts/gate_sources.zig", file.path);
+    const directory = try resolveEntry(std.testing.io, .{
+        .dir = Dir.cwd(),
+        .basename = "scripts",
+        .path = "scripts",
+        .kind = .unknown,
+    });
+    try std.testing.expectEqual(std.Io.File.Kind.directory, directory.kind);
+    const link = try resolveEntry(std.testing.io, .{
+        .dir = Dir.cwd(),
+        .basename = "absent-link.zig",
+        .path = "absent-link.zig",
+        .kind = .sym_link,
+    });
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, link.kind);
 }

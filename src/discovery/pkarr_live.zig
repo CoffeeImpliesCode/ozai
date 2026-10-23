@@ -112,7 +112,7 @@ pub const HttpError = error{
     ///
     /// A `404` is the ordinary answer to a resolve for a node nobody published
     /// there, which is why this is an error the caller can recognise and not a
-    /// refusal to try: `relayStatus` hands the code back.
+    /// refusal to try: `Response.status` carries the code.
     StatusNotSuccess,
     /// The response was truncated: the body the `Content-Length` named is not
     /// all there. Refused rather than read short, because a pkarr packet's
@@ -224,7 +224,7 @@ pub const Answer = struct {
 ///
 /// The relay's answer is a status and nothing else — a pkarr relay stores the
 /// packet and says so — so this function reads the status and hands the code to
-/// `relayStatus` rather than returning a body.
+/// `Response.status` rather than returning a body.
 ///
 /// **The key is checked against the node being published.** A secret whose node
 /// id is not the one the records are about would publish one node's addresses
@@ -336,19 +336,6 @@ pub const Response = struct {
     buffer: []u8,
 };
 
-/// The status a failed exchange carried, or null when the failure was not a
-/// status.
-///
-/// `error.StatusNotSuccess` is one error for every non-2xx, so a caller that
-/// wants to tell a `404` from a `503` has to reach for this — and it has to,
-/// because for a pkarr relay those are different facts: `404` means this node
-/// has published nothing there and `503` means the relay is unwell, and a
-/// publisher that treats them alike retries forever against a relay that has
-/// nothing for it.
-pub fn relayStatus(out: *const Response) ?u16 {
-    return out.status;
-}
-
 /// One request on the wire and one response read back.
 ///
 /// `request` is the framed packet for a `PUT` and empty for a `GET`, and
@@ -453,7 +440,7 @@ fn readResponse(
     // the first one.
     var rest = head;
     var content_length: ?usize = null;
-    while (std.mem.indexOf(u8, rest, "\r\n")) |at| {
+    while (std.mem.find(u8, rest, "\r\n")) |at| {
         const line = rest[0..at];
         rest = rest[at + 2 ..];
         if (line.len == 0) break;
@@ -511,7 +498,7 @@ fn readResponse(
 /// RFC 9112 §4's status line: `HTTP-version SP status-code SP [ reason ]`.
 /// Anything that is not that shape is `error.StatusNotSuccess` with a status of
 /// zero, which is not a code any server may send — so a caller reading
-/// `relayStatus` cannot mistake a malformed line for a real one.
+/// `Response.status` cannot mistake a malformed line for a real one.
 fn statusOf(head: []const u8) HttpError!u16 {
     const line_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
     const line = head[0..line_end];
@@ -662,7 +649,7 @@ test "the URL a node is asked at is upstream's own path shape" {
 test "a status is only success between 200 and 299" {
     // `404` is the ordinary answer to a resolve for a node nobody published
     // there and `503` is a relay that is unwell; `exchange` refuses both and
-    // hands the code back through `relayStatus`, and this is the arithmetic
+    // hands the code back through `Response.status`, and this is the arithmetic
     // behind that refusal.
     try t.expectError(error.StatusNotSuccess, statusOf("HTTP/1.1 404 Not Found\r\n"));
     try t.expectError(error.StatusNotSuccess, statusOf("HTTP/1.1 503 Service Unavailable\r\n"));

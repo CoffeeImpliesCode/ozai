@@ -1,51 +1,14 @@
-//! The rig `discovery/dial_source_walk.zig` is observed against, and the tests
-//! that drive it.
+//! Consumer tests for `dial_source_walk.zig`, with a real QUIC dialer and
+//! caller-supplied discovery answers, time and entropy.
 //!
-//+//! Split out of `discovery/dial_source.zig` along the line the file already
-//! drew: everything above `const t = std.testing;` is the walk, everything
-//! below it is the apparatus. That split is by responsibility and not by
-//! convenience — the walk reaches six modules and no socket, and the rig
-//! reaches `quic_bridge`, `batch` and the vendored `quic` core. Keeping the two
-//! apart is what lets the shipped `ozai` module stay as pure as the walk's own
-//! module doc claims it is.
+//! The merge winner is observed through the destination of its first outgoing
+//! datagrams, without forwarding them to a fabricated peer. The other cases
+//! distinguish empty answers, unavailable services and retrieval cancellation.
+//! Relay routes are not used to identify a winning URL: they share a virtual
+//! endpoint address so the connection can later select a physical path.
 //!
-//! # What the rig is
-//!
-//! Two `quic_bridge.Bridge`s and one `dial.Dialer` over a shared
-//! `addr_map.MappedAddrs`, so a connection this run opens is one the receiving
-//! end can name — `transport/dial.zig`'s own harness, rebuilt because that one
-//! is private to a file this milestone does not change. Around it, the doubles
-//! a run needs to be *observable* rather than merely exercised: a `FakeRelay`
-//! whose answer set is a value, a `Counter` in front of the cancellation handle
-//! so "was this one asked" is read rather than inferred, a `Counted` that puts
-//! that counter on an ordinary service, and an `Unstartable` for the arm
-//! `resolve.ResolveError` actually has.
-//!
-//! Nothing here opens a socket and nothing reads a clock: `forward` hands a
-//! connection's datagrams straight to the peer, and every instant is
-//! `at_instant`. That is the same shortcut `transport/dial.zig`'s harness
-//! takes, and the module doc there gives the reason.
-//!
-//! # The tests, and where they moved
-//!
-//! All five blocks below came from `discovery/dial_source.zig` unchanged and
-//! none moved out of this file: every one of them drives
-//! `dialFromSources`, so the walk's own module would have had to import the
-//! whole rig to keep them, and a production module importing `quic_bridge` is
-//! the contamination the split exists to prevent. They assert behaviour — that
-//! the merge chose the winning relay, that a refusal stops the walk where it
-//! made its claim, that every retrieval a run started is stopped on every path
-//! out — and none of them asserts wiring, so none of them is one
-//! `AGENTS.md` §9 deletes.
-//!
-//! # Reaching these blocks from a test root
-//!
-//! Nothing imports this module: it has no public declarations, and a bare
-//! `@import` does not make Zig collect the test blocks in a file. `src/root.zig`
-//! and `src/portable_test.zig` each name it through `std.testing.refAllDecls`,
-//! which forces the whole file whether or not it has public decls. Without
-//! that line the tests below silently stop running and `zig build test` stays
-//! green, so the registration is not optional.
+//! `src/root.zig` and `src/portable_test.zig` register these tests through
+//! `std.testing.refAllDecls`.
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
@@ -57,11 +20,8 @@ const walk = @import("dial_source_walk.zig");
 
 const t = std.testing;
 const key = @import("../base/key.zig");
-const ula = @import("../base/ula.zig");
 const dns = @import("dns.zig");
-const batch = @import("../transport/batch.zig");
 const quic_bridge = @import("../transport/quic_bridge.zig");
-const quic = @import("quic");
 
 /// Fixed seeds, so a run draws the same connection ids, the same nonces and
 /// the same synthetic host bits every time.
@@ -321,57 +281,24 @@ fn refuseStart(
     return error.OutOfMemory;
 }
 
-/// Hand one round of a connection's datagrams to a bridge and say whether it
-/// produced any.
-///
-/// No socket is opened and none is needed: the datagrams are handed straight
-/// over, which is what makes a dialled connection testable at all. A relay
-/// path's datagram would go to a relay client first, which is the work this
-/// milestone does not build, so it is handed to the peer instead — the same
-/// shortcut `transport/dial.zig`'s own harness takes.
-fn forward(
-    conn: quic_bridge.Conn,
-    into: *quic_bridge.Bridge,
-    map: *const addr_map.MappedAddrs,
-    engine: *Prng,
-) quic_bridge.Error!bool {
-    var scratch: [2 * max_datagram]u8 = undefined;
-    var egress: [max_egress]quic_bridge.Egress = undefined;
-    var out: [max_egress * max_datagram]u8 = undefined;
-    const from = conn.local() orelse return error.NoPathAddress;
-    const sends = try conn.drain(&egress, &out, at_instant, engine.random());
-    for (sends) |send| {
-        var runs = try batch.Runs.init(send.send, batch.Capability.none);
-        while (runs.next()) |run| {
-            _ = try into.recv(map, .{
-                .bytes = run.contents,
-                .from = from,
-                .local = send.to,
-                .ecn = run.ecn,
-            }, &scratch, at_instant, engine.random());
-        }
-    }
-    return sends.len != 0;
-}
-
-test "the merge chooses the address and the dial opens on it" {
+test "the merge chooses the destination of the dial's outgoing datagrams" {
     var engine: Prng = Prng.init(1);
     var harness: Harness = undefined;
     try harness.init(&engine);
     defer harness.deinit();
     const peer = harness.server_secret.nodeId();
 
-    // The second source names `two.example.`, which is greater in the address
-    // value order than the first source's `one.example.`. Taking the first
-    // usable answer instead of merging would dial the wrong relay.
+    // Distinct direct destinations make the selected address observable at the
+    // send boundary. A relay URL cannot do that: relay routes for one peer
+    // deliberately share its virtual endpoint address.
     var stops: Counter = .{};
     var relay: FakeRelay = .{
         .answers = "signed\x00",
-        .packets = &.{.{ .node_id = peer, .txt = .init("relay=https://two.example./\x00") }},
+        .packets = &.{.{ .node_id = peer, .txt = .init("addr=192.0.2.2:9002\x00") }},
     };
     var resolver = resolve.PkarrResolver.init(relay.source(stops.cancellation()));
     var service = dns.DnsAddressLookup.init(
-        .init("relay=https://one.example./\x00"),
+        .init("addr=192.0.2.1:9001\x00"),
         null,
     );
     var named_one = Counted.init(service.lookup());
@@ -385,8 +312,7 @@ test "the merge chooses the address and the dial opens on it" {
         requestAt(&harness, &engine),
     );
 
-    // Both were asked, and the later one won. The counts are the assertion
-    // that the walk does not stop at the first answer.
+    // A walk that stops at the first answer sends to the wrong destination.
     try t.expectEqual(@as(u32, 1), named_one.asked);
     try t.expectEqual(@as(u32, 1), named_two.asked);
     try t.expect(outcome.first_failure == null);
@@ -396,35 +322,24 @@ test "the merge chooses the address and the dial opens on it" {
         else => return error.ExpectedADial,
     };
     try t.expectEqual(item.Provenance.pkarr, dialled.provenance);
-    // Three separate answers from one target, which is what `resolveRoute`
-    // exists to give: the address the core is told, the key that owns it, and
-    // the subnet it sits in. The key is the *second* source's relay, and the
-    // map is what says so — the winning address, not the first one asked for.
-    try t.expectEqual(ula.Path.relay, dialled.dial.route.subnet.?);
-    const expected: addr_map.Key = .{ .relay = .{
-        .relay = try addr.RelayUrl.parse("https://two.example./"),
-        .node = peer,
-    } };
-    try t.expectEqual(expected, dialled.dial.route.key.?);
-    try t.expectEqual(expected, dial.ownerOf(&harness.map, dialled.dial.route.socket).?);
-    // One key for one target: the relay the other service named was never a
-    // target, so no address was allocated for it.
-    try t.expectEqual(@as(usize, 1), harness.map.by_key.count());
 
     // The stream the answer came out of is closed before the run returns, so
     // nothing in the result is a slice into an arena that has just been
     // emptied.
     try t.expectEqual(@as(u32, 1), stops.stops);
 
-    // The first flight leaves for the address the merge chose and a peer
-    // accepts it: the whole distance from "cannot be found" to "a connection
-    // exists", with no socket open and no clock read.
-    try t.expectEqual(@as(usize, 1), harness.client.manager.entries.items.len);
-    const client = harness.client.connectionAt(0) orelse
-        return error.TestUnexpectedResult;
-    try t.expect(try forward(client, harness.server, &harness.map, &engine));
-    const accepted = harness.server.connectionAt(0) orelse return error.NoAcceptedConnection;
-    try t.expectEqual(quic.connection.State.handshake, accepted.entry.conn.state);
+    const expected: addr.SocketAddr = .{
+        .ip = .{ .v4 = .{ 192, 0, 2, 2 } },
+        .port = 9002,
+    };
+    var egress: [max_egress]quic_bridge.Egress = undefined;
+    var out: [max_egress * max_datagram]u8 = undefined;
+    const sends = try dialled.dial.conn.drain(&egress, &out, at_instant, engine.random());
+    try t.expect(sends.len != 0);
+    for (sends) |send| {
+        try t.expectEqual(expected, send.to);
+        try t.expect(send.send.contents.len != 0);
+    }
 }
 
 test "a service that will not resolve stops the walk where it made its claim" {
@@ -529,7 +444,6 @@ test "an answer with nothing in it does not stop the walk" {
         else => return error.ExpectedADial,
     };
     try t.expectEqual(item.Provenance.pkarr, dialled.provenance);
-    try t.expectEqual(ula.Path.relay, dialled.dial.route.subnet.?);
 }
 
 test "an empty result, an empty address list and a refused path are told apart" {

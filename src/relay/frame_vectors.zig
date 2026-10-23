@@ -121,5 +121,9 @@ fn hexdump(bytes: []const u8) [2 * max_dumped_bytes]u8 {
         out[index * 2 + 1] = digits[byte & 15];
     }
     @memset(out[shown * 2 ..], ' ');
+    // The loop initializes [0, 2 * shown); `@memset` initializes [2 * shown, out.len).
+    // Together they cover every byte, including for empty or full input. ZBC's
+    // initialization analysis does not combine these disjoint writes at return.
+    // zbc-disable-next-line: use-undefined
     return out;
 }

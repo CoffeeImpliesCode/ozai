@@ -147,6 +147,53 @@ pub const AckRange = struct {
 /// truncated silently into a wrong answer, only into a shorter ACK.
 pub const MAX_ACK_RANGES: usize = 32;
 
+const AckPayload = struct {
+    /// Largest packet number the peer acknowledges.
+    largest_ack: u64,
+    /// The peer's ACK delay as it went on the wire, unscaled: the
+    /// consumer applies `TransportParams.ack_delay_exponent` to get
+    /// microseconds.
+    ack_delay: u64,
+    /// How far below `largest_ack` the first acknowledged range reaches.
+    /// The range is `[largest_ack - first_ack_range, largest_ack]`.
+    first_ack_range: u64,
+    /// How many entries of `ack_ranges` are valid, 0 to `MAX_ACK_RANGES`.
+    /// The tail of the array is not part of the frame even after a decode.
+    ack_range_count: u8 = 0,
+    /// Ranges below the first, in descending order. Only
+    /// `ack_ranges[0..ack_range_count]` is valid.
+    ack_ranges: [MAX_ACK_RANGES]AckRange = undefined,
+};
+
+const AckEcnPayload = struct {
+    /// The same four ACK fields, with the same validity rule on
+    /// `ack_ranges`; the three ECN counts follow.
+    largest_ack: u64,
+    ack_delay: u64,
+    first_ack_range: u64,
+    ack_range_count: u8 = 0,
+    ack_ranges: [MAX_ACK_RANGES]AckRange = undefined,
+    /// Packets the peer received with ECN ECT(0), cumulative.
+    ecn_ect0: u64,
+    /// Packets the peer received with ECN ECT(1), cumulative.
+    ecn_ect1: u64,
+    /// Packets the peer received with ECN CE, cumulative.
+    ecn_ce: u64,
+};
+
+const NewConnectionIdPayload = struct {
+    /// The peer's sequence number for this connection ID.
+    seq_num: u64,
+    /// The lowest sequence number the peer still wants; a receiver retires
+    /// everything below it.
+    retire_prior_to: u64,
+    /// Borrowed from the decode buffer; see the type doc.
+    conn_id: []u8,
+    /// Copied out of the wire at decode, so it is owned and stays valid
+    /// past the receive buffer.
+    stateless_reset_token: [16]u8,
+};
+
 /// One QUIC frame, tagged by `FrameType`.
 ///
 /// **Which variants borrow.** Every `[]u8` and `[]const u8` payload a decode
@@ -174,39 +221,9 @@ pub const Frame = union(FrameType) {
 
     ping: void,
 
-    ack: struct {
-        /// Largest packet number the peer acknowledges.
-        largest_ack: u64,
-        /// The peer's ACK delay as it went on the wire, unscaled: the
-        /// consumer applies `TransportParams.ack_delay_exponent` to get
-        /// microseconds.
-        ack_delay: u64,
-        /// How far below `largest_ack` the first acknowledged range reaches.
-        /// The range is `[largest_ack - first_ack_range, largest_ack]`.
-        first_ack_range: u64,
-        /// How many entries of `ack_ranges` are valid, 0 to `MAX_ACK_RANGES`.
-        /// The tail of the array is not part of the frame even after a decode.
-        ack_range_count: u8 = 0,
-        /// Ranges below the first, in descending order. Only
-        /// `ack_ranges[0..ack_range_count]` is valid.
-        ack_ranges: [MAX_ACK_RANGES]AckRange = undefined,
-    },
+    ack: AckPayload,
 
-    ack_ecn: struct {
-        /// The same four ACK fields, with the same validity rule on
-        /// `ack_ranges`; the three ECN counts follow.
-        largest_ack: u64,
-        ack_delay: u64,
-        first_ack_range: u64,
-        ack_range_count: u8 = 0,
-        ack_ranges: [MAX_ACK_RANGES]AckRange = undefined,
-        /// Packets the peer received with ECN ECT(0), cumulative.
-        ecn_ect0: u64,
-        /// Packets the peer received with ECN ECT(1), cumulative.
-        ecn_ect1: u64,
-        /// Packets the peer received with ECN CE, cumulative.
-        ecn_ce: u64,
-    },
+    ack_ecn: AckEcnPayload,
 
     reset_stream: struct {
         /// Which stream is being reset: a stream ID, not an index or a count.
@@ -286,18 +303,7 @@ pub const Frame = union(FrameType) {
     /// As `streams_blocked_bidi`, for unidirectional streams.
     streams_blocked_uni: u64,
 
-    new_connection_id: struct {
-        /// The peer's sequence number for this connection ID.
-        seq_num: u64,
-        /// The lowest sequence number the peer still wants; a receiver retires
-        /// everything below it.
-        retire_prior_to: u64,
-        /// Borrowed from the decode buffer; see the type doc.
-        conn_id: []u8,
-        /// Copied out of the wire at decode, so it is owned and stays valid
-        /// past the receive buffer.
-        stateless_reset_token: [16]u8,
-    },
+    new_connection_id: NewConnectionIdPayload,
 
     retire_connection_id: struct {
         /// The sequence number of the connection ID being retired, in the
@@ -363,12 +369,12 @@ pub const Frame = union(FrameType) {
     add_address: native_nat.AddAddress,
     reach_address: native_nat.ReachAddress,
     remove_address: u64,
-    path_ack: struct { path_id: u32, ack: @FieldType(Frame, "ack") },
-    path_ack_ecn: struct { path_id: u32, ack: @FieldType(Frame, "ack_ecn") },
+    path_ack: struct { path_id: u32, ack: AckPayload },
+    path_ack_ecn: struct { path_id: u32, ack: AckEcnPayload },
     path_abandon: struct { path_id: u32, error_code: u64 },
     path_status_backup: struct { path_id: u32, status_seq_no: u64 },
     path_status_available: struct { path_id: u32, status_seq_no: u64 },
-    path_new_connection_id: struct { path_id: u32, cid: @FieldType(Frame, "new_connection_id") },
+    path_new_connection_id: struct { path_id: u32, cid: NewConnectionIdPayload },
     path_retire_connection_id: struct { path_id: u32, seq_num: u64 },
     max_path_id: u32,
     paths_blocked: u32,
@@ -484,22 +490,27 @@ pub const Frame = union(FrameType) {
                     ecn_ce = try packet.readVarInt(reader);
                 }
 
-
                 if (is_path) {
                     if (is_ecn) break :blk .{ .path_ack_ecn = .{
                         .path_id = path_id,
                         .ack = .{
-                            .largest_ack = largest_ack, .ack_delay = ack_delay,
-                            .first_ack_range = first_ack_range, .ack_range_count = range_count,
+                            .largest_ack = largest_ack,
+                            .ack_delay = ack_delay,
+                            .first_ack_range = first_ack_range,
+                            .ack_range_count = range_count,
                             .ack_ranges = additional_ranges,
-                            .ecn_ect0 = ecn_ect0, .ecn_ect1 = ecn_ect1, .ecn_ce = ecn_ce,
+                            .ecn_ect0 = ecn_ect0,
+                            .ecn_ect1 = ecn_ect1,
+                            .ecn_ce = ecn_ce,
                         },
                     } };
                     break :blk .{ .path_ack = .{
                         .path_id = path_id,
                         .ack = .{
-                            .largest_ack = largest_ack, .ack_delay = ack_delay,
-                            .first_ack_range = first_ack_range, .ack_range_count = range_count,
+                            .largest_ack = largest_ack,
+                            .ack_delay = ack_delay,
+                            .first_ack_range = first_ack_range,
+                            .ack_range_count = range_count,
                             .ack_ranges = additional_ranges,
                         },
                     } };
@@ -726,21 +737,21 @@ pub const Frame = union(FrameType) {
                 .reordering_threshold = try packet.readVarInt(reader),
             } },
 
-            0x9f81a6, 0x9f81a7 => .{ .observed_address =
-                try observed_address.Report.read(reader, frame_type == 0x9f81a7) },
-            0x3d7f90, 0x3d7f91 => .{ .add_address =
-                try native_nat.AddAddress.read(reader, frame_type == 0x3d7f91) },
-            0x3d7f92, 0x3d7f93 => .{ .reach_address =
-                try native_nat.ReachAddress.read(reader, frame_type == 0x3d7f93) },
+            0x9f81a6, 0x9f81a7 => .{ .observed_address = try observed_address.Report.read(reader, frame_type == 0x9f81a7) },
+            0x3d7f90, 0x3d7f91 => .{ .add_address = try native_nat.AddAddress.read(reader, frame_type == 0x3d7f91) },
+            0x3d7f92, 0x3d7f93 => .{ .reach_address = try native_nat.ReachAddress.read(reader, frame_type == 0x3d7f93) },
             0x3d7f94 => .{ .remove_address = try packet.readVarInt(reader) },
             0x3e75 => .{ .path_abandon = .{
-                .path_id = try readPathId(reader), .error_code = try packet.readVarInt(reader),
+                .path_id = try readPathId(reader),
+                .error_code = try packet.readVarInt(reader),
             } },
             0x3e76 => .{ .path_status_backup = .{
-                .path_id = try readPathId(reader), .status_seq_no = try packet.readVarInt(reader),
+                .path_id = try readPathId(reader),
+                .status_seq_no = try packet.readVarInt(reader),
             } },
             0x3e77 => .{ .path_status_available = .{
-                .path_id = try readPathId(reader), .status_seq_no = try packet.readVarInt(reader),
+                .path_id = try readPathId(reader),
+                .status_seq_no = try packet.readVarInt(reader),
             } },
             0x3e78 => blk: {
                 const path_id = try readPathId(reader);
@@ -753,19 +764,24 @@ pub const Frame = union(FrameType) {
                 var token: [16]u8 = undefined;
                 try reader.readSliceAll(&token);
                 break :blk .{ .path_new_connection_id = .{
-                    .path_id = path_id, .cid = .{
-                        .seq_num = sequence, .retire_prior_to = retire,
-                        .conn_id = cid, .stateless_reset_token = token,
+                    .path_id = path_id,
+                    .cid = .{
+                        .seq_num = sequence,
+                        .retire_prior_to = retire,
+                        .conn_id = cid,
+                        .stateless_reset_token = token,
                     },
                 } };
             },
             0x3e79 => .{ .path_retire_connection_id = .{
-                .path_id = try readPathId(reader), .seq_num = try packet.readVarInt(reader),
+                .path_id = try readPathId(reader),
+                .seq_num = try packet.readVarInt(reader),
             } },
             0x3e7a => .{ .max_path_id = try readPathId(reader) },
             0x3e7b => .{ .paths_blocked = try readPathId(reader) },
             0x3e7c => .{ .path_cids_blocked = .{
-                .path_id = try readPathId(reader), .next_seq = try packet.readVarInt(reader),
+                .path_id = try readPathId(reader),
+                .next_seq = try packet.readVarInt(reader),
             } },
             else => return error.FrameEncodingError,
         };
@@ -1055,8 +1071,7 @@ pub const Frame = union(FrameType) {
     /// so a decoded frame and a hand-built one answer the same.
     pub fn isAckEliciting(self: Frame) bool {
         return switch (self) {
-            .padding, .ack, .ack_ecn, .path_ack, .path_ack_ecn,
-            .connection_close, .application_close => false,
+            .padding, .ack, .ack_ecn, .path_ack, .path_ack_ecn, .connection_close, .application_close => false,
             .datagram, .datagram_with_length => true,
             else => true,
         };
@@ -1070,8 +1085,7 @@ pub const Frame = union(FrameType) {
     /// answer true.
     pub fn isProbing(self: Frame) bool {
         return switch (self) {
-            .padding, .path_challenge, .path_response, .new_connection_id,
-            .observed_address => true,
+            .padding, .path_challenge, .path_response, .new_connection_id, .observed_address => true,
             else => false,
         };
     }
@@ -1102,10 +1116,20 @@ pub const Frame = union(FrameType) {
             .handshake_done,
             .ack_frequency,
             .immediate_ack,
-            .observed_address, .add_address, .reach_address, .remove_address,
-            .path_ack, .path_ack_ecn, .path_abandon,
-            .path_status_backup, .path_status_available, .path_new_connection_id,
-            .path_retire_connection_id, .max_path_id, .paths_blocked, .path_cids_blocked,
+            .observed_address,
+            .add_address,
+            .reach_address,
+            .remove_address,
+            .path_ack,
+            .path_ack_ecn,
+            .path_abandon,
+            .path_status_backup,
+            .path_status_available,
+            .path_new_connection_id,
+            .path_retire_connection_id,
+            .max_path_id,
+            .paths_blocked,
+            .path_cids_blocked,
             => pkt_type == .one_rtt,
             // All others: 0-RTT and 1-RTT only
             .reset_stream,
@@ -1127,6 +1151,21 @@ pub const Frame = union(FrameType) {
             => pkt_type == .one_rtt or pkt_type == .zero_rtt,
         };
     }
+};
+
+const PendingNewConnectionIdPayload = struct {
+    /// The sequence number to attach to this connection ID.
+    seq_num: u64,
+    /// The lowest sequence number the peer should keep.
+    retire_prior_to: u64,
+    /// Inline storage for the connection ID, at most 20 bytes (RFC 9000
+    /// §17.2); only `cid_buf[0..cid_len]` is the ID.
+    cid_buf: [20]u8,
+    /// Caller-enforced length, 1..20; `write` slices the inline buffer.
+    cid_len: u8,
+    /// The token a reset for this connection ID must end with, copied in
+    /// alongside the ID so the pair stays together in the queue.
+    stateless_reset_token: [16]u8,
 };
 
 /// A pending control frame to be sent in the next outgoing packet.
@@ -1209,20 +1248,7 @@ pub const PendingControlFrame = union(enum) {
         /// The application error code; as `Frame.stop_sending.error_code`.
         error_code: u64,
     },
-    new_connection_id: struct {
-        /// The sequence number to attach to this connection ID.
-        seq_num: u64,
-        /// The lowest sequence number the peer should keep.
-        retire_prior_to: u64,
-        /// Inline storage for the connection ID, at most 20 bytes (RFC 9000
-        /// §17.2); only `cid_buf[0..cid_len]` is the ID.
-        cid_buf: [20]u8,
-        /// Caller-enforced length, 1..20; `write` slices the inline buffer.
-        cid_len: u8,
-        /// The token a reset for this connection ID must end with, copied in
-        /// alongside the ID so the pair stays together in the queue.
-        stateless_reset_token: [16]u8,
-    },
+    new_connection_id: PendingNewConnectionIdPayload,
 
     /// draft-ietf-quic-ack-frequency: when the peer asked this endpoint to
     /// ACK. The fields carry the same meanings as `Frame.ack_frequency`, and
@@ -1247,7 +1273,7 @@ pub const PendingControlFrame = union(enum) {
     path_cids_blocked: @FieldType(Frame, "path_cids_blocked"),
     path_new_connection_id: struct {
         path_id: u32,
-        cid: @FieldType(PendingControlFrame, "new_connection_id"),
+        cid: PendingNewConnectionIdPayload,
     },
 
     /// Write this pending control frame directly on the wire.
@@ -2160,13 +2186,20 @@ test "native extension malformed path IDs and ACK ranges" {
 }
 
 test "native extension frame fuzz canonical encoding fixed point" {
-    try std.testing.fuzz({}, fuzzNativeFrame, .{});
+    // Coverage needs fuzz instrumentation, but Zig 0.16.0's fuzz runner has bug #36326.
+    if (comptime @import("builtin").fuzz and @import("coverage_options").coverage) {
+        var smith: std.testing.Smith = .{ .in = &.{} };
+        try fuzzNativeFrame({}, &smith);
+    } else {
+        try std.testing.fuzz({}, fuzzNativeFrame, .{});
+    }
 }
 
 fn fuzzNativeFrame(_: void, smith: *std.testing.Smith) !void {
     const types = [_]u64{
         0x9f81a6, 0x9f81a7, 0x3d7f90, 0x3d7f91, 0x3d7f92, 0x3d7f93, 0x3d7f94,
-        0x3e, 0x3f, 0x3e75, 0x3e76, 0x3e77, 0x3e78, 0x3e79, 0x3e7a, 0x3e7b, 0x3e7c,
+        0x3e,     0x3f,     0x3e75,   0x3e76,   0x3e77,   0x3e78,   0x3e79,
+        0x3e7a,   0x3e7b,   0x3e7c,
     };
     var input: [128]u8 = undefined;
     var stream = io.fixedBufferStream(&input);
@@ -2192,8 +2225,10 @@ test "multipath pending CID owns storage and writes complete body" {
     const pending = PendingControlFrame{ .path_new_connection_id = .{
         .path_id = 1,
         .cid = .{
-            .seq_num = 0, .retire_prior_to = 0,
-            .cid_buf = .{0xab} ** 20, .cid_len = 1,
+            .seq_num = 0,
+            .retire_prior_to = 0,
+            .cid_buf = .{0xab} ** 20,
+            .cid_len = 1,
             .stateless_reset_token = .{0xcd} ** 16,
         },
     } };
@@ -2205,8 +2240,7 @@ test "multipath pending CID owns storage and writes complete body" {
     try std.testing.expectEqual(writer.seek, consumed);
     try std.testing.expectEqual(@as(u32, 1), frame.path_new_connection_id.path_id);
     try std.testing.expectEqualSlices(u8, &.{0xab}, frame.path_new_connection_id.cid.conn_id);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xcd} ** 16),
-        &frame.path_new_connection_id.cid.stateless_reset_token);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xcd} ** 16), &frame.path_new_connection_id.cid.stateless_reset_token);
     try std.testing.expect(!frame.isProbing());
     for (0..writer.seek) |cut| {
         if (Frame.parse(buffer[0..cut])) |_| return error.AcceptedTruncatedCid else |_| {}

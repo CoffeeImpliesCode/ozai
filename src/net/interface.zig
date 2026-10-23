@@ -500,7 +500,7 @@ fn v6() IpAddress {
 /// `nameFrom` already enforces — the same `IFNAMSIZ - 1` the read is handed —
 /// so the two agree by construction, and a longer argument is cut at the one
 /// length the kernel cannot produce rather than at a length chosen here.
-fn iface_name(text: []const u8) Name {
+fn ifaceName(text: []const u8) Name {
     const kept = @min(text.len, name_length);
     var buffer: [name_length + 1]u8 = @splat(0);
     @memcpy(buffer[0..kept], text[0..kept]);
@@ -508,8 +508,8 @@ fn iface_name(text: []const u8) Name {
     return nameFrom(sentinel);
 }
 
-fn on_iface(interface: []const u8, ip: IpAddress, up: bool, loopback: bool) Entry {
-    return .{ .interface = iface_name(interface), .ip = ip, .up = up, .loopback = loopback };
+fn onIface(interface: []const u8, ip: IpAddress, up: bool, loopback: bool) Entry {
+    return .{ .interface = ifaceName(interface), .ip = ip, .up = up, .loopback = loopback };
 }
 
 /// A `Snapshot` carrying `entries` in the order they are written.
@@ -531,9 +531,9 @@ fn carries(reach: *const Reach, ip: IpAddress) bool {
 
 test "an interface address is reachable and the families stay apart" {
     const snapshot = try filled(&.{
-        on_iface("eth0", v4(1), true, false),
-        on_iface("eth0", v6(), true, false),
-        on_iface("docker0", v4(2), true, false),
+        onIface("eth0", v4(1), true, false),
+        onIface("eth0", v6(), true, false),
+        onIface("docker0", v4(2), true, false),
     });
 
     const reach = reachableAt(&snapshot, test_host, test_port, false);
@@ -551,8 +551,8 @@ test "an interface address is reachable and the families stay apart" {
 }
 
 test "an interface that is down reaches nobody" {
-    const up = try filled(&.{on_iface("eth0", v4(1), true, false)});
-    const down = try filled(&.{on_iface("eth0", v4(1), false, false)});
+    const up = try filled(&.{onIface("eth0", v4(1), true, false)});
+    const down = try filled(&.{onIface("eth0", v4(1), false, false)});
 
     // The flags are recorded by `read` and applied here, so one bit the caller
     // never set is the whole difference between a published address and none.
@@ -577,8 +577,8 @@ test "an interface that is down reaches nobody" {
 
 test "loopback is counted only when the caller says its peer is this host" {
     const snapshot = try filled(&.{
-        on_iface("eth0", v4(1), true, false),
-        on_iface("lo", v4(3), true, true),
+        onIface("eth0", v4(1), true, false),
+        onIface("lo", v4(3), true, true),
     });
 
     const off = reachableAt(&snapshot, test_host, test_port, false);
@@ -594,9 +594,9 @@ test "loopback is counted only when the caller says its peer is this host" {
 
 test "one address on two interfaces is one address" {
     const bonded = try filled(&.{
-        on_iface("eth0", v4(1), true, false),
-        on_iface("bond0", v4(1), true, false),
-        on_iface("eth1", v4(1), true, false),
+        onIface("eth0", v4(1), true, false),
+        onIface("bond0", v4(1), true, false),
+        onIface("eth1", v4(1), true, false),
     });
 
     // A bond or an anycast address has three interfaces behind it here and a
@@ -607,7 +607,7 @@ test "one address on two interfaces is one address" {
     // And a read in which the address moved to one of those interfaces is not
     // a change at all, which is what makes the dedup load-bearing rather than
     // a tidy-up.
-    const onto_bond = try filled(&.{on_iface("bond0", v4(1), true, false)});
+    const onto_bond = try filled(&.{onIface("bond0", v4(1), true, false)});
     const change: Change = .{ .previous = bonded, .current = onto_bond, .loopback = false };
     try t.expect(!change.moved().changed());
 }
@@ -632,16 +632,16 @@ test "the synthetic address is the one ula builds and ula reads it back" {
 
 test "two reads of an unchanged machine differ in nothing, in either order" {
     const first = try filled(&.{
-        on_iface("eth0", v4(1), true, false),
-        on_iface("eth1", v4(2), true, false),
+        onIface("eth0", v4(1), true, false),
+        onIface("eth1", v4(2), true, false),
     });
     const same = try filled(&.{
-        on_iface("eth0", v4(1), true, false),
-        on_iface("eth1", v4(2), true, false),
+        onIface("eth0", v4(1), true, false),
+        onIface("eth1", v4(2), true, false),
     });
     const reversed = try filled(&.{
-        on_iface("eth1", v4(2), true, false),
-        on_iface("eth0", v4(1), true, false),
+        onIface("eth1", v4(2), true, false),
+        onIface("eth0", v4(1), true, false),
     });
 
     // Order is the kernel's and no rule depends on it, so a read that came back
@@ -655,10 +655,10 @@ test "two reads of an unchanged machine differ in nothing, in either order" {
 
 test "the comparison follows the policy the change was stored with" {
     const with_loopback = try filled(&.{
-        on_iface("lo", v4(3), true, true),
-        on_iface("eth0", v4(1), true, false),
+        onIface("lo", v4(3), true, true),
+        onIface("eth0", v4(1), true, false),
     });
-    const without_loopback = try filled(&.{on_iface("eth0", v4(1), true, false)});
+    const without_loopback = try filled(&.{onIface("eth0", v4(1), true, false)});
 
     // The same two reads, one machine that lost nothing. Counted under a
     // policy that hides loopback — a peer on another host — the interface
@@ -688,12 +688,12 @@ test "the comparison follows the policy the change was stored with" {
 
 test "a change reports what appeared and what retired" {
     const before = try filled(&.{
-        on_iface("eth0", v4(1), true, false),
-        on_iface("eth1", v4(2), true, false),
+        onIface("eth0", v4(1), true, false),
+        onIface("eth1", v4(2), true, false),
     });
     const after = try filled(&.{
-        on_iface("eth1", v4(2), true, false),
-        on_iface("eth2", v4(9), true, false),
+        onIface("eth1", v4(2), true, false),
+        onIface("eth2", v4(9), true, false),
     });
 
     // One address went and a different one came: a swap. Reporting it as
@@ -713,14 +713,14 @@ test "a snapshot past the ceiling refuses rather than truncating" {
     var snapshot: Snapshot = undefined;
     snapshot.clear();
     for (1..max_entries + 1) |index| {
-        try snapshot.add(on_iface("eth0", v4(@intCast(index)), true, false));
+        try snapshot.add(onIface("eth0", v4(@intCast(index)), true, false));
     }
     try t.expectEqual(max_entries, snapshot.count());
 
     // A snapshot quietly missing an address would publish a local set short of
     // the truth, so the ceiling is a refusal and the entries already in are
     // still all there.
-    try t.expectError(error.TooManyEntries, snapshot.add(on_iface("eth1", v4(200), true, false)));
+    try t.expectError(error.TooManyEntries, snapshot.add(onIface("eth1", v4(200), true, false)));
     try t.expectEqual(max_entries, snapshot.count());
     try t.expect(std.meta.eql(v4(1), snapshot.at(0).?.ip));
     try t.expect(snapshot.at(max_entries) == null);
@@ -756,13 +756,13 @@ test "a kernel address word is the address, not its byte swap" {
 }
 
 test "an interface name is at most fifteen bytes" {
-    try t.expectEqualStrings("eth0", iface_name("eth0").slice());
+    try t.expectEqualStrings("eth0", ifaceName("eth0").slice());
     // The width is `IFNAMSIZ - 1`, so this name fills it exactly and a copy
     // bounded one byte short would lose the last one.
-    try t.expectEqualStrings("abcdefghijklmno", iface_name("abcdefghijklmno").slice());
+    try t.expectEqualStrings("abcdefghijklmno", ifaceName("abcdefghijklmno").slice());
     // And the bound holds for a name the kernel cannot produce. Nothing writes
     // sixteen bytes, so this pins the width rather than a machine.
-    try t.expectEqual(name_length, iface_name("abcdefghijklmnopqrst").len);
+    try t.expectEqual(name_length, ifaceName("abcdefghijklmnopqrst").len);
 }
 
 // The only test here that needs this machine's real interface list, because it

@@ -16,9 +16,12 @@ pub const GossipEvidence = struct {
         peer: ozai.NodeId,
         payload: []const u8,
     ) void {
-        const self: *GossipEvidence = @ptrCast(@alignCast(context.?));
+        const pointer = context orelse @panic("gossip evidence callback requires its context");
+        const self: *GossipEvidence = @ptrCast(@alignCast(pointer));
         if (self.failure != null) return;
-        self.write(topic, peer, payload) catch |err| { self.failure = err; };
+        self.write(topic, peer, payload) catch |err| {
+            self.failure = err;
+        };
     }
 
     fn write(
@@ -27,8 +30,10 @@ pub const GossipEvidence = struct {
         peer: ozai.NodeId,
         payload: []const u8,
     ) std.Io.Writer.Error!void {
-        try self.writer.print("gossip received topic {x} peer {f} bytes {d} payload {x}\n",
-            .{ topic.bytes, peer, payload.len, payload });
+        try self.writer.print(
+            "gossip received topic {x} peer {f} bytes {d} payload {x}\n",
+            .{ topic.bytes, peer, payload.len, payload },
+        );
         try self.writer.flush();
     }
 };
@@ -46,17 +51,34 @@ pub fn report(
             "dials: {d} of {d} refused; {d} connections finished\n" ++
             "gossip: neighbour up {d}, down {d}; broadcasts received {d}\n" ++
             "held: connections up {d}, at the stop\n" ++
-            "close: {d} connections owed, {d} close datagrams written, 0 acknowledged by any peer\n",
-        .{ stats.steps, stats.datagrams_in, stats.datagrams_out,
-            stats.attempts, stats.spawned, stats.handler_connections,
-            stats.dials, stats.dials_refused, stats.connections_finished,
-            stats.neighbor_up, stats.neighbor_down, stats.broadcasts_received,
-            holding.connections, close.connections, close.datagrams },
+            "close: {d} connections owed, {d} close datagrams written, " ++
+            "0 acknowledged by any peer\n",
+        .{
+            stats.steps,
+            stats.datagrams_in,
+            stats.datagrams_out,
+            stats.attempts,
+            stats.spawned,
+            stats.handler_connections,
+            stats.dials,
+            stats.dials_refused,
+            stats.connections_finished,
+            stats.neighbor_up,
+            stats.neighbor_down,
+            stats.broadcasts_received,
+            holding.connections,
+            close.connections,
+            close.datagrams,
+        },
     );
     try text.print(
         "shutdown: {t}, {d} handler shutdowns, {d} accepts cancelled, socket {s}\n",
-        .{ node.accept.shutdown.phase, stats.handler_shutdowns, stats.accepts_cancelled,
-            if (node.socket_open) "still open" else "closed" },
+        .{
+            node.accept.shutdown.phase,
+            stats.handler_shutdowns,
+            stats.accepts_cancelled,
+            if (node.socket_open) "still open" else "closed",
+        },
     );
 }
 
@@ -68,6 +90,7 @@ test "gossip evidence preserves complete binary payload" {
     defer secret.deinit();
     GossipEvidence.receive(&evidence, .{ .bytes = @splat(1) }, secret.nodeId(), "\x00a\xff\n");
     try std.testing.expect(evidence.failure == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "bytes 4 payload 0061ff0a\n") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, out.written(), "bytes 4 payload 0061ff0a\n") != null,
+    );
 }
-

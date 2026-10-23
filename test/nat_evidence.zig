@@ -10,8 +10,7 @@ pub const Evidence = struct {
         var canonical: [4096]u8 = undefined;
         const length = try std.Io.Dir.realPathFileAbsolute(io, path, &canonical);
         if (!std.mem.eql(u8, canonical[0..length], path)) return error.UnsafeEvidencePath;
-        const directory = try std.Io.Dir.openDirAbsolute(io, path,
-            .{ .follow_symlinks = false });
+        const directory = try std.Io.Dir.openDirAbsolute(io, path, .{ .follow_symlinks = false });
         errdefer directory.close(io);
         try process.assertOwnedDir(directory);
         return .{ .directory = directory };
@@ -26,8 +25,15 @@ pub const Evidence = struct {
         if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null)
             return error.InvalidEvidenceName;
         try process.assertOwnedDir(self.directory);
-        const file = try self.directory.createFile(io, name,
-            .{ .exclusive = true, .truncate = false, .permissions = .fromMode(0o600) });
+        const file = try self.directory.createFile(
+            io,
+            name,
+            .{
+                .exclusive = true,
+                .truncate = false,
+                .permissions = .fromMode(0o600),
+            },
+        );
         defer file.close(io);
         try file.writeStreamingAll(io, bytes);
     }

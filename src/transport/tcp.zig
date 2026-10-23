@@ -1,130 +1,16 @@
-//! Nonblocking TCP streams and listeners, with caller-owned buffers and polling.
-//!
-//! This file mirrors `transport/socket.zig`, and the mirroring is the point —
-//! the datagram socket is the seam this project already established, and a
-//! second stream seam that disagreed with it about where `io` lives, about
-//! what a stop may do, or about which error a timeout is would be a second
-//! convention rather than a second module.
-//!
-//! # What is mirrored, and what it is for
-//!
-//! Read `transport/socket.zig` first; the shape is its and this file quotes it
-//! rather than restating it. Concretely, each of these is a copy of a decision
-//! `socket.zig` already argues for, not a habit:
-//!
-//! - **`io` is a parameter and is stored nowhere.** `docs/DECISIONS/0002` says
-//!   "`rt.io()` is never stored. It is a parameter to the functions that need
-//!   it", so `Tcp` holds descriptors and a flag and no `Io`. What the runtime
-//!   is asked for is cancellation and nothing else, because a descriptor this
-//!   module opened is a descriptor no `Io` backend has been told about, and
-//!   handing it to one would be a claim that only holds for `Io.Threaded`.
-//! - **`io` is the second parameter**, after the receiver, on every operation
-//!   that needs it. `socket.zig` gives the reason: a method's receiver is its
-//!   first parameter, and every other method on every other type in this
-//!   project puts its receiver first. `stop` is the one operation without an
-//!   `io`, and that is the one a signal handler may call.
-//! - **The wake descriptor is the second descriptor the struct owns.** A
-//!   `poll` is asleep in the kernel; there is nowhere to consult a flag from,
-//!   so a wait that has to be *ended* rather than run to the end of its slice
-//!   needs a descriptor to become readable. An `eventfd` rather than a
-//!   self-pipe, for `socket.zig`'s reasons: one descriptor instead of two, a
-//!   counter instead of a byte buffer, and `EFD_SEMAPHORE` so a read takes one
-//!   wake off the counter rather than all of them.
-//! - **Stop is two signal-handler-safe calls**: one atomic store and one
-//!   `write`. Both are on POSIX's list; an `Io` is not, and the drain
-//!   `socket.zig`'s stop defers to a send would need `recvmsg`, which is not.
-//! - **The wake is polled beside the handle, and stop outranks readiness.** A
-//!   stop is a message to the wait, not a fact about the stream, so it is
-//!   checked first and it answers `error.Canceled` whatever else the same
-//!   `poll` pass found.
-//! - **`EINTR` is retried under a fixed bound**, because a signal is not a
-//!   fact about a connection and retrying is the only correct answer, and a
-//!   timeout answers `error.WouldBlock` — the same answer `Socket.receive`
-//!   gives for a datagram queue that stayed empty.
-//! - **No buffer is stored.** The caller's buffer is the caller's, which is
-//!   what lets a stack pool one and what lets a test hand over a stack array.
-//!
-//! # Where this file parts company: a stopped stream stays stopped
-//!
-//! `Socket.stop` is a message, not a latch, because a stopped datagram socket
-//! is still usable: the next send drains the queue and spends the counter, and
-//! the datagrams in that queue are the kernel's to drop — nobody had read them
-//! and nobody is going to. **A stream has no equivalent of that drain**, and
-//! that is a fact about streams rather than a decision this module made.
-//! Every byte in a stream's receive buffer was put there by the peer and is
-//! owed to it, and there is no read that discards a stream's bytes without
-//! discarding a protocol message somebody is part way through decoding. So
-//! there is nothing to drain, nothing to restart, and no method here that
-//! un-stops a stream: `stop` is terminal and a caller that has stopped a
-//! stream closes it. The absence is the point — a `Tcp` with a restart path
-//! would be a restart that has to invent somewhere to put the bytes it just
-//! threw away.
-//!
-//! # Listener and incremental connect
-//!
-//! `Listener` owns a nonblocking listening descriptor. `accept` never waits:
-//! an empty queue returns null, and a successful accept transfers a new `Tcp`
-//! with its own wake descriptor to the caller. The bound address is read back
-//! from the kernel so an ephemeral bind reports its actual port.
-//!
-//! `startConnect` starts one handshake and records its state. Further starts
-//! report that state without repeating `connect(2)`. `finishConnect` polls
-//! with a zero timeout and returns false while the handshake is pending.
-//! `connect` is the bounded-wait convenience over the same state machine.
-//! A failed handshake retains its error: reading `SO_ERROR` clears the kernel
-//! error, but must not turn a failed stream into a successful one.
-//!
-//! # The half-close, and the short write
-//!
-//! Two decisions, and they are the ones where a caller can lose track of its
-//! own bytes:
-//!
-//! **A peer's half-close is a `read` of zero, never an error.** `read(2)` is
-//! the standard for this: a return of zero is how POSIX spells end-of-file,
-//! and for a stream that is the peer's `shutdown(SHUT_WR)` or its last
-//! `close`. It is a count rather than a failure because the peer that
-//! half-closed can still read — the other direction stays open until this one
-//! closes it — so refusing it would tell a caller the stream is finished when
-//! it is only half finished, and a caller that believes that will not send the
-//! last thing it had to say.
-//!
-//! **A write that transfers less than it was handed is a short count, never an
-//! error.** A stream has no message boundary and no datagram size limit, so
-//! `send(2)` takes what fits in the send buffer and returns that count. The
-//! alternative would have to be an error, and *an error with no count is the
-//! one thing that loses a caller's bytes*: the caller cannot then tell how much
-//! of its buffer left the host and where to resume from. So the count is the
-//! whole contract, and `error.PeerClosed` — which is `EPIPE` and carries the
-//! guarantee that nothing at all was written — is the only write refusal that
-//! says anything about bytes, because it says they are all still there.
-//!
-//! Together the two are the accounting: every byte a caller handed this module
-//! either appears in a returned count or is reported with the count unchanged.
-//! No path returns an error without saying how much left.
-//!
-//! # Reuse
-//!
-//! The address conversions are `transport/socket_addr.zig`'s
-//! `writeSockaddr` and `readSockaddr`, reached where they are defined rather
-//! than through `socket.zig`, because importing that facade for two functions
-//! would pull the whole datagram surface into every caller of a stream. The
-//! `eventfd` and the `getsockname` are `transport/socket_open.zig`'s
-//! `createWake` and `boundAddress` for the same reason, and the errno
-//! vocabulary of the open is that file's `OpenError`. `transport` does not
-//! import `discovery`, and this file is where that direction is kept.
-
+//! Owned incremental TCP streams with borrowed execution and caller-owned buffers.
 const std = @import("std");
 
 const base_addr = @import("../base/addr.zig");
-const socket_addr = @import("socket_addr.zig");
-const socket_open = @import("socket_open.zig");
-
+const execution_module = @import("tcp_execution.zig");
+const Execution = execution_module.Execution;
 const tcp_error = @import("tcp_error.zig");
 const tcp_sys = @import("tcp_sys.zig");
-
 const posix = std.posix;
 const c = std.c;
 const linux = std.os.linux;
+const readSockaddr = @import("socket_addr.zig").readSockaddr;
+const writeSockaddr = @import("socket_addr.zig").writeSockaddr;
 
 /// See `tcp_sys.max_syscall_attempts`.
 pub const max_syscall_attempts = tcp_sys.max_syscall_attempts;
@@ -140,22 +26,10 @@ pub const ReadError = tcp_error.ReadError;
 /// See `tcp_error.WriteError`.
 pub const WriteError = tcp_error.WriteError;
 
-const readSockaddr = socket_addr.readSockaddr;
-const writeSockaddr = socket_addr.writeSockaddr;
-const createWake = socket_open.createWake;
-
-/// The counter an `eventfd` counts in, which the kernel fixes at eight bytes
-/// and both `read` and `write` want all of. A value rather than a count of
-/// anything in this file, which is the whole of what a wake carries.
-const wake_width = @sizeOf(u64);
-
 /// An owned TCP stream, created unconnected or accepted already connected.
 ///
-/// No `Io` is stored, for the reason the module doc gives. No buffer is
-/// either: the receive buffer is the caller's, which is what lets a stack pool
-/// one and what lets a test hand over a stack array. The descriptors own the
-/// connection and its terminal stop wake; connect state records the handshake
-/// independently of the stop flag.
+/// No Io or buffer is stored. Execution is borrowed through cleanup and all
+/// concurrent stop calls, so the provider must outlive this owner.
 ///
 /// A successful `create` owns both descriptors. Close them exactly once, with
 /// `close`, after all operations and stop callers finish. Copies share those
@@ -172,9 +46,8 @@ pub const Tcp = struct {
     /// The descriptor a stop writes to, in the same `poll` set as `handle`
     /// and the only thing that can end a wait before its timeout.
     wake: c.fd_t,
-    /// Set by `stop` and never cleared. There is no restart path and the
-    /// module doc says why there cannot be one; every wait on a stopped
-    /// stream answers `error.Canceled` at once.
+    execution: Execution,
+    /// Terminal latch: stream bytes cannot be drained to implement a restart.
     stopped: std.atomic.Value(bool),
     /// Requested destination for a client, or the accepted peer for a server.
     peer: base_addr.SocketAddr,
@@ -197,16 +70,17 @@ pub const Tcp = struct {
     /// matters twice over: a stream whose wait cannot be ended is the failure
     /// the wake descriptor exists to prevent, and a stream opened for the
     /// wrong family cannot connect at all.
-    pub fn create(peer: base_addr.SocketAddr) OpenError!Tcp {
-        const handle = try tcp_sys.createStream(peer.ip);
-        errdefer _ = c.close(handle);
-        // After the descriptor, because a socket refused on nothing is one
-        // fewer descriptor to leak than a socket refused after its wake.
-        const wake = try createWake();
-        errdefer _ = c.close(wake);
+    pub fn create(io: std.Io, peer: base_addr.SocketAddr, execution: Execution) OpenError!Tcp {
+        try io.checkCancel();
+        const handle = try execution.vtable.createStream(io, execution.context, peer.ip);
+        errdefer execution.vtable.close(execution.context, handle);
+        try io.checkCancel();
+        const wake = try execution.vtable.createWake(io, execution.context);
+        errdefer execution.vtable.close(execution.context, wake);
         return .{
             .handle = handle,
             .wake = wake,
+            .execution = execution,
             .stopped = .init(false),
             .peer = peer,
             .local = .{ .ip = peer.ip, .port = 0 },
@@ -221,31 +95,19 @@ pub const Tcp = struct {
     /// after this and a `defer stream.close()` on a stopped stream must not
     /// be able to hand back something that looks usable.
     pub fn close(self: *Tcp) void {
-        _ = c.close(self.wake);
-        _ = c.close(self.handle);
+        self.execution.vtable.close(self.execution.context, self.wake);
+        self.execution.vtable.close(self.execution.context, self.handle);
     }
 
     /// Name this stream stopped: end the wait in flight, and answer every
     /// later wait at once.
     ///
-    /// Both halves of this body are `transport/socket.zig`'s `Socket.stop` and
-    /// both are here for its reasons. Everything the body does is something a
-    /// signal handler may do: one store and one `write`, both on POSIX's list
-    /// of calls such a handler is allowed to make. A store alone is not a wake
-    /// — there is nowhere to consult a flag from, because the waiter is asleep
-    /// in the kernel — and the drain `Socket.stop` defers to its next send
-    /// would need `recvmsg`, which is not on that list.
-    ///
-    /// **A stopped stream stays stopped.** See the module doc: a stream's
-    /// receive buffer is bytes the peer is owed and nothing may discard them,
-    /// so there is no drain to perform and no restart to perform it for. There
-    /// is no method that un-stops this value.
-    ///
-    /// Keep the stream alive and open until every concurrent stop returns.
+    /// Only native Execution is signal-handler safe. Scripted callbacks must
+    /// be called from ordinary execution. Keep this owner and its provider alive
+    /// until every concurrent stop returns. Stop never drains stream bytes.
     pub fn stop(self: *Tcp) void {
         self.stopped.store(true, .release);
-        var one: u64 = 1;
-        _ = c.write(self.wake, std.mem.asBytes(&one), wake_width);
+        self.execution.vtable.wake(self.execution.context, self.wake);
     }
 
     /// Connect to `peer`, waiting at most `timeout_ms`, and say what it cost.
@@ -262,8 +124,7 @@ pub const Tcp = struct {
     /// `ECONNREFUSED` implementation-defined, so a caller that wants to try
     /// again closes this one and opens another.
     pub fn connect(self: *Tcp, io: std.Io, timeout_ms: ?i32) ConnectError!void {
-        try io.checkCancel();
-        if (try self.startConnect()) return;
+        if (try self.startConnect(io)) return;
         try self.awaitReady(io, timeout_ms, posix.POLL.OUT);
         if (!try self.finishConnect(io)) return error.WouldBlock;
     }
@@ -271,37 +132,34 @@ pub const Tcp = struct {
     /// Start one nonblocking handshake. True means connected; false means pending.
     /// Repeated calls report the retained state without issuing another connect.
     /// A terminal error is retained until close; the descriptor cannot be reused.
-    pub fn startConnect(self: *Tcp) ConnectError!bool {
+    pub fn startConnect(self: *Tcp, io: std.Io) ConnectError!bool {
         if (self.stopped.load(.acquire)) return error.Canceled;
+        try io.checkCancel();
         switch (self.connect_state) {
             .idle => {},
             .connecting => return false,
             .connected => return true,
             .failed => |err| return err,
         }
-        var name: c.sockaddr.storage = undefined;
-        const length = writeSockaddr(self.peer, &name);
-        const result = c.connect(self.handle, @as(*const c.sockaddr, @ptrCast(&name)), length);
-        switch (c.errno(result)) {
-            .SUCCESS => return self.completeConnect(),
-            // EINTR may leave the handshake running; never issue a second connect.
-            .INPROGRESS, .ALREADY, .AGAIN, .INTR => {
-                self.connect_state = .connecting;
-                return false;
-            },
-            else => |errno| {
-                const err = connectError(errno);
-                self.connect_state = .{ .failed = err };
-                return err;
-            },
-        }
+        const connected = self.execution.vtable.startConnect(
+            io,
+            self.execution.context,
+            self.handle,
+            self.peer,
+        ) catch |err| {
+            self.connect_state = .{ .failed = err };
+            return err;
+        };
+        if (connected) return self.completeConnect(io);
+        self.connect_state = .connecting;
+        return false;
     }
 
     /// Poll a pending handshake once with zero timeout, without restarting it.
     /// False means not ready yet. Calling before startConnect is Unexpected.
     pub fn finishConnect(self: *Tcp, io: std.Io) ConnectError!bool {
-        try io.checkCancel();
         if (self.stopped.load(.acquire)) return error.Canceled;
+        try io.checkCancel();
         switch (self.connect_state) {
             .idle => return error.Unexpected,
             .connecting => {},
@@ -312,17 +170,26 @@ pub const Tcp = struct {
             error.WouldBlock => return false,
             else => return err,
         };
-        tcp_sys.connectResult(self.handle) catch |err| {
+        self.execution.vtable.connectionError(io, self.execution.context, self.handle) catch |err| {
             self.connect_state = .{ .failed = err };
             return err;
         };
-        return self.completeConnect();
+        return self.completeConnect(io);
     }
 
-    fn completeConnect(self: *Tcp) ConnectError!bool {
-        self.local = tcp_sys.localAddress(self.handle) catch |err| {
-            self.connect_state = .{ .failed = err };
-            return err;
+    fn completeConnect(self: *Tcp, io: std.Io) ConnectError!bool {
+        self.local = self.execution.vtable.boundAddress(
+            io,
+            self.execution.context,
+            self.handle,
+        ) catch |err| {
+            const mapped: ConnectError = switch (err) {
+                error.AddressNotAvailable => error.AddressNotAvailable,
+                error.Canceled => error.Canceled,
+                else => error.Unexpected,
+            };
+            self.connect_state = .{ .failed = mapped };
+            return mapped;
         };
         self.connect_state = .connected;
         return true;
@@ -346,7 +213,7 @@ pub const Tcp = struct {
         timeout_ms: ?i32,
     ) ReadError!usize {
         try self.awaitReady(io, timeout_ms, posix.POLL.IN);
-        return tcp_sys.recvStream(self.handle, io, buffer);
+        return self.execution.vtable.read(io, self.execution.context, self.handle, buffer);
     }
 
     /// Put as much of `bytes` on the wire as the stream takes, and say how
@@ -369,171 +236,31 @@ pub const Tcp = struct {
         timeout_ms: ?i32,
     ) WriteError!usize {
         try self.awaitReady(io, timeout_ms, posix.POLL.OUT);
-        return tcp_sys.sendStream(self.handle, io, bytes);
+        return self.execution.vtable.write(io, self.execution.context, self.handle, bytes);
     }
 
     /// Wait for the descriptor to be ready for `events`, or for a stop to end
     /// the wait.
     ///
-    /// A `poll` on the descriptor and not an `Io` operation, for
-    /// `transport/socket.zig`'s reason: this module opened the descriptor with
-    /// `std.c.socket`, so no backend has ever been told the descriptor exists
-    /// and only `Io.Threaded` would cope with being handed one.
-    /// `posix.poll` already retries a signal, and zero ready is the timeout
-    /// rather than an error.
-    ///
-    /// The set has two entries, and that is the whole of how a stop reaches a
-    /// wait already in progress: the wake is a descriptor like any other and
-    /// `poll` returns for it exactly as it returns for a byte. **A stop is
-    /// checked first and outranks whatever else the same pass found**: it is a
-    /// message to the wait and not a fact about the stream, and a wait that
-    /// has been told to stop is over whether or not bytes were ready.
-    ///
-    /// The wake counter is deliberately left standing. Nothing here spends it,
-    /// because there is no restart for it to be spent on: `stop` is terminal,
-    /// so a unit standing on the counter is the correct state of a stopped
-    /// stream, and every later wait answers `error.Canceled` at once rather
-    /// than waiting on a descriptor nobody will use again.
+    /// The owner checks its terminal latch after the callback too: a concurrent
+    /// stop outranks readiness and provider errors from the same wait.
     fn awaitReady(
         self: *const Tcp,
         io: std.Io,
         timeout_ms: ?i32,
         events: i16,
     ) WaitError!void {
-        try io.checkCancel();
         if (self.stopped.load(.acquire)) return error.Canceled;
-        var descriptors = [_]posix.pollfd{
-            .{
-                .fd = self.handle,
-                .events = events,
-                .revents = 0,
-            },
-            .{
-                .fd = self.wake,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            },
-        };
-        _ = posix.poll(&descriptors, timeout_ms orelse -1) catch |err| switch (err) {
-            error.NetworkDown => return error.NetworkDown,
-            error.SystemResources => return error.ResourcesExhausted,
-            error.Unexpected => return error.Unexpected,
-        };
-        if (descriptors[1].revents != 0) return error.Canceled;
-        if (descriptors[0].revents == 0) return error.WouldBlock;
-    }
-};
-
-fn connectError(errno: c.E) ConnectError {
-    return switch (errno) {
-        .CONNREFUSED => error.ConnectionRefused,
-        .TIMEDOUT => error.ConnectionTimedOut,
-        .NETUNREACH => error.NetworkUnreachable,
-        .HOSTUNREACH => error.HostUnreachable,
-        .NETDOWN => error.NetworkDown,
-        .ADDRNOTAVAIL => error.AddressNotAvailable,
-        .ACCES, .PERM => error.PermissionDenied,
-        .CONNRESET => error.ConnectionReset,
-        .NOMEM, .NOBUFS => error.ResourcesExhausted,
-        else => error.Unexpected,
-    };
-}
-
-/// Socket creation and binding errors, plus interruption of listen.
-pub const ListenError = OpenError || error{Interrupted};
-/// Accept errors include creation of the accepted stream's owned wake descriptor.
-pub const AcceptError = OpenError || error{
-    Interrupted,
-    ConnectionAborted,
-    NetworkDown,
-    NetworkUnreachable,
-    HostUnreachable,
-    ProtocolUnsupported,
-};
-
-/// An owned nonblocking listener. Close exactly once after accept callers finish.
-/// Copies share the descriptor; serialize accept calls and do not close a copy.
-pub const Listener = struct {
-    handle: c.fd_t,
-    /// Actual bound address, including the kernel-selected ephemeral port.
-    local: base_addr.SocketAddr,
-
-    /// Bind and listen with a bounded kernel backlog; no runtime or wake is stored.
-    pub fn init(bind: base_addr.SocketAddr) ListenError!Listener {
-        const handle = try tcp_sys.createStream(bind.ip);
-        errdefer _ = c.close(handle);
-        var name: c.sockaddr.storage = undefined;
-        const length = writeSockaddr(bind, &name);
-        try socket_open.bindSocket(handle, &name, length);
-        var attempt: usize = 0;
-        while (attempt < max_syscall_attempts) : (attempt += 1) {
-            const result = c.listen(handle, 128);
-            switch (c.errno(result)) {
-                .SUCCESS => return .{
-                    .handle = handle,
-                    .local = try socket_open.boundAddress(handle),
-                },
-                .INTR => continue,
-                .ADDRINUSE => return error.AddressInUse,
-                .ACCES, .PERM => return error.PermissionDenied,
-                .NOMEM, .NOBUFS => return error.ResourcesExhausted,
-                .OPNOTSUPP => return error.SocketModeUnsupported,
-                .INVAL => return error.InvalidArgument,
-                else => return error.Unexpected,
-            }
-        }
-        return error.Interrupted;
-    }
-
-    /// Return null immediately when no connection is queued. A returned stream
-    /// owns both accepted and wake descriptors and must be closed exactly once.
-    pub fn accept(self: *const Listener) AcceptError!?Tcp {
-        var attempt: usize = 0;
-        while (attempt < max_syscall_attempts) : (attempt += 1) {
-            var name: c.sockaddr.storage = undefined;
-            var length: c.socklen_t = @sizeOf(c.sockaddr.storage);
-            const handle = c.accept4(
-                self.handle,
-                @as(*c.sockaddr, @ptrCast(&name)),
-                &length,
-                linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
-            );
-            if (handle >= 0) {
-                errdefer _ = c.close(handle);
-                const peer = readSockaddr(&name) orelse return error.AddressFamilyUnsupported;
-                const local = try socket_open.boundAddress(handle);
-                const wake = try createWake();
-                return Tcp{
-                    .handle = handle,
-                    .wake = wake,
-                    .stopped = .init(false),
-                    .peer = peer,
-                    .local = local,
-                    .connect_state = .connected,
-                };
-            }
-            switch (c.errno(handle)) {
-                .INTR => continue,
-                .AGAIN => return null,
-                .CONNABORTED => return error.ConnectionAborted,
-                .ACCES, .PERM => return error.PermissionDenied,
-                .MFILE, .NFILE => return error.DescriptorQuotaExceeded,
-                .NOMEM, .NOBUFS => return error.ResourcesExhausted,
-                .NETDOWN => return error.NetworkDown,
-                .NETUNREACH => return error.NetworkUnreachable,
-                .HOSTUNREACH, .HOSTDOWN => return error.HostUnreachable,
-                .PROTO, .NOPROTOOPT => return error.ProtocolUnsupported,
-                .OPNOTSUPP => return error.SocketModeUnsupported,
-                .INVAL => return error.InvalidArgument,
-                else => return error.Unexpected,
-            }
-        }
-        return error.Interrupted;
-    }
-
-    /// Close the listener, not streams already transferred by accept.
-    pub fn close(self: *Listener) void {
-        _ = c.close(self.handle);
+        try io.checkCancel();
+        const result = self.execution.vtable.wait(io, self.execution.context, .{
+            .handle = self.handle,
+            .wake = self.wake,
+            .events = events,
+            .timeout_ms = timeout_ms,
+        });
+        if (self.stopped.load(.acquire)) return error.Canceled;
+        try io.checkCancel();
+        try result;
     }
 };
 
@@ -548,29 +275,29 @@ fn loopback(port: u16) base_addr.SocketAddr {
 
 test "a nonblocking listener reports an empty accept queue" {
     // An empty queue must return immediately without allocating a stream or wake.
-    var listener = try Listener.init(loopback(0));
+    var listener = try @import("tcp_listener.zig").Listener.init(t.io, loopback(0), .native);
     defer listener.close();
     try t.expect(listener.local.port != 0);
-    try t.expect((try listener.accept()) == null);
+    try t.expect((try listener.accept(t.io)) == null);
 }
 
 test "incremental connect and listener exchange bytes with correct addresses" {
     // Exercise the public server seam and repeated starts without a second handshake.
-    var listener = try Listener.init(loopback(0));
+    var listener = try @import("tcp_listener.zig").Listener.init(t.io, loopback(0), .native);
     defer listener.close();
-    var client = try Tcp.create(listener.local);
+    var client = try Tcp.create(t.io, listener.local, .native);
     defer client.close();
-    const connected = try client.startConnect();
-    try t.expectEqual(connected, try client.startConnect());
+    const connected = try client.startConnect(t.io);
+    try t.expectEqual(connected, try client.startConnect(t.io));
     var ready = [_]posix.pollfd{
         .{ .fd = client.handle, .events = posix.POLL.OUT, .revents = 0 },
         .{ .fd = listener.handle, .events = posix.POLL.IN, .revents = 0 },
     };
     _ = try posix.poll(&ready, fixture_timeout_ms);
     try t.expect(try client.finishConnect(t.io));
-    try t.expect(try client.startConnect());
+    try t.expect(try client.startConnect(t.io));
     try t.expect(try client.finishConnect(t.io));
-    var server = (try listener.accept()) orelse return error.TestFixtureRefused;
+    var server = (try listener.accept(t.io)) orelse return error.TestFixtureRefused;
     defer server.close();
     try t.expectEqual(listener.local, server.local);
     try t.expectEqual(client.local, server.peer);
@@ -586,11 +313,11 @@ test "incremental connect and listener exchange bytes with correct addresses" {
     try t.expectEqual(@as(usize, 4), try server.write(t.io, "pong", fixture_timeout_ms));
     try t.expectEqual(@as(usize, 4), try client.read(t.io, &buffer, fixture_timeout_ms));
     try t.expectEqualStrings("pong", &buffer);
-    try t.expect((try listener.accept()) == null);
+    try t.expect((try listener.accept(t.io)) == null);
     server.stop();
     try t.expectError(error.Canceled, server.read(t.io, &buffer, 0));
     client.stop();
-    try t.expectError(error.Canceled, client.startConnect());
+    try t.expectError(error.Canceled, client.startConnect(t.io));
     try t.expectError(error.Canceled, client.finishConnect(t.io));
 }
 
@@ -598,12 +325,12 @@ test "incremental connect retains a failed result and never restarts it" {
     // SO_ERROR is consumed by reads, so a refused handshake must retain its result.
     const handle = try bindLoopback(0);
     defer _ = c.close(handle);
-    var client = try Tcp.create(loopback(try portOf(handle)));
+    var client = try Tcp.create(t.io, loopback(try portOf(handle)), .native);
     defer client.close();
     try t.expectError(error.Unexpected, client.finishConnect(t.io));
-    const connected = client.startConnect() catch |err| {
+    const connected = client.startConnect(t.io) catch |err| {
         try t.expectEqual(error.ConnectionRefused, err);
-        try t.expectError(error.ConnectionRefused, client.startConnect());
+        try t.expectError(error.ConnectionRefused, client.startConnect(t.io));
         return;
     };
     try t.expect(!connected);
@@ -613,7 +340,7 @@ test "incremental connect retains a failed result and never restarts it" {
     _ = try posix.poll(&ready, fixture_timeout_ms);
     try t.expectError(error.ConnectionRefused, client.finishConnect(t.io));
     try t.expectError(error.ConnectionRefused, client.finishConnect(t.io));
-    try t.expectError(error.ConnectionRefused, client.startConnect());
+    try t.expectError(error.ConnectionRefused, client.startConnect(t.io));
 }
 
 /// A real peer on the other end of a real stream, for the tests that need one.
@@ -640,7 +367,7 @@ const Pair = struct {
         const listener = try bindLoopback(0);
         errdefer _ = c.close(listener);
         if (c.listen(listener, 1) != 0) return error.TestFixtureRefused;
-        var stream = try Tcp.create(loopback(try portOf(listener)));
+        var stream = try Tcp.create(t.io, loopback(try portOf(listener)), .native);
         errdefer stream.close();
         try stream.connect(t.io, fixture_timeout_ms);
         return .{ .listener = listener, .peer = try acceptOne(listener), .stream = stream };
@@ -650,6 +377,7 @@ const Pair = struct {
         self.stream.close();
         if (self.peer_open) _ = c.close(self.peer);
         _ = c.close(self.listener);
+        self.* = undefined;
     }
 
     /// Take exactly `buffer.len` bytes from the peer, or say the fixture
@@ -738,7 +466,7 @@ test "a port that is bound and not listening refuses the connect" {
     // connect.
     const listener = try bindLoopback(0);
     defer _ = c.close(listener);
-    var stream = try Tcp.create(loopback(try portOf(listener)));
+    var stream = try Tcp.create(t.io, loopback(try portOf(listener)), .native);
     defer stream.close();
 
     // The refusal is a named arm and not a bare errno, which is what a
@@ -875,4 +603,203 @@ fn stopAfter(io: std.Io, stream: *Tcp, delay_ms: i64) void {
         error.Canceled => {},
     };
     stream.stop();
+}
+
+const StreamScript = struct {
+    fail_at: ?usize = null,
+    operation_count: usize = 0,
+    acquired: [2]bool = .{ false, false },
+    closes: [2]usize = .{ 0, 0 },
+    starts: usize = 0,
+    waits: usize = 0,
+    last_timeout_ms: ?i32 = null,
+    pending: bool = true,
+    wait_error: ?WaitError = null,
+    connection_error: ?ConnectError = null,
+    read_calls: usize = 0,
+    write_calls: usize = 0,
+    stop_during_wait: ?*Tcp = null,
+    wakes: usize = 0,
+
+    fn execution(self: *StreamScript) Execution {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn state(context: ?*anyopaque) *StreamScript {
+        return @ptrCast(@alignCast(context.?));
+    }
+
+    fn trip(self: *StreamScript) OpenError!void {
+        const index = self.operation_count;
+        self.operation_count += 1;
+        if (self.fail_at == index) return error.ResourcesExhausted;
+    }
+
+    fn createStream(_: std.Io, context: ?*anyopaque, _: base_addr.IpAddress) OpenError!c.fd_t {
+        const self = state(context);
+        try self.trip();
+        self.acquired[0] = true;
+        return 0;
+    }
+
+    fn createWake(_: std.Io, context: ?*anyopaque) OpenError!c.fd_t {
+        const self = state(context);
+        try self.trip();
+        self.acquired[1] = true;
+        return 1;
+    }
+
+    fn close(context: ?*anyopaque, handle: c.fd_t) void {
+        const self = state(context);
+        const index: usize = @intCast(handle);
+        std.debug.assert(self.acquired[index]);
+        self.closes[index] += 1;
+        std.debug.assert(self.closes[index] == 1);
+    }
+
+    fn wake(context: ?*anyopaque, handle: c.fd_t) void {
+        std.debug.assert(handle == 1);
+        state(context).wakes += 1;
+    }
+
+    fn startConnect(
+        _: std.Io,
+        context: ?*anyopaque,
+        _: c.fd_t,
+        _: base_addr.SocketAddr,
+    ) ConnectError!bool {
+        const self = state(context);
+        self.starts += 1;
+        return !self.pending;
+    }
+
+    fn wait(_: std.Io, context: ?*anyopaque, options: execution_module.WaitOptions) WaitError!void {
+        const self = state(context);
+        self.waits += 1;
+        self.last_timeout_ms = options.timeout_ms;
+        if (self.stop_during_wait) |stream| stream.stop();
+        if (self.wait_error) |err| return err;
+    }
+
+    fn connectionError(_: std.Io, context: ?*anyopaque, _: c.fd_t) ConnectError!void {
+        if (state(context).connection_error) |err| return err;
+    }
+
+    fn boundAddress(_: std.Io, _: ?*anyopaque, _: c.fd_t) OpenError!base_addr.SocketAddr {
+        return loopback(1234);
+    }
+
+    fn read(_: std.Io, context: ?*anyopaque, _: c.fd_t, buffer: []u8) ReadError!usize {
+        const self = state(context);
+        self.read_calls += 1;
+        if (self.read_calls == 1) {
+            @memcpy(buffer[0..2], "ab");
+            return 2;
+        }
+        if (self.read_calls == 2) return error.ConnectionReset;
+        return 0;
+    }
+
+    fn write(_: std.Io, context: ?*anyopaque, _: c.fd_t, bytes: []const u8) WriteError!usize {
+        const self = state(context);
+        self.write_calls += 1;
+        std.debug.assert(bytes.len >= 2);
+        if (self.write_calls == 1) return 2;
+        return error.PeerClosed;
+    }
+
+    const vtable: Execution.VTable = blk: {
+        var table = Execution.native.vtable.*;
+        table.createStream = createStream;
+        table.createWake = createWake;
+        table.close = close;
+        table.wake = wake;
+        table.startConnect = startConnect;
+        table.wait = wait;
+        table.connectionError = connectionError;
+        table.boundAddress = boundAddress;
+        table.read = read;
+        table.write = write;
+        break :blk table;
+    };
+};
+
+test "scripted stream fail N closes every acquired descriptor once" {
+    // Refuse each acquisition in turn, then let construction succeed.
+    for (0..3) |failure| {
+        var script: StreamScript = .{ .fail_at = failure };
+        if (failure < 2) {
+            try t.expectError(
+                error.ResourcesExhausted,
+                Tcp.create(t.io, loopback(80), script.execution()),
+            );
+        } else {
+            var stream = try Tcp.create(t.io, loopback(80), script.execution());
+            stream.close();
+        }
+        for (script.acquired, script.closes) |acquired, count| {
+            try t.expectEqual(@as(usize, @intFromBool(acquired)), count);
+        }
+    }
+}
+
+test "scripted pending connect waits once and cancellation rolls back both descriptors" {
+    // Cancellation belongs to the owner rollback, not the provider's close callback.
+    var script: StreamScript = .{ .wait_error = error.Canceled };
+    {
+        var stream = try Tcp.create(t.io, loopback(80), script.execution());
+        defer stream.close();
+        try t.expect(!try stream.startConnect(t.io));
+        try t.expect(!try stream.startConnect(t.io));
+        try t.expectError(error.Canceled, stream.connect(t.io, 25));
+        try t.expectEqual(@as(usize, 1), script.starts);
+        try t.expectEqual(@as(usize, 1), script.waits);
+        try t.expectEqual(@as(?i32, 25), script.last_timeout_ms);
+    }
+    try t.expectEqualSlices(usize, &.{ 1, 1 }, &script.closes);
+}
+
+test "scripted finish polls zero and retains terminal connection failure" {
+    var script: StreamScript = .{ .wait_error = error.WouldBlock };
+    var stream = try Tcp.create(t.io, loopback(80), script.execution());
+    defer stream.close();
+    try t.expect(!try stream.startConnect(t.io));
+    try t.expect(!try stream.finishConnect(t.io));
+    try t.expectEqual(@as(?i32, 0), script.last_timeout_ms);
+    script.wait_error = null;
+    script.connection_error = error.ConnectionRefused;
+    try t.expectError(error.ConnectionRefused, stream.finishConnect(t.io));
+    script.connection_error = null;
+    try t.expectError(error.ConnectionRefused, stream.finishConnect(t.io));
+    try t.expectError(error.ConnectionRefused, stream.startConnect(t.io));
+    try t.expectEqual(@as(usize, 1), script.starts);
+}
+
+test "scripted stop outranks readiness and provider failure" {
+    var script: StreamScript = .{ .wait_error = error.NetworkDown };
+    var stream = try Tcp.create(t.io, loopback(80), script.execution());
+    defer stream.close();
+    script.stop_during_wait = &stream;
+    var buffer: [4]u8 = undefined;
+    try t.expectError(error.Canceled, stream.read(t.io, &buffer, 0));
+    try t.expectEqual(@as(usize, 1), script.wakes);
+    try t.expectEqual(@as(usize, 0), script.read_calls);
+}
+
+test "scripted short bytes survive later failures and EOF is zero" {
+    var script: StreamScript = .{};
+    {
+        var stream = try Tcp.create(t.io, loopback(80), script.execution());
+        defer stream.close();
+        var buffer: [4]u8 = undefined;
+        const read_count = try stream.read(t.io, &buffer, 0);
+        try t.expectEqual(@as(usize, 2), read_count);
+        try t.expectEqualStrings("ab", buffer[0..read_count]);
+        try t.expectError(error.ConnectionReset, stream.read(t.io, buffer[read_count..], 0));
+        try t.expectEqual(@as(usize, 0), try stream.read(t.io, &buffer, 0));
+        const written = try stream.write(t.io, "abcd", 0);
+        try t.expectEqual(@as(usize, 2), written);
+        try t.expectError(error.PeerClosed, stream.write(t.io, "abcd"[written..], 0));
+    }
+    try t.expectEqualSlices(usize, &.{ 1, 1 }, &script.closes);
 }

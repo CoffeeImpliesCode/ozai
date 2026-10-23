@@ -197,33 +197,39 @@ pub const PkarrPublisher = struct {
         const stored = self.stored orelse return error.NothingPublished;
         var writer = std.Io.Writer.fixed(out);
         for (stored.endpoint.addrs) |value| {
-            // One record at a time, into a scratch buffer, and copied out with
-            // its separator. The separator goes *between* records, and a `for`
-            // body is the only place that knows where one record ends; writing
-            // it here also means `max_record_length` is a bound this loop
-            // actually relies on rather than one it hopes for.
-            var scratch: [txt.max_record_length]u8 = undefined;
-            var line = std.Io.Writer.fixed(&scratch);
-            switch (value) {
-                .relay => |url| {
-                    line.writeAll("relay=") catch return error.BufferTooSmall;
-                    url.format(&line) catch return error.BufferTooSmall;
-                },
-                .ip => |socket| {
-                    line.writeAll("addr=") catch return error.BufferTooSmall;
-                    txt.writeSocketAddr(socket, &line) catch return error.BufferTooSmall;
-                },
-                .custom => |custom| {
-                    line.writeAll("addr=") catch return error.BufferTooSmall;
-                    custom.format(&line) catch return error.BufferTooSmall;
-                },
-            }
-            writer.writeAll(line.buffered()) catch return error.BufferTooSmall;
-            writer.writeAll("\x00") catch return error.BufferTooSmall;
+            try writeTxtRecord(value, &writer);
         }
         return writer.buffered();
     }
 };
+
+fn writeTxtRecord(value: addr.TransportAddr, writer: *std.Io.Writer) txt.EncodeError!void {
+    // One record at a time, into a scratch buffer, and copied out with
+    // its separator. Keeping the record boundary here makes
+    // `max_record_length` a bound each write actually relies on.
+    var scratch: [txt.max_record_length]u8 = undefined;
+    var line = std.Io.Writer.fixed(&scratch);
+    try writeTxtValue(value, &line);
+    writer.writeAll(line.buffered()) catch return error.BufferTooSmall;
+    writer.writeAll("\x00") catch return error.BufferTooSmall;
+}
+
+fn writeTxtValue(value: addr.TransportAddr, line: *std.Io.Writer) txt.EncodeError!void {
+    switch (value) {
+        .relay => |url| {
+            line.writeAll("relay=") catch return error.BufferTooSmall;
+            url.format(line) catch return error.BufferTooSmall;
+        },
+        .ip => |socket| {
+            line.writeAll("addr=") catch return error.BufferTooSmall;
+            txt.writeSocketAddr(socket, line) catch return error.BufferTooSmall;
+        },
+        .custom => |custom| {
+            line.writeAll("addr=") catch return error.BufferTooSmall;
+            custom.format(line) catch return error.BufferTooSmall;
+        },
+    }
+}
 
 const publisher_vtable: lookup_mod.AddressLookup.VTable = .{
     .publish = publisherPublish,

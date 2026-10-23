@@ -60,8 +60,8 @@ fn native_nat_private_codec_oracle() {
         assert_eq!(decoded.max_remote_nat_traversal_addresses, NonZeroU8::new(limit));
         let mut rest = &bytes[..];
         while !rest.is_empty() {
-            let id: VarInt = rest.get().unwrap();
-            let len: VarInt = rest.get().unwrap();
+            let id: VarInt = BufExt::get(&mut rest).unwrap();
+            let len: VarInt = BufExt::get(&mut rest).unwrap();
             let length = usize::try_from(len.into_inner()).unwrap();
             let value = &rest[..length];
             if id.into_inner() == 0x3d7f91120401 {

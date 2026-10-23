@@ -41,6 +41,9 @@ const range_spec = @import("range_spec.zig");
 const tree_mod = @import("bao_tree.zig");
 const plan_mod = @import("bao_plan.zig");
 const outboard_mod = @import("bao_outboard.zig");
+const verify_mod = @import("bao_proof_verify.zig");
+const getter_mod = @import("getter.zig");
+const test_scratch = @import("test_scratch");
 const requests = @import("requests.zig");
 const store = @import("store.zig");
 
@@ -151,14 +154,18 @@ fn writePlan(
     tree: BaoTree,
     plan: plan_mod.Plan,
 ) Error!void {
-    var verifier = @import("bao_proof_verify.zig").Verifier.init(
-        tree, plan, provider.hash,
+    var verifier = verify_mod.Verifier.init(
+        tree,
+        plan,
+        provider.hash,
     ) catch return error.InvalidOutboard;
     var pair: [pair_length]u8 = undefined;
     for (plan.items[0..plan.len]) |item| switch (item) {
         .skip => verifier.take(&.{}) catch return error.InvalidOutboard,
         .data => |node| {
             var hasher = try subtree.Hasher.init(node.bytes(tree).start);
+            // ZBC cannot prove runRange cannot grow this slice; plan.items is a fixed inline array.
+            // zbc-disable-next-line: slice-loop-reentrant-grow
             try runRange(io, handles.data, node.bytes(tree), provider.scratch, &.{
                 .both = .{ .answer = writer, .hasher = &hasher },
             });
@@ -170,19 +177,33 @@ fn writePlan(
         },
         .pair => |node| {
             if (node.isOutboardParent()) {
+                // ZBC cannot prove pairIndex cannot grow this slice;
+                // plan.items is a fixed inline array.
+                // zbc-disable-next-line: slice-loop-reentrant-grow
                 const index = outboard_mod.pairIndex(tree, node) orelse
                     return error.InvalidOutboard;
                 const read = try handles.outboard.readPositionalAll(
-                    io, &pair, @as(u64, @intCast(index)) * pair_length,
+                    io,
+                    &pair,
+                    @as(u64, @intCast(index)) * pair_length,
                 );
                 if (read != pair_length) return error.ShortOutboard;
             } else {
+                // ZBC cannot prove computePair cannot grow this slice;
+                // plan.items is a fixed inline array.
+                // zbc-disable-next-line: slice-loop-reentrant-grow
                 try computePair(io, handles.data, tree, node, provider.scratch, &pair);
             }
             const values = tree_mod.readPair(&pair);
             const computed = if (verifier.depth == 0)
+                // ZBC cannot prove mergeRoot cannot grow this slice;
+                // plan.items is a fixed inline array.
+                // zbc-disable-next-line: slice-loop-reentrant-grow
                 subtree.mergeRoot(values.left, values.right)
             else
+                // ZBC cannot prove merge cannot grow this slice;
+                // plan.items is a fixed inline array.
+                // zbc-disable-next-line: slice-loop-reentrant-grow
                 subtree.merge(values.left, values.right);
             const expected = if (verifier.depth == 0)
                 provider.hash
@@ -274,7 +295,7 @@ const published = @import("../gossip/plumtree/blake3_vectors.zig");
 /// Chunks 20 through 21 of a 49153-byte blob. The range is not group-aligned,
 /// so its plan needs both halves of the store: two pairs the outboard holds
 /// and five below a group it does not.
-const off_group = ranges.ChunkRange{ .start = 20, .end = 21 };
+const off_group: ranges.ChunkRange = .{ .start = 20, .end = 21 };
 
 /// `off_group` as a request's ranges, over storage that outlives the call.
 ///
@@ -295,7 +316,7 @@ test "a whole blob is answered with size and Bao, and a miss with none" {
     const tree = BaoTree.init(data.len);
     const hash: store.Hash = try tree.rootHash(data);
 
-    var tmp = t.tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     try putBlob(tmp.dir, hash, data);
 
@@ -310,8 +331,12 @@ test "a whole blob is answered with size and Bao, and a miss with none" {
     try t.expectEqual(tree.size, std.mem.readInt(u64, writer.buffered()[0..8], .little));
     const payload = try t.allocator.alloc(u8, data.len);
     defer t.allocator.free(payload);
-    const decoded = try @import("getter.zig").decode(
-        GetRequest.blob(hash), tree.size, hash, writer.buffered(), payload,
+    const decoded = try getter_mod.decode(
+        GetRequest.blob(hash),
+        tree.size,
+        hash,
+        writer.buffered(),
+        payload,
     );
     try t.expectEqualSlices(u8, data, payload[0..decoded.written]);
 
@@ -334,7 +359,7 @@ test "a partial range is the plan's own encoding, pairs in preorder" {
     const tree = BaoTree.init(data.len);
     const hash: store.Hash = try tree.rootHash(data);
 
-    var tmp = t.tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     try putBlob(tmp.dir, hash, data);
 
@@ -350,7 +375,7 @@ test "a partial range is the plan's own encoding, pairs in preorder" {
     const answer = try t.allocator.alloc(u8, expected.len + 8);
     defer t.allocator.free(answer);
     var writer = std.Io.Writer.fixed(answer);
-    const request = off_groupFor(hash);
+    const request = offGroupFor(hash);
     try t.expectEqual(.answered, try provider.answer(t.io, &writer, request));
     try t.expectEqualSlices(u8, expected[0..expected_len], writer.buffered()[8..]);
 }
@@ -362,7 +387,7 @@ test "an invalid outboard parent aborts the provider response" {
     const tree = BaoTree.init(data.len);
     const hash: store.Hash = try tree.rootHash(data);
 
-    var tmp = t.tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     try putBlob(tmp.dir, hash, data);
 
@@ -381,7 +406,7 @@ test "an invalid outboard parent aborts the provider response" {
     const provider = try Provider.init(tmp.dir, &name_storage, hash, &scratch);
     var answer: [1024 * 3]u8 = undefined;
     var writer = std.Io.Writer.fixed(&answer);
-    try t.expectError(error.InvalidOutboard, provider.answer(t.io, &writer, off_groupFor(hash)));
+    try t.expectError(error.InvalidOutboard, provider.answer(t.io, &writer, offGroupFor(hash)));
 }
 
 // Both refusals the store's shape forces: an unbounded hash sequence, and a
@@ -394,7 +419,7 @@ test "a walk this store cannot take is refused, not half-answered" {
     const tree = BaoTree.init(data.len);
     const hash: store.Hash = try tree.rootHash(data);
 
-    var tmp = t.tmpDir(.{});
+    var tmp = try test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     try putBlob(tmp.dir, hash, data);
 
@@ -430,7 +455,7 @@ fn expectNothingWritten(provider: Provider, request: GetRequest) !Outcome {
 }
 
 /// The request that names `off_group` and nothing else, for the blob `hash`.
-fn off_groupFor(hash: store.Hash) GetRequest {
+fn offGroupFor(hash: store.Hash) GetRequest {
     return .{ .hash = hash, .ranges = .{ .items = &off_group_items } };
 }
 
@@ -439,7 +464,7 @@ fn putBlob(dir: std.Io.Dir, hash: store.Hash, data: []const u8) !void {
     var name_storage: store.NameStorage = undefined;
     const paths = store.names(&name_storage, hash);
     const tree = BaoTree.init(data.len);
-    const outboard = try t.allocator.alloc(u8, outboard_length(tree));
+    const outboard = try t.allocator.alloc(u8, outboardLength(tree));
     defer t.allocator.free(outboard);
     const outboard_len = try outboard_mod.encode(tree, data, outboard);
     const partial = try store.createPartial(t.io, dir, paths);
@@ -451,7 +476,7 @@ fn putBlob(dir: std.Io.Dir, hash: store.Hash, data: []const u8) !void {
 
 /// A buffer exactly the outboard's own length, so a test never has to guess
 /// how big one is.
-fn outboard_length(tree: BaoTree) usize {
+fn outboardLength(tree: BaoTree) usize {
     return @intCast(outboard_mod.bytes(tree));
 }
 

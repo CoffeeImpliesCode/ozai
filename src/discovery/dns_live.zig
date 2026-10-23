@@ -94,6 +94,8 @@ const addr = @import("../base/addr.zig");
 const dns = @import("dns.zig");
 const key = @import("../base/key.zig");
 const socket = @import("../transport/socket.zig");
+const socket_addr = @import("../transport/socket_addr.zig");
+const tcp_execution = @import("../transport/tcp_execution.zig");
 
 const batch = @import("../transport/batch.zig");
 
@@ -151,11 +153,11 @@ pub const Resolver = struct {
     /// an instant this value deliberately does not carry, so one resolver asks
     /// one server.
     server: addr.SocketAddr,
-    /// Set by `stopResolver` and read at every seam entry. Terminal, and the
-    /// reason a stopped resolver cannot be asked: `resolve.Stream.deinit` fires
-    /// on every path out of a resolve, so an abandoned resolve must not leave a
-    /// query going out under a socket somebody has released.
+    /// Set by service-wide cancellation and read at every seam entry.
+    /// Terminal; operation cancellation through `begin` leaves this owner usable.
     stopped: std.atomic.Value(bool) = .init(false),
+    /// Borrowed fallback operations; the provider outlives every begun retrieval.
+    stream_execution: tcp_execution.Execution = .native,
 
     /// Open a socket bound to `local` and ask `server`.
     ///
@@ -241,6 +243,8 @@ pub const Resolver = struct {
             .server = self.server,
             .id = id,
             .resolver_stopped = &self.stopped,
+            .stream_execution = self.stream_execution,
+            .operation_local_cancel = true,
         };
     }
 
@@ -307,14 +311,16 @@ pub const Retrieval = struct {
     stopped: std.atomic.Value(bool) = .init(false),
     /// Resolver-wide cancellation also stops a fallback after UDP has returned.
     resolver_stopped: ?*const std.atomic.Value(bool) = null,
+    /// Borrowed TCP provider, retained only through synchronous `ask` and its cleanup.
+    stream_execution: tcp_execution.Execution = .native,
+    /// `Resolver.begin` observes this operation's latch in bounded UDP wait slices.
+    /// Other injected seams retain their existing `datagram.stop` contract.
+    operation_local_cancel: bool = false,
 
-    /// `resolve.Cancellation` over this one lookup. `fire` reaches the socket
-    /// through the seam, which is what makes an abandoned resolve stop its
-    /// query rather than only its own bookkeeping.
-    ///
-    /// Separate from `Resolver.cancellation` on purpose: this one ends one
-    /// ask and the socket stays usable for the next, and a resolver whose every
-    /// resolve stopped its socket would resolve exactly once.
+    /// Stop this lookup. Retrievals begun by `Resolver.begin` leave the resolver
+    /// available for the next serialized query and observe cancellation within one
+    /// UDP/TCP poll slice. Other injected seams also receive their stop callback.
+    /// Keep the retrieval alive until the ask and all cancellation calls return.
     pub fn cancellation(self: *Retrieval) resolve.Cancellation {
         return .{ .ctx = @ptrCast(@alignCast(self)), .stop = stopRetrieval };
     }
@@ -341,12 +347,7 @@ pub const Retrieval = struct {
             .udp_payload = self.udp_payload,
         }, request.wire);
         try self.datagram.send(self.datagram.ctx, io, self.server, framed);
-        const reply = self.datagram.receive(
-            self.datagram.ctx,
-            io,
-            request.reply,
-            request.deadline_ms,
-        ) catch |err| {
+        const reply = self.receive(io, request, started) catch |err| {
             if (self.stopped.load(.acquire)) return error.Canceled;
             return switch (err) {
                 error.Empty => .{ .timeout = {} },
@@ -365,18 +366,62 @@ pub const Retrieval = struct {
                     @divFloor(elapsed_ns, std.time.ns_per_ms))
             else
                 host_io.query_timeout_ms;
-            const message = lookup_live.retryStream(alloc, io, over_stream,
-                @intCast(@min(timeout_ms, host_io.query_timeout_ms)), .{
+            const message = lookup_live.retryStream(
+                alloc,
+                io,
+                over_stream,
+                @intCast(@min(timeout_ms, host_io.query_timeout_ms)),
+                .{
                     .retrieval = &self.stopped,
                     .resolver = self.resolver_stopped,
-                }) catch |err| switch (err) {
-                    error.Empty => return .timeout,
-                    else => return err,
-                };
+                },
+                self.stream_execution,
+            ) catch |err| switch (err) {
+                error.Empty => return .timeout,
+                else => return err,
+            };
             defer alloc.free(message);
             return answer.readAnswer(alloc, message, request.name, self.id, &self.owner);
         }
         return answer.readAnswer(alloc, reply.bytes, request.name, self.id, &self.owner);
+    }
+
+    fn receive(
+        self: *Retrieval,
+        io: std.Io,
+        request: Request,
+        started: std.Io.Timestamp,
+    ) lookup_io.SocketError!lookup_io.Datagram.Reply {
+        if (!self.operation_local_cancel) {
+            return self.datagram.receive(
+                self.datagram.ctx,
+                io,
+                request.reply,
+                request.deadline_ms,
+            );
+        }
+        while (true) {
+            if (self.stopped.load(.acquire)) return error.Canceled;
+            const slice: i32 = if (request.deadline_ms) |deadline| blk: {
+                const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - started.nanoseconds;
+                const left = @as(i96, deadline) * std.time.ns_per_ms - elapsed;
+                if (left <= 0) return error.Empty;
+                const left_ms = @divFloor(left + std.time.ns_per_ms - 1, std.time.ns_per_ms);
+                break :blk @intCast(@min(left_ms, poll_slice_ms));
+            } else poll_slice_ms;
+            const reply = self.datagram.receive(
+                self.datagram.ctx,
+                io,
+                request.reply,
+                slice,
+            ) catch |err| {
+                if (self.stopped.load(.acquire)) return error.Canceled;
+                if (err == error.Empty) continue;
+                return err;
+            };
+            if (self.stopped.load(.acquire)) return error.Canceled;
+            return reply;
+        }
     }
 };
 
@@ -499,15 +544,12 @@ fn stopResolver(ctx: *anyopaque) void {
     self.handle.stop();
 }
 
-/// One retrieval's stop: mark it, then stop the socket the seam names.
-///
-/// The order is what makes a second `fire` cheap rather than wrong:
-/// `resolve.Stream.deinit` fires on every path out of a resolve, so the flag is
-/// set first and the socket is told once.
+/// A begun operation only latches cancellation; its bounded waits observe the flag.
+/// An independently injected seam retains its own stop behavior.
 fn stopRetrieval(ctx: *anyopaque) void {
     const self: *Retrieval = @ptrCast(@alignCast(ctx));
     if (self.stopped.swap(true, .acq_rel)) return;
-    self.datagram.stop(self.datagram.ctx);
+    if (!self.operation_local_cancel) self.datagram.stop(self.datagram.ctx);
 }
 
 const t = std.testing;
@@ -712,9 +754,11 @@ test "live retrieval repeats a truncated UDP question over TCP and returns its r
     try t.expectEqualStrings(support.captured_record, result.records.bytes);
     peer.join();
     joined = true;
-    try t.expect(!fixture.failed);
-    try t.expectEqualStrings(script.question[0..script.question_len],
-        fixture.question[0..fixture.question_len]);
+    try t.expectEqual(@as(?TcpDnsFixture.ExchangeError, null), fixture.failure);
+    try t.expectEqualStrings(
+        script.question[0..script.question_len],
+        fixture.question[0..fixture.question_len],
+    );
 }
 
 test "TCP fallback rejects partial prefixes and partial length-prefixed answers" {
@@ -854,8 +898,14 @@ const TruncatedDatagram = struct {
         return .{ .ctx = self, .send = send, .receive = receive, .stop = stop };
     }
 
-    fn send(ctx: *anyopaque, io: std.Io, to: addr.SocketAddr,
-        bytes: []const u8) lookup_io.SocketError!void {
+    fn send(
+        ctx: *anyopaque,
+        // Datagram.send requires the context slot first; reordering changes its vtable ABI.
+        // ziglint-ignore: Z023
+        io: std.Io,
+        to: addr.SocketAddr,
+        bytes: []const u8,
+    ) lookup_io.SocketError!void {
         _ = io;
         const self: *TruncatedDatagram = @ptrCast(@alignCast(ctx));
         if (to.order(self.server) != .eq) return error.Refused;
@@ -863,8 +913,14 @@ const TruncatedDatagram = struct {
         self.question_len = bytes.len;
     }
 
-    fn receive(ctx: *anyopaque, io: std.Io, into: []u8,
-        deadline_ms: ?i32) lookup_io.SocketError!lookup_io.Datagram.Reply {
+    fn receive(
+        ctx: *anyopaque,
+        // Datagram.receive requires the context slot first; reordering changes its vtable ABI.
+        // ziglint-ignore: Z023
+        io: std.Io,
+        into: []u8,
+        deadline_ms: ?i32,
+    ) lookup_io.SocketError!lookup_io.Datagram.Reply {
         _ = io;
         _ = deadline_ms;
         const self: *TruncatedDatagram = @ptrCast(@alignCast(ctx));
@@ -889,7 +945,12 @@ const TcpDnsFixture = struct {
     question: [reply_length]u8 = undefined,
     question_len: usize = 0,
     received_query: std.atomic.Value(bool) = .init(false),
-    failed: bool = false,
+    failure: ?ExchangeError = null,
+
+    const ExchangeError = std.posix.PollError || error{
+        TestFixtureTimeout,
+        TestFixtureRefused,
+    };
 
     fn open(response: []const u8) !TcpDnsFixture {
         return openBound(response, true);
@@ -897,13 +958,18 @@ const TcpDnsFixture = struct {
 
     fn openBound(response: []const u8, listen: bool) !TcpDnsFixture {
         const linux = std.os.linux;
-        const handle = std.c.socket(linux.AF.INET,
-            linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
+        const handle = std.c.socket(
+            linux.AF.INET,
+            linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
+            0,
+        );
         if (handle < 0) return error.TestFixtureRefused;
         errdefer _ = std.c.close(handle);
         var storage: std.c.sockaddr.storage = undefined;
-        const length = @import("../transport/socket_addr.zig").writeSockaddr(
-            .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0 }, &storage);
+        const length = socket_addr.writeSockaddr(
+            .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0 },
+            &storage,
+        );
         if (std.c.bind(handle, @ptrCast(&storage), length) != 0) {
             return error.TestFixtureRefused;
         }
@@ -916,7 +982,8 @@ const TcpDnsFixture = struct {
         }
         return .{
             .listener = handle,
-            .server = @import("../transport/socket_addr.zig").readSockaddr(&storage).?,
+            .server = socket_addr.readSockaddr(&storage) orelse
+                return error.TestUnexpectedResult,
             .response = response,
         };
     }
@@ -943,13 +1010,19 @@ const TcpDnsFixture = struct {
     }
 
     fn serve(self: *TcpDnsFixture) void {
-        self.exchange() catch { self.failed = true; };
+        self.exchange() catch |err| {
+            self.failure = err;
+        };
     }
 
     fn exchange(self: *TcpDnsFixture) !void {
         try ready(self.listener, std.posix.POLL.IN);
-        const handle = std.c.accept4(self.listener, null, null,
-            std.os.linux.SOCK.NONBLOCK | std.os.linux.SOCK.CLOEXEC);
+        const handle = std.c.accept4(
+            self.listener,
+            null,
+            null,
+            std.os.linux.SOCK.NONBLOCK | std.os.linux.SOCK.CLOEXEC,
+        );
         if (handle < 0) return error.TestFixtureRefused;
         defer _ = std.c.close(handle);
         var prefix: [2]u8 = undefined;
@@ -963,6 +1036,8 @@ const TcpDnsFixture = struct {
             try ready(handle, std.posix.POLL.IN);
             return;
         }
+        // Fixture callers bound response to 1232 bytes; ZBC cannot follow those test-only inputs.
+        // zbc-disable-next-line: index-type-narrowing-wraparound
         wire.put16(&prefix, 0, self.declared_length orelse @intCast(self.response.len));
         for ([_][]const u8{ prefix[0..self.prefix_length], self.response }) |part| {
             // Split both framing and payload; clients cannot assume full reads.
@@ -977,3 +1052,393 @@ const TcpDnsFixture = struct {
     }
 };
 
+test "pending DNS TCP connect cancellation consumes only one poll slice" {
+    // Cancellation lands inside the actual TCP owner's pending wait.
+    for ([_]bool{ false, true }) |source_stop| {
+        var script: StreamTripwire = .{ .mode = .pending };
+        var vtable = t.io.vtable.*;
+        vtable.now = StreamTripwire.now;
+        vtable.checkCancel = StreamTripwire.checkCancel;
+        const io: std.Io = .{ .userdata = &script, .vtable = &vtable };
+        var udp: TruncatedDatagram = .{ .server = support.nameserver };
+        var source_stopped: std.atomic.Value(bool) = .init(false);
+        var retrieval: Retrieval = .{
+            .datagram = udp.seam(),
+            .server = support.nameserver,
+            .id = 7,
+            .resolver_stopped = &source_stopped,
+            .stream_execution = script.execution(),
+        };
+        script.stop_flag = if (source_stop) &source_stopped else &retrieval.stopped;
+        var question: [reply_length]u8 = undefined;
+        var reply: [reply_length]u8 = undefined;
+        try t.expectError(error.Canceled, retrieval.ask(t.allocator, io, .{
+            .name = "_iroh.example.",
+            .wire = &question,
+            .reply = &reply,
+            .deadline_ms = 3000,
+        }));
+        try t.expectEqual(@as(usize, 1), script.connects);
+        try t.expectEqual(@as(usize, 1), script.stream_closed);
+        try t.expectEqual(@as(usize, 1), script.wake_closed);
+        try t.expect(script.waited_ms <= poll_slice_ms);
+    }
+}
+
+test "DNS TCP acquisition and partial I/O failures release resources and reply allocation" {
+    // Drive Retrieval through TC into the real fallback and TCP ownership code.
+    for ([_]StreamTripwire.Mode{ .wake_failure, .partial_write, .partial_read, .allocation }) |mode| {
+        var script: StreamTripwire = .{ .mode = mode };
+        var udp: TruncatedDatagram = .{ .server = support.nameserver };
+        var retrieval: Retrieval = .{
+            .datagram = udp.seam(),
+            .server = support.nameserver,
+            .id = 7,
+            .stream_execution = script.execution(),
+        };
+        var allocation = t.FailingAllocator.init(t.allocator, .{
+            .fail_index = if (mode == .allocation) 0 else std.math.maxInt(usize),
+        });
+        var question: [reply_length]u8 = undefined;
+        var reply: [reply_length]u8 = undefined;
+        const expected: Error = if (mode == .allocation) error.OutOfMemory else error.Refused;
+        try t.expectError(expected, retrieval.ask(allocation.allocator(), t.io, .{
+            .name = "_iroh.example.",
+            .wire = &question,
+            .reply = &reply,
+            .deadline_ms = 100,
+        }));
+        try t.expectEqual(allocation.allocated_bytes, allocation.freed_bytes);
+        try t.expectEqual(@as(usize, 1), script.stream_closed);
+        try t.expectEqual(@as(usize, if (mode == .wake_failure) 0 else 1), script.wake_closed);
+        if (mode == .partial_write) try t.expectEqual(@as(usize, 1), script.written);
+        if (mode == .partial_read) try t.expectEqual(@as(usize, 1), script.body_read);
+    }
+}
+
+test "every DNS TCP acquisition failure retains cancellation and exact ownership" {
+    inline for (@typeInfo(StreamTripwire.errors.OpenError).error_set.?) |entry| {
+        const failure: StreamTripwire.errors.OpenError = @field(anyerror, entry.name);
+        for ([_]StreamTripwire.Mode{ .stream_failure, .wake_failure, .bound_failure }) |mode| {
+            var script: StreamTripwire = .{ .mode = mode, .acquire_failure = failure };
+            var udp: TruncatedDatagram = .{ .server = support.nameserver };
+            var retrieval: Retrieval = .{
+                .datagram = udp.seam(),
+                .server = support.nameserver,
+                .id = 7,
+                .stream_execution = script.execution(),
+            };
+            var question: [reply_length]u8 = undefined;
+            var reply: [reply_length]u8 = undefined;
+            const expected: Error = if (failure == error.Canceled) error.Canceled else error.Refused;
+            try t.expectError(expected, retrieval.ask(t.allocator, t.io, .{
+                .name = "_iroh.example.",
+                .wire = &question,
+                .reply = &reply,
+                .deadline_ms = 100,
+            }));
+            try t.expectEqual(
+                @as(usize, if (mode == .stream_failure) 0 else 1),
+                script.stream_closed,
+            );
+            try t.expectEqual(
+                @as(usize, if (mode == .bound_failure) 1 else 0),
+                script.wake_closed,
+            );
+        }
+    }
+}
+
+test "DNS TCP body EOF cancellation and timeout preserve overall deadline and rollback" {
+    for ([_]StreamTripwire.Mode{ .read_eof, .read_canceled, .read_timeout }) |mode| {
+        var script: StreamTripwire = .{ .mode = mode };
+        var vtable = t.io.vtable.*;
+        vtable.now = StreamTripwire.now;
+        vtable.checkCancel = StreamTripwire.checkCancel;
+        const io: std.Io = .{ .userdata = &script, .vtable = &vtable };
+        var udp: TruncatedDatagram = .{ .server = support.nameserver };
+        var retrieval: Retrieval = .{
+            .datagram = udp.seam(),
+            .server = support.nameserver,
+            .id = 7,
+            .stream_execution = script.execution(),
+        };
+        script.stop_flag = &retrieval.stopped;
+        var allocation = t.FailingAllocator.init(t.allocator, .{});
+        var question: [reply_length]u8 = undefined;
+        var reply: [reply_length]u8 = undefined;
+        const result = retrieval.ask(allocation.allocator(), io, .{
+            .name = "_iroh.example.",
+            .wire = &question,
+            .reply = &reply,
+            .deadline_ms = 100,
+        });
+        if (mode == .read_timeout) {
+            const answer_value = try result;
+            defer answer_value.deinit(allocation.allocator());
+            try t.expectEqual(Answer.timeout, answer_value);
+            try t.expectEqual(@as(i32, 100), script.waited_ms);
+        } else {
+            const expected: Error = if (mode == .read_eof) error.ShortMessage else error.Canceled;
+            try t.expectError(expected, result);
+        }
+        try t.expectEqual(allocation.allocated_bytes, allocation.freed_bytes);
+        try t.expectEqual(@as(usize, 1), script.stream_closed);
+        try t.expectEqual(@as(usize, 1), script.wake_closed);
+    }
+}
+
+const StreamTripwire = struct {
+    mode: Mode,
+    acquire_failure: ?errors.OpenError = null,
+    stop_flag: ?*std.atomic.Value(bool) = null,
+    cancel_handle: ?resolve.Cancellation = null,
+    waited_ms: i32 = 0,
+    connects: usize = 0,
+    writes: usize = 0,
+    written: usize = 0,
+    reads: usize = 0,
+    body_read: usize = 0,
+    stream_closed: usize = 0,
+    wake_closed: usize = 0,
+
+    const Mode = enum {
+        pending,
+        stream_failure,
+        wake_failure,
+        bound_failure,
+        partial_write,
+        partial_read,
+        allocation,
+        read_eof,
+        read_canceled,
+        read_timeout,
+    };
+    const errors = @import("../transport/tcp_error.zig");
+    const operations: tcp_execution.Execution.VTable = blk: {
+        var table = tcp_execution.Execution.native.vtable.*;
+        table.createStream = createStream;
+        table.createWake = createWake;
+        table.boundAddress = boundAddress;
+        table.startConnect = startConnect;
+        table.wait = wait;
+        table.read = read;
+        table.write = write;
+        table.close = close;
+        break :blk table;
+    };
+
+    fn execution(self: *StreamTripwire) tcp_execution.Execution {
+        return .{ .context = self, .vtable = &operations };
+    }
+
+    fn of(context: ?*anyopaque) *StreamTripwire {
+        return @ptrCast(@alignCast(context.?));
+    }
+
+    fn now(context: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+        return .{ .nanoseconds = @as(i96, of(context).waited_ms) * std.time.ns_per_ms };
+    }
+
+    fn checkCancel(_: ?*anyopaque) error{Canceled}!void {}
+
+    fn createStream(_: std.Io, context: ?*anyopaque, _: addr.IpAddress) errors.OpenError!std.c.fd_t {
+        const self = of(context);
+        if (self.mode == .stream_failure) return self.acquire_failure.?;
+        return 101;
+    }
+
+    fn createWake(_: std.Io, context: ?*anyopaque) errors.OpenError!std.c.fd_t {
+        const self = of(context);
+        if (self.mode == .wake_failure) return self.acquire_failure orelse error.Unexpected;
+        return 102;
+    }
+
+    fn boundAddress(_: std.Io, context: ?*anyopaque, _: std.c.fd_t) errors.OpenError!addr.SocketAddr {
+        const self = of(context);
+        if (self.mode == .bound_failure) return self.acquire_failure.?;
+        return support.nameserver;
+    }
+
+    fn startConnect(
+        _: std.Io,
+        context: ?*anyopaque,
+        _: std.c.fd_t,
+        _: addr.SocketAddr,
+    ) errors.ConnectError!bool {
+        const self = of(context);
+        self.connects += 1;
+        return self.mode != .pending;
+    }
+
+    fn wait(
+        _: std.Io,
+        context: ?*anyopaque,
+        options: tcp_execution.WaitOptions,
+    ) errors.WaitError!void {
+        const self = of(context);
+        if (self.mode == .pending) {
+            if (self.cancel_handle) |handle| {
+                handle.fire();
+            } else {
+                self.stop_flag.?.store(true, .release);
+            }
+            self.waited_ms += options.timeout_ms orelse return error.Unexpected;
+            return error.WouldBlock;
+        }
+        if (self.mode == .read_timeout and self.reads > 0) {
+            self.waited_ms += options.timeout_ms orelse return error.Unexpected;
+            return error.WouldBlock;
+        }
+    }
+
+    fn write(
+        _: std.Io,
+        context: ?*anyopaque,
+        _: std.c.fd_t,
+        bytes: []const u8,
+    ) errors.WriteError!usize {
+        const self = of(context);
+        self.writes += 1;
+        if (self.mode == .partial_write) {
+            if (self.writes > 1) return error.Unexpected;
+            self.written += 1;
+            return 1;
+        }
+        self.written += bytes.len;
+        return bytes.len;
+    }
+
+    fn read(
+        _: std.Io,
+        context: ?*anyopaque,
+        _: std.c.fd_t,
+        bytes: []u8,
+    ) errors.ReadError!usize {
+        const self = of(context);
+        self.reads += 1;
+        if (self.reads == 1) {
+            wire.put16(bytes, 0, wire.header_length);
+            return host_io.length_prefix_bytes;
+        }
+        if (self.mode == .read_eof) return 0;
+        if (self.mode == .read_canceled) {
+            if (self.cancel_handle) |handle| {
+                handle.fire();
+            } else {
+                self.stop_flag.?.store(true, .release);
+            }
+            bytes[0] = 0;
+            return 1;
+        }
+        if (self.reads == 2) {
+            bytes[0] = 0;
+            self.body_read += 1;
+            return 1;
+        }
+        return error.Unexpected;
+    }
+
+    fn close(context: ?*anyopaque, handle: std.c.fd_t) void {
+        const self = of(context);
+        switch (handle) {
+            101 => self.stream_closed += 1,
+            102 => self.wake_closed += 1,
+            else => @panic("unexpected fixture descriptor"),
+        }
+    }
+};
+
+test "Resolver begin cancellation preserves a second native UDP query after UDP or TCP abort" {
+    // Reuse the public owner after cancellation, including TC pending/partial TCP work.
+    const loopback: addr.SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0 };
+    for ([_]?StreamTripwire.Mode{ null, .pending, .read_canceled }) |tcp_mode| {
+        var server = try socket.Socket.create(loopback, .{});
+        defer server.close();
+        var resolver = try Resolver.open(loopback, server.address, .{});
+        defer resolver.close();
+        var script: StreamTripwire = .{ .mode = tcp_mode orelse .pending };
+        var vtable = t.io.vtable.*;
+        vtable.now = StreamTripwire.now;
+        vtable.checkCancel = StreamTripwire.checkCancel;
+        const scripted_io: std.Io = .{ .userdata = &script, .vtable = &vtable };
+        if (tcp_mode != null) resolver.stream_execution = script.execution();
+        var first = resolver.begin(7);
+        script.cancel_handle = first.cancellation();
+        var fixture: CancelNativeQuery = .{
+            .server = &server,
+            .retrieval = &first,
+            .truncated = tcp_mode != null,
+        };
+        const peer = try std.Thread.spawn(.{}, CancelNativeQuery.run, .{&fixture});
+        var joined = false;
+        defer if (!joined) peer.join();
+        var name: [wire.max_name_length]u8 = undefined;
+        const asked = try capturedNameOf(try capturedNode(), &name);
+        var question: [reply_length]u8 = undefined;
+        var reply: [reply_length]u8 = undefined;
+        try t.expectError(error.Canceled, first.ask(
+            t.allocator,
+            if (tcp_mode == null) t.io else scripted_io,
+            .{ .name = asked, .wire = &question, .reply = &reply, .deadline_ms = 1000 },
+        ));
+        peer.join();
+        joined = true;
+        try t.expectEqual(@as(?lookup_io.SocketError, null), fixture.failure);
+        if (tcp_mode != null) {
+            try t.expectEqual(@as(usize, 1), script.connects);
+            try t.expectEqual(@as(usize, 1), script.stream_closed);
+            try t.expectEqual(@as(usize, 1), script.wake_closed);
+        }
+        // Queue the second answer only after the first ask has stopped consuming UDP.
+        var answer_buffer: [reply_length]u8 = undefined;
+        const response = try support.hexBytes(&answer_buffer, support.captured_answer_hex);
+        wire.put16(response, 0, 8);
+        var server_datagram = lookup_live.Datagram.init(&server);
+        const native = server_datagram.seam();
+        try native.send(native.ctx, t.io, resolver.handle.address, response);
+        var second = resolver.begin(8);
+        const result = try second.ask(t.allocator, t.io, .{
+            .name = asked,
+            .wire = &question,
+            .reply = &reply,
+            .deadline_ms = 1000,
+        });
+        defer result.deinit(t.allocator);
+        try t.expect(result.hasRecords());
+        try t.expectEqualStrings(support.captured_record, result.records.bytes);
+        try t.expect(!resolver.stoppedAlready());
+        const sent = try native.receive(native.ctx, t.io, &reply, 1000);
+        try t.expectEqual(@as(u16, 8), wire.be16(sent.bytes, 0));
+        try t.expectEqual(resolver.handle.address, sent.from);
+    }
+}
+
+const CancelNativeQuery = struct {
+    server: *socket.Socket,
+    retrieval: *Retrieval,
+    truncated: bool,
+    failure: ?lookup_io.SocketError = null,
+
+    fn run(self: *CancelNativeQuery) void {
+        self.exchange() catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn exchange(self: *CancelNativeQuery) lookup_io.SocketError!void {
+        var datagram = lookup_live.Datagram.init(self.server);
+        const native = datagram.seam();
+        var question: [reply_length]u8 = undefined;
+        const received = try native.receive(native.ctx, t.io, &question, 1000);
+        if (wire.be16(received.bytes, 0) != 7) return error.Refused;
+        if (self.truncated) {
+            var response: [wire.header_length]u8 = @splat(0);
+            wire.put16(&response, 0, 7);
+            wire.put16(&response, 2, wire.flag_response | wire.flag_truncated);
+            try native.send(native.ctx, t.io, received.from, &response);
+        } else {
+            self.retrieval.cancellation().fire();
+        }
+    }
+};

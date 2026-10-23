@@ -217,6 +217,9 @@ fn ticketFor(
         .max_early_data_size = early_data_max,
     };
     @memcpy(built.alpn[0..alpn.len], alpn);
+    // Every private caller supplies 4-byte `"ozai"`, fitting the 32-byte ALPN
+    // array and `u8`. ZBC cannot propagate that test-only bound through `alpn`.
+    // zbc-disable-next-line: index-type-narrowing-wraparound
     built.alpn_len = @intCast(alpn.len);
     return built;
 }

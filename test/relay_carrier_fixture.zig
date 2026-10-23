@@ -1,6 +1,8 @@
 //! A bounded consumer of the production Node carrier and pinned inner QUIC connection.
 const std = @import("std");
 const ozai = @import("ozai");
+const node_cli = @import("node_cli");
+const carrier_peer = @import("relay_carrier_peer.zig");
 const bridge = ozai.transport_quic_bridge;
 const Node = ozai.node.Node;
 const alpn = "ozai-relay-endpoint/1";
@@ -8,10 +10,14 @@ pub const std_options: std.Options = .{ .log_level = .warn };
 
 pub fn main(init: std.process.Init) !void {
     const options = try Options.parse(init.minimal.args);
-    if (options.carrier_only) return @import("relay_carrier_peer.zig").run(init, .{
-        .client = options.client, .seed_hex = options.seed_hex, .expect_peer = options.expect_peer,
-        .bind = options.bind, .relay_url = options.relay_url,
-        .message = options.message, .run_ms = options.run_ms,
+    if (options.carrier_only) return carrier_peer.run(init, .{
+        .client = options.client,
+        .seed_hex = options.seed_hex,
+        .expect_peer = options.expect_peer,
+        .bind = options.bind,
+        .relay_url = options.relay_url,
+        .message = options.message,
+        .run_ms = options.run_ms,
     });
     var seed: [32]u8 = undefined;
     const secret_bytes = try std.fmt.hexToBytes(&seed, options.seed_hex);
@@ -23,16 +29,19 @@ pub fn main(init: std.process.Init) !void {
     const peer: [1]ozai.node.Peer = .{.{ .id = expected, .addr = .{ .relay = url } }};
     var config: ozai.node.Config = .{
         .secret = secret,
-        .listen = try ozai.SocketAddr.parse(options.bind),
+        .listen = try node_cli.parseSocket(options.bind),
         .alpn = alpn,
         .peers = if (options.client) &peer else &.{},
         .relay = .{ .client = .{
-            .address = try url.socketAddr(), .host = url.hostSlice(), .secret = secret,
+            .address = try url.socketAddr(),
+            .host = url.hostSlice(),
+            .secret = secret,
+            .execution = ozai.transport_tcp_execution.Execution.native,
         } },
     };
     var candidates: [1]ozai.SocketAddr = undefined;
     if (!options.relay_only) {
-        candidates[0] = try ozai.SocketAddr.parse(
+        candidates[0] = try node_cli.parseSocket(
             options.local_candidate orelse return error.MissingConfiguredCandidate,
         );
         config.traversal = .{ .local_candidates = &candidates, .initiate = options.client };
@@ -43,6 +52,21 @@ pub fn main(init: std.process.Init) !void {
     defer node.deinit();
     var engine = std.Random.DefaultPrng.init(0x70696e6e6564);
     const random = engine.random();
+    // Keep the operation's result until its stream pins have been released and the node
+    // has closed. A close failure takes precedence over the operation's result.
+    const result = runNode(init, node, options, expected, random);
+    const close_ns = std.Io.Clock.awake.now(init.io).nanoseconds;
+    try node.close(init.io, @intCast(close_ns), random);
+    return result;
+}
+
+fn runNode(
+    init: std.process.Init,
+    node: *Node,
+    options: Options,
+    expected: ozai.NodeId,
+    random: std.Random,
+) !void {
     const start = std.Io.Clock.awake.now(init.io);
     const start_ns = start.nanoseconds;
     try node.start(@intCast(start_ns), random);
@@ -61,8 +85,9 @@ pub fn main(init: std.process.Init) !void {
     defer releaseStream(node, stable_id, stream_id);
     for (0..options.run_ms * 100) |_| {
         const now_ns = std.Io.Clock.awake.now(init.io).nanoseconds;
-        if (now_ns - start_ns >= @as(i128, options.run_ms) * std.time.ns_per_ms)
+        if (now_ns - start_ns >= @as(i128, options.run_ms) * std.time.ns_per_ms) {
             return error.DeadlineExceeded;
+        }
         const now: bridge.Instant = @intCast(now_ns);
         const moved = try node.step(init.io, now, random);
         var connection: ?bridge.Conn = null;
@@ -79,24 +104,28 @@ pub fn main(init: std.process.Init) !void {
             connection = candidate;
         }
         if (finished) {
-            if (connection == null or connection.?.closed()) return;
+            // Keep the initiator alive until the responder has completed its proof and closed.
+            const remaining = connection orelse return;
+            if (remaining.closed()) return;
             if (!moved) try std.Io.sleep(init.io, .fromMilliseconds(1), .awake);
             continue;
         }
         if (stable_id != null and connection == null) return error.InnerConnectionClosed;
         if (connection) |conn| {
             if (conn.closed()) return error.InnerConnectionClosed;
-            if (conn.id() != stable_id.?) return error.InnerConnectionChanged;
+            const established_id = stable_id orelse return error.InnerConnectionChanged;
+            if (conn.id() != established_id) return error.InnerConnectionChanged;
             try verifyPeer(conn, expected);
             const route = try selectedRoute(node, conn);
-            if (route != null and route.? == (phase == 1)) {
+            const relay_selected = phase == 1;
+            if (route == @as(?bool, relay_selected)) {
                 if (stream_id == null) {
                     if (options.client) {
                         var opened = try bridge.Stream.open(conn);
                         try opened.pin();
+                        stream_id = opened.id();
                         try opened.write(options.message);
                         opened.close();
-                        stream_id = opened.id();
                     } else {
                         for (0..64) |index| {
                             var inbound = conn.incomingStream(index) orelse break;
@@ -111,8 +140,14 @@ pub fn main(init: std.process.Init) !void {
                 }
                 if (stream_id) |id| {
                     var active = conn.stream(id) orelse return error.StreamDisappeared;
-                    _ = try active.drain(init.gpa, &received);
-                    if (received.items.len > options.message.len) return error.UnexpectedApplicationBytes;
+                    _ = active.drain(
+                        init.gpa,
+                        &received,
+                        options.message.len - received.items.len,
+                    ) catch |err| switch (err) {
+                        error.ByteBudgetExceeded => return error.UnexpectedApplicationBytes,
+                        error.OutOfMemory => return err,
+                    };
                     if (active.finished()) {
                         if (!std.mem.eql(u8, received.items, options.message))
                             return error.UnexpectedApplicationBytes;
@@ -131,8 +166,14 @@ pub fn main(init: std.process.Init) !void {
                             try output.interface.print(
                                 "relay-phase{d}: stable_id {d} remote_id {f} selected {s} " ++
                                     "bytes {d} payload_hex {s}\n",
-                                .{ phase, conn.id(), expected, if (route.?) "relay" else "direct",
-                                    received.items.len, payload[0 .. received.items.len * 2] },
+                                .{
+                                    phase,
+                                    conn.id(),
+                                    expected,
+                                    if (relay_selected) "relay" else "direct",
+                                    received.items.len,
+                                    payload[0 .. received.items.len * 2],
+                                },
                             );
                             try output.flush();
                             previous_stream = active.id();
@@ -141,6 +182,7 @@ pub fn main(init: std.process.Init) !void {
                             if (phase == 2 or options.relay_only) {
                                 try reportCounts(node, options.client, &output.interface);
                                 try output.flush();
+                                if (!options.client) return;
                                 finished = true;
                             }
                             received.clearRetainingCapacity();
@@ -170,7 +212,7 @@ fn releaseStream(node: *Node, connection_id: ?u64, stream_id: ?u64) void {
 
 fn verifyPeer(conn: bridge.Conn, expected: ozai.NodeId) !void {
     if (!conn.entry.conn.is_server) {
-        if (conn.entry.conn.tls13_hs) |*handshake| {
+        if (conn.entry.conn.tls13_hs) |handshake| {
             const authenticated = handshake.peerNodeId() orelse return error.MissingPeerIdentity;
             if (!std.mem.eql(u8, &authenticated, &expected.toBytes()))
                 return error.PeerIdentityMismatch;
@@ -178,7 +220,8 @@ fn verifyPeer(conn: bridge.Conn, expected: ozai.NodeId) !void {
         }
         return error.MissingPeerIdentity;
     }
-    const certificate = conn.entry.conn.peerCertificate() orelse return error.MissingPeerCertificate;
+    const certificate =
+        conn.entry.conn.peerCertificate() orelse return error.MissingPeerCertificate;
     const prefix = [_]u8{ 0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00 };
     if (certificate.len != 44) return error.InvalidPeerCertificate;
     if (!std.mem.eql(u8, certificate[0..12], &prefix)) return error.InvalidPeerCertificate;
@@ -189,8 +232,10 @@ fn reportCounts(node: *Node, client: bool, output: *std.Io.Writer) !void {
     if (node.stats.dials != @as(u64, @intFromBool(client))) return error.UnexpectedDialCount;
     if (node.stats.handler_connections != @as(u64, @intFromBool(!client)))
         return error.UnexpectedAcceptCount;
-    try output.print("relay-counts: dials {d} accepts {d}\n",
-        .{ node.stats.dials, node.stats.handler_connections });
+    try output.print(
+        "relay-counts: dials {d} accepts {d}\n",
+        .{ node.stats.dials, node.stats.handler_connections },
+    );
 }
 
 fn selectedRoute(node: *Node, conn: bridge.Conn) !?bool {

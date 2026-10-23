@@ -183,7 +183,8 @@ fn writeInfoList(writer: *postcard.Writer, list: PeerInfos) Error!void {
 
 fn readData(writer: *postcard.Reader) Error!?[]const u8 {
     if (!try writer.readOption()) return null;
-    return try writer.readBytes();
+    const bytes = try writer.readBytes();
+    return bytes;
 }
 
 fn readInfo(writer: *postcard.Reader) Error!PeerInfo {

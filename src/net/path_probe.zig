@@ -279,6 +279,8 @@ pub const InFlight = struct {
     /// is not the order attempts were begun in and nothing depends on it.
     pub fn end(self: *InFlight, path: TransportAddr) bool {
         const index = self.indexOf(path) orelse return false;
+        // indexOf returns only live indices; ZBC cannot carry its scan proof to this swap.
+        // zbc-disable-next-line: index-minus-one-without-zero-guard
         self.open[index] = self.open[self.len - 1];
         self.len -= 1;
         return true;
@@ -467,7 +469,7 @@ test "a fresh figure is owed nothing and a stale one is owed a challenge" {
     try t.expectEqualStrings("fresh", armOf(plan(&entry, 1_000 + revalidate_after, &none)));
 
     const now = 1_000 + revalidate_after + 1;
-    const ask = challengeOf(plan(&entry, now, &none)).?;
+    const ask = challengeOf(plan(&entry, now, &none)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(Method.path_challenge, ask.method);
     // The path challenged is the entry's own address, and the attempt is timed
     // on the caller's timeline rather than on either of `probe_live`'s.
@@ -494,7 +496,8 @@ test "the challenge travels the path the evidence is about, however it is spelle
     for (cases) |address| {
         var entry = entryWith(20 * millis, 0);
         entry.addr = address;
-        const ask = challengeOf(plan(&entry, revalidate_after + 1, &none)).?;
+        const ask = challengeOf(plan(&entry, revalidate_after + 1, &none)) orelse
+            return error.TestUnexpectedResult;
         try t.expect(ask.path.order(address) == .eq);
         try t.expectEqual(Method.path_challenge, ask.method);
     }
@@ -552,7 +555,8 @@ test "an attempt out is nothing new owed, and it drains through silence" {
 
     // Silence discharges it and reports the entry's evidence, and the record is
     // untouched by either: the figure is still the one taken at 1_000.
-    const answered_nothing = silence(&outstanding, &entry, stale_at).?;
+    const answered_nothing = silence(&outstanding, &entry, stale_at) orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(Verdict.stale, answered_nothing);
     try t.expectEqual(@as(usize, 0), outstanding.count());
     try t.expectEqual(@as(?Nanos, 20 * millis), entry.rtt);
@@ -561,7 +565,8 @@ test "an attempt out is nothing new owed, and it drains through silence" {
     // and still writes nothing — that is what costs the path its traffic.
     try t.expect(outstanding.begin(entry.addr));
     const late = 1_000 + unverified_after + 1;
-    try t.expectEqual(Verdict.unverified, silence(&outstanding, &entry, late).?);
+    try t.expectEqual(Verdict.unverified, silence(&outstanding, &entry, late) orelse
+        return error.TestUnexpectedResult);
     try t.expectEqual(@as(usize, 0), outstanding.count());
     try t.expectEqual(@as(Nanos, 1_000), entry.rtt_at);
     try t.expectEqual(PathStatus.open, entry.status);
@@ -583,7 +588,8 @@ test "a path closed while its attempt was out still drains its slot" {
     // the closed path is, so one more turn discharges it instead of stranding
     // the slot and with it the path's next attempt.
     try t.expectEqualStrings("in_flight", armOf(plan(&closed, revalidate_after + 1, &outstanding)));
-    try t.expectEqual(Verdict.stale, silence(&outstanding, &closed, revalidate_after + 1).?);
+    try t.expectEqual(Verdict.stale, silence(&outstanding, &closed, revalidate_after + 1) orelse
+        return error.TestUnexpectedResult);
     try t.expectEqual(@as(usize, 0), outstanding.count());
     // And now there is nothing to send on.
     try t.expectEqualStrings("no_path", armOf(plan(&closed, revalidate_after + 2, &outstanding)));
@@ -618,12 +624,13 @@ test "a figure is read against the record before the record is written" {
     var table: path_table.Table = .{};
     _ = table.observe(at(1000), .open, 0);
     try t.expect(table.sample(at(1000), 20 * millis, 0));
-    const entry = table.get(at(1000)).?;
+    const entry = table.get(at(1000)) orelse return error.TestUnexpectedResult;
     const now = 1_000 + unverified_after + 1;
     var outstanding: InFlight = .{};
     try t.expect(outstanding.begin(entry.addr));
 
-    const answer = landed(&outstanding, &entry, 40 * millis, now).?;
+    const answer = landed(&outstanding, &entry, 40 * millis, now) orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(Reading.regressed, answer.reading);
     try t.expect(answer.reselect);
     // The attempt is discharged by its answer.
@@ -632,12 +639,13 @@ test "a figure is read against the record before the record is written" {
     // still carries the record the figure was read against.
     try t.expectEqual(@as(?Nanos, 20 * millis), entry.rtt);
     try t.expectEqual(@as(Nanos, 0), entry.rtt_at);
-    try t.expectEqual(@as(?Nanos, 20 * millis), table.get(at(1000)).?.rtt);
+    const unchanged = table.get(at(1000)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(@as(?Nanos, 20 * millis), unchanged.rtt);
 
     // Write the figure and the same figure reads as confirmed against itself,
     // which is why the caller reads `Landing` before it samples.
     try t.expect(table.sample(at(1000), 40 * millis, now));
-    const written = table.get(at(1000)).?;
+    const written = table.get(at(1000)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(?Nanos, 40 * millis), written.rtt);
     try t.expectEqual(@as(Nanos, now), written.rtt_at);
     try t.expectEqual(Reading.confirmed, path_revalidate.classify(&written, 40 * millis));
@@ -653,7 +661,7 @@ test "only a regression or an unrankable record asks for a selection" {
     // Inside the margin against a record that could still be ranked: noise,
     // absorbed, and no selection asked for. This is `path_revalidate`'s own
     // "inside the margin that is noise".
-    const quiet = land(&record, 24 * millis, rankable).?;
+    const quiet = land(&record, 24 * millis, rankable) orelse return error.TestUnexpectedResult;
     try t.expectEqual(Reading.confirmed, quiet.reading);
     try t.expect(!quiet.reselect);
 
@@ -661,19 +669,21 @@ test "only a regression or an unrankable record asks for a selection" {
     // no longer be ranked on. That is a change of kind — `path_select.faster`
     // and `.displaces` both answer for a path with no figure and can do
     // neither now that it has one — so the selection is asked again.
-    const promoted = land(&record, 24 * millis, unrankable).?;
+    const promoted = land(&record, 24 * millis, unrankable) orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(Reading.confirmed, promoted.reading);
     try t.expect(promoted.reselect);
 
     // A regression asks for it whatever the record could be ranked on, because
     // the record is known to be wrong and the margin decides there.
-    const worse = land(&record, 40 * millis, rankable).?;
+    const worse = land(&record, 40 * millis, rankable) orelse return error.TestUnexpectedResult;
     try t.expectEqual(Reading.regressed, worse.reading);
     try t.expect(worse.reselect);
 
     // A path's first figure has no record to regress from and no ranking to
     // keep, so it asks once and absorbs the figure however large it is.
-    const first = land(&entryWith(null, 0), unverified_after * 1000, rankable).?;
+    const first = land(&entryWith(null, 0), unverified_after * 1000, rankable) orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(Reading.first, first.reading);
     try t.expect(first.reselect);
 }
@@ -686,14 +696,15 @@ test "silence costs a path its traffic and writes no status to do it" {
     const now = 1_000 + unverified_after + 1;
     try t.expect(table.sample(at(1001), 10 * millis, now));
 
-    const incumbent = table.get(at(1000)).?;
+    const incumbent = table.get(at(1000)) orelse return error.TestUnexpectedResult;
     var outstanding: InFlight = .{};
     try t.expect(outstanding.begin(incumbent.addr));
-    try t.expectEqual(Verdict.unverified, silence(&outstanding, &incumbent, now).?);
+    try t.expectEqual(Verdict.unverified, silence(&outstanding, &incumbent, now) orelse
+        return error.TestUnexpectedResult);
 
     // The record is untouched: the figure is where it was, and the status is
     // still `.open`, because a failure is a write somebody else made.
-    const after = table.get(at(1000)).?;
+    const after = table.get(at(1000)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(@as(?Nanos, 100 * millis), after.rtt);
     try t.expectEqual(PathStatus.open, after.status);
     try t.expect(after.dialable());
@@ -701,7 +712,8 @@ test "silence costs a path its traffic and writes no status to do it" {
     // The whole of what silence did is arithmetic on the figure's age: it can
     // no longer be ranked on, so the measured challenger displaces it.
     try t.expectEqual(@as(?Nanos, null), after.latency(now));
-    try t.expect(table.get(at(1001)).?.latency(now) != null);
+    const challenger = table.get(at(1001)) orelse return error.TestUnexpectedResult;
+    try t.expect(challenger.latency(now) != null);
     const choice = path_select.switchTo(&table, now, at(1000));
     try t.expectEqual(path_select.Reason.faster, choice.reason);
     try t.expect(sameAddress(choice.path, at(1001)));
@@ -716,7 +728,7 @@ test "a path somebody observed to fail is a different fact from a silent one" {
     // recorded failure and it is refused by name, which no amount of silence
     // can become.
     _ = table.observe(at(1001), .unusable, now);
-    const gone = table.get(at(1001)).?;
+    const gone = table.get(at(1001)) orelse return error.TestUnexpectedResult;
     try t.expect(!gone.dialable());
     try t.expect(!path_select.selectable(&gone));
 
@@ -725,27 +737,31 @@ test "a path somebody observed to fail is a different fact from a silent one" {
     // And nothing this module does adds to it or takes from it.
     try t.expect(landed(&none, &gone, 20 * millis, now) == null);
     try t.expect(silence(&none, &gone, now) == null);
-    try t.expectEqual(PathStatus.unusable, table.get(at(1001)).?.status);
+    const unchanged = table.get(at(1001)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(PathStatus.unusable, unchanged.status);
 
     // A `.inactive` path is not that: it worked and closed, so it is still
     // dialable and would be challenged again if it were open.
     _ = table.observe(at(1001), .{ .inactive = now }, now);
-    try t.expect(table.get(at(1001)).?.dialable());
-    try t.expectEqualStrings("no_path", armOf(plan(&table.get(at(1001)).?, now, &none)));
+    const inactive = table.get(at(1001)) orelse return error.TestUnexpectedResult;
+    try t.expect(inactive.dialable());
+    try t.expectEqualStrings("no_path", armOf(plan(&inactive, now, &none)));
 }
 
 test "a figure that answers an attempt returns the path to trust" {
     var table: path_table.Table = .{};
     _ = table.observe(at(1000), .open, 0);
     try t.expect(table.sample(at(1000), 20 * millis, 0));
-    const entry = table.get(at(1000)).?;
+    const entry = table.get(at(1000)) orelse return error.TestUnexpectedResult;
     const stale_at = 1_000 + revalidate_after + 1;
 
     var outstanding: InFlight = .{};
-    const ask = challengeOf(plan(&entry, stale_at, &outstanding)).?;
+    const ask = challengeOf(plan(&entry, stale_at, &outstanding)) orelse
+        return error.TestUnexpectedResult;
     try t.expect(outstanding.begin(entry.addr));
 
-    const answer = landed(&outstanding, &entry, 22 * millis, ask.at).?;
+    const answer = landed(&outstanding, &entry, 22 * millis, ask.at) orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(Reading.confirmed, answer.reading);
     try t.expect(answer.reselect);
     try t.expect(table.sample(entry.addr, 22 * millis, ask.at));
@@ -753,7 +769,7 @@ test "a figure that answers an attempt returns the path to trust" {
     // The window runs from the new figure, so the path is fresh again and owed
     // nothing for a whole window: revalidation is a cycle and not a countdown
     // to a connection nobody may trust twice.
-    const fresh = table.get(at(1000)).?;
+    const fresh = table.get(at(1000)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(Verdict.fresh, path_revalidate.verdict(&fresh, ask.at));
     try t.expectEqual(@as(?Nanos, 22 * millis), fresh.rtt);
     try t.expectEqualStrings("fresh", armOf(plan(&fresh, ask.at, &outstanding)));
@@ -775,21 +791,21 @@ test "the windows are the ones the module doc claims" {
     // An attempt made at the first stale instant is given up one nanosecond
     // after the entry reads `.unverified`, so the attempt never holds the
     // verdict back.
-    const ask = challengeOf(plan(&entry, revalidate_after + 1, &none)).?;
+    const ask = challengeOf(plan(&entry, revalidate_after + 1, &none)) orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(revalidate_after + 1 + probe_grace, ask.deadline);
     try t.expectEqual(unverified_after + 1, ask.deadline);
 
     // And an attempt is never given up before it is sent, however far the
     // caller's timeline has run.
     const ceiling = std.math.maxInt(Nanos);
-    const late = challengeOf(plan(&entry, ceiling, &none)).?;
+    const late = challengeOf(plan(&entry, ceiling, &none)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(ceiling, late.at);
     try t.expectEqual(ceiling, late.deadline);
 
     // Only one arm exists, and it is the one that travels on the connection.
     try t.expectEqual(@as(usize, 1), @typeInfo(Method).@"enum".fields.len);
-    try t.expectEqual(
-        Method.path_challenge,
-        challengeOf(plan(&entry, revalidate_after + 1, &none)).?.method,
-    );
+    const challenge = challengeOf(plan(&entry, revalidate_after + 1, &none)) orelse
+        return error.TestUnexpectedResult;
+    try t.expectEqual(Method.path_challenge, challenge.method);
 }

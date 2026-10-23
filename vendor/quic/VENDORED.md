@@ -804,10 +804,127 @@ The peer's locked Rust contract tests passed 12/12. The process suite passed
 5/5 tests over 4/4 steps in both modes. It checks the ALPN contract and four
 routes: Zig client to strict `noq`, Zig client to stock iroh, strict `noq`
 client to Zig server, and stock iroh client to Zig server. All four negotiated
-`/iroh-gossip/1` and exchanged the exact 17-byte request and response payloads.
+`ozai` and exchanged the exact 17-byte request and response payloads.
 This proves a bounded TLS handshake and stream exchange. It does not close the
 upstream matrix or prove mixed blob/gossip/relay protocols, NAT traversal or
 0-RTT.
+
+### 10. Native Noq extension wire and lifetime limits
+
+The extension source is Noq 1.3.0 at
+`c1f411562e6078852749b8bcf1190523096a107f`.
+The vendor implements observed-address role transport parameters and frames.
+It also implements native NAT ADD_ADDRESS, REACH_ADDRESS and REMOVE_ADDRESS,
+plus native multipath transport parameters and frames.
+These are Noq wire extensions, not the standalone Number-Time `src/net/qnt.zig` protocol.
+
+`Node.Config.address_discovery_role` opts into native observed-address negotiation.
+Bridge and dial configurations pass that role to the core.
+Native candidate admission uses caller-configured physical addresses.
+No node consumer turns received observations into learned candidates or published addresses.
+The core supports only path IDs 0 and 1 for the connection lifetime.
+Retired IDs retain their slots. Eight historical project address pairs do not expand this capacity.
+
+`test/native_observed_upstream_oracle.rs`, `test/native_nat_upstream_oracle.rs`
+and `test/native_multipath_upstream_oracle.rs` capture pinned Noq private codec output.
+The actual generator captures produced 19-byte observed-address, 43-byte NAT and 24-byte multipath files.
+`src/net/native_oracle_test.zig` is the Zig fixture consumer.
+The fresh Zig consumer passed 9/9: three actual codec cases and six collectors.
+It compares observed-address roles and varint widths, NAT frames and capacity, and ten multipath variants plus the MaxPath TLV.
+Captured files prove encoder/decoder bytes, not live mapping learning or a successful NAT round.
+
+Assembly failure and path abandonment have different contracts.
+`Connection.sendAt` calls `failAssembly` when packet assembly fails.
+It closes with `INTERNAL_ERROR`. The caller must discard the unspecified output buffer.
+`Bridge.Conn.drain` returns `CoreRefused` without publishing an egress prefix.
+Assembly allocation failure is not a recoverable requeue operation.
+
+On first `PATH_ABANDON`, `Connection.requeueAbandonedPath` moves reliable retransmission obligations to the surviving path.
+It retains STREAM bytes and FIN, control obligations, CRYPTO and pending HANDSHAKE_DONE state.
+It retires abandoned sent records and recovery deadlines while preserving packet-number history for subsequent ordinary ACKs.
+Repeated abandonment does not duplicate that work.
+This is a source contract, not a new mixed-peer wire receipt.
+
+The native traversal cancellation model uses sequence and last-local state.
+That standalone model does not drive Node cancellation.
+Configured candidates, native frame handling and this model have different production boundaries.
+
+Main observed vendored QUIC Debug and ReleaseSafe suites passing 671/671 each (`bg288`).
+Current normal-root Debug and ReleaseSafe integration passed 28/28 steps and 2538/2538 tests each (`bg317`).
+The consumer regressions cover owned primary/nested key cleanup and the separate native cancellation model.
+The model remains standalone. No Node cancellation integration or new mixed-peer proof follows from these passes.
+Fresh schema-3 capture, full default gate and live smokes have not run.
+
+### 11. Retry policy before connection allocation
+
+`ConnectionManager` validates Initial tokens before its synchronous policy callback.
+The callback receives borrowed metadata, not an allocated connection.
+It must not retain CID slices or reenter the manager.
+The manager executes accept, Retry, refuse or ignore before `acceptConnection`.
+It refuses Retry for an already validated Initial.
+Router policy now reaches this real preallocation route.
+
+The live normal-stack Retry socket proof recorded one unvalidated Initial and one validated Initial.
+At the Retry response, `allocated_after_retry` was zero.
+The validated Initial then established one connection and exchanged the exact application payload.
+Wire vectors and token/address-binding regressions are separate codec evidence.
+Neither wire vectors alone nor an isolated policy callback proves that socket route.
+
+### 12. Public stream borrows and deferred reclamation
+
+`transport/bridge_conn.Stream` carries its owning `StreamsMap`.
+Public handles borrow core streams and must pin them across connection processing.
+Otherwise, callers must reacquire each handle by ID after that processing.
+`close` ends sending. It does not release the stream.
+`unpin` releases the final active borrow and calls `disposeIfSettled`.
+A settled stream enters deferred reclamation for the next disposal cycle.
+An unacknowledged FIN keeps the stream alive for retransmission.
+The existing overflow backstop preserves reclamation if the disposal queue is full.
+This prevents a settled, formerly pinned stream from remaining unreachable by garbage collection.
+
+### 13. `Connection.deinit` releases both path-owned packet handlers
+
+`packetHandler()` follows the active `transport_path`; teardown must not use
+that selector. It must release the primary `pkt_handler` and, when present,
+the separately owned path-1 handler exactly once. Selecting path 1 during
+teardown can free the path-1 handler twice while leaving the primary handler's
+packet maps allocated.
+
+The regression test leaves each of paths 0 and 1 active in turn, allocates one
+in-flight packet in both handlers, and calls `Connection.deinit` under
+`std.testing.allocator`. Leak detection and double-free detection cover both
+ownership branches.
+
+### 14. Coverage instrumentation avoids Zig 0.16.0's fuzz-runner type error
+
+The six `std.testing.fuzz` calls in `src/quic/frame.zig`,
+`src/quic/native_nat.zig`, `src/quic/observed_address.zig` (two calls),
+`src/quic/tls13.zig`, and `src/quic/transport_params.zig` now dispatch at
+compile time on both `@import("builtin").fuzz` and
+`@import("coverage_options").coverage`. The build supplies that options module
+to both the imported QUIC module and the separate `test_all.zig` test root; its
+`coverage` boolean is the existing `-Dcoverage` value, defaulting to false.
+The same option and guard also serve the project's native-NAT fuzz test in
+`src/net/native_nat.zig`, through the library and portable-test root modules.
+
+Coverage sets the module's `fuzz` flag to obtain LLVM counters, not to execute
+the fuzz runner. Instantiating these calls with that flag triggers Zig compiler
+bug [#36326](https://github.com/ziglang/zig/issues/36326):
+`lib/compiler/test_runner.zig:566` expects `*const debug.StackTrace` but receives
+`*builtin.StackTrace`.
+
+Only when both flags are true does each test directly call its existing
+callback once with a local `std.testing.Smith` initialized with `.in = &.{}`.
+This replays the empty input deterministically and keeps the callback reachable
+for coverage without instantiating `std.testing.fuzz`. Smith's non-null input
+selects corpus replay rather than the fuzz runtime, even in an instrumented
+module.
+
+Otherwise the original `std.testing.fuzz` calls, callbacks, options, and corpus
+replay run unchanged. In particular, without `-Dcoverage=true`,
+`zig build test --fuzz` and `zig build quic-test --fuzz` retain libFuzzer
+dispatch even though `builtin.fuzz` is true. Deterministic assertions, measured
+coverage roots, and dedicated `zig build fuzz` targets are unchanged.
 
 ## Measured cost
 

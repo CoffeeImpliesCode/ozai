@@ -263,11 +263,15 @@ pub const Planner = struct {
     /// flight. What an owner polls on, and the answer when the planner is idle
     /// is null rather than zero: zero is an instant on the caller's timeline
     /// and this file has no business inventing one.
-    pub fn next_due(self: *const Planner) ?Nanos {
+    pub fn nextDue(self: *const Planner) ?Nanos {
         var due: ?Nanos = null;
         for (self.slice()) |target| {
             if (target_mod.settled(target)) continue;
-            if (due == null or target.deadline < due.?) due = target.deadline;
+            if (due) |current_due| {
+                if (target.deadline < current_due) due = target.deadline;
+            } else {
+                due = target.deadline;
+            }
         }
         return due;
     }
@@ -517,11 +521,13 @@ const fixed_peer: NodeId = NodeId.fromBytes([_]u8{9} ** 32) catch
 /// The array is `max_attempts` long whatever `count` is, so a caller hands
 /// `start` the slice `set[0..count]`: the rest of the array is `undefined`,
 /// and an address read out of it is not a candidate.
-fn candidate_set(first: u16, count: usize) [max_attempts]SocketAddr {
+fn candidateSet(first: u16, count: usize) [max_attempts]SocketAddr {
     var set: [max_attempts]SocketAddr = undefined;
     for (0..count) |offset| {
         set[offset] = ip(first + @as(u16, @intCast(offset)));
     }
+    // ZBC cannot follow callers' slices, which use the initialized prefix or all eight slots.
+    // zbc-disable-next-line: use-undefined
     return set;
 }
 
@@ -560,7 +566,7 @@ fn pendingCount(planner: *const Planner) usize {
 /// A planner with one round already started on `count` candidates at `now`.
 fn started(count: usize, now: Nanos) Planner {
     var planner = Planner.init(fixed_peer);
-    const set = candidate_set(4000, count);
+    const set = candidateSet(4000, count);
     _ = planner.start(now, .{ .initiateNatTraversalRound = 1 }, set[0..count]);
     return planner;
 }
@@ -589,8 +595,8 @@ test "a gate decision becomes one ordered list of attempts with one deadline" {
         try t.expect(std.meta.eql(fixed_peer, target.peer));
         try t.expectEqual(Outcome.pending, target.outcome);
     }
-    // One deadline for the round, so `next_due` has one answer.
-    try t.expectEqual(@as(?Nanos, now + attempt_timeout), planner.next_due());
+    // One deadline for the round, so `nextDue` has one answer.
+    try t.expectEqual(@as(?Nanos, now + attempt_timeout), planner.nextDue());
 
     // The same set in ascending order produces the same list.
     const ascending = [_]SocketAddr{ ip(4000), ip(4001), ip(4002) };
@@ -602,7 +608,7 @@ test "a gate decision becomes one ordered list of attempts with one deadline" {
 
 test "the gate's own no-round answers are obeyed and change nothing" {
     const now: Nanos = 10 * std.time.ns_per_s;
-    const set = candidate_set(4000, 3);
+    const set = candidateSet(4000, 3);
 
     // No round is due. Nothing is filed and nothing is superseded, because the
     // instruction names an instant and this file does not schedule it.
@@ -611,7 +617,7 @@ test "the gate's own no-round answers are obeyed and change nothing" {
     try t.expectEqual(@as(usize, 0), quiet.live);
     try t.expectEqual(@as(usize, 0), quiet.superseded);
     try t.expectEqual(@as(usize, 0), planner.slice().len);
-    try t.expect(planner.next_due() == null);
+    try t.expect(planner.nextDue() == null);
 
     // Punching has ended, and a round in flight is superseded rather than left
     // running: the peer is gone and every socket it had open is the owner's.
@@ -634,7 +640,7 @@ test "a new round supersedes the one in flight and files against fresh slots" {
     try t.expectEqual(@as(usize, 0), pendingCount(&planner));
     // The slots are free again, so the bound is about attempts in flight and
     // not about how many rounds this peer has ever run.
-    const set = candidate_set(4000, max_attempts);
+    const set = candidateSet(4000, max_attempts);
     const third = planner.start(now + attempt_timeout, .{ .initiateNatTraversalRound = 1 }, &set);
     try t.expectEqual(@as(usize, max_attempts), third.live);
     try t.expectEqual(@as(usize, max_attempts), planner.slice().len);
@@ -688,7 +694,7 @@ test "a refused round supersedes, so two rounds never share a peer" {
     const now: Nanos = 10 * std.time.ns_per_s;
     var planner = Planner.init(fixed_peer);
     // The full bound in flight.
-    const set = candidate_set(4000, max_attempts);
+    const set = candidateSet(4000, max_attempts);
     try t.expectEqual(@as(usize, max_attempts), planner.start(
         now,
         .{ .initiateNatTraversalRound = 1 },
@@ -724,7 +730,7 @@ test "a connected attempt supersedes the rest and releases nothing it did not ow
     try t.expectEqual(Outcome.connected, planner.slice()[1].outcome);
     try t.expectEqual(Outcome.superseded, planner.slice()[2].outcome);
     // Nothing is in flight, so there is no deadline left to poll on.
-    try t.expect(planner.next_due() == null);
+    try t.expect(planner.nextDue() == null);
 
     // A late answer to one of them changes nothing and releases nothing: the
     // first answer is the only one that had a socket open.
@@ -780,7 +786,7 @@ test "a known-unreachable candidate costs nothing on the next pass" {
 
     // The next pass opens two attempts, not three, and says that one of the
     // candidates was held back rather than filing it and refusing it later.
-    const set = candidate_set(4000, 3);
+    const set = candidateSet(4000, 3);
     const again = planner.start(
         now + holepunch.punch_interval,
         .{ .initiateNatTraversalRound = 1 },
@@ -810,7 +816,7 @@ test "a remembered failure expires rather than blacklisting an address forever" 
     // the address is still suppressed, and at it the candidate opens again.
     try t.expect(planner.remembered()[0].live(after_hold - 1));
     try t.expect(!planner.remembered()[0].live(after_hold));
-    const set = candidate_set(4000, 2);
+    const set = candidateSet(4000, 2);
     const again = planner.start(
         after_hold,
         .{ .initiateNatTraversalRound = 1 },
@@ -836,7 +842,7 @@ test "a repeated failure moves the record rather than adding a second one" {
     // refusal on 4000 can only arrive once the first record has run out, and it
     // goes into one record rather than into a second.
     const after_hold: Nanos = now + failure_hold;
-    const set = candidate_set(4000, 2);
+    const set = candidateSet(4000, 2);
     _ = planner.start(after_hold, .{ .initiateNatTraversalRound = 1 }, set[0..2]);
     try t.expectEqual(@as(usize, 0), planner.remembered().len);
     _ = planner.settle(after_hold, ip(4000), .refused);
@@ -864,7 +870,7 @@ test "a connection clears the record for the address that worked" {
     // answers `.connected` is the next round's: this round's attempt on it has
     // already been answered, and the first answer is the only answer.
     const after_hold: Nanos = now + failure_hold;
-    const set = candidate_set(4000, 1);
+    const set = candidateSet(4000, 1);
     _ = planner.start(after_hold, .{ .initiateNatTraversalRound = 1 }, set[0..1]);
     // The record on 4000 ran out and was collected with the round; the one on
     // 4002 is younger than a hold and is still there to be read.
@@ -963,7 +969,8 @@ test "a copied planner is a snapshot and not an alias" {
     // answer the original would have: nothing in a `Target` points into another
     // `Target`, so a copy cannot read its own bytes by way of the original.
     var moving = original;
-    const settled = moving.settle(now + 1, ip(4000), .connected).target.?;
+    const settled = moving.settle(now + 1, ip(4000), .connected).target orelse
+        return error.TestUnexpectedResult;
     try t.expectEqual(Outcome.pending, copy.slice()[0].outcome);
     try t.expectEqual(@as(usize, 3), pendingCount(&copy));
     try t.expectEqual(@as(usize, 0), pendingCount(&moving));
