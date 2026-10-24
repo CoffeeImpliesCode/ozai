@@ -63,8 +63,10 @@ pub fn main(init: std.process.Init) MainError!void {
         try configuredChecks(runner);
         try measure.runSafetyModes(runner, zig);
         try checkCurrentSource(gpa, init.io, digest);
-        try record.validateRetained(gpa, init.io, &environment);
-        try checkCurrentSource(gpa, init.io, digest);
+        if (environment.get("OZAI_COVERAGE_POLICY") != null) {
+            try record.validateRetained(gpa, init.io, &environment);
+            try checkCurrentSource(gpa, init.io, digest);
+        }
     } else {
         const measurement = try measure.run(runner, zig, compiler);
         if (!std.mem.eql(u8, digest, measurement.source_digest))

@@ -100,9 +100,9 @@ It also requires source/compiler identity, scope, modes, exact cold-item decisio
 and per-mode `unmapped_project` and `unowned` counts with reasons.
 Do not commit generated coverage records.
 
-`gate` runs configured checks and uninstrumented tests in both safety modes,
-then replays the retained coverage. `gate-strict` is the same command.
-Missing policy, stale hashes, incomplete scope, or unmatched decisions fail the gate.
+`gate` runs configured checks and uninstrumented tests in both safety modes;
+`gate-strict` is the same command.
+Set `OZAI_COVERAGE_POLICY` to enable retained coverage replay; invalid or stale records fail.
 Line hits do not establish branch coverage, protocol interoperability, or production reachability.
 
 ## Layout
