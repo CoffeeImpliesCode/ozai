@@ -311,11 +311,6 @@ impl ServerCertVerifier for PinnedServer {
 
 /// The one crypto provider both configurations are built with.
 ///
-/// `ring` rather than `aws-lc-rs`, and said out loud rather than left to
-/// `CryptoProvider::install_default`: a peer that silently picked a provider
-/// would make a signature a function of a process-wide global, which is the
-/// hidden input `docs/ARCHITECTURE.md:37` and `AGENTS.md` §2 forbid. It also
-/// keeps one provider in the graph, so noq-proto's and rustls' agree.
 pub fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
