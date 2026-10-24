@@ -70,6 +70,10 @@ Import `quic` only when application code names the transport core's types.
 Runtime owners require serialized access and exactly one teardown.
 Borrowed values must not outlive their owners. See the type documentation.
 
+The optional `test-rust-interop`, `test-gossip-interop`, `test-blobs-interop`, and
+`test-relay-interop` steps accept `-Diroh-peer=/absolute/path/to/ozai-iroh-peer`.
+Build that peer with `cargo build --locked --manifest-path interop/iroh-peer/Cargo.toml`.
+
 ## Development checks
 
 `direnv allow` loads the optional devenv shell and portable cache defaults.

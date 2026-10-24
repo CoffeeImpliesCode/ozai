@@ -283,9 +283,8 @@ fn assertProof(
 ) !void {
     const expected = try std.fmt.allocPrint(
         arena,
-        "{s} scope neighbors, topic {s}, sender {s}, payload {x}, received {d}, broadcast {d}",
+        "scope neighbors, topic {s}, sender {s}, payload {x}, received {d}, broadcast {d}",
         .{
-            prefix,
             &std.fmt.bytesToHex(expected_topic.toBytes(), .lower),
             &rust_peer.hexId(expected_sender),
             payload,
@@ -299,7 +298,7 @@ fn assertProof(
     for (observed) |line| {
         if (std.mem.eql(u8, expected, line)) return;
     }
-    child.gaveUp("missing exact topic proof {s}", .{expected});
+    child.gaveUp("missing exact topic proof {s} {s}", .{ prefix, expected });
 }
 
 fn assertPinRejected(child: *rust_peer.Process, consumer: *const Consumer, failed: bool) !void {
