@@ -18,3 +18,8 @@ coverage/
 # scratch
 /.worktrees/
 /tmp/
+target/
+__pycache__/
+*.pyc
+.ruff_cache/
+/result*
