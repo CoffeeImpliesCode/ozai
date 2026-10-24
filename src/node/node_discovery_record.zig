@@ -1,11 +1,6 @@
 //! The record this node publishes about itself: the relay addresses it is
 //! reachable at, merged into one publication and written as `_iroh` records.
 //!
-//! It is its own module because it is the one part of the discovery pass that
-//! is a *decision about what may leave this process*, and `AGENTS.md` §2 wants
-//! that separated from the transport so it can be read without reading a
-//! socket. `node_discovery.zig` owns the pass and the timers; this file owns
-//! what the pass publishes.
 //!
 //! # What is in the record, and what is not
 //!

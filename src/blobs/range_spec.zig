@@ -971,11 +971,11 @@ test "codec: malformed spec encodings are named errors" {
 
     // A varint that keeps its continuation bit set for every byte a u64 has
     // room for: no number of further bytes makes it fit.
-    try expectSpecError("01" ++ "80" ** 10, error.BadVarint);
+    try expectSpecError("01" ++ "80808080808080808080", error.BadVarint);
 
     // A varint that terminates inside the width but whose last byte carries
     // more value bits than a u64 has left: a number, not an encoding.
-    try expectSpecError("01" ++ "80" ** 9 ++ "02", error.ValueOutOfRange);
+    try expectSpecError("01" ++ "808080808080808080" ++ "02", error.ValueOutOfRange);
 
     // A count that fits the bytes that follow, and elements that then run out
     // mid-varint.
@@ -1000,8 +1000,8 @@ test "codec: malformed sequence encodings are named errors" {
     try expectSeqError("05", error.BadLength);
     // One pair whose spec claims nine widths and has none.
     try expectSeqError("02" ++ "00" ++ "09", error.BadLength);
-    try expectSeqError("01" ++ "00" ++ "01" ++ "80" ** 10, error.BadVarint);
-    try expectSeqError("01" ++ "00" ++ "01" ++ "80" ** 9 ++ "02", error.ValueOutOfRange);
+    try expectSeqError("01" ++ "00" ++ "01" ++ "80808080808080808080", error.BadVarint);
+    try expectSeqError("01" ++ "00" ++ "01" ++ "808080808080808080" ++ "02", error.ValueOutOfRange);
     try expectSeqErrorWithTrailer("0000", error.TrailingBytes);
 
     // The specs of every pair share one width buffer, so a frame can name more

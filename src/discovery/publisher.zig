@@ -1,22 +1,8 @@
 //! When a record goes out again, what goes out, and whose key may sign it.
 //!
-//! Upstream's publisher is a `watchable.set` plus a background task
-//! (`iroh/src/address_lookup/pkarr.rs`, `PkarrPublisher` at :357 and
-//! `update_endpoint_data`'s `self.watchable.set(Some(info))`): the endpoint
-//! hands over an `EndpointData` whenever it changes, and a timer republishes it
-//! so the relay's copy does not age out. Three things live here that upstream
-//! spreads across a channel and a `tokio` interval, kept as values because
-//! `AGENTS.md` §2 says a state machine takes decoded input plus state and
-//! returns new state plus actions, with no clock and no runtime inside it.
 //!
 //! # How often a record is republished
 //!
-//! **Upstream's interval is 30 seconds and this file does not claim it.** The
-//! constant lives in `iroh/src/address_lookup/pkarr.rs` and no copy of that file
-//! is on this machine — the reference checkout `~/projects/github-n0-computer-iroh*`
-//! that `AGENTS.md` names is not present, and a value quoted from memory is not
-//! evidence. So `republish_interval_ms` is a **caller-supplied parameter with a
-//! documented default**, and the default is stated as this project's choice:
 //!
 //! * `default_republish_interval_ms` is 60 000 ms. A pkarr relay stores a
 //!   packet for an hour at most — that figure is likewise unverified here — so a
@@ -230,10 +216,6 @@ pub const State = struct {
 
     /// What one tick at `now_ms` decides.
     ///
-    /// Pure over this state and the instant, which is the whole of
-    /// `AGENTS.md` §2's rule for this kind of decision: no clock, no socket, no
-    /// allocator. A caller drives it at whatever times it likes and can replay a
-    /// timeline exactly.
     ///
     /// The order is what the arms are for, and it is the order of the questions:
     ///
@@ -431,7 +413,7 @@ pub fn signerRefused(
 const t = std.testing;
 
 fn nodeIdOf(seed: u8) !addr.NodeId {
-    return (try key.SecretKey.fromSeed([_]u8{seed} ** key.SecretKey.seed_length)).nodeId();
+    return (try key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(seed)))).nodeId();
 }
 
 test "the first tick publishes, the next waits out the interval" {
@@ -684,9 +666,9 @@ test "a fan-in refuses mixed nodes and refuses nothing to publish" {
 }
 
 test "a signer that is not the node's own key is refused" {
-    var signer = try key.SecretKey.fromSeed([_]u8{1} ** key.SecretKey.seed_length);
+    var signer = try key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(1)));
     defer signer.deinit();
-    var other = try key.SecretKey.fromSeed([_]u8{2} ** key.SecretKey.seed_length);
+    var other = try key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(2)));
     defer other.deinit();
 
     // The right key signs for its own node.

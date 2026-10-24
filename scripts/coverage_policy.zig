@@ -16,7 +16,6 @@ pub const CountsError = error{
     UnmatchedDisposition,
 };
 pub const ReferenceError = error{InvalidMeasurementReference};
-pub const RecordError = error{ MissingLedger, DuplicateLedger };
 
 const fixture_item: Item = .{
     .mode = "Debug",
@@ -41,7 +40,7 @@ fn fixtureLedger(dispositions: []const Disposition) Ledger {
         .compiler = "0.16.0",
         .measurement = .{
             .path = "/retained/measurement.json",
-            .sha256 = "a" ** 64,
+            .sha256 = &@as([64:0]u8, @splat('a')),
         },
         .scope = scope,
         .modes = modes,
@@ -167,9 +166,6 @@ test "unattributed source cannot be disposed as measured test" {
             &.{item},
         ),
     );
-}
-test "missing embedded record fails" {
-    try std.testing.expectError(error.MissingLedger, extractRecord("# historical narrative only"));
 }
 
 const fixture_unmapped: UnmappedCounts = .{
@@ -595,13 +591,4 @@ pub fn validateReference(reference: MeasurementReference) ReferenceError!void {
     for (reference.sha256) |byte| {
         if (!std.ascii.isHex(byte)) return error.InvalidMeasurementReference;
     }
-}
-
-pub fn extractRecord(markdown: []const u8) RecordError![]const u8 {
-    const marker = "```ozai-coverage-v3\n";
-    const start = std.mem.indexOf(u8, markdown, marker) orelse return error.MissingLedger;
-    const rest = markdown[start + marker.len ..];
-    if (std.mem.indexOf(u8, rest, marker) != null) return error.DuplicateLedger;
-    const end = std.mem.indexOf(u8, rest, "\n```") orelse return error.MissingLedger;
-    return rest[0..end];
 }

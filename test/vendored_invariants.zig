@@ -1,11 +1,5 @@
 //! The gate on what the vendored QUIC core is allowed to reach for.
 //!
-//! M8 spent most of its cost making `vendor/quic/` obey the one rule
-//! `AGENTS.md` §2 and `docs/ARCHITECTURE.md` state plainly: nothing below
-//! `ozai.base` may read a clock, read the environment, or take an allocator it
-//! was not handed. A state machine that reads a clock cannot be driven by a
-//! test — there is no way to put a connection at a chosen time — and one that
-//! opens a socket cannot be handed a datagram at all.
 //!
 //! That rule is enforced here and nowhere else. `vendor/` is excluded from
 //! `zig fmt`, `zlint` and `zbc` through `GATE_EXCLUDE=vendor`, which is the
@@ -48,13 +42,6 @@
 //! `// std.posix.socket` in a comment and a `test "no sockets"` name are not
 //! evidence of anything.
 //!
-//! There are no carve-outs. Upstream had one: `sys.zig`, holding the sockets,
-//! the clock and the process CSPRNG behind a single import. DECISIONS/0001 step
-//! 2 deleted it once its last caller went, and this gate is what keeps that
-//! deletion true. A clock, a libc call, an entropy draw, a file, a process or a
-//! socket anywhere in this tree — its own tests included — is a failure here,
-//! and so is an `@import` of the deleted seam, so the file cannot come back as
-//! a temporary convenience.
 //!
 //! The file list below is the whole gate's coverage, and `@embedFile` cannot
 //! glob, so `build.zig` walks `vendor/quic/src` on every configure and fails

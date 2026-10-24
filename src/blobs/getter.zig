@@ -453,7 +453,7 @@ test "decode separates claimed size from terminal or expected size evidence" {
 }
 
 test "response budget derives finite known and decoder capped unknown allowances" {
-    const request = GetRequest.blob([_]u8{0} ** 32);
+    const request = GetRequest.blob(@as([32]u8, @splat(0)));
     try t.expectEqual(@as(usize, 8 + 1024), try budget(request, 1024));
     const tree = BaoTree.init(49189);
     const plan = plan_mod.planOf(tree, .{ .start = 0, .end = tree.chunks() });

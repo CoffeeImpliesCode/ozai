@@ -10,13 +10,6 @@
 //!
 //! # No clock, and no second table
 //!
-//! Every function here is a function of `elapsed_ms` and of values the caller
-//! holds. Nothing reads a clock, an allocator or a global, for the reason
-//! `discovery/lookup_io.zig`'s module doc gives: a module that reads a clock
-//! cannot be driven at a fixed one, and `docs/DECISIONS/0002-async-substrate.md`
-//! says a struct holding an `Io` cannot be driven twice with different
-//! runtimes. A caller with an `Io` and a deadline drives this; a test with a
-//! list of instants drives the same code.
 //!
 //! # This is not `discovery/host_io.zig`'s schedule, and the reason is the
 //! axis

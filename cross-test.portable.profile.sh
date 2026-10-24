@@ -1,4 +1,4 @@
-# Socket-free protocol/state-machine survey of every Zig 0.16.0 libc target.
+# Socket-free protocol/state-machine survey of libc target triples.
 # Build-only and unsupported rows remain visible; this is not a live backend claim.
 CROSS_BUILD_STEP=test-portable
 CROSS_MATRIX=(

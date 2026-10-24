@@ -202,7 +202,7 @@ const t = std.testing;
 test "the four names are the hash's digits and four different suffixes" {
     var storage: NameStorage = undefined;
     const built = names(&storage, @splat(0xab));
-    const digits = "ab" ** 32;
+    const digits = "abababababababababababababababababababababababababababababababab";
     try t.expectEqualStrings(digits ++ ".data", built.data);
     try t.expectEqualStrings(digits ++ ".outboard", built.outboard);
     try t.expectEqualStrings(digits ++ ".data.partial", built.data_partial);

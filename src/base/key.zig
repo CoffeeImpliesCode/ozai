@@ -342,7 +342,7 @@ const t = std.testing;
 // If our seed derivation ever drifts from ed25519-as-RFC-8032, this is the
 // first thing that breaks.
 test "all-zero seed produces the iroh node id" {
-    var secret = try SecretKey.fromSeed([_]u8{0} ** SecretKey.seed_length);
+    var secret = try SecretKey.fromSeed(@as([SecretKey.seed_length]u8, @splat(0)));
     defer secret.deinit();
     const node_id = secret.nodeId();
     try t.expectEqualStrings(
@@ -357,7 +357,7 @@ test "all-zero seed produces the iroh node id" {
 }
 
 test "local tls name round trips and rejects near misses" {
-    var secret = try SecretKey.fromSeed([_]u8{0} ** SecretKey.seed_length);
+    var secret = try SecretKey.fromSeed(@as([SecretKey.seed_length]u8, @splat(0)));
     defer secret.deinit();
     const node_id = secret.nodeId();
     const name = node_id.toLocalTlsName();
@@ -382,18 +382,18 @@ test "local tls name round trips and rejects near misses" {
 }
 
 test "hex and z32 round trip, and both reject a bad encoding" {
-    const node_id = (try SecretKey.fromSeed([_]u8{7} ** SecretKey.seed_length)).nodeId();
+    const node_id = (try SecretKey.fromSeed(@as([SecretKey.seed_length]u8, @splat(7)))).nodeId();
     try t.expectEqual(node_id, try NodeId.parseHex(&node_id.toHex()));
     try t.expectEqual(node_id, try NodeId.parseZ32(&node_id.toZ32()));
 
     try t.expectError(error.NotOnCurve, NodeId.parseHex("deadbeef"));
-    try t.expectError(error.InvalidLength, NodeId.parseZ32("y" ** 10));
+    try t.expectError(error.InvalidLength, NodeId.parseZ32(&@as([10:0]u8, @splat('y'))));
     // Uppercase z-base-32 is a different alphabet position, not a case variant.
-    try t.expectError(error.InvalidSymbol, NodeId.parseZ32("Y" ** NodeId.z32_length));
+    try t.expectError(error.InvalidSymbol, NodeId.parseZ32(&@as([NodeId.z32_length:0]u8, @splat('Y'))));
 }
 
 test "signatures verify only against the signing node and the signed bytes" {
-    const secret = try SecretKey.fromSeed([_]u8{9} ** SecretKey.seed_length);
+    const secret = try SecretKey.fromSeed(@as([SecretKey.seed_length]u8, @splat(9)));
     const node_id = secret.nodeId();
     const message = "ozai";
 
@@ -401,7 +401,7 @@ test "signatures verify only against the signing node and the signed bytes" {
     try signature.verify(message, node_id);
 
     try t.expectError(error.BadSignature, signature.verify("ozai!", node_id));
-    const other = try SecretKey.fromSeed([_]u8{10} ** SecretKey.seed_length);
+    const other = try SecretKey.fromSeed(@as([SecretKey.seed_length]u8, @splat(10)));
     try t.expectError(
         error.BadSignature,
         signature.verify(message, other.nodeId()),
@@ -409,28 +409,28 @@ test "signatures verify only against the signing node and the signed bytes" {
 }
 
 test "signing is deterministic" {
-    const secret = try SecretKey.fromSeed([_]u8{3} ** SecretKey.seed_length);
+    const secret = try SecretKey.fromSeed(@as([SecretKey.seed_length]u8, @splat(3)));
     try t.expectEqual(secret.sign("same").toBytes(), secret.sign("same").toBytes());
 }
 
 test "node id ordering is lexicographic over bytes" {
-    const low = try NodeId.fromBytes([_]u8{0x00} ** 32);
-    const high = try NodeId.fromBytes([_]u8{0x00} ** 31 ++ [_]u8{0x01});
+    const low = try NodeId.fromBytes(@as([32]u8, @splat(0x00)));
+    const high = try NodeId.fromBytes(@as([31]u8, @splat(0x00)) ++ [_]u8{0x01});
     try t.expectEqual(std.math.Order.lt, low.order(high));
-    try t.expectEqual(std.math.Order.eq, low.order(try NodeId.fromBytes([_]u8{0} ** 32)));
+    try t.expectEqual(std.math.Order.eq, low.order(try NodeId.fromBytes(@as([32]u8, @splat(0)))));
 }
 
 test "non-canonical point bytes are rejected" {
     // y >= p has no curve point; the low 32 bytes of the field modulus plus a
     // high bit is the canonical test std applies.
-    var bytes = [_]u8{0xff} ** 32;
+    var bytes = @as([32]u8, @splat(0xff));
     bytes[31] = 0x7f;
     bytes[0] = 0xed;
     try t.expectError(error.NotOnCurve, NodeId.fromBytes(bytes));
 }
 
 test "secret key zeroes itself on deinit" {
-    var secret = try SecretKey.fromSeed([_]u8{5} ** SecretKey.seed_length);
+    var secret = try SecretKey.fromSeed(@as([SecretKey.seed_length]u8, @splat(5)));
     const before = secret.toBytes();
     try t.expect(std.mem.indexOfScalar(u8, &before, 5) != null);
 

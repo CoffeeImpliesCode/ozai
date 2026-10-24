@@ -19,8 +19,6 @@
 //! published a second dialect of the same line would need a second parser:
 //! `two_process_progress.progress_prefix` and `parseProgress`.
 //!
-//! Every allocation goes through a handle the caller handed in, which here is
-//! `std.testing`'s own allocator: `AGENTS.md` §1 by name.
 
 const std = @import("std");
 

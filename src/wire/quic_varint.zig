@@ -188,7 +188,7 @@ const vectors = [_]struct { value: u64, bytes: []const u8 }{
 
 test "every width, its bytes, its refusals and its fixed point" {
     var scratch: [max_length]u8 = undefined;
-    const untouched = [_]u8{0xaa} ** max_length;
+    const untouched = @as([max_length]u8, @splat(0xaa));
 
     // `inline for` over both tables, so a boundary added to one and not the
     // other is a compile error rather than a boundary nothing sweeps.

@@ -58,7 +58,7 @@ pub const Closed = enum(u16) {
     /// (`RFC 9000` section 16), where `00` means one byte and the low six bits
     /// are the value — which is why the value comes back unchanged.
     pub fn toVarInt(self: Closed) u64 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// The reason a code names, or `error.UnknownClose` for a code this build

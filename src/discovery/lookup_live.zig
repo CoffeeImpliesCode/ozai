@@ -569,12 +569,12 @@ const Prng = std.Random.DefaultPrng;
 
 /// The seed every test's node comes from, so the name asked and the answer
 /// given are the same bytes on every run.
-const seed = [_]u8{7} ** key.SecretKey.seed_length;
+const seed = @as([key.SecretKey.seed_length]u8, @splat(7));
 
 /// The name a lookup of the test's node is asked under, and the bytes its
 /// framed query takes.
 const asked_len = dns.queryNameLength(dns.prod_origin);
-const asked_bytes = lookup_io.queryLength("x" ** asked_len);
+const asked_bytes = lookup_io.queryLength(&@as([asked_len:0]u8, @splat('x')));
 /// Frame an answer to the question `query` carried: its own wire name, one TXT
 /// record under it, and the flags the caller wants the header to carry.
 ///
@@ -1036,8 +1036,8 @@ test "every failure a socket can report is one of the three the seam has" {
     // The whole set on each side, and the two arms that are not `Refused`:
     // `Io`'s own cancellation, and the wait that ran out with nothing in it.
     // A deadline of one millisecond so the seam's own `Empty` is reachable.
-    inline for (@typeInfo(socket.ReceiveError).error_set.?) |member| {
-        const failure: socket.ReceiveError = @field(socket.ReceiveError, member.name);
+    inline for (@typeInfo(socket.ReceiveError).error_set.error_names.?) |member| {
+        const failure: socket.ReceiveError = @field(socket.ReceiveError, member);
         var script: Scripted = .{ .from = nameserver, .fail = failure };
         var datagram: Datagram = .{ .wire = script.wire() };
         const seam = datagram.seam();
@@ -1048,8 +1048,8 @@ test "every failure a socket can report is one of the three the seam has" {
         };
         try t.expectError(want, seam.receive(seam.ctx, t.io, &buffers.reply, 1));
     }
-    inline for (@typeInfo(socket.SendError).error_set.?) |member| {
-        const failure: socket.SendError = @field(socket.SendError, member.name);
+    inline for (@typeInfo(socket.SendError).error_set.error_names.?) |member| {
+        const failure: socket.SendError = @field(socket.SendError, member);
         var script: Scripted = .{ .from = nameserver, .send_fails = failure };
         var datagram: Datagram = .{ .wire = script.wire() };
         const seam = datagram.seam();

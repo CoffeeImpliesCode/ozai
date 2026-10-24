@@ -44,7 +44,7 @@ pub const max_kills = max_conns;
 pub const disconnect_grace: Nanos = 1_000;
 /// The topic the simulator runs: 32 zero bytes, which is upstream's
 /// `sim::TOPIC` and a fixture rather than a value anyone would choose.
-pub const topic: TopicId = TopicId.fromBytes([_]u8{0} ** topic_id_length);
+pub const topic: TopicId = TopicId.fromBytes(@as([topic_id_length]u8, @splat(0)));
 /// The number of neighbour events one `neighbourEvents` buffer holds.
 /// Sized for a swarm that reshuffles several times over, which is several
 /// times the node count.

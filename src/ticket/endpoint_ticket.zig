@@ -206,7 +206,7 @@ pub const EndpointTicket = struct {
         // a ticket layout this build has no arm for, which is a different
         // thing from a field inside a ticket carrying an arm we lack, and a
         // caller reads the two differently.
-        if (try reader.readU32() != @intFromEnum(WireVariant.variant1)) {
+        if (try reader.readU32() != @backingInt(WireVariant.variant1)) {
             return error.UnknownTicketVariant;
         }
 
@@ -625,7 +625,7 @@ test "a custom payload longer than a CustomAddr holds is refused" {
     try writer.writeLen(1);
     try writer.writeVariant(TransportTag.custom);
     try writer.writeU64(1);
-    try writer.writeBytes(&[_]u8{0xaa} ** (addr.max_inline_length + 1));
+    try writer.writeBytes(&@as([(addr.max_inline_length + 1)]u8, @splat(0xaa)));
 
     try t.expectError(error.CustomAddrTooLong, EndpointTicket.decodeBytes(alloc, writer.finish()));
 }
@@ -657,7 +657,7 @@ test "maxEncodedLength bounds every encoding this module writes" {
     const id = try NodeId.parseHex(golden_id_hex);
 
     var address = try NodeAddr.withRelay(alloc, id, try RelayUrl.parse("https://a.example./"));
-    const socket: SocketAddr = .{ .ip = .{ .v6 = [_]u8{ 0x20, 0x01 } ** 8 }, .port = 65535 };
+    const socket: SocketAddr = .{ .ip = .{ .v6 = .{ 0x20, 0x01, 0x20, 0x01, 0x20, 0x01, 0x20, 0x01, 0x20, 0x01, 0x20, 0x01, 0x20, 0x01, 0x20, 0x01 } }, .port = 65535 };
     address = (try address.insert(alloc, .{ .ip = socket })) orelse
         return error.TestUnexpectedResult;
     const custom = try CustomAddr.parse(

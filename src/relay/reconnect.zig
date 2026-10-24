@@ -54,13 +54,6 @@
 //!
 //! # The backoff, and why it is not random here
 //!
-//! `backoff` doubles from `first_delay` up to `max_delay`, and the loop is
-//! bounded by `attempt` rather than by a wall clock. Upstream jitters its
-//! reconnect; this file does not, because `AGENTS.md` §2 asks for seeds over
-//! entropy and a caller that wants jitter can add it to the wait the state names.
-//! The doubling saturates, so an attempt count that would overflow a `u8`
-//! multiplication cannot, and the cap means the arithmetic terminates whatever
-//! number it is handed.
 //!
 //! Everything here is pure over values: a state, an event and an instant in, a
 //! new state and at most one action out. No clock, no socket, no allocator, and

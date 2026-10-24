@@ -104,7 +104,7 @@ pub const captive_portal_timeout: Nanos = 2 * std.time.ns_per_s;
 /// past their ends.
 const family_count = 3;
 comptime {
-    if (@typeInfo(Probe).@"enum".fields.len != family_count) {
+    if (@typeInfo(Probe).@"enum".field_names.len != family_count) {
         @compileError("report.Probe gained a family; this file's masks are sized for three");
     }
 }
@@ -424,7 +424,7 @@ pub const Plan = struct {
     fn stride(self: Plan) TaskIndex {
         var count: TaskIndex = 0;
         for (family_order) |proto| {
-            if (self.run[@intFromEnum(proto)]) count += ladder(proto);
+            if (self.run[@backingInt(proto)]) count += ladder(proto);
         }
         return count;
     }
@@ -442,7 +442,7 @@ pub const Plan = struct {
         var relay: TaskIndex = 0;
         while (relay < relays) : (relay += 1) {
             for (family_order) |proto| {
-                if (!self.run[@intFromEnum(proto)]) continue;
+                if (!self.run[@backingInt(proto)]) continue;
                 var attempt: TaskIndex = 0;
                 while (attempt < ladder(proto)) : (attempt += 1) {
                     if (seen == index) {
@@ -487,9 +487,9 @@ pub fn plan(input: Input) Plan {
     const needs_v6 = input.if_state.have_v6 != (carried_v6 != null);
 
     var run: [family_count]bool = .{ false, false, false };
-    run[@intFromEnum(Probe.qad_ipv4)] = input.protocols.includes(.qad_ipv4) and
+    run[@backingInt(Probe.qad_ipv4)] = input.protocols.includes(.qad_ipv4) and
         input.if_state.have_v4 and needs_v4;
-    run[@intFromEnum(Probe.qad_ipv6)] = input.protocols.includes(.qad_ipv6) and
+    run[@backingInt(Probe.qad_ipv6)] = input.protocols.includes(.qad_ipv6) and
         input.if_state.have_v6 and needs_v6;
     // `ProbePlan::with_last_report` (`probes.rs:117-128`): a round with a last
     // report that measured something schedules no HTTPS probe at all, and only
@@ -498,7 +498,7 @@ pub fn plan(input: Input) Plan {
     // is reproduced as written: the QAD path is what fills an incremental
     // round, and an HTTPS probe measures no address, so there is nothing for
     // one to add.
-    run[@intFromEnum(Probe.https)] = input.protocols.includes(.https) and
+    run[@backingInt(Probe.https)] = input.protocols.includes(.https) and
         (input.round.last == null or isEmpty(&input.round.last.?.relay_latency));
 
     return .{
@@ -631,13 +631,13 @@ test "a v6 probe is planned only when the host's capability and its answer disag
     };
 
     // A v6 host with no v6 answer needs one.
-    try t.expect(plan(base).run[@intFromEnum(Probe.qad_ipv6)]);
+    try t.expect(plan(base).run[@backingInt(Probe.qad_ipv6)]);
     // A v6 host whose live connection already has one does not: this is the
     // whole point of the connection carrying it.
     var incremental = base;
     incremental.round = freshRound();
     incremental.round.carried_v6 = carried;
-    try t.expect(!plan(incremental).run[@intFromEnum(Probe.qad_ipv6)]);
+    try t.expect(!plan(incremental).run[@backingInt(Probe.qad_ipv6)]);
     // A host that has just lost IPv6 with an answer still in hand is the case
     // the two families' rules differ on: v6's rule says "probe", and the
     // capability gate upstream applies to both families (`net_report.rs:523`)
@@ -646,7 +646,7 @@ test "a v6 probe is planned only when the host's capability and its answer disag
     lost.if_state.have_v6 = false;
     lost.round = freshRound();
     lost.round.carried_v6 = carried;
-    try t.expect(!plan(lost).run[@intFromEnum(Probe.qad_ipv6)]);
+    try t.expect(!plan(lost).run[@backingInt(Probe.qad_ipv6)]);
     // v4 has no such clause: it is asked only whether it has an answer.
     var v4: Input = .{
         .relays = &relays,
@@ -654,7 +654,7 @@ test "a v6 probe is planned only when the host's capability and its answer disag
         .protocols = .{ .https = false, .qad_ipv4 = true, .qad_ipv6 = false },
         .now = test_start,
     };
-    try t.expect(plan(v4).run[@intFromEnum(Probe.qad_ipv4)]);
+    try t.expect(plan(v4).run[@backingInt(Probe.qad_ipv4)]);
     v4.round = freshRound();
     v4.round.carried_v4 = .{
         .relay = relays[1],
@@ -662,7 +662,7 @@ test "a v6 probe is planned only when the host's capability and its answer disag
         .latency = millis(10),
         .addr = public_v4,
     };
-    try t.expect(!plan(v4).run[@intFromEnum(Probe.qad_ipv4)]);
+    try t.expect(!plan(v4).run[@backingInt(Probe.qad_ipv4)]);
 }
 
 test "a round is full on the first one, on request, every five minutes, and after a portal" {

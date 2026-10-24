@@ -49,7 +49,7 @@ fn bodyOf(frame: []const u8) ![]const u8 {
 fn expectRefused(frame: []const u8) !void {
     if (codec.decode(frame)) |message| {
         std.debug.print("a frame that should not decode came back as layer {d}\n", .{
-            @intFromEnum(std.meta.activeTag(message)),
+            @backingInt(std.meta.activeTag(message)),
         });
         return error.RefusedFrameDecoded;
     } else |_| {}
@@ -317,7 +317,7 @@ test "a frame prefix that does not match the bytes present is refused" {
 }
 
 test "the stream header round-trips, and a body that is not a topic id is refused" {
-    const topic = gossip.TopicId.fromBytes([_]u8{0x5a} ** gossip.topic_id_length);
+    const topic = gossip.TopicId.fromBytes(@as([gossip.topic_id_length]u8, @splat(0x5a)));
     var buf: [limits.max_header_size]u8 = undefined;
     const frame = try codec.encodeStreamHeader(codec.StreamHeader.init(topic), &buf);
     try t.expect(frame.len <= limits.max_header_size);
@@ -454,12 +454,12 @@ test "the largest peer list and the largest IHave list round-trip" {
 }
 
 test "maximum owned bytes match the upstream receive frame budget" {
-    const data = [_]u8{0x01} ** gossip.peer_data_max;
+    const data = @as([gossip.peer_data_max]u8, @splat(0x01));
     const join: codec.Message = .{ .swarm = .{ .join = &data } };
     try t.expectEqual(codec.max_message_size, codec.encodedLen(join));
     const broadcast: codec.Message = .{ .gossip = .{ .gossip = .{
         .id = plumtree.MessageId.fromContent("big"),
-        .content = &([_]u8{0x02} ** plumtree.max_content),
+        .content = &(@as([plumtree.max_content]u8, @splat(0x02))),
         .scope = .neighbors,
     } } };
     try t.expectEqual(codec.max_message_size, codec.encodedLen(broadcast));
@@ -502,8 +502,8 @@ test "frame-fitting upstream vectors and payloads exceed old local capacities" {
         .id = plumtree.MessageId.fromContent("wide"),
         .round = .{ .value = 65535 },
     };
-    const contact = [_]u8{0x42} ** 257;
-    const content = [_]u8{0x43} ** 1025;
+    const contact = @as([257]u8, @splat(0x42));
+    const content = @as([1025]u8, @splat(0x43));
     const messages = [_]codec.Message{
         .{ .swarm = .{ .shuffle_reply = .{ .nodes = try gossip.PeerInfos.init(&infos) } } },
         .{ .gossip = .{ .i_have = try plumtree.IHaves.init(&ihaves) } },
@@ -553,7 +553,7 @@ test "all ten pinned upstream state serializer variants decode and reencode exac
     }
     const header = @embedFile("fixtures/iroh-2885dd9/header.bin");
     const decoded_header = try codec.decodeStreamHeader(header);
-    try t.expectEqualSlices(u8, &([_]u8{0x74} ** 32), &decoded_header.topic_id.bytes);
+    try t.expectEqualSlices(u8, &(@as([32]u8, @splat(0x74))), &decoded_header.topic_id.bytes);
     try t.expectEqualSlices(u8, header, try codec.encodeStreamHeader(decoded_header, &out));
 }
 
@@ -570,7 +570,7 @@ test "actual upstream boundary vectors retain contact content and long vectors" 
 }
 
 test "decoded PeerData is copied before receive storage is reused" {
-    const original = [_]u8{0x42} ** 300;
+    const original = @as([300]u8, @splat(0x42));
     var frame: [room]u8 = undefined;
     const encoded = try codec.encode(.{ .swarm = .{ .join = &original } }, &frame);
     // Encoding a populated Join must preserve its borrowed PeerData on decode.

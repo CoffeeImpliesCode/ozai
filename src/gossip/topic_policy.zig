@@ -140,7 +140,7 @@ const test_node_id = @import("plumtree/test_node_id.zig");
 /// A topic named by one byte. A `TopicId` is 32 bytes an application chose and
 /// every one of them is as good as any other, so the bytes only have to differ.
 fn testTopic(tag: u8) TopicId {
-    var bytes = [_]u8{0} ** gossip.topic_id_length;
+    var bytes = @as([gossip.topic_id_length]u8, @splat(0));
     bytes[0] = tag;
     return TopicId.fromBytes(bytes);
 }

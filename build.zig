@@ -205,17 +205,10 @@ pub fn build(b: *std.Build) void {
             "test-native-interop",
             "Run same-connection NAT interop in private namespaces (explicit fixture CLI required)",
         );
-        if (b.args) |args| {
-            const run_nat = b.addSystemCommand(&.{ "unshare", "-Urn", "--" });
-            run_nat.addArtifactArg(nat_fixture);
-            run_nat.addArgs(args);
-            native_step.dependOn(&run_nat.step);
-        } else {
-            native_step.dependOn(&b.addFail(
-                "test-native-interop requires -- --node-peer ABS --rust-relay ABS " ++
-                    "--evidence-dir ABS --original-netns net:[N] --original-userns user:[N]",
-            ).step);
-        }
+        const run_nat = b.addSystemCommand(&.{ "unshare", "-Urn", "--" });
+        run_nat.addArtifactArg2(nat_fixture, .{});
+        run_nat.addPassthruArgs();
+        native_step.dependOn(&run_nat.step);
     } else {
         b.step("test-native-interop", "Run Linux private-namespace NAT interop")
             .dependOn(&b.addFail("test-native-interop requires a Linux target").step);
@@ -223,7 +216,7 @@ pub fn build(b: *std.Build) void {
 
     const run_node = b.addRunArtifact(node_exe);
     run_node.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_node.addArgs(args);
+    run_node.addPassthruArgs();
     b.step(
         "run-ozai-node",
         "Run an ozai node until it is stopped",
@@ -698,8 +691,8 @@ pub fn build(b: *std.Build) void {
     // for LLVM counters, so a coverage build of this artifact would hand it
     // `-ffuzz` outside the fuzzer's driver, which is the crash above. Separate
     // artifacts are how that exclusion is expressed.
-    const fuzz_optimize: std.builtin.OptimizeMode =
-        if (optimize == .Debug) .ReleaseSafe else optimize;
+    const fuzz_optimize: std.lang.Optimize =
+        if (optimize == .debug) .safe else optimize;
     // One pair per decoder: a target file and a corpus directory, and nothing
     // else. Later milestones add a sibling of this pair, not a second harness.
     const fuzz_targets = [_]struct { name: []const u8, file: []const u8 }{

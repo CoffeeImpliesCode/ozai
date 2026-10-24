@@ -98,14 +98,6 @@
 //!
 //! # Purity
 //!
-//! One clock read, and it is `std.Io.Clock.awake` for the latency and the
-//! budget above — never for a decision: every refusal here is a refusal
-//! regardless of how much time was left. `std.Io` **is** a field of `Live`,
-//! because `Transport.VTable`'s six callbacks carry no runtime and the seam
-//! offers nowhere else to put one; `docs/DECISIONS/0002-async-substrate.md`'s
-//! rule is kept as far as the interface allows, which is to exactly one field
-//! set once from the caller's parameter at `init`. No global, no thread, no
-//! allocator: every buffer is the caller's and nothing here allocates.
 //!
 //! # Divergences from upstream, and what is unpinned
 //!

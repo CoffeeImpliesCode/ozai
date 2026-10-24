@@ -37,7 +37,7 @@ const input_buffer_len = 1200;
 
 /// A node nobody in this file is a packet from, so `verify` against it has to
 /// be a different answer from `verify` against the packet's own key.
-const other_seed = [_]u8{8} ** ozai.SecretKey.seed_length;
+const other_seed = @as([ozai.SecretKey.seed_length]u8, @splat(8));
 
 comptime {
     // A seed longer than the window the fuzzer reads into would be cut short
@@ -66,7 +66,7 @@ test "pkarr oracle permits correct field boundary rejections" {
     };
     for (boundaries) |boundary| {
         for ([_]u8{ 0, 0x80 }) |sign_bit| {
-            var bytes = [_]u8{0} ** (pkarr.header_length + 1);
+            var bytes = @as([(pkarr.header_length + 1)]u8, @splat(0));
             std.mem.writeInt(u256, bytes[0..32], boundary.y, .little);
             bytes[31] |= sign_bit;
             if (boundary.canonical) {

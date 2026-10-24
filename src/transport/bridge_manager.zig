@@ -90,11 +90,6 @@ pub const Bridge = struct {
     /// A bridge presenting `config.secret`'s node, with a `ConnectionManager`
     /// built from it.
     ///
-    /// `random` seeds the core's SipHash key and draws the connection ids it
-    /// hands out; `io` is used only where `config` left a transport key
-    /// null, and for that it is `std.Io.randomSecure` rather than a process
-    /// CSPRNG — a global RNG is what `AGENTS.md` §2 forbids, and an `std.Io`
-    /// the caller was handed is not a global.
     ///
     /// The returned pointer is owned by `gpa` and freed by `destroy`.
     /// `config.alpn` is borrowed and must remain alive and unchanged.
@@ -440,10 +435,6 @@ test "a node's identity reaches the core as a bare SPKI and the handshake finish
     const conn = bridge.connectionAt(0) orelse return error.TestUnexpectedResult;
     try t.expect(conn.established());
 
-    // The answer to the question `docs/PLAN.md`'s mapping raises: the core
-    // does not validate a peer's address, so an RFC 4193 ULA is a peer
-    // address like any other. It round-trips through the core's own address
-    // type unchanged, and `classify` still recognises it.
     try t.expectEqual(client_addr, conn.peer().?);
     try t.expectEqual(server_addr, conn.local().?);
     try t.expectEqual(
@@ -572,11 +563,6 @@ test "the same call at two instants gives two answers" {
     try t.expect(before.len > 0);
     try t.expectEqual(Tick.live, bridge.tick(conn, start, client.random()));
 
-    // At an instant past the idle timeout, the same two calls say the
-    // connection is over and there is nothing left to send. Nothing in this
-    // file read a clock to get there: the answers differ because the
-    // arguments did, which is the property `docs/DECISIONS/0002` is about and
-    // the only way a test can tell a threaded clock from a stored one.
     const later = start + 60 * std.time.ns_per_s;
     try t.expectEqual(Tick.finished, bridge.tick(conn, later, client.random()));
     try t.expectEqual(

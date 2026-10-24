@@ -15,8 +15,8 @@ const TopicId = topic_id.TopicId;
 test "a topic id is 32 opaque bytes and nothing more" {
     try t.expectEqual(@as(usize, 32), topic_id_length);
     try t.expectEqual(@as(usize, 32), @sizeOf(TopicId));
-    const zero = [_]u8{0} ** topic_id_length;
-    var one = [_]u8{0} ** topic_id_length;
+    const zero = @as([topic_id_length]u8, @splat(0));
+    var one = @as([topic_id_length]u8, @splat(0));
     one[0] = 1;
     const left = TopicId.fromBytes(one);
     const right = TopicId.fromBytes(zero);

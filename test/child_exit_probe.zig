@@ -49,9 +49,9 @@ fn classifyObservation(pid: std.process.Child.Id, info: *const linux.siginfo_t) 
     if (observed_pid == 0) return false;
     if (observed_pid != pid) return error.OwnershipMismatch;
     return switch (info.code) {
-        @intFromEnum(linux.CLD.EXITED),
-        @intFromEnum(linux.CLD.KILLED),
-        @intFromEnum(linux.CLD.DUMPED),
+        @backingInt(linux.CLD.EXITED),
+        @backingInt(linux.CLD.KILLED),
+        @backingInt(linux.CLD.DUMPED),
         => true,
         else => error.ChildStateUnavailable,
     };
@@ -131,16 +131,16 @@ test "kernel observation requires an exact child ID and a terminal CLD code" {
     try std.testing.expect(!try classifyObservation(42, &info));
 
     info.fields.common.first.piduid.pid = 43;
-    info.code = @intFromEnum(linux.CLD.EXITED);
+    info.code = @backingInt(linux.CLD.EXITED);
     try std.testing.expectError(error.OwnershipMismatch, classifyObservation(42, &info));
 
     info.fields.common.first.piduid.pid = 42;
     inline for (.{ linux.CLD.EXITED, linux.CLD.KILLED, linux.CLD.DUMPED }) |code| {
-        info.code = @intFromEnum(code);
+        info.code = @backingInt(code);
         try std.testing.expect(try classifyObservation(42, &info));
     }
     inline for (.{ linux.CLD.TRAPPED, linux.CLD.STOPPED, linux.CLD.CONTINUED }) |code| {
-        info.code = @intFromEnum(code);
+        info.code = @backingInt(code);
         try std.testing.expectError(error.ChildStateUnavailable, classifyObservation(42, &info));
     }
     info.code = 0;

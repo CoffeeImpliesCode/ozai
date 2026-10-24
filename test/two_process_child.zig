@@ -20,8 +20,6 @@ const roster_ns = @import("two_process_roster.zig");
 const signal_safety = @import("child_signal_safety.zig");
 const cleanup = @import("child_cleanup.zig");
 
-/// Every allocation in this file goes through a handle the caller handed in,
-/// which here is `std.testing`'s own allocator: `AGENTS.md` §1 by name.
 pub const Allocator = std.mem.Allocator;
 
 /// No peers, for a node that is only going to be dialled.

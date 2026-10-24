@@ -21,18 +21,6 @@
 //! address costs nothing on the next pass — no socket, no deadline, no entry
 //! in the attempt list.
 //!
-//! **A permanently remembered failure is its own bug, and this one expires.**
-//! A record is live for `failure_hold` and no longer; nothing in this file can
-//! extend it, and `start` collects the expired ones before it looks at the
-//! candidates. Two reasons it cannot be permanent. First, a NAT rebinding is
-//! not a failure of the address — `docs/DECISIONS/0001` records one measured at
-//! 2.2 s, and an address whose mapping was rebuilt during a punch answers on
-//! the next round. A record that outlived that would blacklist a working
-//! address for the life of the connection. Second, this tree has no way to
-//! learn that a peer's mapping changed: `holepunch_run`'s gap table says the
-//! candidate sets are never aged, so expiry is the *only* mechanism that can
-//! bring a candidate back, and a permanent record would be a peer's direct path
-//! gone for good over one round that nobody answered.
 //!
 //! `failure_hold` is two `punch_interval`s. One interval is the gap between
 //! rounds, and a candidate that failed in the round just gone is retried in the

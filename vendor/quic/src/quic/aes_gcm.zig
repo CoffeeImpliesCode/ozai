@@ -14,7 +14,6 @@
 //! to v0-v15, so 6+ blocks and 11 round keys don't fit and keys get reloaded.
 //! On arm64 GHASH also runs in vector registers (see `vec_ghash`). Elsewhere
 //! GHASH is `ghash.zig`, and without hardware AES, CTR is std's.
-//! See DECISIONS/zig_std_divergences.md.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -36,7 +35,7 @@ const RoundKeys = [Aes128.rounds + 1]Block;
 /// arm64: GHASH in vector registers. `ghash.zig` does its arithmetic on u128,
 /// which LLVM keeps in general registers, so every multiply moves operands
 /// across and back. Same multiply and reduction, on vectors.
-const vec_ghash = fast and builtin.cpu.arch == .aarch64 and builtin.mode != .ReleaseSmall;
+const vec_ghash = fast and builtin.cpu.arch == .aarch64 and builtin.optimize != .small;
 /// Powers of H that `Ghash.init` computes: H, H^2, ... H^16.
 const pc_count = @typeInfo(@FieldType(Ghash, "hx")).array.len;
 /// Byte order of GHASH's big-endian 128-bit integers.

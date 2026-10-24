@@ -174,9 +174,9 @@ test "a name has to be a name" {
     try t.expectError(error.BufferTooSmall, writeQuery("a.b.", .{ .id = 0 }, out[0..4]));
     // 63 octets is RFC 1035 §2.3.4's cap and one more is refused: a length
     // octet over 63 is indistinguishable from a pointer's first octet.
-    _ = try writeQuery("a." ++ "x" ** wire.max_label_length ++ ".example.com.", .{ .id = 0 }, &out);
+    _ = try writeQuery("a." ++ &@as([wire.max_label_length:0]u8, @splat('x')) ++ ".example.com.", .{ .id = 0 }, &out);
     try t.expectError(error.LabelTooLong, writeQuery(
-        "a." ++ "x" ** (wire.max_label_length + 1) ++ ".example.com.",
+        "a." ++ &@as([(wire.max_label_length + 1):0]u8, @splat('x')) ++ ".example.com.",
         .{ .id = 0 },
         &out,
     ));

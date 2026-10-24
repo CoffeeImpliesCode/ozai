@@ -157,7 +157,7 @@ pub fn encode(message: Message, version: ProtocolVersion, out: []u8) Error![]con
     // type and no payload.
     try checkEncodable(message);
     var writer = Writer.init(out);
-    try writer.writeVarInt(@intFromEnum(frame_type));
+    try writer.writeVarInt(@backingInt(frame_type));
     switch (message) {
         .server_challenge => |challenge| try writer.write(&challenge.challenge),
         .client_auth => |auth| {
@@ -356,7 +356,7 @@ test "codec: a datagram over max_packet_size is refused on the way out too" {
 }
 
 test "codec: a writer with no room is BufferFull, never a resize" {
-    const ping: Message = .{ .ping = [_]u8{42} ** 8 };
+    const ping: Message = .{ .ping = @as([8]u8, @splat(42)) };
     // Nine bytes: the header and the payload, exactly.
     var exact: [9]u8 = undefined;
     const written = try encode(ping, .v2, &exact);

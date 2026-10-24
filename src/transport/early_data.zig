@@ -195,7 +195,7 @@ const alpn_other = "/iroh-qad/0";
 /// The peer a seed names: a real ed25519 node id, for the reason the
 /// resumption policy's own helper gives.
 fn testNodeId(seed: u8) !NodeId {
-    var secret = try base_key.SecretKey.fromSeed([_]u8{seed} ** base_key.SecretKey.seed_length);
+    var secret = try base_key.SecretKey.fromSeed(@as([base_key.SecretKey.seed_length]u8, @splat(seed)));
     defer secret.deinit();
     return secret.nodeId();
 }
@@ -210,7 +210,7 @@ fn ticketFor(
     early_data_max: u32,
 ) SessionTicket {
     var built: SessionTicket = .{
-        .psk = [_]u8{0xa5} ** 32,
+        .psk = @as([32]u8, @splat(0xa5)),
         .lifetime = lifetime_s,
         .creation_time = created_s,
         .quic_version = version,

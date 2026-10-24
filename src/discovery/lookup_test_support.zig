@@ -22,7 +22,7 @@ pub const upstream_id = "1992d53c02cdc04566e5c0edb1ce83305cd550297953a047a445ea3
 
 /// The name and the size the questions are framed at.
 pub const asked_len = dns.queryNameLength(dns.prod_origin);
-pub const asked_bytes = query.queryLength("x" ** asked_len);
+pub const asked_bytes = query.queryLength(&@as([asked_len:0]u8, @splat('x')));
 
 /// A datagram socket that answers from a script, which is how every seam test
 /// runs a whole lookup with no nameserver and no network.
@@ -146,7 +146,7 @@ pub const captured_answer_hex =
 pub const captured_record = "relay=https://example.com/\x00";
 
 /// The seed that packet was signed with, and so the node its name is about.
-pub const captured_seed = [_]u8{7} ** key.SecretKey.seed_length;
+pub const captured_seed = @as([key.SecretKey.seed_length]u8, @splat(7));
 
 /// The name in `captured_answer_hex`: `_iroh.<z32>.` with no origin, which is
 /// what a publisher signs for itself.

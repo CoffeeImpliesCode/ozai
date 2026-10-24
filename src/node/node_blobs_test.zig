@@ -147,7 +147,7 @@ fn answerTestRequest(
 
 test "getter sends upstream EOF request selecting boundary chunks" {
     const options: blobs.Getter = .{
-        .hash = [_]u8{0x42} ** 32,
+        .hash = @as([32]u8, @splat(0x42)),
         .range = .{ .start = 15, .end = 18 },
     };
     var bytes: [128]u8 = undefined;
@@ -163,7 +163,7 @@ test "getter sends upstream EOF request selecting boundary chunks" {
 }
 
 test "getter never publishes truncated EOF as completion" {
-    const options: blobs.Getter = .{ .hash = [_]u8{0x42} ** 32, .size = 49189 };
+    const options: blobs.Getter = .{ .hash = @as([32]u8, @splat(0x42)), .size = 49189 };
     var payload: [128]u8 = undefined;
     try t.expectError(error.ResponseTruncated, blobs.decodeResponse(options, &.{}, &payload));
     var size: [8]u8 = undefined;
@@ -179,7 +179,7 @@ test "range request refuses empty or inverted chunk interval" {
     }) |range| {
         try t.expectError(
             error.InvalidRange,
-            blobs.encodeRequest(.{ .hash = [_]u8{0} ** 32, .range = range }, &bytes),
+            blobs.encodeRequest(.{ .hash = @as([32]u8, @splat(0)), .range = range }, &bytes),
         );
     }
 }
@@ -190,6 +190,6 @@ test "expected size mismatch is consumer visible before export" {
     var payload: [1]u8 = undefined;
     try t.expectError(
         error.SizeMismatch,
-        blobs.decodeResponse(.{ .hash = [_]u8{0} ** 32, .size = 49190 }, &size, &payload),
+        blobs.decodeResponse(.{ .hash = @as([32]u8, @splat(0)), .size = 49190 }, &size, &payload),
     );
 }

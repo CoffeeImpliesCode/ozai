@@ -22,14 +22,6 @@ const Instant = bridge_mod.Instant;
 
 /// How long `run` blocks on the socket when a pass moved nothing.
 ///
-/// A poll loop has no timer wheel, so this interval *is* the resolution the
-/// QUIC timers and the gossip clocks are served at, and it is also how long a
-/// stop signal waits to be seen: `Socket.awaitReadable` retries a signal
-/// rather than letting it out. A quarter of a second is coarse for a datagram
-/// path and right for the two things this loop is actually waiting on — a
-/// peer's handshake and membership's shuffles — and it is the honest ceiling
-/// of a loop with no scheduler to hold deadlines (`DECISIONS/0002`) and no
-/// send path on `Io.Uring`.
 pub const poll_interval_ms = 250;
 
 /// The loop's stop signal: a flag a signal handler can set, and a deadline the

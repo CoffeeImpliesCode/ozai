@@ -29,7 +29,7 @@ pub fn writeSockaddr(address: base_addr.SocketAddr, out: *c.sockaddr.storage) so
             target.* = .{
                 .family = linux.AF.INET,
                 .port = std.mem.nativeToBig(u16, address.port),
-                .addr = @bitCast(octets),
+                .addr = std.mem.readInt(u32, &octets, @import("builtin").cpu.arch.endian()),
             };
             return @sizeOf(c.sockaddr.in);
         },
@@ -56,7 +56,7 @@ pub fn readSockaddr(raw: *const c.sockaddr.storage) ?base_addr.SocketAddr {
         linux.AF.INET => v4: {
             const peer: *const c.sockaddr.in = @ptrCast(@alignCast(raw));
             break :v4 base_addr.SocketAddr{
-                .ip = .{ .v4 = @bitCast(peer.addr) },
+                .ip = .{ .v4 = std.mem.toBytes(peer.addr) },
                 .port = std.mem.bigToNative(u16, peer.port),
             };
         },

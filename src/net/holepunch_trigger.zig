@@ -123,13 +123,6 @@ pub const expired = target_mod.expired;
 
 /// How many attempts one round may hold.
 ///
-/// Eight, and the tree already says why twice: `docs/DECISIONS/0001` records
-/// that iroh works to "up to 8 concurrent paths per connection" against a core
-/// holding two `NetworkPath`s behind one `active_path_idx`
-/// (`vendor/quic/src/quic/connection.zig:626`), and `path_table.max_paths`
-/// adopts the same figure with the same citation. More than eight in-flight
-/// direct attempts to one peer is more concurrent paths than the substrate is
-/// built for, so the ninth is a refusal rather than a ninth socket.
 ///
 /// A round whose candidate set is shorter than this never reaches the bound,
 /// and one that is longer has candidates the round will not try this pass.
@@ -513,7 +506,7 @@ fn ip(port_number: u16) SocketAddr {
     return .{ .ip = .{ .v4 = .{ 192, 0, 2, 1 } }, .port = port_number };
 }
 
-const fixed_peer: NodeId = NodeId.fromBytes([_]u8{9} ** 32) catch
+const fixed_peer: NodeId = NodeId.fromBytes(@as([32]u8, @splat(9))) catch
     @compileError("the fixed test peer is not a canonical ed25519 point");
 
 /// `count` candidates on consecutive ports from `first`, in that order.
@@ -807,10 +800,6 @@ test "a remembered failure expires rather than blacklisting an address forever" 
     var planner = started(2, now);
     _ = planner.settle(now + 1, ip(4000), .refused);
 
-    // A NAT rebinding is not a failure of the address. `DECISIONS/0001`
-    // measures one at 2.2 s, so a record that outlived a hold longer than the
-    // rebinding would blacklist a working address for the connection's life —
-    // and nothing in this tree can learn that a mapping changed.
     const after_hold: Nanos = now + 1 + failure_hold;
     // The record runs out at its own hold, to the nanosecond: one short of it
     // the address is still suppressed, and at it the candidate opens again.

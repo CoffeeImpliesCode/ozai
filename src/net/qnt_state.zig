@@ -28,24 +28,6 @@
 //! against one (`Result.baseline`), so five rounds yield **at most four
 //! measurements**. Every justification below is about that number.
 //!
-//! 1. **Five is the smallest bound that can still produce a median after one
-//!    loss.** `min_rounds` is three measurements; three measurements plus the
-//!    baseline is four rounds; five leaves exactly one spare round for a reply
-//!    that never arrives. A lossy path loses one reply as a matter of course
-//!    rather than as an exception, and at four rounds a single loss would drop
-//!    the exchange below `min_rounds` and throw away every measurement it had.
-//!    The test named for this loses a round on purpose.
-//! 2. **Four measurements tolerate an outlier at each end.** That is what the
-//!    median buys and it is the whole reason for not using the minimum: a busy
-//!    path routinely produces one round that catches a send buffer draining, and
-//!    one such round must move the answer by nothing.
-//! 3. **Seven buys a second spare round for a cost nobody pays.** Going from
-//!    four measurements to six changes the median only when the first four
-//!    already disagreed, which is a case the outcome already names as
-//!    `.exhausted`, and it costs two more probes *and* two more replies. Five
-//!    round trips is comfortably inside what one path operation already costs
-//!    in this tree: `docs/DECISIONS/0001` measured a path validation at up to
-//!    109 RTTs on a saturated link.
 //!
 //! **The rule is the median, and the alternatives were weighed:**
 //!
@@ -142,14 +124,6 @@
 //! - **The challenge.** Chosen by whoever armed the round, echoed by the peer,
 //!   and compared exactly.
 //!
-//! The frame's sequence number is deliberately **not** part of either check.
-//! It cannot correlate anything: the *responder* chooses it, so two exchanges
-//! with the same peer both start it wherever it happens to be, and a frame with
-//! a high number is not therefore the answer to the newest request. It also
-//! needs no monotonicity gate of its own — a replayed frame carries a
-//! challenge that no longer matches — and a second gate over the same decision
-//! would be duplicate validation of the kind `AGENTS.md` §9 asks to be proved
-//! before it is kept.
 
 const std = @import("std");
 const qnt = @import("qnt.zig");
@@ -305,7 +279,7 @@ pub const Exchange = struct {
     /// Every round this exchange ran, oldest first. Zeroed rather than undefined
     /// so two exchanges compare with `==`.
     rounds: [max_rounds]Round =
-        [_]Round{.{ .index = 0, .result = .absent }} ** max_rounds,
+        @as([max_rounds]Round, @splat(.{ .index = 0, .result = .absent })),
     /// How many entries of `rounds` are real.
     round_count: usize = 0,
     /// The answer, once the exchange has produced one.
@@ -554,7 +528,7 @@ fn sample(challenge: Challenge, highest: u64) qnt.Frame {
         .sequence = 1,
         .challenge = challenge,
         .timestamp = 1,
-        .ranges = [_]qnt.PacketRange{.{ .first = 0, .last = 0 }} ** qnt.max_packet_ranges,
+        .ranges = @as([qnt.max_packet_ranges]qnt.PacketRange, @splat(.{ .first = 0, .last = 0 })),
         .range_count = 1,
     };
     frame.ranges[0] = .{ .first = 0, .last = highest };
@@ -564,7 +538,7 @@ fn sample(challenge: Challenge, highest: u64) qnt.Frame {
 /// A challenge that is distinct per round, so a test never accidentally matches
 /// the wrong one.
 fn challengeOf(round: u8) Challenge {
-    var bytes: Challenge = [_]u8{0} ** qnt.challenge_length;
+    var bytes: Challenge = @as([qnt.challenge_length]u8, @splat(0));
     bytes[0] = round;
     return bytes;
 }

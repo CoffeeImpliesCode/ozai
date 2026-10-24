@@ -9,7 +9,8 @@ fn localShuffle(length: usize, reject: bool) !void {
     const bytes: [4025]u8 = @splat(0x87);
     const contact = bytes[0..length];
     var state = try swarm.State.init(try testNodeId(1), null, .{
-        .shuffle_active_view_count = 1, .shuffle_passive_view_count = 0,
+        .shuffle_active_view_count = 1,
+        .shuffle_passive_view_count = 0,
     }, .init(42));
     var out: swarm.Actions(swarm.SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
@@ -65,7 +66,8 @@ fn storedReply(length: usize, reject: bool) !void {
     var input: [4100]u8 = undefined;
     const join = try budget_peer.receiveIncoming(.{ .swarm = .{ .join = contact } }, &input);
     try state.handle(.{ .recv_message = .{
-        .from = try testNodeId(2), .message = join.swarm,
+        .from = try testNodeId(2),
+        .message = join.swarm,
     } }, &out);
     try t.expectEqualSlices(u8, contact, state.peer_data.get(try testNodeId(2)).?.slice());
     out.clear();
@@ -81,7 +83,8 @@ fn storedReply(length: usize, reject: bool) !void {
         .ttl = .{ .value = 0 },
     } } }, &input);
     const result = state.handle(.{ .recv_message = .{
-        .from = try testNodeId(2), .message = shuffle.swarm,
+        .from = try testNodeId(2),
+        .message = shuffle.swarm,
     } }, &out);
     try t.expectEqualSlices(u8, contact, state.peer_data.get(try testNodeId(2)).?.slice());
     try t.expectEqual(@as(usize, 1), state.activeView().len);

@@ -134,8 +134,8 @@ pub const Address = union(enum) {
     /// and reads no host beyond the byte order it converts out of, so the same
     /// address binds the same bytes on every host.
     pub fn identity(self: Address) [identity_length]u8 {
-        var out = [_]u8{0} ** identity_length;
-        out[0] = @intFromEnum(std.meta.activeTag(self));
+        var out = @as([identity_length]u8, @splat(0));
+        out[0] = @backingInt(std.meta.activeTag(self));
         switch (self) {
             .unset => {},
             .ipv4 => |v4| {
@@ -160,14 +160,14 @@ pub const identity_length: usize = 1 + 2 + 16 + 4;
 
 /// `::ffff:0:0/96`: ten zero octets and two `0xff`.
 fn isMappedIpv6(six: Ipv6Address) bool {
-    if (!mem.eql(u8, six.bytes[0..10], &[_]u8{0} ** 10)) return false;
+    if (!mem.eql(u8, six.bytes[0..10], &@as([10]u8, @splat(0)))) return false;
     return six.bytes[10] == 0xff and six.bytes[11] == 0xff;
 }
 
 const t = std.testing;
 
 /// 2001:db8::1.
-const documented: [16]u8 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{1};
+const documented: [16]u8 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1};
 
 test "an unset path is an address the core does not have yet" {
     const unset: Address = .unset;
@@ -205,14 +205,14 @@ test "eql: different IPv4 addresses" {
 test "eql: a family is part of the answer" {
     // Mapped IPv6 and native IPv4 remain different path families.
     const v4 = Address.initIpv4(.{ 127, 0, 0, 1 }, 4433);
-    const bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 };
+    const bytes = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 };
     const mapped = Address.initIpv6(bytes, 4433, 0);
     try t.expect(!v4.eql(mapped));
     try t.expect(!mapped.eql(v4));
 }
 
 test "eql: the scope is part of a path" {
-    const bytes = [_]u8{ 0xfe, 0x80 } ++ [_]u8{0} ** 13 ++ [_]u8{1};
+    const bytes = [_]u8{ 0xfe, 0x80 } ++ @as([13]u8, @splat(0)) ++ [_]u8{1};
     const on_one = Address.initIpv6(bytes, 4433, 1);
     const on_two = Address.initIpv6(bytes, 4433, 2);
     try t.expect(!on_one.eql(on_two));
@@ -236,12 +236,12 @@ test "sameIp: different IPs" {
 }
 
 test "isIpv4Mapped: IPv4-mapped IPv6" {
-    const bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 };
+    const bytes = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 127, 0, 0, 1 };
     try t.expect(Address.initIpv6(bytes, 4433, 0).isIpv4Mapped());
 }
 
 test "isIpv4Mapped: regular IPv6 is not mapped" {
-    const bytes = [_]u8{0} ** 15 ++ [_]u8{1};
+    const bytes = @as([15]u8, @splat(0)) ++ [_]u8{1};
     try t.expect(!Address.initIpv6(bytes, 4433, 0).isIpv4Mapped());
 }
 
@@ -260,12 +260,12 @@ test "isEffectivelyIpv4: IPv4" {
 }
 
 test "isEffectivelyIpv4: IPv4-mapped IPv6" {
-    const bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 };
+    const bytes = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 10, 0, 0, 1 };
     try t.expect(Address.initIpv6(bytes, 80, 0).isEffectivelyIpv4());
 }
 
 test "isEffectivelyIpv4: native IPv6 is not v4" {
-    const bytes = [_]u8{ 0x20, 0x01 } ++ [_]u8{0} ** 14;
+    const bytes = [_]u8{ 0x20, 0x01 } ++ @as([14]u8, @splat(0));
     try t.expect(!Address.initIpv6(bytes, 80, 0).isEffectivelyIpv4());
 }
 
@@ -290,7 +290,7 @@ test "identity: two addresses never bind the same bytes" {
         try t.expect(!std.mem.eql(u8, &expected, &variant.identity()));
     }
     const zero_ipv4 = Address.initIpv4(.{ 0, 0, 0, 0 }, 0);
-    const zero_ipv6 = Address.initIpv6([_]u8{0} ** 16, 0, 0);
+    const zero_ipv6 = Address.initIpv6(@as([16]u8, @splat(0)), 0, 0);
     try t.expect(!mem.eql(u8, &zero_ipv4.identity(), &zero_ipv6.identity()));
 }
 
@@ -302,6 +302,6 @@ test "identity: the encoding does not depend on the host's byte order" {
     try t.expectEqualSlices(u8, &documented, bytes[3..19]);
     try t.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, bytes[19..23]);
     const ipv4 = Address.initIpv4(.{ 127, 0, 0, 1 }, 4433);
-    const expected_ipv4 = [_]u8{ 1, 0x11, 0x51, 127, 0, 0, 1 } ++ [_]u8{0} ** 16;
+    const expected_ipv4 = [_]u8{ 1, 0x11, 0x51, 127, 0, 0, 1 } ++ @as([16]u8, @splat(0));
     try t.expectEqualSlices(u8, &expected_ipv4, &ipv4.identity());
 }

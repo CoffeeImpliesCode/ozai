@@ -106,7 +106,7 @@ pub const Simulator = struct {
             .duplicated = 0,
             .max_round = 0,
         };
-        var seen = [_]bool{false} ** max_peers;
+        var seen = @as([max_peers]bool, @splat(false));
         self.network.events.clearRetainingCapacity();
         try self.network.command(from, .{
             .broadcast = .{ .content = content, .scope = .swarm },

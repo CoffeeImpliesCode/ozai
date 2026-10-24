@@ -11,11 +11,13 @@ test "last writable ForwardJoin keeps complete contact data" {
     var out: swarm.Actions(swarm.SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
     try state.handle(.{ .recv_message = .{
-        .from = try testNodeId(2), .message = .{ .join = null },
+        .from = try testNodeId(2),
+        .message = .{ .join = null },
     } }, &out);
     out.clear();
     try state.handle(.{ .recv_message = .{
-        .from = try testNodeId(3), .message = .{ .join = &contact },
+        .from = try testNodeId(3),
+        .message = .{ .join = &contact },
     } }, &out);
     try t.expect(state.active_view.contains(try testNodeId(3)));
     try t.expectEqualSlices(u8, &contact, state.peer_data.get(try testNodeId(3)).?.slice());
@@ -48,20 +50,23 @@ fn forwardInclusive(length: usize, ttl: u16, reject: bool) !void {
     try budget_peer.seedNeighbor(&state, try testNodeId(3), null, &out);
     var input: [4100]u8 = undefined;
     const incoming: codec.Message = .{ .swarm = .{ .forward_join = .{
-        .peer = .{ .id = try testNodeId(4), .data = contact }, .ttl = .{ .value = ttl },
+        .peer = .{ .id = try testNodeId(4), .data = contact },
+        .ttl = .{ .value = ttl },
     } } };
     try t.expectEqual(@as(usize, 4096), codec.encodedLen(incoming));
     const decoded = try budget_peer.receiveIncoming(incoming, &input);
     try t.expectEqualSlices(u8, contact, decoded.swarm.forward_join.peer.data.?);
     var output: [4100]u8 = undefined;
     const proposed: codec.Message = .{ .swarm = .{ .forward_join = .{
-        .peer = decoded.swarm.forward_join.peer, .ttl = .{ .value = ttl - 1 },
+        .peer = decoded.swarm.forward_join.peer,
+        .ttl = .{ .value = ttl - 1 },
     } } };
     try t.expectEqual(@as(usize, if (reject) 4096 else 4095), codec.encodedLen(proposed));
     if (reject) try t.expectError(error.FrameTooLarge, codec.encode(proposed, &output));
     const rng_before = state.rng;
     const result = state.handle(.{ .recv_message = .{
-        .from = try testNodeId(2), .message = decoded.swarm,
+        .from = try testNodeId(2),
+        .message = decoded.swarm,
     } }, &out);
     if (reject) {
         try t.expectEqual(@as(usize, 0), state.passiveView().len);
@@ -79,7 +84,9 @@ fn forwardInclusive(length: usize, ttl: u16, reject: bool) !void {
         for (out.slice()) |action| {
             if (action == .send_message) {
                 try t.expectEqualSlices(
-                    u8, &(try testNodeId(3)).toBytes(), &action.send_message.to.toBytes(),
+                    u8,
+                    &(try testNodeId(3)).toBytes(),
+                    &action.send_message.to.toBytes(),
                 );
                 const message: codec.Message = .{ .swarm = action.send_message.message };
                 try t.expectEqual(@as(usize, 4095), codec.encodedLen(message));

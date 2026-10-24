@@ -30,8 +30,6 @@
 //
 // # Why `std.c` and not `std.Io.net`
 //
-// `docs/DECISIONS/0002-async-substrate.md` names both gaps in the stock
-// surface, and this file is the answer to them:
 //
 // 1. **Control messages.** `std.Io.net` has `OutgoingMessage.control` and
 //    `IncomingMessage.control` in the type, and `Io.Threaded` lowers a
@@ -48,15 +46,6 @@
 //
 // # Where `io` is, and where it is not
 //
-// `DECISIONS/0002`: "`rt.io()` is never stored. It is a parameter to the
-// functions that need it." So `Socket` holds descriptors and no `Io`, and
-// every operation that can be cancelled takes one. What the runtime is asked
-// for is cancellation and nothing else — `Io.Threaded.checkCancel` is an
-// atomic load — because a descriptor this module opened is a descriptor no
-// `Io` backend can poll, and handing it to one would be a claim that only
-// holds for `Threaded`. The wait before a receive is a `poll` on the
-// descriptor for the same reason, and a task cancelled inside the `recvmsg`
-// is not seen until that call returns.
 //
 // # The second descriptor, and the wait it ends
 //
@@ -213,11 +202,6 @@ const sendmsg = msg.sendmsg;
 
 /// A bound UDP socket that speaks `batch`.
 ///
-/// No `Io` is stored, for the reason `DECISIONS/0002` gives. No buffer is
-/// either: the receive buffer and the control buffer are the caller's, which
-/// is what lets a stack pool them and what lets a test hand over a stack
-/// array. Two descriptors and one flag, and every one of the three is about
-/// being stopped rather than about carrying a datagram; see `stop`.
 ///
 /// A successful `create` owns both descriptors. Close them exactly once after
 /// all operations and stop callers finish. Copies share those descriptors.
@@ -318,22 +302,8 @@ pub const Socket = struct {
         _ = c.write(self.wake, std.mem.asBytes(&one), wake_width);
     }
 
-    // A method's receiver is its first parameter, so `io` comes second on
-    // every operation that needs the runtime — which is all of them except
-    // `stop`, and that is the one a signal handler may call.
-    // `docs/DECISIONS/0002-async-substrate.md` wants the runtime threaded
-    // rather than stored and does not say which position it takes, and every
-    // other method on every other type in this project puts its receiver
-    // first.
-
     /// Send `payload` to `dest` and say what it carried.
     ///
-    /// One `sendmsg` per `batch.Runs` run, the segmentation control message
-    /// on exactly the runs that are segmented, and the traffic class on every
-    /// one — the model's own order, from `batch.cmsg`. A run of one datagram
-    /// carries no segment size whatever the batch was, which is the fallback
-    /// `DECISIONS/0002` promised and which `Report.degraded` makes visible
-    /// instead of silent.
     ///
     /// **Every datagram this call sends reaches the wire once.** A run refused
     /// for segmentation lowers the socket's capability for good and is
@@ -646,7 +616,7 @@ fn kernelGro(stride: c_int) KernelGro {
 }
 
 test "a single datagram writes one control message" {
-    const payload = [_]u8{0xaa} ** 64;
+    const payload = @as([64]u8, @splat(0xaa));
     const send = batch.Send.single(&payload, .ect1);
     var messages: [batch.max_cmsg]batch.Cmsg = undefined;
     var control: ControlBuffer = undefined;
@@ -766,7 +736,7 @@ test "an IPv4 ECN byte is read even when shorter than the send option" {
 }
 
 test "a segmented run writes the traffic class then the segment size" {
-    const payload = [_]u8{0} ** 200;
+    const payload = @as([200]u8, @splat(0));
     const send = try batch.Send.batch(&payload, 100, .ce);
     var messages: [batch.max_cmsg]batch.Cmsg = undefined;
     var control: ControlBuffer = undefined;
@@ -792,7 +762,7 @@ test "a segmented run writes the traffic class then the segment size" {
 }
 
 test "a message this seam did not ask for does not hide the one after it" {
-    const payload = [_]u8{0} ** 200;
+    const payload = @as([200]u8, @splat(0));
     const send = try batch.Send.batch(&payload, 100, .ect0);
     var messages: [batch.max_cmsg]batch.Cmsg = undefined;
     var control: ControlBuffer = undefined;
@@ -828,7 +798,7 @@ test "a message this seam did not ask for does not hide the one after it" {
 }
 
 test "a blob that ends inside a message says so" {
-    const payload = [_]u8{0} ** 200;
+    const payload = @as([200]u8, @splat(0));
     const send = try batch.Send.batch(&payload, 100, .ect0);
     var messages: [batch.max_cmsg]batch.Cmsg = undefined;
     var control: ControlBuffer = undefined;
@@ -885,7 +855,7 @@ test "an address survives the kernel's own layout" {
     try t.expectEqual(v4, readSockaddr(&raw).?);
 
     const v6: base_addr.SocketAddr = .{
-        .ip = .{ .v6 = [_]u8{0} ** 15 ++ [_]u8{0x01} },
+        .ip = .{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{0x01} },
         .port = 65535,
     };
     try t.expectEqual(@as(socklen_t, @sizeOf(c.sockaddr.in6)), writeSockaddr(v6, &raw));
@@ -948,7 +918,7 @@ test "a driver that cannot segment degrades the batch and says so" {
     // The fallback, as the value a caller inspects: a four-datagram batch goes
     // out as four `sendmsg`s and the report says the batch was degraded,
     // rather than leaving the wire to be the only evidence.
-    const payload = [_]u8{0} ** 40;
+    const payload = @as([40]u8, @splat(0));
     const send = try batch.Send.batch(&payload, 10, .ect0);
     const degraded = batch.report(send, .v4, .segmentation);
     try t.expect(degraded.degraded);
@@ -976,7 +946,7 @@ test "a driver that cannot segment degrades the batch and says so" {
 }
 
 test "a lost codepoint is reported, and only on IPv4" {
-    const payload = [_]u8{0} ** 8;
+    const payload = @as([8]u8, @splat(0));
     const send = batch.Send.single(&payload, .ce);
     const lost = batch.report(send, .v4, .unknown_control_message);
     try t.expectEqual(@as(?batch.Ecn, null), lost.carried);
@@ -1125,11 +1095,6 @@ test "a batch that took the fallback says it was degraded" {
 
     const report = try sendBatch(t.io, &writer, loopback, fixture.send, &fixture.caps);
 
-    // The fallback `DECISIONS/0002` promised, made visible rather than a
-    // slower wire to notice: the run this socket could take went out as one
-    // `sendmsg` and the five datagrams of the tail it refused went out one
-    // each, and the caller is told the batch was degraded rather than left to
-    // measure it.
     try t.expect(report.degraded);
 
     // Nothing about the codepoint, because every run this module wrote carried

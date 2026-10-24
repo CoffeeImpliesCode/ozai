@@ -741,7 +741,7 @@ const t = std.testing;
 /// The error is propagated rather than asserted away anyway: a seed that was
 /// somehow not accepted fails the test that named it, not the whole run.
 fn testSecret(seed: u8) !SecretKey {
-    return SecretKey.fromSeed([_]u8{seed} ** SecretKey.seed_length);
+    return SecretKey.fromSeed(@as([SecretKey.seed_length]u8, @splat(seed)));
 }
 
 test "the message signed for a challenge is derived, not the challenge" {

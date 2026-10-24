@@ -173,7 +173,7 @@ pub const RequestType = enum(u8) {
 
 comptime {
     for (std.enums.values(RequestType)) |arm| {
-        if (@intFromEnum(arm) > std.math.maxInt(u7)) {
+        if (@backingInt(arm) > std.math.maxInt(u7)) {
             @compileError("a request discriminant has to be one byte on the wire");
         }
     }
@@ -456,7 +456,7 @@ pub fn writeRequestType(writer: *postcard.Writer, tag: RequestType) Error!void {
     // below 128, so the canonical spelling of each is the single raw byte that
     // upstream reads. The `comptime` block above `RequestType` is what keeps
     // that true if an arm is ever added.
-    try writer.writeU8(@intFromEnum(tag));
+    try writer.writeU8(@backingInt(tag));
 }
 
 /// `count` bytes of `reader`, and `reader` past them.
@@ -507,10 +507,10 @@ test "golden: Request wire format, iroh-blobs protocol.rs request_wire_format" {
     // 020001000100            # the ChunkRangesSeq
     try expectRequestBytes(
         .{ .to_eof = .{ .get = GetRequest.blob(da_hash) } },
-        "00" ++ "da" ** 32 ++ "020001000100",
+        "00" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "020001000100",
     );
     try expectRequestFrom(
-        "00" ++ "da" ** 32 ++ "020001000100",
+        "00" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "020001000100",
         .{ .to_eof = .{ .get = GetRequest.blob(da_hash) } },
     );
 
@@ -519,10 +519,10 @@ test "golden: Request wire format, iroh-blobs protocol.rs request_wire_format" {
     // 01000100                # the ChunkRangesSeq
     try expectRequestBytes(
         .{ .to_eof = .{ .get = GetRequest.all(da_hash) } },
-        "00" ++ "da" ** 32 ++ "01000100",
+        "00" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "01000100",
     );
     try expectRequestFrom(
-        "00" ++ "da" ** 32 ++ "01000100",
+        "00" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "01000100",
         .{ .to_eof = .{ .get = GetRequest.all(da_hash) } },
     );
 
@@ -550,9 +550,9 @@ test "golden: the push frame, derived from the captured get vector" {
     const push: Request = .{
         .length_prefixed = .{ .request = .{ .get = GetRequest.blob(da_hash) } },
     };
-    try expectRequestBytes(push, "08" ++ "26" ++ "da" ** 32 ++ "020001000100");
+    try expectRequestBytes(push, "08" ++ "26" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "020001000100");
     try expectRequestFrom(
-        "08" ++ "26" ++ "da" ** 32 ++ "020001000100",
+        "08" ++ "26" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "020001000100",
         push,
     );
 }
@@ -649,7 +649,7 @@ test "framing: the two shapes are not interchangeable" {
     // framing is told so instead. Here it is `BadLength`, because the shifted
     // hash leaves a 0xda where the sequence's element count is.
     {
-        const push_body = "26" ++ "da" ** 32 ++ "020001000100";
+        const push_body = "26" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "020001000100";
         var reader = postcard.Reader.init(push_body);
         var room: Room = .{};
         var storage = room.storage();
@@ -659,7 +659,7 @@ test "framing: the two shapes are not interchangeable" {
     // And each framing refuses a type it does not carry, before it reads a
     // byte of the body.
     {
-        const push_frame = "08" ++ "26" ++ "da" ** 32 ++ "020001000100";
+        const push_frame = "08" ++ "26" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "020001000100";
         var reader = postcard.Reader.init(push_frame[1..]);
         var room: Room = .{};
         var storage = room.storage();
@@ -680,7 +680,7 @@ test "framing: the two shapes are not interchangeable" {
     // Every reserved arm is refused by the framing that would otherwise carry
     // it, and refused by name rather than read as a body.
     for (2..8) |slot| {
-        const tag: RequestType = @enumFromInt(@as(u8, @intCast(slot)));
+        const tag: RequestType = @fromBackingInt(@intCast(@as(u8, @intCast(slot))));
         var reader = postcard.Reader.init("");
         var room: Room = .{};
         var storage = room.storage();
@@ -710,32 +710,32 @@ test "codec: malformed request encodings are named errors" {
     // `from_bytes` does not finalize its deserializer and would ignore that
     // byte; `finish` is what makes the two different frames.
     try expectRequestErrorHex(
-        "00" ++ "da" ** 32 ++ "01000100" ++ "00",
+        "00" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "01000100" ++ "00",
         error.TrailingBytes,
     );
     // A `get` whose sequence declares a varint no `u64` can hold, and one
     // whose last byte carries more value bits than a `u64` has.
     try expectRequestErrorHex(
-        "00" ++ "da" ** 32 ++ "01" ++ "00" ++ "80" ** 10,
+        "00" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "01" ++ "00" ++ "80808080808080808080",
         error.BadVarint,
     );
     try expectRequestErrorHex(
-        "00" ++ "da" ** 32 ++ "01" ++ "00" ++ "80" ** 9 ++ "02",
+        "00" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "01" ++ "00" ++ "808080808080808080" ++ "02",
         error.ValueOutOfRange,
     );
     // A `get` whose hash is cut short.
-    try expectRequestErrorHex("00" ++ "da" ** 8, error.UnexpectedEnd);
+    try expectRequestErrorHex("00" ++ "dadadadadadadada", error.UnexpectedEnd);
 
     // A `push` whose declared length is past `max_message_size`, and one whose
     // length is inside the cap and not inside the stream.
     try expectRequestErrorHex("08" ++ "ffffffff01", error.MessageTooLarge);
-    try expectRequestErrorHex("08" ++ "27" ++ "da" ** 8, error.UnexpectedEnd);
+    try expectRequestErrorHex("08" ++ "27" ++ "dadadadadadadada", error.UnexpectedEnd);
     // A `push` whose body decodes and then carries a byte the body did not
     // claim. The length is 39 and the body is 39: the 32 hash bytes, the
     // six-byte sequence, and one byte the `PushRequest` never asked for. The
     // payload sits outside the prefix, so this byte is not it either.
     try expectRequestErrorHex(
-        "08" ++ "27" ++ "da" ** 32 ++ "020001000100" ++ "ff",
+        "08" ++ "27" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "020001000100" ++ "ff",
         error.TrailingBytes,
     );
     // A `push` with no length at all: the stream ends where the length is.
@@ -744,7 +744,7 @@ test "codec: malformed request encodings are named errors" {
     // A `get_many` whose hash count is one the frame could carry and the
     // caller's storage could not. Every hash is 32 bytes, so a count of five
     // fits in the bytes that follow and not in `Room`'s four slots.
-    try expectRequestErrorHex("09" ++ "05" ++ "da" ** 32 ++ "0000", error.BufferFull);
+    try expectRequestErrorHex("09" ++ "05" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "0000", error.BufferFull);
 
     // A `get` whose body is past `max_message_size`. This is the same cap the
     // `push` arm checks against a declared length, and it is the one rule in
@@ -770,15 +770,15 @@ test "every request discriminant is one byte on the wire" {
         var buffer: [1]u8 = undefined;
         var writer = postcard.Writer.init(&buffer);
         try writeRequestType(&writer, arm);
-        try testing.expectEqualSlices(u8, &.{@intFromEnum(arm)}, writer.finish());
+        try testing.expectEqualSlices(u8, &.{@backingInt(arm)}, writer.finish());
     }
     // The four arms that carry a request are the four upstream dispatches on,
     // and the order is the one `RequestType`'s own comment demands: it "must
     // contain the request types in the same order as the full requests".
-    try testing.expectEqual(@as(u8, 0), @intFromEnum(RequestType.get));
-    try testing.expectEqual(@as(u8, 1), @intFromEnum(RequestType.observe));
-    try testing.expectEqual(@as(u8, 8), @intFromEnum(RequestType.push));
-    try testing.expectEqual(@as(u8, 9), @intFromEnum(RequestType.get_many));
+    try testing.expectEqual(@as(u8, 0), @backingInt(RequestType.get));
+    try testing.expectEqual(@as(u8, 1), @backingInt(RequestType.observe));
+    try testing.expectEqual(@as(u8, 8), @backingInt(RequestType.push));
+    try testing.expectEqual(@as(u8, 9), @backingInt(RequestType.get_many));
 }
 
 // -- The test helpers this module's own tests use ----------------------------

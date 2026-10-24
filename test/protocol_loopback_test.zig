@@ -1,12 +1,6 @@
 //! The first application protocol over a real connection: gossip between ozai
 //! endpoints, and the plan's blob property over the same socket.
 //!
-//! `test/loopback_test.zig` proved two endpoints can finish a handshake and
-//! move bytes. What it moved was a question and an answer the test chose
-//! itself, so the protocol was never asked whether its half of the stack fits
-//! the other half's. Nothing in this project has yet sent a *protocol message*
-//! across a kernel socket. This file does, and it starts with the layer
-//! `docs/PLAN.md` names first: `src/gossip/`.
 //!
 //! # What is asserted, and what is not
 //!
@@ -481,7 +475,7 @@ test "a blob the provider does not have is EOF on the wire, not an error frame" 
     // below then reads a range the wire never carried. See the module doc: a
     // decoded message is borrowed out of the frame it was decoded from, and
     // here the frame has to be the one that outlives the comparison.
-    var storages = [_]blobs_link.DecodeStorage{.{}} ** requests.len;
+    var storages = @as([requests.len]blobs_link.DecodeStorage, @splat(.{}));
     for (&storages) |*storage| storage.init();
     round = 0;
     while (round < wire.max_rounds) : (round += 1) {

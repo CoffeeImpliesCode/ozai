@@ -1254,7 +1254,7 @@ pub const PacketHandler = struct {
     /// handlers driven with one generator still produce independent
     /// schedules.
     pub fn nextPacketNumber(self: *PacketHandler, level: EncLevel, random: std.Random) u64 {
-        const idx = @intFromEnum(level);
+        const idx = @backingInt(level);
         if (level == .application and self.next_pn[idx] == self.skip_pn) {
             self.skipped_pns = .{ self.skip_pn, self.skipped_pns[0] };
             self.next_pn[idx] += 1;
@@ -1281,7 +1281,7 @@ pub const PacketHandler = struct {
         first_ack_range: u64,
         ack_ranges: []const AckRange,
     ) bool {
-        if (largest_ack >= self.next_pn[@intFromEnum(level)]) return true;
+        if (largest_ack >= self.next_pn[@backingInt(level)]) return true;
         if (level != .application) return false;
         for (self.skipped_pns) |maybe| {
             const skipped = maybe orelse continue;
@@ -1299,7 +1299,7 @@ pub const PacketHandler = struct {
     /// packet number encoder measures against when it chooses how many bytes
     /// to spend, so a null makes it encode the full four bytes.
     pub fn getLargestAcked(self: *const PacketHandler, level: EncLevel) ?u64 {
-        const idx = @intFromEnum(level);
+        const idx = @backingInt(level);
         return self.sent[idx].largest_acked;
     }
 
@@ -1315,7 +1315,7 @@ pub const PacketHandler = struct {
     /// counts what the space actually holds and the same packet can be sent
     /// again.
     pub fn onPacketSent(self: *PacketHandler, pkt: SentPacket) !void {
-        const idx = @intFromEnum(pkt.enc_level);
+        const idx = @backingInt(pkt.enc_level);
         try self.sent[idx].onPacketSent(pkt);
         if (pkt.in_flight) {
             self.bytes_in_flight += pkt.size;
@@ -1328,7 +1328,7 @@ pub const PacketHandler = struct {
     /// allocate a recovery record, arm PTO, sample RTT or return these bytes
     /// through ACK/loss results to the on-path congestion controller.
     pub fn onOffPathPacketSent(self: *PacketHandler, pn: u64) void {
-        const idx = @intFromEnum(EncLevel.application);
+        const idx = @backingInt(EncLevel.application);
         assert(pn < self.next_pn[idx]);
         assert(!self.sent[idx].sent_packets.contains(pn));
         if (self.sent[idx].largest_sent) |largest| assert(pn > largest);
@@ -1342,7 +1342,7 @@ pub const PacketHandler = struct {
     /// `error.OutOfMemory` leaves the tracker exactly as it was — nothing is
     /// recorded and no ACK is scheduled — so the packet has to arrive again.
     pub fn onPacketReceived(self: *PacketHandler, level: EncLevel, pn: u64, ack_eliciting: bool, now: i64, ecn: u2) !void {
-        const idx = @intFromEnum(level);
+        const idx = @backingInt(level);
         try self.recv[idx].onPacketReceived(pn, ack_eliciting, now, ecn);
     }
 
@@ -1374,7 +1374,7 @@ pub const PacketHandler = struct {
         now: i64,
         result: *AckResult,
     ) !void {
-        const idx = @intFromEnum(level);
+        const idx = @backingInt(level);
 
         const max_delay_ns = self.rtt_stats.max_ack_delay;
         std.debug.assert(max_delay_ns >= 0);
@@ -1428,7 +1428,7 @@ pub const PacketHandler = struct {
     /// caller that asks and drops the frame has spent it. `now` and the
     /// exponent are this connection's own clock and transport parameter.
     pub fn getAckFrame(self: *PacketHandler, level: EncLevel, now: i64, ack_delay_exponent: u64) ?Frame {
-        const idx = @intFromEnum(level);
+        const idx = @backingInt(level);
         return self.recv[idx].getAckFrame(now, ack_delay_exponent);
     }
 
@@ -1440,7 +1440,7 @@ pub const PacketHandler = struct {
     /// ACK-only send loop that never drains `bytes_in_flight`, so this is
     /// used only when the packet being built carries something else.
     pub fn getAckFrameForced(self: *PacketHandler, level: EncLevel, now: i64, ack_delay_exponent: u64) ?Frame {
-        const idx = @intFromEnum(level);
+        const idx = @backingInt(level);
         return self.recv[idx].getAckFrameForced(now, ack_delay_exponent);
     }
 
@@ -1449,7 +1449,7 @@ pub const PacketHandler = struct {
     /// What the packet packer asks before forcing an ACK onto a data packet.
     /// It says an ACK is owed, not that one is due now.
     pub fn hasUnackedAckEliciting(self: *const PacketHandler, level: EncLevel) bool {
-        const idx = @intFromEnum(level);
+        const idx = @backingInt(level);
         return self.recv[idx].hasUnackedAckEliciting();
     }
 
@@ -1473,7 +1473,7 @@ pub const PacketHandler = struct {
     /// `pto_count`, capped at thirty bits of shift and at sixty seconds for
     /// the application space or three for the handshake spaces.
     pub fn spacePtoDeadline(self: *const PacketHandler, tracker: SentPacketTracker, idx: usize) ?i64 {
-        const is_handshake_space = (idx != @intFromEnum(EncLevel.application));
+        const is_handshake_space = (idx != @backingInt(EncLevel.application));
         if (tracker.ack_eliciting_in_flight == 0) {
             if (!(is_handshake_space and tracker.last_ack_eliciting_sent_time != null)) {
                 return null;
@@ -1491,7 +1491,7 @@ pub const PacketHandler = struct {
             break :blk tracker.last_ack_eliciting_sent_time.?;
         };
 
-        var pto_duration = if (idx == @intFromEnum(EncLevel.application))
+        var pto_duration = if (idx == @backingInt(EncLevel.application))
             self.rtt_stats.pto()
         else
             self.rtt_stats.ptoNoAckDelay();
@@ -1499,7 +1499,7 @@ pub const PacketHandler = struct {
         // Use per-space PTO count for independent backoff per encryption level
         const shift: u6 = @intCast(@min(tracker.pto_count, 30));
         pto_duration = pto_duration << shift;
-        const max_pto = if (idx == @intFromEnum(EncLevel.application)) MAX_PTO else MAX_HANDSHAKE_PTO;
+        const max_pto = if (idx == @backingInt(EncLevel.application)) MAX_PTO else MAX_HANDSHAKE_PTO;
         pto_duration = @min(pto_duration, max_pto);
 
         return base_time + pto_duration;
@@ -1548,7 +1548,7 @@ pub const PacketHandler = struct {
             if (tracker.loss_time) |lt| {
                 if (lt <= now and (earliest == null or lt < earliest.?)) {
                     earliest = lt;
-                    result = @enumFromInt(idx);
+                    result = @fromBackingInt(@intCast(idx));
                 }
             }
         }
@@ -1567,7 +1567,7 @@ pub const PacketHandler = struct {
     /// below never run on a pass that declared nothing lost. The space keeps
     /// its armed `loss_time` and the same call can be run again.
     pub fn detectLossesForSpace(self: *PacketHandler, level: EncLevel, now: i64, result: *AckResult) !void {
-        const idx = @intFromEnum(level);
+        const idx = @backingInt(level);
         result.reset();
         try self.sent[idx].detectLostPackets(&self.rtt_stats, now, result);
         for (result.lost.constSlice()) |pkt| {
@@ -1592,7 +1592,7 @@ pub const PacketHandler = struct {
             const timeout = self.spacePtoDeadline(tracker, idx) orelse continue;
             if (earliest == null or timeout < earliest.?) {
                 earliest = timeout;
-                result = @enumFromInt(idx);
+                result = @fromBackingInt(@intCast(idx));
             }
         }
 
@@ -1614,7 +1614,7 @@ pub const PacketHandler = struct {
     /// result released afterwards would destroy into a pool whose map no
     /// longer names them.
     pub fn dropSpace(self: *PacketHandler, level: EncLevel) void {
-        const idx = @intFromEnum(level);
+        const idx = @backingInt(level);
 
         var it = self.sent[idx].sent_packets.iterator();
         while (it.next()) |entry| {
@@ -1936,7 +1936,7 @@ test "SentPacketTracker: every packet taken from the pool goes back" {
     defer ph.deinit();
     var result: AckResult = .{};
     defer result.deinit(testing.allocator);
-    const app = &ph.sent[@intFromEnum(EncLevel.application)];
+    const app = &ph.sent[@backingInt(EncLevel.application)];
 
     var pn: u64 = 0;
     var now: i64 = 1_000_000;
@@ -1967,7 +1967,7 @@ test "SentPacketTracker: every packet taken from the pool goes back" {
     ph.dropSpace(.handshake);
     try testing.expectEqual(@as(u64, pn), result.acked.constSlice()[0].pn); // still readable
     result.release(testing.allocator);
-    try testing.expectEqual(@as(usize, 0), ph.sent[@intFromEnum(EncLevel.handshake)].live);
+    try testing.expectEqual(@as(usize, 0), ph.sent[@backingInt(EncLevel.handshake)].live);
 }
 
 /// The application packet numbers a handler leaves unsent over `packets`
@@ -2153,7 +2153,7 @@ fn ackPassUnderAnyRefusal(gpa: Allocator) !void {
     defer handler.deinit();
     var result: AckResult = .{};
     defer result.deinit(gpa);
-    const app = &handler.sent[@intFromEnum(EncLevel.application)];
+    const app = &handler.sent[@backingInt(EncLevel.application)];
 
     const now: i64 = 1_000_000_000;
     for (0..8) |i| {
@@ -2216,7 +2216,7 @@ test "PacketHandler: an ACK pass refused once is safe to repeat, and to drop" {
     defer handler.deinit();
     var result: AckResult = .{};
     defer result.deinit(testing.allocator);
-    const app = &handler.sent[@intFromEnum(EncLevel.application)];
+    const app = &handler.sent[@backingInt(EncLevel.application)];
 
     const now: i64 = 1_000_000_000;
     for (0..8) |i| {
@@ -2267,7 +2267,7 @@ test "PacketHandler: a refused loss pass leaves the loss timer armed and is safe
     defer result.deinit(testing.allocator);
     var loss_result: AckResult = .{};
     defer loss_result.deinit(testing.allocator);
-    const app = &handler.sent[@intFromEnum(EncLevel.application)];
+    const app = &handler.sent[@backingInt(EncLevel.application)];
 
     const now: i64 = 1_000_000_000;
     for (0..6) |i| {
@@ -2324,9 +2324,9 @@ test "native control records survive packet-threshold loss with owned payloads" 
         .{ .path_new_connection_id = .{ .path_id = 2, .cid = .{
             .seq_num = 8,
             .retire_prior_to = 3,
-            .cid_buf = [_]u8{0xab} ** 20,
+            .cid_buf = @as([20]u8, @splat(0xab)),
             .cid_len = 1,
-            .stateless_reset_token = [_]u8{0xcd} ** 16,
+            .stateless_reset_token = @as([16]u8, @splat(0xcd)),
         } } },
         .{ .path_retire_connection_id = .{ .path_id = 2, .seq_num = 8 } },
         .{ .max_path_id = 12 },

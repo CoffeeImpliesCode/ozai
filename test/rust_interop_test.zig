@@ -535,7 +535,6 @@ fn startZig(secret: SecretKey) !Zig {
     return zig;
 }
 
-
 /// One round: everything the Zig side has, then everything the peer has said.
 ///
 /// One pass of `loopback_link.zig`'s `step`/`take` with the far end being a

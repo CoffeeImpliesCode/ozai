@@ -282,7 +282,7 @@ comptime {
 /// A request name, differing in its first byte. The bytes stand for whatever
 /// the caller derives the name from, so only the difference is load-bearing.
 fn requestId(tag: u8) RequestId {
-    var id: RequestId = .{0} ** request_id_len;
+    var id: RequestId = @splat(0);
     id[0] = tag;
     return id;
 }

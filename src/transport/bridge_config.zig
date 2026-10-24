@@ -87,11 +87,6 @@ pub const Error = batch.Error || error{
     /// starts as — so this is a connection whose path has not been named yet,
     /// which a client is until its dialer writes one onto it.
     NoPathAddress,
-    /// The core refused to build a packet. Its own error set is `anyerror` —
-    /// `Connection.sendAt` (`connection.zig:3139`) carries no named set —
-    /// so a bridge that propagated it would put `anyerror` in its public API,
-    /// which `AGENTS.md` forbids. What it was is logged before the refusal
-    /// is named, so nothing is dropped on the floor.
     CoreRefused,
 };
 
@@ -200,12 +195,6 @@ pub fn demandsPeerCertificate(config: Config) bool {
 
 /// The transport key the caller supplied, or one drawn from `io`.
 ///
-/// A null here is upstream drawing from the process CSPRNG, which
-/// `AGENTS.md` §2 forbids and `vendor/quic/VENDORED.md` records as one of
-/// the three things the patch removed. `std.Io.randomSecure` is the caller's
-/// own entropy, reached through the handle the caller was already given: no
-/// global, nothing stored, and a test that wants determinism passes the key
-/// instead.
 ///
 /// Both of its answers keep their own name. They arrive together in one
 /// error set (`std.Io.RandomSecureError`) and mean opposite things to

@@ -296,7 +296,7 @@ test "refusal: the eleven frames that are not statements" {
     // Twelve arms of `Message` and one refusal each: the two statements are the
     // other two, so the count is the whole of the union's coverage stated here
     // rather than left to be inferred.
-    try std_testing.expectEqual(@as(usize, 14), @typeInfo(Message).@"union".fields.len);
+    try std_testing.expectEqual(@as(usize, 14), @typeInfo(Message).@"union".field_names.len);
     for (not_statements) |message| {
         for ([_]ProtocolVersion{ .v1, .v2 }) |version| {
             try std_testing.expectError(

@@ -34,7 +34,7 @@ pub const Config = struct {
     /// and recovered by `extractServerId`. Only the first `server_id_len`
     /// bytes are ever read; the rest are padding, and a config that leaves
     /// them set is not wrong because nothing looks at them.
-    server_id: [15]u8 = .{0} ** 15,
+    server_id: [15]u8 = @splat(0),
     /// Bytes of this server's id a CID carries. 1 to 15; see the combined
     /// rule on the type.
     server_id_len: u4,
@@ -285,7 +285,7 @@ pub fn feistelDecrypt(key: [16]u8, data: []u8, total_len: u8) void {
 
 /// Build the 16-byte AES input block: [half_data | zero_padding | total_len | round]
 fn expandBlock(half: []const u8, half_len: u8, total_len: u8, round: u8) [16]u8 {
-    var block: [16]u8 = .{0} ** 16;
+    var block: [16]u8 = @splat(0);
     @memcpy(block[0..half_len], half[0..half_len]);
     // Positions 14 and 15 hold total_len and round number
     block[14] = total_len;
@@ -568,13 +568,13 @@ test "quic_lb: a shorter connection id leaves the decoder's buffer half empty" {
     var prng = std.Random.DefaultPrng.init(0x62756666);
     // A whole 20-byte buffer with a 7-byte connection id at its front and the
     // rest left as another packet's bytes.
-    var buffer = [_]u8{0xff} ** 20;
+    var buffer = @as([20]u8, @splat(0xff));
     var cid: [7]u8 = undefined;
     generateCid(&config, &cid, prng.random());
     @memcpy(buffer[0..cid.len], &cid);
 
-    var extracted = [_]u8{0xaa} ** 15;
+    var extracted = @as([15]u8, @splat(0xaa));
     try std.testing.expect(extractServerId(&config, buffer[0..], &extracted));
     try std.testing.expectEqualSlices(u8, config.server_id[0..2], extracted[0..2]);
-    try std.testing.expectEqualSlices(u8, &[_]u8{0xaa} ** 13, extracted[2..]);
+    try std.testing.expectEqualSlices(u8, &@as([13]u8, @splat(0xaa)), extracted[2..]);
 }

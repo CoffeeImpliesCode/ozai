@@ -55,12 +55,6 @@
 //!
 //! # No golden vector is claimed
 //!
-//! The records below are constructed, not captured, and the tests therefore
-//! prove *this decoder's* refusals and field reads and nothing about any other
-//! implementation. Whether these bytes interoperate with a nameserver is
-//! unverified here, and `AGENTS.md` §2 says a wire claim is only as good as a
-//! captured vector — so no such claim is made. `lookup_answer.zig` holds the
-//! one captured DNS answer this project has.
 
 const std = @import("std");
 
@@ -625,7 +619,7 @@ test "a record whose RDLENGTH is not its family's width is refused" {
     ));
     // And one octet over, which `RDLENGTH` can name and `Family` cannot read.
     var over: [256]u8 = undefined;
-    const seventeen = [_]u8{0} ** 17;
+    const seventeen = @as([17]u8, @splat(0));
     const over_at = try frameAnswer(&over, asked, 6, &.{
         .{ .owner = asked, .kind = host_wire.type_aaaa, .rdata = &seventeen },
     });

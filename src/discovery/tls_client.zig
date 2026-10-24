@@ -563,7 +563,7 @@ fn bindLoopback(port: u16) !c.fd_t {
     errdefer _ = c.close(handle);
     var address: c.sockaddr.in = .{
         .port = std.mem.nativeToBig(u16, port),
-        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        .addr = std.mem.readInt(u32, &.{ 127, 0, 0, 1 }, @import("builtin").target.cpu.arch.endian()),
     };
     if (c.bind(handle, @ptrCast(&address), @sizeOf(c.sockaddr.in)) != 0)
         return error.TestFixtureRefused;
@@ -586,7 +586,7 @@ fn acceptOne(listener: c.fd_t) !c.fd_t {
     while (true) {
         accepted = c.accept(listener, null, &length);
         if (accepted < 0) {
-            if (@as(c_int, @intFromEnum(c.E.INTR)) == c._errno().*) continue;
+            if (@as(c_int, @backingInt(c.E.INTR)) == c._errno().*) continue;
             return error.TestFixtureRefused;
         }
         return accepted;

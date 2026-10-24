@@ -29,13 +29,6 @@ pub const core_slots: usize = path_action.supported_paths;
 
 /// How old a latency sample may be and still be believed.
 ///
-/// The same figure `net/path_table.zig` names, and the same reasoning from the
-/// same paragraph of `DECISIONS/0001`: a worst-case NAT rebinding took eight
-/// path challenges at 109 RTTs, so a sample younger than that describes a
-/// mapping that has not been disturbed since it was taken. Restated rather than
-/// imported, because that constant is a per-peer selection policy and this is a
-/// per-connection mirror; the two can be retuned apart, and this file's only
-/// claim is that a stale figure is not handed out as a current one.
 pub const rtt_max_age: Nanos = 5 * std.time.ns_per_s;
 
 /// The core's own `PathValidationState`, re-exported so a caller reporting on a
@@ -411,12 +404,6 @@ pub const Table = struct {
 
     /// Drop `key` and answer whether it was there.
     ///
-    /// The last entry moves into the gap, so `len` holds and the order `slice`
-    /// reports is no longer the order it had. This is the only operation that
-    /// removes an entry outright, and it is not the mirror's decision to make:
-    /// `DECISIONS/0001` measures what a migration throws away, so the table that
-    /// records it keeps the history rather than deciding to lose it. A caller
-    /// pruning for its own reasons calls this.
     pub fn forget(self: *Table, key: Key) bool {
         const index = self.indexOf(key) orelse return false;
         // `indexOf` returns only an index visited under `index < self.len`; this

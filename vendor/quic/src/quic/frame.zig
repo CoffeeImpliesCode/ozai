@@ -1007,7 +1007,7 @@ pub const Frame = union(FrameType) {
                 try packet.writeVarInt(writer, sequence);
             },
             inline .path_ack, .path_ack_ecn => |value| {
-                try packet.writeVarInt(writer, @intFromEnum(std.meta.activeTag(self)));
+                try packet.writeVarInt(writer, @backingInt(std.meta.activeTag(self)));
                 try packet.writeVarInt(writer, value.path_id);
                 const ack = &value.ack;
                 try packet.writeVarInt(writer, ack.largest_ack);
@@ -1032,7 +1032,7 @@ pub const Frame = union(FrameType) {
                 try packet.writeVarInt(writer, value.error_code);
             },
             inline .path_status_backup, .path_status_available => |value| {
-                try packet.writeVarInt(writer, @intFromEnum(std.meta.activeTag(self)));
+                try packet.writeVarInt(writer, @backingInt(std.meta.activeTag(self)));
                 try packet.writeVarInt(writer, value.path_id);
                 try packet.writeVarInt(writer, value.status_seq_no);
             },
@@ -1051,7 +1051,7 @@ pub const Frame = union(FrameType) {
                 try packet.writeVarInt(writer, value.seq_num);
             },
             .max_path_id, .paths_blocked => |value| {
-                try packet.writeVarInt(writer, @intFromEnum(std.meta.activeTag(self)));
+                try packet.writeVarInt(writer, @backingInt(std.meta.activeTag(self)));
                 try packet.writeVarInt(writer, value);
             },
             .path_cids_blocked => |value| {
@@ -1227,7 +1227,7 @@ pub const PendingControlFrame = union(enum) {
         /// Inline storage for the token. 92 bytes is the largest a
         /// NEW_TOKEN may carry (RFC 9000 §19.7), so the token is copied in
         /// rather than borrowed; `token_len` says how much of it is real.
-        token_buf: [92]u8 = .{0} ** 92,
+        token_buf: [92]u8 = @splat(0),
         /// Bytes of `token_buf` to emit, 0 to 92. `write` does not check the
         /// bound, so a producer that sets more than 92 gets a slice that runs
         /// past the array.
@@ -1570,7 +1570,7 @@ test "parseSized ends each frame where the next one starts" {
         .immediate_ack,
         .{ .crypto = .{ .offset = 7, .data = @constCast("hello") } },
         .{ .stream = .{ .stream_id = 4, .offset = 9, .length = 3, .fin = true, .data = @constCast("abc") } },
-        .{ .new_connection_id = .{ .seq_num = 1, .retire_prior_to = 0, .conn_id = @constCast(&[_]u8{0xcd} ** 8), .stateless_reset_token = .{0} ** 16 } },
+        .{ .new_connection_id = .{ .seq_num = 1, .retire_prior_to = 0, .conn_id = @constCast(&@as([8]u8, @splat(0xcd))), .stateless_reset_token = @splat(0) } },
         .{ .connection_close = .{ .error_code = 1, .frame_type = 0, .reason = @constCast("bye") } },
         .{ .datagram_with_length = .{ .data = @constCast("dg") } },
     };
@@ -1920,12 +1920,12 @@ test "parse path_response frame" {
 }
 
 test "parse connection_close frame" {
-    var bytes = [_]u8{ 0x1c, 0x10, @intFromEnum(FrameType.max_data), 16, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112 };
+    var bytes = [_]u8{ 0x1c, 0x10, @backingInt(FrameType.max_data), 16, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112 };
 
     switch (try Frame.parse(&bytes)) {
         FrameType.connection_close => |connection_close| {
             try std.testing.expect(connection_close.error_code == 0x10);
-            try std.testing.expect(connection_close.frame_type == @intFromEnum(FrameType.max_data));
+            try std.testing.expect(connection_close.frame_type == @backingInt(FrameType.max_data));
             try std.testing.expectEqualStrings("abcdefghijklmnop", connection_close.reason);
         },
         else => unreachable,
@@ -2227,9 +2227,9 @@ test "multipath pending CID owns storage and writes complete body" {
         .cid = .{
             .seq_num = 0,
             .retire_prior_to = 0,
-            .cid_buf = .{0xab} ** 20,
+            .cid_buf = @splat(0xab),
             .cid_len = 1,
-            .stateless_reset_token = .{0xcd} ** 16,
+            .stateless_reset_token = @splat(0xcd),
         },
     } };
     var buffer: [64]u8 = undefined;
@@ -2240,7 +2240,7 @@ test "multipath pending CID owns storage and writes complete body" {
     try std.testing.expectEqual(writer.seek, consumed);
     try std.testing.expectEqual(@as(u32, 1), frame.path_new_connection_id.path_id);
     try std.testing.expectEqualSlices(u8, &.{0xab}, frame.path_new_connection_id.cid.conn_id);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xcd} ** 16), &frame.path_new_connection_id.cid.stateless_reset_token);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xcd))), &frame.path_new_connection_id.cid.stateless_reset_token);
     try std.testing.expect(!frame.isProbing());
     for (0..writer.seek) |cut| {
         if (Frame.parse(buffer[0..cut])) |_| return error.AcceptedTruncatedCid else |_| {}
@@ -2250,13 +2250,13 @@ test "multipath pending CID owns storage and writes complete body" {
 test "Frame.isProbing matches native Noq classification" {
     const probes = [_]Frame{
         .{ .padding = 1 },
-        .{ .path_challenge = .{0} ** 8 },
-        .{ .path_response = .{0} ** 8 },
+        .{ .path_challenge = @splat(0) },
+        .{ .path_response = @splat(0) },
         .{ .new_connection_id = .{
             .seq_num = 0,
             .retire_prior_to = 0,
             .conn_id = @constCast(&[_]u8{0xab}),
-            .stateless_reset_token = .{0} ** 16,
+            .stateless_reset_token = @splat(0),
         } },
         .{ .observed_address = .{
             .sequence = 0,
@@ -2271,7 +2271,7 @@ test "Frame.isProbing matches native Noq classification" {
             .seq_num = 0,
             .retire_prior_to = 0,
             .conn_id = @constCast(&[_]u8{0xab}),
-            .stateless_reset_token = .{0} ** 16,
+            .stateless_reset_token = @splat(0),
         },
     } };
     try std.testing.expect(!path_new_connection_id.isProbing());

@@ -30,9 +30,6 @@ pub const Traversal = struct {
     initiate: bool = false,
 };
 
-/// Every allocation goes through a handle the caller handed in: nothing here
-/// reaches for a global allocator, which is what `AGENTS.md` §1 asks for by
-/// name and what `DECISIONS/0002` buys for every layer above the transport.
 pub const Allocator = std.mem.Allocator;
 
 /// One peer this node dials when it starts.

@@ -37,9 +37,9 @@ pub fn noteMismatch(
     var recorded: Mismatch = .{
         .peer = peer,
         .holder = holder,
-        .got = [_]u8{0} ** gossip.peer_data_max,
+        .got = @as([gossip.peer_data_max]u8, @splat(0)),
         .got_len = @min(got.len, gossip.peer_data_max),
-        .want = [_]u8{0} ** gossip.peer_data_max,
+        .want = @as([gossip.peer_data_max]u8, @splat(0)),
         .want_len = @min(want.len, gossip.peer_data_max),
     };
     @memcpy(recorded.got[0..recorded.got_len], got[0..recorded.got_len]);

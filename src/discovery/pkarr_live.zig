@@ -518,9 +518,9 @@ test "the signer is refused, and refused before anything is signed" {
     // it publishes would make every resolver believe one node is reachable at
     // another's name, and the refusal is its own arm rather than a member of
     // the parse set so a caller can tell it from a malformed body.
-    var signer = try key.SecretKey.fromSeed([_]u8{1} ** key.SecretKey.seed_length);
+    var signer = try key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(1)));
     defer signer.deinit();
-    var other = try key.SecretKey.fromSeed([_]u8{2} ** key.SecretKey.seed_length);
+    var other = try key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(2)));
     defer other.deinit();
 
     var secret_ptr = signer;
@@ -568,9 +568,9 @@ test "a body signed by another node is a refusal and not a parse failure" {
     // packet, read in both of the forms `pkarr.zig` decodes. No network:
     // `pkarr.Packet` is a codec and this is the whole of what `resolve` adds
     // above it.
-    var signer = try key.SecretKey.fromSeed([_]u8{1} ** key.SecretKey.seed_length);
+    var signer = try key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(1)));
     defer signer.deinit();
-    var other = try key.SecretKey.fromSeed([_]u8{2} ** key.SecretKey.seed_length);
+    var other = try key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(2)));
     defer other.deinit();
 
     var name: [pkarr_body.nameLength()]u8 = undefined;

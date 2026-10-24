@@ -19,9 +19,6 @@
 //! how the answer behind the prefix is handed to the same decoder — and a
 //! caller that owns both owns the connection.
 //!
-//! `StreamRetry` is therefore a value and not an action, which is also
-//! `AGENTS.md` §2's rule for network logic: the decision is pure over bytes,
-//! and the socket lives in the module that is allowed to have one.
 //!
 //! # The staggering table: offsets from the walk's start, not intervals
 //!

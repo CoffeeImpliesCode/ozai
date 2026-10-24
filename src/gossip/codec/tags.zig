@@ -129,11 +129,11 @@ const priority_names = [_][]const u8{ "high", "low" };
 const scope_names = [_][]const u8{ "swarm", "neighbors" };
 
 comptime {
-    assertOrder(&layer_names, @typeInfo(topic_message).@"union".fields);
-    assertOrder(&swarm_names, @typeInfo(swarm_message).@"union".fields);
-    assertOrder(&tree_names, @typeInfo(tree_message).@"union".fields);
-    assertOrder(&priority_names, @typeInfo(swarm_priority).@"enum".fields);
-    assertOrder(&scope_names, @typeInfo(delivery_scope).@"union".fields);
+    assertOrder(&layer_names, @typeInfo(topic_message).@"union".field_names);
+    assertOrder(&swarm_names, @typeInfo(swarm_message).@"union".field_names);
+    assertOrder(&tree_names, @typeInfo(tree_message).@"union".field_names);
+    assertOrder(&priority_names, @typeInfo(swarm_priority).@"enum".field_names);
+    assertOrder(&scope_names, @typeInfo(delivery_scope).@"union".field_names);
 }
 
 fn assertOrder(comptime names: []const []const u8, comptime fields: anytype) void {
@@ -141,7 +141,7 @@ fn assertOrder(comptime names: []const []const u8, comptime fields: anytype) voi
         @compileError("a message union gained or lost an arm; its tag table is out of date");
     }
     inline for (names, 0..) |name, index| {
-        if (!std.mem.eql(u8, fields[index].name, name)) {
+        if (!std.mem.eql(u8, fields[index], name)) {
             @compileError("a message arm was reordered; its tag table is out of date");
         }
     }

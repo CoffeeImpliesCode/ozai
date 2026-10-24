@@ -257,7 +257,7 @@ test "carried names the ten frames that are not datagrams" {
     // The other four of the fourteen do carry one, and counting the table at
     // compile time is what makes the two lists add up rather than assume it.
     var table: usize = 0;
-    inline for (@typeInfo(frame.FrameType).@"enum".fields) |_| table += 1;
+    inline for (@typeInfo(frame.FrameType).@"enum".field_names) |_| table += 1;
     try std_testing.expectEqual(rest.len + 4, table);
 }
 
@@ -332,7 +332,7 @@ test "iroh relay 1.3 GRO snapshot delivers exact native segments" {
 }
 
 test "native datagram prefixes reject missing identity and GRO metadata" {
-    const secret = try key.SecretKey.fromSeed(.{42} ** 32);
+    const secret = try key.SecretKey.fromSeed(@splat(42));
     const peer = secret.nodeId();
     var output: [80]u8 = undefined;
     const encoded = try frame.encode(try carry(peer, .{

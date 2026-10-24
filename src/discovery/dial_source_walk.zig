@@ -16,15 +16,6 @@
 //! winner under `item.Item.order` is the one that is dialled. Two
 //! consequences, and neither is a detail:
 //!
-//! * The order the caller listed its sources in is not consulted. The *set*
-//!   decides, which is what `docs/PLAN.md` M5's "a total order or zones flap"
-//!   asks for; a second comparator here would be a second answer to a
-//!   question `item.zig` has already answered, and the two would disagree the
-//!   first time a service reported a stale address.
-//! * No source is skipped because an earlier one produced a usable address.
-//!   A walk that stopped at the first answer would make the dial depend on
-//!   the order the configuration happens to be written in, which is a
-//!   configuration detail wearing the clothes of a preference.
 //!
 //! # Four answers, and none of them is another one
 //!
@@ -79,17 +70,6 @@
 //! type does not say is in that one gap, and it is all I/O this milestone
 //! does not build:
 //!
-//! * a query written to a socket and the answer read back, so a `std.Io`, a
-//!   write buffer and a deadline — a pkarr query is a signed packet of the
-//!   layout `docs/PLAN.md` M3 gives, posted to a relay, and a DNS lookup
-//!   builds a query for `_iroh.<z32>.<origin>` (`iroh-dns/src/dns.rs:1062`)
-//!   and waits on a transaction id;
-//! * an abort handle for that wait, which is `resolve.Cancellation` and the
-//!   only reason a stream here can be told to stop;
-//! * entropy for what a lookup signs or numbers with, the way a dial draws
-//!   one (`transport/dial.zig`);
-//! * a copy of the answer set, because the buffer an `Io` read fills does not
-//!   outlive the call and a service holds its answers as values.
 //!
 //! Those four are what a real `resolve.PacketSource` and a real
 //! `dns.DnsAddressLookup` are built with, and this milestone does not build

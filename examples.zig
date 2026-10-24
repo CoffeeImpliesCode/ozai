@@ -15,7 +15,7 @@ pub fn addExamples(
     b: *std.Build,
     lib_mod: *std.Build.Module,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) void {
     const examples = [_]struct { name: []const u8, file: []const u8 }{
         .{ .name = "ozai-node-id", .file = "src/examples/node_id.zig" },
@@ -38,7 +38,7 @@ pub fn addExamples(
 
         const run = b.addRunArtifact(executable);
         run.step.dependOn(b.getInstallStep());
-        if (b.args) |args| run.addArgs(args);
+        run.addPassthruArgs();
         b.step(
             b.fmt("run-{s}", .{example.name}),
             b.fmt("Run {s}", .{example.name}),

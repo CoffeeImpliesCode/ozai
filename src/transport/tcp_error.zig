@@ -11,10 +11,6 @@
 //!
 //! # No set here is an open `anyerror`
 //!
-//! Every arm names an errno or a fact about the stream, and `WaitError` is
-//! the only part three sets have in common. A caller that `switch`es on one of
-//! them has to handle every arm, which is what `AGENTS.md` §1 asks for and
-//! what a `transport/socket.zig` caller already gets.
 //!
 //! Acquisition reuses the socket errno vocabulary and adds explicit Io
 //! cancellation before creating or accepting owned descriptors.
@@ -124,8 +120,8 @@ pub const WriteError = WaitError || error{
 /// asked for by hand, and a set that stops sharing an arm with `WaitError`
 /// fails the `comptime` block below rather than one call site's `switch`.
 fn hasArm(comptime set: type, comptime name: []const u8) bool {
-    for (@typeInfo(set).error_set.?) |member| {
-        if (std.mem.eql(u8, member.name, name)) return true;
+    for (@typeInfo(set).error_set.error_names.?) |member| {
+        if (std.mem.eql(u8, member, name)) return true;
     }
     return false;
 }
@@ -138,9 +134,9 @@ comptime {
     // names. The arms a set adds *beside* `WaitError` are its own — a reset is
     // not a wait — so they are deliberately not checked here.
     for (.{ ReadError, WriteError, ConnectError }) |set| {
-        for (@typeInfo(WaitError).error_set.?) |member| {
-            if (!hasArm(set, member.name)) {
-                @compileError("a wait arm is missing from a set: " ++ member.name);
+        for (@typeInfo(WaitError).error_set.error_names.?) |member| {
+            if (!hasArm(set, member)) {
+                @compileError("a wait arm is missing from a set: " ++ member);
             }
         }
     }
@@ -156,11 +152,11 @@ test "every wait arm is shared, and only a refused write names a dead peer" {
     // ordinary close into a retry loop that can never end.
     var read_only: usize = 0;
     var write_only: usize = 0;
-    inline for (@typeInfo(ReadError).error_set.?) |member| {
-        read_only += @intFromBool(!hasArm(WaitError, member.name));
+    inline for (@typeInfo(ReadError).error_set.error_names.?) |member| {
+        read_only += @intFromBool(!hasArm(WaitError, member));
     }
-    inline for (@typeInfo(WriteError).error_set.?) |member| {
-        write_only += @intFromBool(!hasArm(WaitError, member.name));
+    inline for (@typeInfo(WriteError).error_set.error_names.?) |member| {
+        write_only += @intFromBool(!hasArm(WaitError, member));
     }
     try t.expectEqual(@as(usize, 2), read_only);
     try t.expectEqual(@as(usize, 3), write_only);

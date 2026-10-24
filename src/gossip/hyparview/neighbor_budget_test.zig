@@ -19,13 +19,15 @@ test "Neighbor4096 rejects Join before membership commit" {
     var input: [4100]u8 = undefined;
     const decoded = try budget_peer.receiveIncoming(.{ .swarm = .{ .join = &contact } }, &input);
     const candidate: codec.Message = .{ .swarm = .{ .neighbor = .{
-        .priority = .high, .data = state.myData(),
+        .priority = .high,
+        .data = state.myData(),
     } } };
     var output: [4100]u8 = undefined;
     try t.expectEqual(@as(usize, 4096), codec.encodedLen(candidate));
     try t.expectError(error.FrameTooLarge, codec.encode(candidate, &output));
     const result = state.handle(.{ .recv_message = .{
-        .from = try testNodeId(2), .message = decoded.swarm,
+        .from = try testNodeId(2),
+        .message = decoded.swarm,
     } }, &out);
     try t.expectEqual(@as(usize, 0), state.activeView().len);
     try t.expectEqual(@as(usize, 0), state.passiveView().len);
@@ -50,7 +52,8 @@ test "Neighbor4095 accepts tiny Join with full own4089 data" {
     var input: [4100]u8 = undefined;
     const decoded = try budget_peer.receiveIncoming(.{ .swarm = .{ .join = &contact } }, &input);
     try state.handle(.{ .recv_message = .{
-        .from = try testNodeId(2), .message = decoded.swarm,
+        .from = try testNodeId(2),
+        .message = decoded.swarm,
     } }, &out);
     try t.expect(state.active_view.contains(try testNodeId(2)));
     try t.expect(state.pending_neighbor_requests.contains(try testNodeId(2)));

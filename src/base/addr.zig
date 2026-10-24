@@ -157,7 +157,7 @@ pub const TransportAddr = union(enum) {
         const self_tag = std.meta.activeTag(self);
         const other_tag = std.meta.activeTag(other);
         if (self_tag != other_tag) {
-            return std.math.order(@intFromEnum(self_tag), @intFromEnum(other_tag));
+            return std.math.order(@backingInt(self_tag), @backingInt(other_tag));
         }
         return switch (self) {
             .relay => |url| url.order(other.relay),
@@ -377,7 +377,7 @@ test "relay url rejects what is not a relay" {
     try t.expectError(error.UnsupportedScheme, RelayUrl.parse("ftp://example.com./"));
     try t.expectError(error.UnexpectedComponent, RelayUrl.parse("https://example.com./relay"));
     try t.expectError(error.UnexpectedComponent, RelayUrl.parse("https://example.com./?x=1"));
-    try t.expectError(error.HostTooLong, RelayUrl.parse("https://" ++ ("a" ** 254) ++ "./"));
+    try t.expectError(error.HostTooLong, RelayUrl.parse("https://" ++ (&@as([254:0]u8, @splat('a'))) ++ "./"));
     // Port 0 is the one value of `port` no `RelayUrl` may carry, and `parse`
     // is what keeps it out: `std.Uri` hands `:0` over as the number zero
     // rather than refusing it, so the check is this module's own line. That
@@ -445,7 +445,7 @@ test "custom address binary form is a little-endian id then raw data" {
     try t.expectError(error.Malformed, CustomAddr.parseBinary(binary[0..7]));
     try t.expectError(
         error.DataTooLong,
-        CustomAddr.parseBinary(binary[0..custom_id_length] ++ "x" ** 31),
+        CustomAddr.parseBinary(binary[0..custom_id_length] ++ &@as([31:0]u8, @splat('x'))),
     );
 }
 
@@ -480,7 +480,7 @@ test "custom address text form outlives the frame it was parsed in" {
 }
 
 test "custom address outlives the copy into a node address" {
-    const node_id = (try key.SecretKey.fromSeed([_]u8{2} ** key.SecretKey.seed_length)).nodeId();
+    const node_id = (try key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(2)))).nodeId();
     const alloc = t.allocator;
     var storage: [max_inline_length]u8 = undefined;
 
@@ -513,7 +513,7 @@ test "transport address ordering is variant, then inner" {
 }
 
 test "node addr keeps its address list sorted and unique" {
-    const node_id = (try key.SecretKey.fromSeed([_]u8{1} ** key.SecretKey.seed_length)).nodeId();
+    const node_id = (try key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(1)))).nodeId();
     const alloc = t.allocator;
 
     var addr = try NodeAddr.withRelay(alloc, node_id, try RelayUrl.parse("https://z.example./"));
@@ -554,7 +554,7 @@ test "a mid-list insert keeps every address it shifted" {
     // index 0 with two addresses behind it. Every other insert in this file
     // appended, where the shift copies nothing and a copy in the wrong
     // direction is indistinguishable from a copy in the right one.
-    const node_id = (try key.SecretKey.fromSeed([_]u8{1} ** key.SecretKey.seed_length)).nodeId();
+    const node_id = (try key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(1)))).nodeId();
     const alloc = t.allocator;
     const first_host = IpAddress.parse("192.168.96.145") orelse return error.TestUnexpectedResult;
     const first: TransportAddr = .{ .ip = .{ .ip = first_host, .port = 60165 } };
@@ -593,7 +593,7 @@ test "a duplicate with addresses behind it is rejected and changes nothing" {
     // `first` has `second` behind it, so the lower bound lands short of the
     // end. A duplicate at the last index cannot tell a rejection that fires
     // before the shift from one that fires because nothing had to move.
-    const node_id = (try key.SecretKey.fromSeed([_]u8{1} ** key.SecretKey.seed_length)).nodeId();
+    const node_id = (try key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(1)))).nodeId();
     const alloc = t.allocator;
     const first_host = IpAddress.parse("192.168.96.145") orelse return error.TestUnexpectedResult;
     const first: TransportAddr = .{ .ip = .{ .ip = first_host, .port = 60165 } };

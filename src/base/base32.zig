@@ -182,25 +182,25 @@ test "z-base-32 rejects a bad symbol" {
     // '0' is in neither alphabet.
     try std.testing.expectError(
         error.InvalidSymbol,
-        decode(z32, 32, "0" ** 52),
+        decode(z32, 32, &@as([52:0]u8, @splat('0'))),
     );
 }
 
 test "z-base-32 rejects a wrong length" {
-    try std.testing.expectError(error.InvalidLength, decode(z32, 32, "y" ** 51));
-    try std.testing.expectError(error.InvalidLength, decode(z32, 32, "y" ** 53));
+    try std.testing.expectError(error.InvalidLength, decode(z32, 32, &@as([51:0]u8, @splat('y'))));
+    try std.testing.expectError(error.InvalidLength, decode(z32, 32, &@as([53:0]u8, @splat('y'))));
 }
 
 test "decode rejects non-zero padding bits" {
     // 32 bytes need 52 symbols; the last carries 4 real bits and 1 pad bit.
     // 'y' is symbol 0, so swap in a symbol whose low bit is set.
-    var text = encode(z32, 32, &([_]u8{0} ** 32));
+    var text = encode(z32, 32, &(@as([32]u8, @splat(0))));
     text[text.len - 1] = 'b';
     try std.testing.expectError(error.NonZeroPadding, decode(z32, 32, &text));
 }
 
 test "dnssec base32 accepts either case and emits lower" {
-    const bytes = [_]u8{0xfb} ** 32;
+    const bytes = @as([32]u8, @splat(0xfb));
     const lower = encode(dnssec, 32, &bytes);
     for (lower) |c| try t.expect(std.ascii.isLower(c) or std.ascii.isDigit(c));
 
@@ -214,7 +214,7 @@ test "dnssec base32 accepts either case and emits lower" {
 }
 
 test "z-base-32 is case sensitive" {
-    const bytes = [_]u8{0xff} ** 32;
+    const bytes = @as([32]u8, @splat(0xff));
     const text = encode(z32, 32, &bytes);
     var upper: [text.len]u8 = undefined;
     _ = std.ascii.upperString(&upper, &text);

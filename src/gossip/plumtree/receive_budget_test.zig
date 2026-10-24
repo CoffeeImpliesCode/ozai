@@ -20,7 +20,9 @@ fn receiveBudget(length: usize, scope: tree.DeliveryScope, reject: bool) !void {
     const content = bytes[0..length];
     const id = tree.MessageId.fromContent(content);
     const incoming: codec.Message = .{ .gossip = .{ .gossip = .{
-        .id = id, .content = content, .scope = scope,
+        .id = id,
+        .content = content,
+        .scope = scope,
     } } };
     try t.expectEqual(@as(usize, if (reject) 4097 else 4096), codec.encodedLen(incoming));
     var state: tree.State = .init(try testNodeId(1), .{});
@@ -39,7 +41,8 @@ fn receiveBudget(length: usize, scope: tree.DeliveryScope, reject: bool) !void {
     // Over-budget bodies cannot decode, but the public state API must reject them too.
     const message = if (reject) incoming else try receiveInclusive(incoming, &input);
     const result = state.handle(.{ .recv_message = .{
-        .from = try testNodeId(2), .message = message.gossip,
+        .from = try testNodeId(2),
+        .message = message.gossip,
     } }, 0, &out);
     try t.expectEqual(@as(usize, 0), state.cache.count());
     try t.expectEqual(@as(usize, 0), state.lazy_push_queue_len);
@@ -53,8 +56,7 @@ fn receiveBudget(length: usize, scope: tree.DeliveryScope, reject: bool) !void {
         try t.expectError(error.MessageTooLarge, result);
     } else {
         try result;
-        try t.expectEqual(@as(usize, if (scope == .swarm) 1 else 0),
-            state.received_messages.count());
+        try t.expectEqual(@as(usize, if (scope == .swarm) 1 else 0), state.received_messages.count());
         if (scope == .swarm) try t.expect(state.received_messages.contains(id));
         var delivered: usize = 0;
         var output: [4100]u8 = undefined;
@@ -102,7 +104,9 @@ test "inclusive swarm4056 round65535 wraps into writable4094 forward" {
     const content: [4056]u8 = @splat(0x95);
     const id = tree.MessageId.fromContent(&content);
     const incoming: codec.Message = .{ .gossip = .{ .gossip = .{
-        .id = id, .content = &content, .scope = .{ .swarm = .{ .value = 65535 } },
+        .id = id,
+        .content = &content,
+        .scope = .{ .swarm = .{ .value = 65535 } },
     } } };
     try t.expectEqual(@as(usize, 4096), codec.encodedLen(incoming));
     var input: [4100]u8 = undefined;
@@ -113,7 +117,8 @@ test "inclusive swarm4056 round65535 wraps into writable4094 forward" {
     var out: tree.Actions(tree.OutEvent) = .init(t.allocator);
     defer out.deinit();
     try state.handle(.{ .recv_message = .{
-        .from = try testNodeId(2), .message = decoded.gossip,
+        .from = try testNodeId(2),
+        .message = decoded.gossip,
     } }, 0, &out);
     try t.expectEqual(@as(usize, 1), state.received_messages.count());
     try t.expect(state.received_messages.contains(id));
@@ -121,8 +126,7 @@ test "inclusive swarm4056 round65535 wraps into writable4094 forward" {
     const cached = state.cache.get(id).?;
     try t.expectEqualSlices(u8, &content, cached.content);
     try t.expectEqual(@as(u16, 0), cached.scope.swarm.value);
-    try t.expectEqual(@as(usize, 4094),
-        codec.encodedLen(.{ .gossip = .{ .gossip = cached } }));
+    try t.expectEqual(@as(usize, 4094), codec.encodedLen(.{ .gossip = .{ .gossip = cached } }));
     var delivered: usize = 0;
     var forwards: usize = 0;
     var output: [4100]u8 = undefined;

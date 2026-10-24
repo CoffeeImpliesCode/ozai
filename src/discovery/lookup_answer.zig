@@ -116,10 +116,6 @@ pub fn readAnswer(
 
 /// What one header says, once the fields this file acts on have been checked.
 ///
-/// Public because a second reader — `discovery/host_io.zig` — parses the same
-/// header for the host record types. One header, one parser: `AGENTS.md` §1
-/// does not allow a second copy of this rule to exist because a second caller
-/// needed it.
 pub const Counts = struct {
     questions: u16,
     answers: u16,

@@ -66,12 +66,6 @@
 //!
 //! # Entropy is the caller's, and `io` is a parameter
 //!
-//! The transaction id is a parameter of `Resolver.begin`, so the caller draws it
-//! from its own generator and this file holds none. `io: std.Io` is a parameter
-//! of every call and is stored nowhere, for the reason
-//! `docs/DECISIONS/0002-async-substrate.md` gives: a struct holding an `Io`
-//! cannot be driven twice with different runtimes. `Resolver` owns a socket, a
-//! server address and a stop latch, and those are the only three things it has.
 //!
 //! # A truncated datagram is retried over TCP
 //!
@@ -1117,8 +1111,8 @@ test "DNS TCP acquisition and partial I/O failures release resources and reply a
 }
 
 test "every DNS TCP acquisition failure retains cancellation and exact ownership" {
-    inline for (@typeInfo(StreamTripwire.errors.OpenError).error_set.?) |entry| {
-        const failure: StreamTripwire.errors.OpenError = @field(anyerror, entry.name);
+    inline for (@typeInfo(StreamTripwire.errors.OpenError).error_set.error_names.?) |entry| {
+        const failure: StreamTripwire.errors.OpenError = @field(anyerror, entry);
         for ([_]StreamTripwire.Mode{ .stream_failure, .wake_failure, .bound_failure }) |mode| {
             var script: StreamTripwire = .{ .mode = mode, .acquire_failure = failure };
             var udp: TruncatedDatagram = .{ .server = support.nameserver };

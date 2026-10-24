@@ -585,7 +585,7 @@ test "a push body cannot be read as a get body, on the wire" {
     {
         var clean_frame: [job_ns.request_room]u8 = undefined;
         var clean_writer = postcard.Writer.init(&clean_frame);
-        try clean_writer.writeU8(@intFromEnum(blobs.RequestType.get));
+        try clean_writer.writeU8(@backingInt(blobs.RequestType.get));
         try framed.request.write(&clean_writer);
         const clean_bytes = clean_writer.finish();
         // `EofFraming.read` takes the *body*: the discriminant is read by
@@ -632,7 +632,7 @@ test "a push body cannot be read as a get body, on the wire" {
     {
         var swapped: [job_ns.request_room + ranges_mod.payload_length]u8 = undefined;
         @memcpy(swapped[0..received_push.len], received_push);
-        swapped[0] = @intFromEnum(blobs.RequestType.get);
+        swapped[0] = @backingInt(blobs.RequestType.get);
         var reader = postcard.Reader.init(swapped[1..]);
         try t.expectError(
             error.BufferFull,
@@ -646,7 +646,7 @@ test "a push body cannot be read as a get body, on the wire" {
         const received_get = job_ns.received(&link.provider_bytes, get.stream);
         var swapped: [job_ns.request_room]u8 = undefined;
         @memcpy(swapped[0..received_get.len], received_get);
-        swapped[0] = @intFromEnum(blobs.RequestType.push);
+        swapped[0] = @backingInt(blobs.RequestType.push);
         var reader = postcard.Reader.init(swapped[0..received_get.len]);
         try t.expectError(
             error.UnexpectedEnd,
@@ -885,8 +885,6 @@ test "a run is within one datagram, at every segment size" {
                     try t.expectEqual(@as(usize, @intCast(size)), @as(usize, value));
                     try t.expect(run.contents.len > size);
                 } else {
-                    // And a run of one datagram carries no segment size, which
-                    // is the fallback `DECISIONS/0002` promised.
                     try t.expectEqual(@as(usize, 1), run.datagramCount());
                 }
             }

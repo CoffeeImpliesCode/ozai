@@ -212,4 +212,3 @@ test "child ownership guard rejects missing prepared identity before exit inspec
     );
     try std.testing.expect(!guard.term_sent);
 }
-

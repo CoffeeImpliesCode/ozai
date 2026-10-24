@@ -222,7 +222,7 @@ const client_conns: []const holepunch.Connection = &.{.{ .id = 4, .side = .clien
 /// curve point is a fact about the build and not about the run: a constant
 /// that stopped being one stops the build, where a `catch unreachable` would
 /// abort the first test that read it and say nothing about why.
-const peer_node: addr.NodeId = addr.NodeId.fromBytes([_]u8{7} ** 32) catch
+const peer_node: addr.NodeId = addr.NodeId.fromBytes(@as([32]u8, @splat(7))) catch
     @compileError("the fixed test peer is not a canonical ed25519 point");
 
 /// A published record carrying exactly `addrs`.

@@ -89,13 +89,6 @@
 //!
 //! # What is not claimed
 //!
-//! Nothing here is a wire format, so there are no captured bytes to pin
-//! against and `AGENTS.md` §2's "wire compatibility is a test" has nothing to
-//! bite on. What this file rests on is one call shape: `reachableAt` over a
-//! `Snapshot` under a stored policy, both from `interface.zig`. The reachability
-//! rule is that module's — the `IFF_UP` filter, the loopback policy and the
-//! per-family lists are all applied there and are deliberately not restated,
-//! which is why this file passes the policy rather than choosing it.
 
 const std = @import("std");
 
@@ -189,7 +182,7 @@ pub const Verdict = enum {
 ///
 /// Read from the enum rather than written down, so `Tally` grows with the type
 /// and a new answer cannot be added to a counter that has no room for it.
-pub const verdict_count = @typeInfo(Verdict).@"enum".fields.len;
+pub const verdict_count = @typeInfo(Verdict).@"enum".field_names.len;
 
 /// How many of a set of paths each verdict covers.
 ///
@@ -204,11 +197,11 @@ pub const Tally = struct {
 
     /// How many paths came to `answer`.
     pub fn get(self: *const Tally, answer: Verdict) usize {
-        return self.counts[@intFromEnum(answer)];
+        return self.counts[@backingInt(answer)];
     }
 
     fn record(self: *Tally, answer: Verdict) void {
-        self.counts[@intFromEnum(answer)] += 1;
+        self.counts[@backingInt(answer)] += 1;
     }
 };
 
@@ -568,9 +561,9 @@ test "the host bits and the port cannot reach the verdict" {
     // would be a verdict about something other than this machine's interfaces.
     const bindings = [_]Binding{
         test_binding,
-        .{ .host = .{0xff} ** 8, .port = 0 },
-        .{ .host = .{0} ** 8, .port = 1 },
-        .{ .host = .{0xaa} ** 8, .port = std.math.maxInt(u16) },
+        .{ .host = @splat(0xff), .port = 0 },
+        .{ .host = @splat(0), .port = 1 },
+        .{ .host = @splat(0xaa), .port = std.math.maxInt(u16) },
     };
     for (bindings) |one| {
         try t.expectEqual(Verdict.stranded, verdict(&change, &lost, one));
@@ -623,9 +616,9 @@ test "every verdict arm is reachable and the tally counts each path once" {
     };
 
     var seen: usize = 0;
-    inline for (@typeInfo(Verdict).@"enum".fields) |field| {
+    inline for (@typeInfo(Verdict).@"enum".field_names) |field| {
         var hits: usize = 0;
-        for (counted) |one| hits += one.get(@enumFromInt(field.value));
+        for (counted) |one| hits += one.get(@field(Verdict, field));
         // An arm nothing reaches is an answer this file cannot give, and adding
         // one would otherwise land at zero with nothing looking for it.
         try t.expect(hits > 0);

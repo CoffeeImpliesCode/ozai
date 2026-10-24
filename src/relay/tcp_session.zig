@@ -90,7 +90,7 @@ pub const Session = struct {
 
     pub fn flush(self: *Session, io: std.Io, role: ws.Role) Error!void {
         if (self.pending_payload) |length| {
-            var mask: ws.MaskKey = .{0} ** 4;
+            var mask: ws.MaskKey = @splat(0);
             if (role == .client) io.randomSecure(&mask) catch return error.RandomUnavailable;
             const header_len = ws.headerLen(length, role == .client);
             const start = ws.max_header_length - header_len;
@@ -264,7 +264,7 @@ test "client next consumes server ping without entropy and preserves binary frag
     const first = try ws.encode(
         &connection.rx,
         .server,
-        .{ .fin = false, .opcode = .binary, .key = .{0} ** 4 },
+        .{ .fin = false, .opcode = .binary, .key = @splat(0) },
         "first",
     );
     connection.rx_len = first.len;
@@ -284,7 +284,7 @@ test "client next consumes server ping without entropy and preserves binary frag
     const ping = try ws.encode(
         &connection.rx,
         .server,
-        .{ .fin = true, .opcode = .ping, .key = .{0} ** 4 },
+        .{ .fin = true, .opcode = .ping, .key = @splat(0) },
         "probe",
     );
     connection.rx_len = ping.len;
@@ -387,13 +387,13 @@ test "ignored text does not reset following binary fragments at next poll" {
     const text = try ws.encode(
         &connection.rx,
         .server,
-        .{ .fin = true, .opcode = .text, .key = .{0} ** 4 },
+        .{ .fin = true, .opcode = .text, .key = @splat(0) },
         "ignored",
     );
     const first = try ws.encode(
         connection.rx[text.len..],
         .server,
-        .{ .fin = false, .opcode = .binary, .key = .{0} ** 4 },
+        .{ .fin = false, .opcode = .binary, .key = @splat(0) },
         "first",
     );
     connection.rx_len = text.len + first.len;
@@ -404,7 +404,7 @@ test "ignored text does not reset following binary fragments at next poll" {
     const last = try ws.encode(
         &connection.rx,
         .server,
-        .{ .fin = true, .opcode = .continuation, .key = .{0} ** 4 },
+        .{ .fin = true, .opcode = .continuation, .key = @splat(0) },
         "last",
     );
     connection.rx_len = last.len;
@@ -419,13 +419,13 @@ test "EOF drains every complete buffered binary message before Closed" {
     const first = try ws.encode(
         &connection.rx,
         .server,
-        .{ .fin = true, .opcode = .binary, .key = .{0} ** 4 },
+        .{ .fin = true, .opcode = .binary, .key = @splat(0) },
         "first",
     );
     const second = try ws.encode(
         connection.rx[first.len..],
         .server,
-        .{ .fin = true, .opcode = .binary, .key = .{0} ** 4 },
+        .{ .fin = true, .opcode = .binary, .key = @splat(0) },
         "second",
     );
     connection.rx_len = first.len + second.len;

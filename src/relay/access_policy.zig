@@ -332,7 +332,7 @@ test "no sentence means the default denial, and a long one is refused not cut" {
 
     // A reason the codec cannot carry is refused with nothing written, because a
     // shortened one is a sentence the relay did not decide to say.
-    const too_long_text = "x" ** (frame.ServerDeniesAuth.max_reason_length + 1);
+    const too_long_text = &@as([(frame.ServerDeniesAuth.max_reason_length + 1):0]u8, @splat('x'));
     var long: Scripted = .{ .allowed = served, .reason = too_long_text };
     const verbose: Policy = .{ .context = &long, .decide = Scripted.decide };
     const too_long = handshake.step(

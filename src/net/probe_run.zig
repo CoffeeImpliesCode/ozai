@@ -209,14 +209,14 @@ fn relaySet(scratch: []u8) ![3]RelayUrl {
 /// which is the only place a reader can see both.
 const family_count = 3;
 comptime {
-    if (@typeInfo(report.Probe).@"enum".fields.len != family_count) {
+    if (@typeInfo(report.Probe).@"enum".field_names.len != family_count) {
         @compileError("report.Probe gained a family; this file's table is sized for three");
     }
 }
 
 /// The two families a relay can be asked for an address over.
-const v4_slot = @intFromEnum(report.Probe.qad_ipv4);
-const v6_slot = @intFromEnum(report.Probe.qad_ipv6);
+const v4_slot = @backingInt(report.Probe.qad_ipv4);
+const v6_slot = @backingInt(report.Probe.qad_ipv6);
 
 const public_v4: SocketAddr = .{ .ip = .{ .v4 = .{ 198, 51, 100, 7 } }, .port = 41234 };
 const other_v4: SocketAddr = .{ .ip = .{ .v4 = .{ 198, 51, 100, 9 } }, .port = 51234 };
@@ -325,7 +325,7 @@ const Fake = struct {
             .https => .{ .https = self.think[live.task.relay] },
             .qad_ipv4, .qad_ipv6 => .{ .qad = .{
                 .latency = self.think[live.task.relay],
-                .reported = self.reported[live.task.relay][@intFromEnum(live.task.proto)] orelse
+                .reported = self.reported[live.task.relay][@backingInt(live.task.proto)] orelse
                     return null,
             } },
         };

@@ -154,7 +154,7 @@ const t = std.testing;
 /// One record's fixed block and its `RDATA`, written field by field: what an
 /// `A` record looks like on the wire and nothing else.
 fn addressRecord(kind: u16, ttl: u32, rdata: []const u8) [fixed_length + 16]u8 {
-    var record = [_]u8{0} ** (fixed_length + 16);
+    var record = @as([(fixed_length + 16)]u8, @splat(0));
     wire.put16(&record, type_at, kind);
     wire.put16(&record, class_at, wire.class_in);
     wire.put32(&record, ttl_at, ttl);

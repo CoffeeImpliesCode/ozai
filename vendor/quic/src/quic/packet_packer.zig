@@ -141,7 +141,7 @@ pub const PacketPacker = struct {
     /// original. `init` copies without a length check, so a source id longer
     /// than twenty bytes overflows here — the bound is RFC 9000 §17.2's
     /// twenty, and the caller is what enforces it.
-    scid_buf: [20]u8 = .{0} ** 20,
+    scid_buf: [20]u8 = @splat(0),
     /// Bytes of `scid_buf` in use, at most twenty.
     scid_len: u8 = 0,
 
@@ -150,7 +150,7 @@ pub const PacketPacker = struct {
     /// Same copy and same unchecked twenty-byte bound as `scid_buf`. Written
     /// by `init` and by `updateDcid`, and read for every packet header, so
     /// changing it changes where the next packet goes.
-    dcid_buf: [20]u8 = .{0} ** 20,
+    dcid_buf: [20]u8 = @splat(0),
     /// Bytes of `dcid_buf` in use, at most twenty.
     dcid_len: u8 = 0,
     /// The QUIC version written into every long header but a 0-RTT one, and,
@@ -1074,7 +1074,7 @@ pub const PacketPacker = struct {
             // Roll back the packet number we consumed — no packet will be sent.
             // This applies even with pad_target > 0: sending a padded Initial with
             // no ACK/CRYPTO content just wastes PNs and pushes the PTO forward.
-            const idx = @intFromEnum(level);
+            const idx = @backingInt(level);
             pkt_handler.next_pn[idx] -= 1;
             return 0; // Nothing to send
         }
@@ -1429,7 +1429,7 @@ test "PacketPacker: pack 1-RTT with stream data" {
     try testing.expect(out_buf[0] & 0x80 == 0);
 
     // Verify sent packet tracking
-    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
     try testing.expectEqual(@as(usize, 1), pkt_handler.sent[app_idx].sent_packets.count());
 }
 
@@ -1662,7 +1662,7 @@ test "PacketPacker: HANDSHAKE_DONE frame packed in 1-RTT" {
     try testing.expect(!packer.send_handshake_done);
 
     // Sent packet should be tracked as ack-eliciting with handshake_done
-    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
     try testing.expectEqual(@as(usize, 1), pkt_handler.sent[app_idx].sent_packets.count());
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
     const pkt = it.next().?.value_ptr.*;
@@ -1716,7 +1716,7 @@ test "PacketPacker: ecn_mark propagates to SentPacket" {
     try testing.expect(written > 0);
 
     // Check the sent packet has ecn_marked set
-    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
     const pkt = it.next().?.value_ptr.*;
     try testing.expect(pkt.ecn_marked);
@@ -1762,7 +1762,7 @@ test "PacketPacker: key_phase bit in short header" {
     // After header protection is applied, the key_phase bit is masked.
     // But the two packets should differ (different key phase + different content).
     // Just verify both produced output and used different PNs.
-    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
     try testing.expectEqual(@as(u64, 2), pkt_handler.next_pn[app_idx]);
 }
 
@@ -1812,7 +1812,7 @@ test "PacketPacker: pending control frames in 1-RTT" {
     try testing.expectEqual(@as(?frame_mod.PendingControlFrame, null), pending_frames.pop());
 
     // Sent packet should be ack-eliciting
-    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
     const pkt = it.next().?.value_ptr.*;
     try testing.expect(pkt.ack_eliciting);
@@ -1860,7 +1860,7 @@ test "PacketPacker: stream frame info tracked in SentPacket" {
     );
 
     // Verify stream frame info was recorded in SentPacket
-    const app_idx = @intFromEnum(ack_handler.EncLevel.application);
+    const app_idx = @backingInt(ack_handler.EncLevel.application);
     var it = pkt_handler.sent[app_idx].sent_packets.iterator();
     const pkt = it.next().?.value_ptr.*;
     const sf = pkt.getStreamFrames();
@@ -2012,7 +2012,7 @@ test "PacketPacker: an Initial control frame with no room waits for the next pac
             .is_app = false,
         },
     }));
-    try crypto_mgr.getStream(0).writeData("c" ** crypto_bytes);
+    try crypto_mgr.getStream(0).writeData(&@as([crypto_bytes:0]u8, @splat('c')));
     const keys = try testServerKeys();
 
     var out_buf: [1500]u8 = undefined;
@@ -2104,7 +2104,7 @@ test "PacketPacker: a 1-RTT packet carrying only a CONNECTION_CLOSE is not ack-e
     var out_buf: [1500]u8 = undefined;
     try testing.expect(try packAppOnly(&packer, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &out_buf, rng.random()) > 0);
 
-    const app = pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)].sent_packets;
+    const app = pkt_handler.sent[@backingInt(ack_handler.EncLevel.application)].sent_packets;
     try testing.expectEqual(@as(usize, 1), app.count());
     const sent = app.values()[0];
     try testing.expect(!sent.ack_eliciting);
@@ -2135,7 +2135,7 @@ test "PacketPacker: a 1-RTT packet carrying only a NEW_TOKEN is ack-eliciting" {
     var out_buf: [1500]u8 = undefined;
     try testing.expect(try packAppOnly(&packer, &pkt_handler, &crypto_mgr, &streams, &pending_frames, &out_buf, rng.random()) > 0);
 
-    const app = pkt_handler.sent[@intFromEnum(ack_handler.EncLevel.application)].sent_packets;
+    const app = pkt_handler.sent[@backingInt(ack_handler.EncLevel.application)].sent_packets;
     try testing.expectEqual(@as(usize, 1), app.count());
     const sent = app.values()[0];
     try testing.expect(sent.ack_eliciting);
@@ -2320,8 +2320,8 @@ test "PacketPacker: a coalesced client Initial waits for a datagram that can rea
     defer streams.deinit();
     var pending_frames = frame_mod.PendingFrameQueue{};
     // The ClientHello, and the Finished that shares its datagram.
-    try crypto_mgr.getStream(0).writeData("a" ** 600);
-    try crypto_mgr.getStream(2).writeData("b" ** 40);
+    try crypto_mgr.getStream(0).writeData(&@as([600:0]u8, @splat('a')));
+    try crypto_mgr.getStream(2).writeData(&@as([40:0]u8, @splat('b')));
     // One seal at both levels: the packer takes it as given, and what is under
     // test is how the two levels share the datagram's padding.
     const keys = try testClientKeys();
@@ -2398,7 +2398,7 @@ test "PacketPacker: an Initial with a silent Handshake level pads itself" {
         var streams = stream_mod.StreamsMap.init(testing.allocator, is_server);
         defer streams.deinit();
         var pending_frames = frame_mod.PendingFrameQueue{};
-        try crypto_mgr.getStream(0).writeData("a" ** 600);
+        try crypto_mgr.getStream(0).writeData(&@as([600:0]u8, @splat('a')));
 
         var out_buf: [1500]u8 = undefined;
         const written = try packer.packCoalesced(
@@ -2458,7 +2458,7 @@ test "PacketPacker: a pass that shares the floor with nothing still reaches 1200
         var streams = stream_mod.StreamsMap.init(testing.allocator, false);
         defer streams.deinit();
         var pending_frames = frame_mod.PendingFrameQueue{};
-        try crypto_mgr.getStream(0).writeData("a" ** 600);
+        try crypto_mgr.getStream(0).writeData(&@as([600:0]u8, @splat('a')));
         if (case.handshake_crypto > 0) {
             // `case.handshake_crypto` is a case value, not a comptime one, so
             // `**` cannot spell this repeat — the CRYPTO is filled at runtime
@@ -2548,7 +2548,7 @@ test "PacketPacker: a congestion-limited pass still makes Handshake progress" {
     defer streams.deinit();
     var pending_frames = frame_mod.PendingFrameQueue{};
     // Larger than one bounded Initial can carry, so data remains queued.
-    try crypto_mgr.getStream(0).writeData("c" ** 2048);
+    try crypto_mgr.getStream(0).writeData(&@as([2048:0]u8, @splat('c')));
     // The Handshake flight, bytes that differ by position so that what a pass
     // handed over and what it kept is checkable as data and not as a count
     // alone. It is larger than what one pass carries out of the room kept back
@@ -3244,7 +3244,7 @@ test "PacketPacker: empty and short off-path calls consume no packet number" {
         packet[0..20],
         &handler,
         &keys.seal,
-        .{ .challenge = .{1} ** 8 },
+        .{ .challenge = @splat(1) },
         rng.random(),
     ));
     try testing.expectEqual(@as(u64, 0), handler.next_pn[2]);

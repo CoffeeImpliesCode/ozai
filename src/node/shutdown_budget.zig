@@ -288,8 +288,8 @@ test "the boundary is the named bound, and it is spent at the bound" {
 test "the connection close is the only step a budget ever gives up" {
     // Four points on the timeline, the last of which no wall clock reaches.
     const elapsed = [4]Nanos{ 0, announce_budget - 1, announce_budget, std.math.maxInt(Nanos) };
-    inline for (@typeInfo(order.Step).@"enum".fields) |field| {
-        const step: order.Step = @enumFromInt(field.value);
+    inline for (@typeInfo(order.Step).@"enum".field_names) |field| {
+        const step: order.Step = @field(order.Step, field);
         for (elapsed) |at| {
             // The close is the only step a budget may give up, and it is given
             // up only once the bound is spent. At `0` and one nanosecond short
@@ -324,8 +324,8 @@ test "giving up the announcement gives up nothing else" {
     try t.expect(ledger.hasGiven(.connections));
     // And nothing was given up twice on the way, which is the other half of
     // what "exactly once" means.
-    inline for (@typeInfo(order.Release).@"enum".fields) |field| {
-        try t.expect(ledger.hasGiven(@enumFromInt(field.value)));
+    inline for (@typeInfo(order.Release).@"enum".field_names) |field| {
+        try t.expect(ledger.hasGiven(@field(order.Release, field)));
     }
 }
 
@@ -344,8 +344,8 @@ test "a wind-down that announces every peer gives every release up once" {
     // And every release, including the one two steps reach, went exactly once:
     // the second reach of `.connections` found nothing and gave nothing, which
     // is what "once" means here rather than "twice, harmlessly".
-    inline for (@typeInfo(order.Release).@"enum".fields) |field| {
-        try t.expect(ledger.hasGiven(@enumFromInt(field.value)));
+    inline for (@typeInfo(order.Release).@"enum".field_names) |field| {
+        try t.expect(ledger.hasGiven(@field(order.Release, field)));
     }
     try t.expectError(error.ReleasedTwice, ledger.giveUp(.connections));
 }
@@ -369,8 +369,8 @@ test "a caller may choose a longer bound, and not a different step" {
     try t.expect(patient.maySkip(.connections, announce_budget * 4));
     // Whatever the bound, the step given up is the announcement and only the
     // announcement.
-    inline for (@typeInfo(order.Step).@"enum".fields) |field| {
-        const step: order.Step = @enumFromInt(field.value);
+    inline for (@typeInfo(order.Step).@"enum".field_names) |field| {
+        const step: order.Step = @field(order.Step, field);
         try t.expectEqual(step == .connections, patient.maySkip(step, announce_budget * 4));
     }
 }

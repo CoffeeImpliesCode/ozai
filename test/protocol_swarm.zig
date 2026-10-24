@@ -27,9 +27,6 @@ const wire = @import("protocol_wire.zig");
 
 const NodeId = ozai.NodeId;
 
-/// The ALPN both ends of a gossip link speak. Upstream's is
-/// `b"/iroh-gossip/1"`; the gossip module carries no ALPN of its own, and this
-/// is the one `docs/PLAN.md` names at M9.
 pub const gossip_alpn = "/iroh-gossip/1";
 
 /// A swarm of endpoints, each one dialling every peer with a higher index.
@@ -60,11 +57,11 @@ pub const Mesh = struct {
     pub fn init(mesh: *Mesh, seed: u64) !void {
         mesh.* = .{
             .nodes = undefined,
-            .ports = [_]u16{0} ** node_ns.max_nodes,
+            .ports = @as([node_ns.max_nodes]u16, @splat(0)),
             .codec = undefined,
             .frame = undefined,
             .wire_out = undefined,
-            .disconnects = [_]std.ArrayList(NodeId){.empty} ** node_ns.max_nodes,
+            .disconnects = @as([node_ns.max_nodes]std.ArrayList(NodeId), @splat(.empty)),
         };
         errdefer for (&mesh.disconnects) |*queue| queue.deinit(t.allocator);
         // Short intervals, so the `shuffle` and `pending_neighbor_request`

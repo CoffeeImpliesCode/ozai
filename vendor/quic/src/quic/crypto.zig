@@ -153,10 +153,10 @@ pub const EncryptionLevel = enum(u8) {
 pub const Open = struct {
     /// The AEAD key, zero-padded to `max_key_len`: the bytes past
     /// `cipher_suite.keyLen()` are zero and are never read.
-    key: [max_key_len]u8 = .{0} ** max_key_len,
+    key: [max_key_len]u8 = @splat(0),
     /// The header-protection key, zero-padded the same way. Only the first
     /// `cipher_suite.hpKeyLen()` bytes are read.
-    hp_key: [max_key_len]u8 = .{0} ** max_key_len,
+    hp_key: [max_key_len]u8 = @splat(0),
     /// The static IV every packet's nonce is `packet_number` XORed into
     /// (RFC 9001 §5.3). It has no default, and a zero one makes every packet
     /// under this key share a nonce.
@@ -303,10 +303,10 @@ pub const Open = struct {
 pub const Seal = struct {
     /// The AEAD key, zero-padded to `max_key_len`: the bytes past
     /// `cipher_suite.keyLen()` are zero and are never read.
-    key: [max_key_len]u8 = .{0} ** max_key_len,
+    key: [max_key_len]u8 = @splat(0),
     /// The header-protection key, zero-padded the same way. Only the first
     /// `cipher_suite.hpKeyLen()` bytes are read.
-    hp_key: [max_key_len]u8 = .{0} ** max_key_len,
+    hp_key: [max_key_len]u8 = @splat(0),
     /// The static IV every packet's nonce is `packet_number` XORed into
     /// (RFC 9001 §5.3). It has no default, and a zero one makes every packet
     /// under this key share a nonce.
@@ -509,7 +509,7 @@ pub fn computeHpMask(sample: *const [SAMPLE_LEN]u8, hp_key: [max_key_len]u8, cip
             // RFC 9001 §5.4.4: counter=sample[0..4] LE, nonce=sample[4..16]
             const counter = std.mem.readInt(u32, sample[0..4], .little);
             const nonce: [12]u8 = sample[4..16].*;
-            var zeros: [MASK_LEN]u8 = .{0} ** MASK_LEN;
+            var zeros: [MASK_LEN]u8 = @splat(0);
             var mask: [MASK_LEN]u8 = undefined;
             ChaCha20IETF.xor(&mask, &zeros, counter, hp_key, nonce);
             return mask;
@@ -669,7 +669,7 @@ pub fn deriveInitialKeyMaterial(
     cid: []const u8,
     version: u32,
     comptime is_server: bool,
-) !std.meta.Tuple(&.{ Open, Seal }) {
+) !struct { Open, Seal } {
     if (!protocol.isSupportedVersion(version)) {
         std.log.debug("unsupported QUIC version: 0x{x:0>8}", .{version});
         return error.InvalidVersion;
@@ -689,9 +689,9 @@ pub fn deriveInitialKeyMaterial(
     const client_key_16 = hkdfExpandLabel(secret, label_key, "", key_len);
     const client_iv = hkdfExpandLabel(secret, label_iv, "", nonce_len);
     const client_hp_16 = hkdfExpandLabel(secret, label_hp, "", key_len);
-    var client_key: [max_key_len]u8 = .{0} ** max_key_len;
+    var client_key: [max_key_len]u8 = @splat(0);
     @memcpy(client_key[0..key_len], &client_key_16);
-    var client_hp_key: [max_key_len]u8 = .{0} ** max_key_len;
+    var client_hp_key: [max_key_len]u8 = @splat(0);
     @memcpy(client_hp_key[0..key_len], &client_hp_16);
 
     // Server
@@ -699,9 +699,9 @@ pub fn deriveInitialKeyMaterial(
     const server_key_16 = hkdfExpandLabel(secret, label_key, "", key_len);
     const server_iv = hkdfExpandLabel(secret, label_iv, "", nonce_len);
     const server_hp_16 = hkdfExpandLabel(secret, label_hp, "", key_len);
-    var server_key: [max_key_len]u8 = .{0} ** max_key_len;
+    var server_key: [max_key_len]u8 = @splat(0);
     @memcpy(server_key[0..key_len], &server_key_16);
-    var server_hp_key: [max_key_len]u8 = .{0} ** max_key_len;
+    var server_hp_key: [max_key_len]u8 = @splat(0);
     @memcpy(server_hp_key[0..key_len], &server_hp_16);
 
     var open: Open = undefined;
@@ -724,7 +724,7 @@ test "decryptPayload rejects a payload shorter than its tag" {
     var open = keys[0];
 
     // The payload length is the peer's Length varint minus the packet number.
-    var short = [_]u8{0} ** 8;
+    var short = @as([8]u8, @splat(0));
     try std.testing.expectError(error.AuthenticationFailed, open.decryptPayload(0, &.{}, &short));
 }
 
@@ -899,7 +899,7 @@ pub fn deriveKeyPaddedV(secret: [32]u8, actual_len: usize, version: u32) [max_ke
 
 // Derive key with an explicit label string (runtime).
 fn deriveKeyPaddedL(secret: [32]u8, actual_len: usize, label: []const u8) [max_key_len]u8 {
-    var result: [max_key_len]u8 = .{0} ** max_key_len;
+    var result: [max_key_len]u8 = @splat(0);
     if (actual_len == 32) {
         result = hkdfExpandLabel(secret, label, "", 32);
     } else {
@@ -1336,10 +1336,10 @@ test "deriveNextTrafficSecret produces different secret" {
 }
 
 test "KeyUpdateManager: init and basic operations" {
-    const recv_secret = [_]u8{0xAA} ** 32;
-    const send_secret = [_]u8{0xBB} ** 32;
-    const recv_hp = [_]u8{0xCC} ** max_key_len;
-    const send_hp = [_]u8{0xDD} ** max_key_len;
+    const recv_secret = @as([32]u8, @splat(0xAA));
+    const send_secret = @as([32]u8, @splat(0xBB));
+    const recv_hp = @as([max_key_len]u8, @splat(0xCC));
+    const send_hp = @as([max_key_len]u8, @splat(0xDD));
 
     var mgr = KeyUpdateManager.init(recv_secret, send_secret, recv_hp, send_hp);
 
@@ -1364,10 +1364,10 @@ test "KeyUpdateManager: init and basic operations" {
 }
 
 test "KeyUpdateManager: roll keys" {
-    const recv_secret = [_]u8{0xAA} ** 32;
-    const send_secret = [_]u8{0xBB} ** 32;
-    const recv_hp = [_]u8{0xCC} ** max_key_len;
-    const send_hp = [_]u8{0xDD} ** max_key_len;
+    const recv_secret = @as([32]u8, @splat(0xAA));
+    const send_secret = @as([32]u8, @splat(0xBB));
+    const recv_hp = @as([max_key_len]u8, @splat(0xCC));
+    const send_hp = @as([max_key_len]u8, @splat(0xDD));
 
     var mgr = KeyUpdateManager.init(recv_secret, send_secret, recv_hp, send_hp);
     const orig_open_key = mgr.current_open.key;
@@ -1403,10 +1403,10 @@ test "KeyUpdateManager: roll keys" {
 }
 
 test "KeyUpdateManager: prev key expiry" {
-    const recv_secret = [_]u8{0xAA} ** 32;
-    const send_secret = [_]u8{0xBB} ** 32;
-    const recv_hp = [_]u8{0xCC} ** max_key_len;
-    const send_hp = [_]u8{0xDD} ** max_key_len;
+    const recv_secret = @as([32]u8, @splat(0xAA));
+    const send_secret = @as([32]u8, @splat(0xBB));
+    const recv_hp = @as([max_key_len]u8, @splat(0xCC));
+    const send_hp = @as([max_key_len]u8, @splat(0xDD));
 
     var mgr = KeyUpdateManager.init(recv_secret, send_secret, recv_hp, send_hp);
 
@@ -1426,10 +1426,10 @@ test "KeyUpdateManager: prev key expiry" {
 
 test "KeyUpdateManager: encrypt/decrypt roundtrip across key update" {
     // Simulate two sides: client and server with swapped secrets
-    const client_recv = [_]u8{0x11} ** 32; // = server_send
-    const client_send = [_]u8{0x22} ** 32; // = server_recv
-    const hp_a = [_]u8{0x33} ** max_key_len;
-    const hp_b = [_]u8{0x44} ** max_key_len;
+    const client_recv = @as([32]u8, @splat(0x11)); // = server_send
+    const client_send = @as([32]u8, @splat(0x22)); // = server_recv
+    const hp_a = @as([max_key_len]u8, @splat(0x33));
+    const hp_b = @as([max_key_len]u8, @splat(0x44));
 
     var client = KeyUpdateManager.init(client_recv, client_send, hp_a, hp_b);
     var server = KeyUpdateManager.init(client_send, client_recv, hp_b, hp_a);
@@ -1541,7 +1541,7 @@ test "encodePacketNumber" {
 }
 
 test "hkdfExpandLabel" {
-    const early_secret = HkdfSha256.extract(&.{}, &[_]u8{0} ** 32);
+    const early_secret = HkdfSha256.extract(&.{}, &@as([32]u8, @splat(0)));
     var empty_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("", &empty_hash, .{});
     const derived_secret = hkdfExpandLabel(early_secret, "derived", &empty_hash, 32);
@@ -1814,8 +1814,8 @@ test "RFC 9001 A.5: ChaCha20-Poly1305 short header packet" {
 test "multipath protection separates paths and packet numbers for both suites" {
     inline for (.{ CipherSuite.aes_128_gcm_sha256, CipherSuite.chacha20_poly1305_sha256 }) |suite| {
         var seal = Seal{
-            .key = .{0x42} ** max_key_len,
-            .nonce = .{0xa5} ** nonce_len,
+            .key = @splat(0x42),
+            .nonce = @splat(0xa5),
             .cipher_suite = suite,
         };
         var open = Open{
@@ -1863,7 +1863,7 @@ test "pinned rustls multipath nonce layout and full domain boundaries" {
         0x01, 0x03, 0x01, 0x07, 0x15, 0x27, 0x35, 0x43, 0x5d, 0x6f, 0x7d, 0x83,
     };
     try std.testing.expectEqualSlices(u8, &expected, &makeNonceForPath(iv, 0x01020304, 0x1122334455667788));
-    const zero_iv = [_]u8{0} ** nonce_len;
+    const zero_iv = @as([nonce_len]u8, @splat(0));
     const max_expected = [_]u8{
         0xff, 0xff, 0xff, 0xff, 0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     };
@@ -1904,10 +1904,10 @@ test "pinned rustls ring multipath AES path two golden ciphertext" {
 // generation on another; encryption usage still belongs to the shared key.
 test "KeyUpdateManager multipath ACK markers and global encryption count" {
     var manager = KeyUpdateManager.init(
-        .{0xaa} ** 32,
-        .{0xbb} ** 32,
-        .{0xcc} ** max_key_len,
-        .{0xdd} ** max_key_len,
+        @splat(0xaa),
+        @splat(0xbb),
+        @splat(0xcc),
+        @splat(0xdd),
     );
     manager.onPacketSentForPath(0, 100);
     manager.onAckForPath(1, 100);
@@ -1943,10 +1943,10 @@ test "KeyUpdateManager multipath ACK markers and global encryption count" {
 // clears it only when an application packet is selected for sending.
 test "KeyUpdateManager peer update guard waits for actual application send" {
     var manager = KeyUpdateManager.init(
-        .{0xaa} ** 32,
-        .{0xbb} ** 32,
-        .{0xcc} ** max_key_len,
-        .{0xdd} ** max_key_len,
+        @splat(0xaa),
+        @splat(0xbb),
+        @splat(0xcc),
+        @splat(0xdd),
     );
     try std.testing.expect(!manager.peer_update_unacked);
     manager.onPeerKeyUpdate(1000, 100);
@@ -1969,10 +1969,10 @@ test "KeyUpdateManager peer update guard waits for actual application send" {
 // packet-space send clears update_unacked. Both routes consume shared keys.
 test "KeyUpdateManager off-path sends count without confirming peer update" {
     var manager = KeyUpdateManager.init(
-        .{0xaa} ** 32,
-        .{0xbb} ** 32,
-        .{0xcc} ** max_key_len,
-        .{0xdd} ** max_key_len,
+        @splat(0xaa),
+        @splat(0xbb),
+        @splat(0xcc),
+        @splat(0xdd),
     );
     manager.onPeerKeyUpdate(1000, 100);
     manager.onOffPathPacketSentForPath(1, 7);
@@ -1994,10 +1994,10 @@ test "KeyUpdateManager off-path sends count without confirming peer update" {
 
 test "KeyUpdateManager local rotation waits for peer acknowledgment and prior key expiry" {
     var manager = KeyUpdateManager.init(
-        .{0xaa} ** 32,
-        .{0xbb} ** 32,
-        .{0xcc} ** max_key_len,
-        .{0xdd} ** max_key_len,
+        @splat(0xaa),
+        @splat(0xbb),
+        @splat(0xcc),
+        @splat(0xdd),
     );
     const path_zero_pto_ns: i64 = 100;
     const path_one_pto_ns: i64 = 500;

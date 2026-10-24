@@ -1,13 +1,6 @@
 //! A Bao tree's walk over BLAKE3: an input offset, a chaining value that is
 //! not the root, and the merge of two chaining values.
 //!
-//! A Bao tree is the BLAKE3 tree under another name. Its nodes are that tree's
-//! nodes and its root hash is that function's hash, so the only thing this
-//! layer adds is a place to start: `Hasher` opens at an offset into a larger
-//! input and returns the chaining value the whole tree holds for the same
-//! range. It reads no socket, no clock and no allocator. It is a function of
-//! bytes, an offset and the state the walk has built, which is what
-//! `AGENTS.md` §2 asks of anything that looks like a protocol.
 //!
 //! What is pinned to published bytes, and what is not, is the subject of the
 //! test blocks below. The root path is pinned, at every length both vector

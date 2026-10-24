@@ -22,7 +22,7 @@ const NodeId = key.NodeId;
 /// The error is propagated rather than asserted away anyway: a seed that was
 /// somehow not accepted fails the test that named it, not the whole run.
 pub fn testSecret(seed: u8) !key.SecretKey {
-    return key.SecretKey.fromSeed([_]u8{seed} ** key.SecretKey.seed_length);
+    return key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(seed)));
 }
 
 /// The node id that key claims.

@@ -365,10 +365,10 @@ test "the request rules, each refused by name" {
     // The bounds. `max_fields` and `max_field_length` are numbers this relay
     // chose, so these refusals are of a policy rather than of the RFC.
     try std_testing.expectError(error.FieldTooLong, parse(request(
-        "X: " ++ "y" ** (max_field_length + 1) ++ "\r\n",
+        "X: " ++ &@as([(max_field_length + 1):0]u8, @splat('y')) ++ "\r\n",
     )));
     try std_testing.expectError(error.HeaderTooLong, parse(
-        "GET /relay HTTP/1.1\r\nX: " ++ "y" ** (max_header_length + 1) ++ "\r\n\r\n",
+        "GET /relay HTTP/1.1\r\nX: " ++ &@as([(max_header_length + 1):0]u8, @splat('y')) ++ "\r\n\r\n",
     ));
     // `max_fields` counts the whole block, and `base_fields` is four of them, so
     // the bound is `max_fields` less four. Field names need not be distinct for
@@ -376,14 +376,21 @@ test "the request rules, each refused by name" {
     // over case and one fewer is the case just under it.
     const filler_line = "X-Filler: v\r\n";
     const base_field_count = 4;
+    const fillers = comptime blk: {
+        var out: [(max_fields - base_field_count + 1) * filler_line.len]u8 = undefined;
+        for (0..max_fields - base_field_count + 1) |i| {
+            @memcpy(out[i * filler_line.len ..][0..filler_line.len], filler_line);
+        }
+        break :blk out;
+    };
     try std_testing.expectError(error.TooManyFields, parse(
         "GET /relay HTTP/1.1\r\n" ++
-            (filler_line ** (max_fields - base_field_count + 1)) ++
+            fillers ++
             base_fields ++ "\r\n",
     ));
     try std_testing.expectEqual(@as(?Version, null), (try parse(
         "GET /relay HTTP/1.1\r\n" ++
-            (filler_line ** (max_fields - base_field_count)) ++
+            fillers[0 .. fillers.len - filler_line.len] ++
             base_fields ++ "\r\n",
     )).version);
 

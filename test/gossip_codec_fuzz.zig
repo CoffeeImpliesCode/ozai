@@ -203,8 +203,8 @@ fn checkMessage(message: Message) !usize {
     // gives this layer. An encoder and a decoder that agreed on a different
     // number would pass a round trip and fail here.
     const layer: u8 = switch (decoded) {
-        .swarm => @intFromEnum(codec.Layer.swarm),
-        .gossip => @intFromEnum(codec.Layer.gossip),
+        .swarm => @backingInt(codec.Layer.swarm),
+        .gossip => @backingInt(codec.Layer.gossip),
     };
     try t.expectEqual(layer, body[0]);
 

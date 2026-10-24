@@ -8,13 +8,6 @@
 //! needed at all? That question is asked here against `conn_index.zig`, and
 //! this file is the seam between the two.
 //!
-//! **Refresh is deliberately not a method here.** A `refresh` that forwarded to
-//! `ticket_cache.put` would be a second name for one call — the wiring
-//! `AGENTS.md` §9 writes a test to delete. Every decision a refresh has to make
-//! lives with the claim it changes: an address-less offer is refused, a
-//! replacement needs no slot, a full cache refuses a newcomer and not a
-//! returning peer. A caller offering a ticket holds `addr.node_id` and calls
-//! `put`.
 //!
 //! **Nothing here opens a socket, reads a clock or allocates.** `now_s` is a
 //! second on the caller's own clock and is only ever differenced inside the

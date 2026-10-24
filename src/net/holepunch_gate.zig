@@ -38,13 +38,6 @@ pub const retry_interval: Nanos = 100 * std.time.ns_per_ms;
 
 /// How many addresses one connection may advertise to its peer.
 ///
-/// Upstream's `MAX_QNT_ADDRESSES`, a `u8` there and chosen for machines with
-/// many interfaces — a MacOS host carrying more than 25 VPN and docker
-/// interfaces is the reason written beside it. Overrunning it is
-/// `too_many_addresses`, and that error is fatal, so the ceiling is a
-/// correctness bound rather than a tuning one. `docs/DECISIONS/0001` calls it
-/// the tuning knob that matters after the multipath substrate lands, because
-/// convergence is then carried by how fast the path table churns.
 pub const max_qnt_addresses: usize = 32;
 
 /// Whether `count` addresses fit under `max_qnt_addresses`.
@@ -176,9 +169,6 @@ pub const PunchState = struct {
 
 /// One instruction for whoever drives the QUIC stack.
 ///
-/// The call is the transport's and lands with the substrate in
-/// `docs/DECISIONS/0001`. Naming it as a value is what lets the gate be tested
-/// without one: a test compares the instruction, not a socket.
 pub const Action = union(enum) {
     /// Call `initiate_nat_traversal_round` on this connection, now.
     initiateNatTraversalRound: ConnId,
@@ -334,7 +324,7 @@ comptime {
     // reason; this says so out loud and pins the count the arms above were
     // copied from, so a variant added without a classification fails the build
     // rather than inheriting a default arm nobody chose.
-    if (@typeInfo(NatTraversalError).@"enum".fields.len != 6) {
+    if (@typeInfo(NatTraversalError).@"enum".field_names.len != 6) {
         @compileError("a NatTraversalError variant has no classification");
     }
 }

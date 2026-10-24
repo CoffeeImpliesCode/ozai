@@ -24,7 +24,7 @@ const Packet = @import("tcp_client.zig").Packet;
 pub const Server = struct {
     listener: listener.Listener,
     address: SocketAddr,
-    peers: [16]?Peer = .{null} ** 16,
+    peers: [16]?Peer = @splat(null),
 
     pub fn init(io: std.Io, bind: SocketAddr, execution: Execution) Error!Server {
         const bound = try listener.Listener.init(io, bind, execution);
@@ -156,8 +156,8 @@ test "authenticated websocket relay forwards copied datagrams with authenticated
     const io = std.testing.io;
     var server = try Server.init(io, .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0 }, Execution.native);
     defer server.deinit();
-    const first_secret = try key.SecretKey.fromSeed(.{1} ** 32);
-    const second_secret = try key.SecretKey.fromSeed(.{2} ** 32);
+    const first_secret = try key.SecretKey.fromSeed(@splat(1));
+    const second_secret = try key.SecretKey.fromSeed(@splat(2));
     var first = try Client.init(io, .{
         .address = server.address,
         .execution = Execution.native,
@@ -202,7 +202,7 @@ test "client refuses header injection before opening TCP" {
         .execution = Execution.native,
         .address = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1 },
         .host = "relay\r\nInjected: value",
-        .secret = try key.SecretKey.fromSeed(.{3} ** 32),
+        .secret = try key.SecretKey.fromSeed(@splat(3)),
     }));
 }
 
@@ -228,11 +228,11 @@ test "server disconnects invalid authentication without failing listener" {
         try raw.flush(io, .client);
         try server.poll(io);
     }
-    var secret = try SecretKey.fromSeed(.{4} ** 32);
+    var secret = try SecretKey.fromSeed(@splat(4));
     defer secret.deinit();
     try raw.relay(.{ .client_auth = .{
         .node_id = secret.nodeId(),
-        .signature = key.Signature.fromBytes(.{0} ** 64),
+        .signature = key.Signature.fromBytes(@splat(0)),
     } });
     for (0..1000) |_| {
         if (raw.busy()) try raw.flush(io, .client);
@@ -242,9 +242,9 @@ test "server disconnects invalid authentication without failing listener" {
 }
 
 test "destination backpressure retains authenticated pending datagram without overwriting tx" {
-    var source_secret = try SecretKey.fromSeed(.{5} ** 32);
+    var source_secret = try SecretKey.fromSeed(@splat(5));
     defer source_secret.deinit();
-    var target_secret = try SecretKey.fromSeed(.{6} ** 32);
+    var target_secret = try SecretKey.fromSeed(@splat(6));
     defer target_secret.deinit();
     var server: Server = .{
         .listener = undefined,
@@ -286,9 +286,9 @@ test "destination backpressure retains authenticated pending datagram without ov
 }
 
 test "server retries authenticated pending datagram after source EOF" {
-    var source_secret = try SecretKey.fromSeed(.{7} ** 32);
+    var source_secret = try SecretKey.fromSeed(@splat(7));
     defer source_secret.deinit();
-    var target_secret = try SecretKey.fromSeed(.{8} ** 32);
+    var target_secret = try SecretKey.fromSeed(@splat(8));
     defer target_secret.deinit();
     var server: Server = .{
         .listener = undefined,
@@ -335,7 +335,7 @@ test "Client delivers coalesced datagrams at EOF one receive per poll" {
             .eof = true,
             .transport = injected.transport(),
         },
-        .secret = try SecretKey.fromSeed(.{9} ** 32),
+        .secret = try SecretKey.fromSeed(@splat(9)),
         .host_len = 0,
         .state = .ready,
     };
@@ -348,7 +348,7 @@ test "Client delivers coalesced datagrams at EOF one receive per poll" {
     const first_wire = try ws.encode(
         &client.connection.rx,
         .server,
-        .{ .fin = true, .opcode = .binary, .key = .{0} ** 4 },
+        .{ .fin = true, .opcode = .binary, .key = @splat(0) },
         first,
     );
     const second = try frame.encode(.{ .relay_to_client_datagram = .{
@@ -358,7 +358,7 @@ test "Client delivers coalesced datagrams at EOF one receive per poll" {
     const second_wire = try ws.encode(
         client.connection.rx[first_wire.len..],
         .server,
-        .{ .fin = true, .opcode = .binary, .key = .{0} ** 4 },
+        .{ .fin = true, .opcode = .binary, .key = @splat(0) },
         second,
     );
     client.connection.rx_len = first_wire.len + second_wire.len;
@@ -381,7 +381,7 @@ test "incomplete HTTP upgrade at EOF fails rather than holding a session forever
             .eof = true,
             .transport = injected.transport(),
         },
-        .secret = try SecretKey.fromSeed(.{10} ** 32),
+        .secret = try SecretKey.fromSeed(@splat(10)),
         .host_len = 0,
         .state = .upgrade,
     };
@@ -424,19 +424,19 @@ test "client authentication action write failure closes session exactly once" {
     var client: Client = .{
         .address = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 1 },
         .connection = .{ .stream = undefined, .transport = injected.transport() },
-        .secret = try SecretKey.fromSeed(.{41} ** 32),
+        .secret = try SecretKey.fromSeed(@splat(41)),
         .host_len = 0,
         .state = .challenge,
     };
     defer client.deinit();
     var payload: [128]u8 = undefined;
     const challenge = try frame.encode(.{
-        .server_challenge = .{ .challenge = .{43} ** 16 },
+        .server_challenge = .{ .challenge = @splat(43) },
     }, .v2, &payload);
     const wire = try ws.encode(&client.connection.rx, .server, .{
         .fin = true,
         .opcode = .binary,
-        .key = .{0} ** 4,
+        .key = @splat(0),
     }, challenge);
     client.connection.rx_len = wire.len;
     try client.poll(std.testing.io);
@@ -456,9 +456,9 @@ test "server confirmation action write failure removes authenticated peer" {
         .listener = undefined,
         .address = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 0 },
     };
-    var secret = try SecretKey.fromSeed(.{47} ** 32);
+    var secret = try SecretKey.fromSeed(@splat(47));
     defer secret.deinit();
-    const challenge: frame.ServerChallenge = .{ .challenge = .{53} ** 16 };
+    const challenge: frame.ServerChallenge = .{ .challenge = @splat(53) };
     server.peers[0] = .{
         .connection = .{ .stream = undefined, .transport = injected.transport() },
         .state = .auth,

@@ -240,11 +240,6 @@ pub const State = struct {
 /// One discovery pass: republish this node's record if it is due, and ask about
 /// one peer if a lookup is due.
 ///
-/// **No clock is read here and none is stored.** `now_ms` is `at` in the unit
-/// `publisher.tick` and `next_lookup_ms` are in, which is `publisher`'s own
-/// requirement ("`tick` takes `now_ms` as an argument") and the reason this
-/// pass is drivable at a counter. `io` is threaded per operation and reaches
-/// neither a field nor a decision, which is `docs/DECISIONS/0002`'s rule.
 ///
 /// Returns whether anything moved, so `Node.step`'s caller can tell an idle
 /// pass from a busy one — the same `bool` every other pass in that step

@@ -277,7 +277,7 @@ test "the provenance set is upstream's three services" {
     try t.expectEqual(@as(usize, 3), Provenance.all.len);
     // `all` is what a caller iterates. An arm missing from it would be
     // rankable and unnameable, so the list is held to the enum here.
-    try t.expectEqual(Provenance.all.len, @typeInfo(Provenance).@"enum".fields.len);
+    try t.expectEqual(Provenance.all.len, @typeInfo(Provenance).@"enum".field_names.len);
     inline for (Provenance.all, 0..) |provenance, rank| {
         try t.expectEqual(@as(u8, @intCast(rank)), provenance.rank());
     }

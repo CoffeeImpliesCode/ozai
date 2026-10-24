@@ -25,14 +25,6 @@
 //!
 //! # No wire, and nothing unpinned
 //!
-//! Not one byte passes through this file. Upstream's `HolepunchAttempt`
-//! (`iroh/src/socket/remote_map/remote_state.rs`) is *one*
-//! `initiate_nat_traversal_round` over the whole candidate set, so there is no
-//! upstream byte sequence for a per-candidate attempt and none is claimed here.
-//! `docs/DECISIONS/0001` records that the call itself is not in this tree yet.
-//! What these values cost upstream is one field: the stack's own round has no
-//! deadline of its own, so a deadline added per candidate is an ozai
-//! construction and is pinned by the tests in this file, not by a vector.
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
@@ -70,7 +62,7 @@ comptime {
     // and a variant added without a settle arm fails the build rather than
     // inheriting a default nobody chose. `holepunch_gate.zig` does this for
     // `NatTraversalError` for the same reason.
-    if (@typeInfo(Outcome).@"enum".fields.len != 5) {
+    if (@typeInfo(Outcome).@"enum".field_names.len != 5) {
         @compileError("an Outcome variant has no settle arm");
     }
 }
@@ -168,7 +160,7 @@ fn ip(port: u16) SocketAddr {
     return .{ .ip = .{ .v4 = .{ 192, 0, 2, 1 } }, .port = port };
 }
 
-const peer: NodeId = NodeId.fromBytes([_]u8{9} ** 32) catch
+const peer: NodeId = NodeId.fromBytes(@as([32]u8, @splat(9))) catch
     @compileError("the fixed test peer is not a canonical ed25519 point");
 
 /// An in-flight attempt on `port`, started at `start` with a 1 s deadline.

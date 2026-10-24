@@ -203,7 +203,7 @@ test "test scratch rejects missing and relative roots before filesystem writes" 
     var environment: std.process.Environ.Map = .init(t.allocator);
     defer environment.deinit();
     try t.expectError(error.MissingScratch, createTmpDir(t.allocator, t.io, &environment, .{}));
-    try environment.put("HOST_SCRATCH_ROOT", ".zig-cache/tmp");
+    try environment.put("GATE_SCRATCH", ".zig-cache/tmp");
     try t.expectError(error.UnapprovedScratch, createTmpDir(t.allocator, t.io, &environment, .{}));
 }
 

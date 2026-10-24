@@ -134,13 +134,6 @@
 //!
 //! # What is pinned, and what is not
 //!
-//! This file emits no bytes and encodes nothing, so there is nothing here for
-//! `AGENTS.md` §2's "wire compatibility is a test" to bite on. What it rests
-//! on is RFC 9000 §8.2.2, read as a written specification: no captured upstream
-//! bytes exist on this machine, so what a peer's `PATH_RESPONSE` looks like on
-//! the wire is not reproduced here and nothing here claims interoperability.
-//! The numbers are the tree's own, borrowed rather than restated, and the
-//! `comptime` block holds their order at the build.
 
 const std = @import("std");
 const addr = @import("../base/addr.zig");
@@ -804,7 +797,7 @@ test "the windows are the ones the module doc claims" {
     try t.expectEqual(ceiling, late.deadline);
 
     // Only one arm exists, and it is the one that travels on the connection.
-    try t.expectEqual(@as(usize, 1), @typeInfo(Method).@"enum".fields.len);
+    try t.expectEqual(@as(usize, 1), @typeInfo(Method).@"enum".field_names.len);
     const challenge = challengeOf(plan(&entry, revalidate_after + 1, &none)) orelse
         return error.TestUnexpectedResult;
     try t.expectEqual(Method.path_challenge, challenge.method);

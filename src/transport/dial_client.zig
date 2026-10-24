@@ -913,11 +913,6 @@ test "two targets to one peer are two connections, because the core has one path
         engine.random(),
     );
 
-    // The multipath cost `DECISIONS/0001` records, as the core sees it: a
-    // datagram from the second address on one connection would be a migration
-    // challenge (`connection.zig:1541`), not a second path, so a peer with
-    // two addresses is two connections and the caller owns the policy that
-    // says which one to use.
     try t.expectEqual(@as(usize, 2), pair.dialer_bridge.manager.connectionCount());
     try t.expect(over_relay.conn.id() != over_ip.conn.id());
     try t.expectEqual(over_relay.route.socket, over_relay.conn.peer().?);

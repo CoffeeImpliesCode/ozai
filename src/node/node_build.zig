@@ -71,7 +71,7 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, config: Config, seed: u64) Err
         .lease = undefined,
         .gossip_topics = &.{},
         .timers = .empty,
-        .named = [_]NodeId{undefined} ** named_ring,
+        .named = @as([named_ring]NodeId, @splat(undefined)),
         .named_len = 0,
         .engine = Prng.init(seed),
         .egress = &.{},

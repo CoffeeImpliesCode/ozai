@@ -9,7 +9,7 @@ const Address = @import("../address.zig").Address;
 test "native NAT varint width boundaries preserve numbers and address bytes" {
     const addresses = [_]Address{
         .initIpv4(.{ 127, 0, 0, 1 }, 1),
-        .initIpv6([_]u8{0} ** 16, 0, 0),
+        .initIpv6(@as([16]u8, @splat(0)), 0, 0),
     };
     for (addresses, 0..) |address, family| {
         for ([_]u64{ 0, 63, 64, 16383, 16384, 1073741823, 1073741824, 0x3fffffffffffffff }) |number| {
@@ -135,7 +135,7 @@ test "native NAT source-derived golden bytes cover both frames and address famil
     }, &.{ 0x80, 0x3d, 0x7f, 0x92, 0x80, 0, 0x40, 0, 0, 0, 0, 0, 0xff, 0xff }, false);
     try expectGolden(ReachAddress, .{
         .round = 0x3fffffffffffffff,
-        .address = .initIpv6([_]u8{0xff} ** 16, 65535, 0),
+        .address = .initIpv6(@as([16]u8, @splat(0xff)), 65535, 0),
     }, &.{
         0x80, 0x3d, 0x7f, 0x93, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -176,7 +176,7 @@ test "native NAT accepts nonminimal varints and drops local IPv6 scope" {
     try std.testing.expectEqual(@as(u64, 0), (try ReachAddress.read(&reach_reader, false)).round);
     const scoped: AddAddress = .{
         .sequence = 0,
-        .address = .initIpv6([_]u8{0} ** 16, 0, 7),
+        .address = .initIpv6(@as([16]u8, @splat(0)), 0, 7),
     };
     var bytes: [32]u8 = undefined;
     var writer = io.fixedBufferStream(&bytes);

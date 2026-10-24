@@ -27,17 +27,6 @@
 // `EndpointInner`'s drop report at `iroh/src/socket.rs:220-230`. Each is
 // named where it is reproduced.
 //
-// Upstream's loop is a tokio `select!` and its `accept` futures are tasks on a
-// `JoinSet`. Both are what `docs/ARCHITECTURE.md` and `docs/DECISIONS/0002`
-// rule out: a machine that needs a scheduler to be tested has its boundary in
-// the wrong place, and this project reaches about half of iroh without a
-// network. So the loop here is a function of `(state, event)` and a task is a
-// struct the caller drives. Everything the upstream loop decides is reproduced
-// as a value: which of the four verdicts ends an attempt and which continues
-// it, that a `retry` is address validation on a direct path and a cost on a
-// relay, that a second `retry` on a flow that has already proved itself is a
-// *refusal* rather than a token, that an `accept` which fails is a drop and not
-// an error code, and that a shutdown is handlers, then cancel, then close.
 //
 // Nothing here opens a socket, reads a clock, or takes a runtime, and that is
 // the reason the file has this shape rather than a limitation of it. The two

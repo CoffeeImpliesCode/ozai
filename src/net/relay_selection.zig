@@ -382,7 +382,7 @@ const Place = struct {
 /// for and the reason two calls with equal arguments give equal plans.
 fn beats(challenger: *const Ranked, incumbent: *const Ranked) bool {
     if (challenger.rank.tier != incumbent.rank.tier) {
-        return @intFromEnum(challenger.rank.tier) < @intFromEnum(incumbent.rank.tier);
+        return @backingInt(challenger.rank.tier) < @backingInt(incumbent.rank.tier);
     }
     if (challenger.rank.latency != incumbent.rank.latency) {
         return challenger.rank.latency < incumbent.rank.latency;

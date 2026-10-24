@@ -192,7 +192,7 @@ fn runBulk(total: usize, c2s_loss: Link.Loss, s2c_loss: Link.Loss, one_way_ns: i
     var entropy = TestRandom.init(0);
     const random = entropy.random();
 
-    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, .{1} ** 16, .{2} ** 16, random);
+    var mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, @splat(1), @splat(2), random);
     defer mgr.deinit();
 
     const client = try alloc.create(connection.Connection);
@@ -384,7 +384,7 @@ const Pair = struct {
         self.now = test_now;
         self.entropy = TestRandom.init(0);
         self.random = self.entropy.random();
-        self.mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, .{1} ** 16, .{2} ** 16, self.random);
+        self.mgr = connection_manager.ConnectionManager.init(alloc, serverTls(), .{}, @splat(1), @splat(2), self.random);
         self.client = try alloc.create(connection.Connection);
         errdefer {
             alloc.destroy(self.client);
@@ -440,7 +440,7 @@ test "stateless reset: a client whose server lost the connection drains" {
     p.mgr.removeConnection(p.mgr.entries.items[0]);
 
     const s = try p.client.openStream();
-    try s.send.writeData("x" ** 64);
+    try s.send.writeData(&@as([64:0]u8, @splat('x')));
     var buf: [MAX_DGRAM]u8 = undefined;
     var resp: [MAX_DGRAM]u8 = undefined;
     const n = try p.client.sendAt(&buf, p.now, p.random);

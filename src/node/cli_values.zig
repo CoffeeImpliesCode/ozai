@@ -178,6 +178,6 @@ test "lookup timing accepts exact bounds and rejects nonnumeric values" {
 test "DNS origins preserve absolute spelling and reject oversized labels" {
     try std.testing.expectEqualStrings("dns.iroh.link.", try parseDnsOrigin("dns.iroh.link."));
     try std.testing.expectEqualStrings("test.invalid", try parseDnsOrigin("test.invalid"));
-    try std.testing.expectError(error.InvalidDnsOrigin, parseDnsOrigin("a" ** 64 ++ ".invalid"));
+    try std.testing.expectError(error.InvalidDnsOrigin, parseDnsOrigin(&@as([64:0]u8, @splat('a')) ++ ".invalid"));
     try std.testing.expectError(error.InvalidDnsOrigin, parseDnsOrigin("test..invalid"));
 }

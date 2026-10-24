@@ -573,8 +573,8 @@ test "PSS signatures verify with std's verifier, for every TLS hash" {
     inline for (.{ Sha256, Sha384, Sha512 }) |H| {
         const s = try key.signPss(H, "message", &sig, prng.random());
         try testing.expectEqual(256, s.len);
-        try Certificate.rsa.PSSSignature.verify(256, s[0..256].*, "message", public, H);
-        try testing.expectError(error.InvalidSignature, Certificate.rsa.PSSSignature.verify(256, s[0..256].*, "massage", public, H));
+        try Certificate.rsa.PSSSignature.verify(256, s[0..256], "message", public, H);
+        try testing.expectError(error.InvalidSignature, Certificate.rsa.PSSSignature.verify(256, s[0..256], "massage", public, H));
     }
 }
 
@@ -631,7 +631,7 @@ test "malformed and unsupported encodings" {
     // An Ed25519 PKCS#8 key is not RSA. It is the right shape and 48 bytes
     // long, so the only thing refusing it is the algorithm.
     var ed_buf: [128]u8 = undefined;
-    const ed = ed25519Pkcs8(&[_]u8{0x2b} ** 32, &ed_buf);
+    const ed = ed25519Pkcs8(&@as([32]u8, @splat(0x2b)), &ed_buf);
     try testing.expectEqual(48, ed.len);
     try testing.expectError(error.UnsupportedKey, PrivateKey.pkcs1FromPkcs8(ed));
 }

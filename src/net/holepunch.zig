@@ -5,12 +5,6 @@
 //! What ozai owns is everything around that call: when to make it, what to do
 //! with the answer, and which paths to forget.
 //!
-//! All three are pure over state, so all three are here, and all three are
-//! testable before the QUIC stack exists. Nothing below reads a clock — the
-//! elapsed time arrives as `now` — and the call leaves as an `Action` value
-//! that names it rather than as a call. `docs/DECISIONS/0001` is why the call
-//! leaves at all: the substrate is a fork of someone else's QUIC and is not in
-//! this tree yet.
 //!
 //! Every function here takes plain slices and returns plain values, which is
 //! what makes them fuzzable: `decide`, `settle`, `classify` and `prune`
@@ -308,7 +302,7 @@ test "every error variant is classified, and none is left over" {
         .extension_not_negotiated,
     };
     try t.expectEqual(
-        @typeInfo(NatTraversalError).@"enum".fields.len,
+        @typeInfo(NatTraversalError).@"enum".field_names.len,
         retryable.len + fatal.len,
     );
     for (retryable) |err| try expectVerdict(err, .{ .retry = retry_interval });

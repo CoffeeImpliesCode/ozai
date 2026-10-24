@@ -5,8 +5,8 @@ const evidence = @import("nat_evidence.zig");
 const options = @import("nat_options.zig");
 const proof = @import("nat_proof.zig");
 
-const endpoint_a_seed = "5a" ** 32;
-const endpoint_b_seed = "6c" ** 32;
+const endpoint_a_seed = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+const endpoint_b_seed = "6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c";
 const message = "ozai-rootless-nat-same-connection";
 pub const Role = enum { server, client };
 
@@ -85,7 +85,7 @@ pub fn run(
         "--bind",
         "0.0.0.0:3340",
         "--seed-hex",
-        "44" ** 32,
+        "4444444444444444444444444444444444444444444444444444444444444444",
         "--for",
         relay_duration,
     });
@@ -365,8 +365,8 @@ fn cleanup(
                     @tagName(value),
                     switch (value) {
                         .exited => |code| @as(u32, code),
-                        .signal => |signal| @intFromEnum(signal),
-                        .stopped => |signal| @intFromEnum(signal),
+                        .signal => |signal| @backingInt(signal),
+                        .stopped => |signal| @backingInt(signal),
                         .unknown => |code| @as(u32, code),
                     },
                     if (cleanup_error) |err| @errorName(err) else "none",

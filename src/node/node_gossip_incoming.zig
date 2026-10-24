@@ -189,8 +189,8 @@ fn topicIndex(topics: []const hyparview.TopicId, topic: hyparview.TopicId) ?usiz
 }
 
 test "gossip topic dispatch rejects another subscribed name without consuming its state" {
-    const a = hyparview.TopicId.fromBytes([_]u8{1} ** 32);
-    const b = hyparview.TopicId.fromBytes([_]u8{2} ** 32);
+    const a = hyparview.TopicId.fromBytes(@as([32]u8, @splat(1)));
+    const b = hyparview.TopicId.fromBytes(@as([32]u8, @splat(2)));
     try std.testing.expectEqual(@as(?usize, 1), topicIndex(&.{ a, b }, b));
     try std.testing.expectEqual(@as(?usize, null), topicIndex(&.{a}, b));
 }

@@ -79,14 +79,6 @@
 //!
 //! # What is pinned, and what is not
 //!
-//! Nothing here is a wire format, so there are no captured bytes to pin
-//! against: `AGENTS.md` §2's "wire compatibility is a test" has nothing to bite
-//! on. What this file depends on is two ABIs. `struct ifaddrs` is spelled once
-//! below and is pinned by a test that fills a `sockaddr` by hand plus a test
-//! that reads this machine; `getifaddrs` itself is pinned by the link. Both are
-//! libc headers rather than a peer implementation, and neither has been
-//! checked against a musl build — that needs a second toolchain and is not
-//! claimed here.
 
 const std = @import("std");
 
@@ -393,7 +385,7 @@ fn ipFrom(raw: *const c.sockaddr.storage) ?IpAddress {
     return switch (header.family) {
         linux.AF.INET => word: {
             const narrow: *const c.sockaddr.in = @ptrCast(@alignCast(raw));
-            break :word IpAddress{ .v4 = @bitCast(narrow.addr) };
+            break :word IpAddress{ .v4 = std.mem.toBytes(narrow.addr) };
         },
         linux.AF.INET6 => wide: {
             const broad: *const c.sockaddr.in6 = @ptrCast(@alignCast(raw));
@@ -732,7 +724,7 @@ test "a kernel address word is the address, not its byte swap" {
     narrow.* = .{
         .family = linux.AF.INET,
         .port = std.mem.nativeToBig(u16, test_port),
-        .addr = @bitCast([4]u8{ 192, 0, 2, 7 }),
+        .addr = std.mem.readInt(u32, &.{ 192, 0, 2, 7 }, @import("builtin").target.cpu.arch.endian()),
     };
     // Written out. A byte swap in `ipFrom` where the bit cast belongs turns
     // this into `7.2.0.192`, which is routable, wrong, and silently so.

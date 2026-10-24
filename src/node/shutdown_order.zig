@@ -303,23 +303,23 @@ pub const Mask = u16;
 
 /// One release's bit.
 pub fn maskOf(release: Release) Mask {
-    return @as(Mask, 1) << @intCast(@intFromEnum(release));
+    return @as(Mask, 1) << @intCast(@backingInt(release));
 }
 
 /// Every release, as a mask: what a finished wind-down has made of it is `every`
 /// with all of these set.
 pub const every: Mask = blk: {
     var mask: Mask = 0;
-    for (@typeInfo(Release).@"enum".fields, 0..) |_, index| {
+    for (@typeInfo(Release).@"enum".field_names, 0..) |_, index| {
         mask |= @as(Mask, 1) << @intCast(index);
     }
     break :blk mask;
 };
 
-const step_count = @typeInfo(Step).@"enum".fields.len;
+const step_count = @typeInfo(Step).@"enum".field_names.len;
 
 comptime {
-    if (@typeInfo(Release).@"enum".fields.len > @bitSizeOf(Mask)) {
+    if (@typeInfo(Release).@"enum".field_names.len > @bitSizeOf(Mask)) {
         @compileError("a release no longer fits this ledger's mask");
     }
 }
@@ -356,7 +356,7 @@ pub const Ledger = struct {
         for (blockedBy(step)) |needed| {
             if (!self.hasRun(needed)) return error.OutOfOrder;
         }
-        self.ran[@intFromEnum(step)] = true;
+        self.ran[@backingInt(step)] = true;
     }
 
     /// Record that `release` is given up, and refuse the second time.
@@ -377,7 +377,7 @@ pub const Ledger = struct {
 
     /// Whether `step` has been performed.
     pub fn hasRun(self: Ledger, step: Step) bool {
-        return self.ran[@intFromEnum(step)];
+        return self.ran[@backingInt(step)];
     }
 
     /// Whether `release` has been given up.
@@ -426,17 +426,17 @@ test "every step the wind-down performs is in the order, and in it once" {
     try t.expectEqual(@as(usize, step_count), order.len);
     // Every step has a place, so `position` is never the answer a caller gets
     // for a step this file names.
-    inline for (@typeInfo(Step).@"enum".fields) |field| {
-        const step: Step = @enumFromInt(field.value);
+    inline for (@typeInfo(Step).@"enum".field_names) |field| {
+        const step: Step = @field(Step, field);
         try t.expect(position(step) != null);
     }
     // And the sequence is a strict order: nothing precedes itself, and for two
     // distinct steps exactly one direction holds.
-    inline for (@typeInfo(Step).@"enum".fields, 0..) |field, index| {
-        const a: Step = @enumFromInt(field.value);
+    inline for (@typeInfo(Step).@"enum".field_names, 0..) |field, index| {
+        const a: Step = @field(Step, field);
         try t.expect(!precedes(a, a));
-        inline for (@typeInfo(Step).@"enum".fields, 0..) |other, other_index| {
-            const b: Step = @enumFromInt(other.value);
+        inline for (@typeInfo(Step).@"enum".field_names, 0..) |other, other_index| {
+            const b: Step = @field(Step, other);
             try t.expectEqual(index != other_index, precedes(a, b) != precedes(b, a));
         }
     }
@@ -464,8 +464,8 @@ test "a wind-down that runs the whole order gives every release up once" {
     try t.expectEqual(@as(Mask, 0), ledger.outstanding());
     // And nothing was given up twice: `giveUp` refuses the second reach, and
     // this walk reached every release and came back.
-    inline for (@typeInfo(Release).@"enum".fields) |field| {
-        try t.expect(ledger.hasGiven(@enumFromInt(field.value)));
+    inline for (@typeInfo(Release).@"enum".field_names) |field| {
+        try t.expect(ledger.hasGiven(@field(Release, field)));
     }
 }
 
@@ -519,8 +519,8 @@ test "a release given up twice is refused, and a latch is how it is given once" 
 }
 
 test "the only step a caller may skip is the close, and only without a stamp" {
-    inline for (@typeInfo(Step).@"enum".fields) |field| {
-        const step: Step = @enumFromInt(field.value);
+    inline for (@typeInfo(Step).@"enum".field_names) |field| {
+        const step: Step = @field(Step, field);
         const only_close = step == .connections;
         try t.expectEqual(only_close, skippable(step));
         try t.expectEqual(only_close, skipped(step, .{}));

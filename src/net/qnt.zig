@@ -109,12 +109,6 @@
 //!   and 1.3.0, and `iroh-net` 0.9.0, 0.12.0, 0.16.0, 0.20.0, 0.24.0 and 0.28.0,
 //!   the same way. No occurrence.
 //!
-//! What that leaves is that "QNT" in that ecosystem names the NAT-traversal
-//! *extension*, and this file is the older meaning of the same acronym — a
-//! number-and-time report — which is what this tree's `docs/DECISIONS/0001`
-//! means when it says QNT rides the app connection. The list above is what was
-//! actually read, not every published revision of every document: a revision
-//! that exists and was not opened is not evidence either way.
 //!
 //! So the layout below rests on the QAD block's rule composed with the
 //! measurement QNT is for, and on nothing else. **Pinned by the tests:** both
@@ -381,7 +375,7 @@ pub fn decode(bytes: []const u8) Error!Decoded {
     const range_count: usize = @intCast(count);
     // Zeroed rather than undefined, so `Frame`'s equality is total: a decoded
     // frame compares equal to the frame it was encoded from, tail included.
-    var ranges = [_]PacketRange{.{ .first = 0, .last = 0 }} ** max_packet_ranges;
+    var ranges = @as([max_packet_ranges]PacketRange, @splat(.{ .first = 0, .last = 0 }));
     var index: usize = 0;
     while (index < range_count) : (index += 1) {
         const first = try quic_varint.get(bytes, &offset);
@@ -507,7 +501,7 @@ fn frameWith(
         .sequence = sequence,
         .challenge = .{ 1, 2, 3, 4, 5, 6, 7, 8 },
         .timestamp = timestamp,
-        .ranges = [_]PacketRange{.{ .first = 0, .last = 0 }} ** max_packet_ranges,
+        .ranges = @as([max_packet_ranges]PacketRange, @splat(.{ .first = 0, .last = 0 })),
         .range_count = ranges.len,
     };
     for (ranges, 0..) |range, index| built.ranges[index] = range;
@@ -685,7 +679,7 @@ test "a range list past the ceiling is refused, never clipped" {
 
 test "an inverted range and a non-canonical list are three refusals" {
     var scratch: [max_frame_length]u8 = undefined;
-    var out: [max_frame_length]u8 = [_]u8{0} ** max_frame_length;
+    var out: [max_frame_length]u8 = @as([max_frame_length]u8, @splat(0));
 
     // 20 then 10: the range names no packet numbers at all.
     try t.expectError(
@@ -737,7 +731,7 @@ test "a value past the widest varint is refused before a byte is written" {
 
     // Each varint field has its own ceiling and the same arm, and the check is
     // ahead of the write: the buffer is still the caller's own bytes afterwards.
-    const untouched = [_]u8{0xaa} ** max_frame_length;
+    const untouched = @as([max_frame_length]u8, @splat(0xaa));
     var scratch = untouched;
     for ([_]Frame{
         frameWith(.v4, max_value + 1, 1, &sweep_ranges),

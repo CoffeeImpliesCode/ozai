@@ -280,7 +280,7 @@ test "ChunkRangeSet: a boundary list, and not a width list" {
     // `last_chunk` is upstream's `ChunkRanges::last_chunk`, which is
     // `from_range_from(u64::MAX)`: the start rounds down to zero, so the range
     // runs to the end of whatever blob it is read against.
-    try expectSetHex(.last_chunk, "02" ++ "00" ++ "ff" ** 9 ++ "01");
+    try expectSetHex(.last_chunk, "02" ++ "00" ++ "ffffffffffffffffff" ++ "01");
     try testing.expect(ChunkRangeSet.empty.isEmpty());
     try testing.expect(!ChunkRangeSet.empty.isAll());
     try testing.expect(ChunkRangeSet.all.isAll());
@@ -346,9 +346,9 @@ test "decode is total: the real frames first, then a mutation sweep" {
     // above are exercised as themselves and the sweep has something
     // recognisable to mutate away from.
     const request_seeds = [_][]const u8{
-        "00" ++ "da" ** 32 ++ "020001000100",
-        "00" ++ "da" ** 32 ++ "01000100",
-        "08" ++ "26" ++ "da" ** 32 ++ "020001000100",
+        "00" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "020001000100",
+        "00" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "01000100",
+        "08" ++ "26" ++ "dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada" ++ "020001000100",
     };
     // And one observe item, framed the way a provider frames it, so the
     // observe half of the sweep starts from a run that decodes rather than

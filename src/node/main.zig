@@ -64,7 +64,7 @@ pub fn main(init: std.process.Init) !void {
         const bind: ozai.SocketAddr = .{
             .ip = switch (server.ip) {
                 .v4 => .{ .v4 = .{ 0, 0, 0, 0 } },
-                .v6 => .{ .v6 = .{0} ** 16 },
+                .v6 => .{ .v6 = @splat(0) },
             },
             .port = 0,
         };

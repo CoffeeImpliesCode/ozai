@@ -182,7 +182,7 @@ test "a node that quits leaves the swarm and the rest stay connected" {
     try network.command(3, try joinOf(&.{try sim.nodeIdFor(2)}));
     try network.runTrips(2);
 
-    var seen = [_]bool{false} ** sim.max_peers;
+    var seen = @as([sim.max_peers]bool, @splat(false));
     index = 0;
     while (index < 4) : (index += 1) {
         for (network.neighbors(index)) |neighbour| {
@@ -200,7 +200,7 @@ test "a node that quits leaves the swarm and the rest stay connected" {
     // longer counting as joined and no longer holding a link.
     try t.expect(!network.hasJoined(3));
     try t.expectEqual(@as(usize, 0), network.neighborCount(3));
-    var after = [_]bool{false} ** sim.max_peers;
+    var after = @as([sim.max_peers]bool, @splat(false));
     index = 0;
     while (index < 3) : (index += 1) {
         for (network.neighbors(index)) |neighbour| {

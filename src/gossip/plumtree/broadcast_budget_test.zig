@@ -62,7 +62,9 @@ fn neighborsBroadcast(length: usize, reject: bool) !void {
     const bytes: [4059]u8 = @splat(0x96);
     const content = bytes[0..length];
     const message: codec.Message = .{ .gossip = .{ .gossip = .{
-        .id = tree.MessageId.fromContent(content), .content = content, .scope = .neighbors,
+        .id = tree.MessageId.fromContent(content),
+        .content = content,
+        .scope = .neighbors,
     } } };
     try t.expectEqual(@as(usize, if (reject) 4096 else 4095), codec.encodedLen(message));
     var state: tree.State = .init(try testNodeId(1), .{});
@@ -115,7 +117,8 @@ fn localBroadcastAdmission(scope: tree.Scope, length: usize) !void {
     defer out.deinit();
     const rejected = bytes[0..length];
     try t.expectError(error.MessageTooLarge, state.handle(.{ .broadcast = .{
-        .content = rejected, .scope = scope,
+        .content = rejected,
+        .scope = scope,
     } }, 100, &out));
     try t.expectEqual(@as(usize, 0), out.count());
     try t.expect(!state.started);
@@ -126,7 +129,8 @@ fn localBroadcastAdmission(scope: tree.Scope, length: usize) !void {
 
     const content = "accepted after first local refusal";
     try state.handle(.{ .broadcast = .{
-        .content = content, .scope = scope,
+        .content = content,
+        .scope = scope,
     } }, 100, &out);
     try t.expect(state.started);
     var evictions: usize = 0;

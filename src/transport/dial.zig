@@ -57,17 +57,6 @@
 //
 // # `io`, the instant and the generator
 //
-// `Instant` and `std.Random` are parameters of every call that moves the core
-// forward, and nothing in this file reads a clock or draws entropy, for the
-// reason `quic_bridge.zig`'s module doc gives. `std.Io` is stronger here than
-// threaded: **there is no `std.Io` on this path at all.** `Bridge.create` takes
-// one because it draws the two transport secrets a caller may leave null; a
-// dial draws nothing — a client signs no Retry token and issues no NEW_TOKEN,
-// and the one secret a client has is its own seed, which the caller already
-// holds in `Config.secret`. A parameter with no work is a parameter a caller
-// has to thread for a fiction, so there is not one, and this is the same
-// property `docs/DECISIONS/0002` buys from the other side: a dialler driven
-// twice at two instants with two generators is two dialler's worth of answers.
 //
 // # The address, and what the core is told
 //
@@ -82,14 +71,6 @@
 // caller an `Egress` carrying only the address, so the address is all the
 // socket layer ever sees and `ownerOf` is how it turns one back into a key.
 //
-// **One target, one address, one connection.** The core holds two
-// `NetworkPath`s and indexes one as active (`connection.zig:626`), and a 1-RTT
-// packet carrying at least one non-probing frame, from any other address,
-// becomes a migration rather than a second path (`connection.zig:1540`). So
-// the multipath cost `DECISIONS/0001` records is observable here as a hard one:
-// a peer reachable over a relay and a direct path is **two dials**, and the
-// caller owns the policy that says which. Nothing in this file can widen it,
-// and pretending otherwise would be a second core.
 //
 // The migration adds no path and queues none either: `handleMigration` writes
 // the alternate slot (`connection.zig:3442`) and promotes it (`:3452`), so the
@@ -106,23 +87,6 @@
 //
 // Two further things the core does with an address, both found by reading it:
 //
-// 1. **A dialled connection's first inbound datagram rewrites its path.**
-//    `connectInto` leaves `path_initialized` false and `paths` zeroed, and
-//    `recv` builds the path from the first datagram it sees
-//    (`connection.zig:1533`). So the two addresses `open` writes are what the
-//    first flight is sent to and nothing more, and they are written only
-//    because `Conn.drain` reads the destination off the active path before any
-//    packet has arrived. For a relay that is the right answer — the reply
-//    arrives from the relay's real address and the core should keep sending
-//    there — and it means the caller's job after the first exchange is to hold
-//    a socket for whatever address the core now holds.
-// 2. **The synthetic address is never validated.** The core's only
-//    address-sensitive policy is `NetworkPath.canSend`
-//    (`connection.zig:127`), the server-side anti-amplification limit, and it
-//    is guarded by `is_server` at both uses (`connection.zig:3270`, `:3381`).
-//    An RFC 4193 ULA is a peer address like any other to a client, which is
-//    the answer `DECISIONS/0001` asks for and it is a different answer than
-//    the server side's.
 //
 // # The pin, and the shape that keeps it set
 //

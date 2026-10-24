@@ -160,7 +160,7 @@ fn expectMultipath(frame: Frame, path_id: u32) !void {
             try t.expectEqual(@as(u64, 0), value.cid.seq_num);
             try t.expectEqual(@as(u64, 0), value.cid.retire_prior_to);
             try t.expectEqualSlices(u8, &.{0xab}, value.cid.conn_id);
-            try t.expectEqualSlices(u8, &([_]u8{0xcd} ** 16), &value.cid.stateless_reset_token);
+            try t.expectEqualSlices(u8, &(@as([16]u8, @splat(0xcd))), &value.cid.stateless_reset_token);
         },
         .path_retire_connection_id => |value| {
             try t.expectEqual(path_id, value.path_id);

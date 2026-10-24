@@ -1059,9 +1059,9 @@ pub fn generateRetryToken(
 /// Authenticated Retry CIDs copied into inline storage. Lengths are 0..20;
 /// manual writes must preserve those bounds. Copies are independent.
 pub const ValidatedToken = struct {
-    odcid_buf: [20]u8 = .{0} ** 20,
+    odcid_buf: [20]u8 = @splat(0),
     odcid_len: u8 = 0,
-    retry_scid_buf: [20]u8 = .{0} ** 20,
+    retry_scid_buf: [20]u8 = @splat(0),
     retry_scid_len: u8 = 0,
 
     /// Borrow the original DCID from this receiver until it is moved or rewritten.
@@ -1465,7 +1465,7 @@ test "Retry token: wrong address rejected" {
 /// 2001:db8::1. The last byte is the tail, and below it is the only byte a
 /// second address changes — so a test that swaps it is asserting about the
 /// tail and about nothing else.
-const ipv6_tail_one: [16]u8 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{1};
+const ipv6_tail_one: [16]u8 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{1};
 
 // The legacy binding omits the IPv6 tail; IPv4 tests cannot detect this.
 test "Retry token: an IPv6 address differing only in its tail is not the same address" {
@@ -1568,7 +1568,7 @@ test "Retry: integrity tag compute and verify" {
     const pkt_writer = &pkt_fbs;
 
     // First byte: Retry packet type
-    try pkt_writer.writeByte(@intFromEnum(PacketType.retry));
+    try pkt_writer.writeByte(@backingInt(PacketType.retry));
     // Version
     try pkt_writer.writeInt(u32, 0x00000001, ENDIAN);
     // DCID
@@ -1673,7 +1673,7 @@ test "Header.parse rejects a long header with the fixed bit clear" {
 }
 
 test "splitProtected rejects lengths the datagram cannot back" {
-    var buf = [_]u8{0} ** 64;
+    var buf = @as([64]u8, @splat(0));
     var fbs = io.fixedBufferStream(&buf);
     fbs.seek = 10;
 
@@ -1719,7 +1719,7 @@ test "a version negotiation packet carries no length field, so it is the whole d
     // RFC 9000 §6.1: first byte with the long-header bit, a version of zero,
     // both connection ids, then the versions a peer may choose from. There is
     // no Length field anywhere in it.
-    var bytes = [_]u8{0} ** 40;
+    var bytes = @as([40]u8, @splat(0));
     bytes[0] = 0xc0;
     std.mem.writeInt(u32, bytes[1..5], 0, .big);
     bytes[5] = 4;
@@ -1756,8 +1756,8 @@ fn sealPathTestPacket(
 
 test "path decrypt authenticates both paths and rejects cross-path nonces" {
     // Equal packet numbers on distinct paths must authenticate only on their own path.
-    const secret = [_]u8{0x31} ** 32;
-    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    const secret = @as([32]u8, @splat(0x31));
+    const hp = @as([crypto.max_key_len]u8, @splat(0x42));
     var ku = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
     var space = PacketNumSpace{ .crypto_open = ku.current_open };
     for ([_]u32{ 0, 1 }) |path_id| {
@@ -1783,8 +1783,8 @@ test "path decrypt authenticates both paths and rejects cross-path nonces" {
 
 test "path key update rejects wrong path and reconstructed packet number without rotation" {
     // Authentication failure must not authorize a generation change.
-    const secret = [_]u8{0x31} ** 32;
-    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    const secret = @as([32]u8, @splat(0x31));
+    const hp = @as([crypto.max_key_len]u8, @splat(0x42));
     var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
     var sender = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
     sender.rollKeys(0, 100);
@@ -1814,8 +1814,8 @@ test "path key update rejects wrong path and reconstructed packet number without
 test "path key update preserves ciphertext between previous and next generation attempts" {
     // Both adjacent generations have the opposite phase; failed previous-key opening
     // must not destroy the ciphertext needed to authenticate the next generation.
-    const secret = [_]u8{0x31} ** 32;
-    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    const secret = @as([32]u8, @splat(0x31));
+    const hp = @as([crypto.max_key_len]u8, @splat(0x42));
     var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
     var sender = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
     const previous_seal = sender.current_seal;
@@ -1843,8 +1843,8 @@ test "path key update preserves ciphertext between previous and next generation 
 test "authenticated next key updates reject lower and equal packet numbers on both paths" {
     // Next-generation authentication is not permission to rotate at or below
     // the receiving path's watermark, even when previous keys share its phase.
-    const secret = [_]u8{0x31} ** 32;
-    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    const secret = @as([32]u8, @splat(0x31));
+    const hp = @as([crypto.max_key_len]u8, @splat(0x42));
     const watermarks = [_]u64{ 100, 10 };
     for ([_]bool{ false, true }) |has_previous| {
         var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
@@ -1886,8 +1886,8 @@ test "authenticated next key updates reject lower and equal packet numbers on bo
 test "next key update permission uses only the receiving path watermark" {
     // A valid path-1 update may be below path 0's largest PN; the converse
     // must use path 0's own high watermark, not the low one from path 1.
-    const secret = [_]u8{0x31} ** 32;
-    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    const secret = @as([32]u8, @splat(0x31));
+    const hp = @as([crypto.max_key_len]u8, @splat(0x42));
     var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
     var sender = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
     sender.rollKeys(0, 100);
@@ -1927,8 +1927,8 @@ test "next key update permission uses only the receiving path watermark" {
 test "current and previous generation duplicate packets never authorize rotation" {
     // Duplicate suppression belongs to the caller. Authentic reordered packets
     // must not be mistaken for next-generation updates by their phase bit.
-    const secret = [_]u8{0x31} ** 32;
-    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    const secret = @as([32]u8, @splat(0x31));
+    const hp = @as([crypto.max_key_len]u8, @splat(0x42));
     var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
     const previous_seal = receiver.current_seal;
     receiver.rollKeys(0, 100);
@@ -1958,8 +1958,8 @@ test "current and previous generation duplicate packets never authorize rotation
 test "new paths accept next generation packet zero but unauthenticated updates cannot close" {
     // With no received packet the watermark is absent, not packet zero.
     // A forged update below a real watermark must remain an authentication drop.
-    const secret = [_]u8{0x31} ** 32;
-    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    const secret = @as([32]u8, @splat(0x31));
+    const hp = @as([crypto.max_key_len]u8, @splat(0x42));
     var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
     var sender = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
     sender.rollKeys(0, 100);
@@ -2000,8 +2000,8 @@ test "new paths accept next generation packet zero but unauthenticated updates c
 test "second authenticated peer update waits for an actual send on either path" {
     // Shared keys cannot rotate twice on peer request before we send with the
     // first update. Authentication drops and old/current packets remain allowed.
-    const secret = [_]u8{0x31} ** 32;
-    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    const secret = @as([32]u8, @splat(0x31));
+    const hp = @as([crypto.max_key_len]u8, @splat(0x42));
     for ([_]u32{ 0, 1 }) |path_id| {
         var receiver = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
         var sender = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
@@ -2075,8 +2075,8 @@ test "second authenticated peer update waits for an actual send on either path" 
 test "path opening leaves Initial and Handshake legacy protection unchanged" {
     // Multipath is a 1-RTT extension; even the path-aware entry must open long
     // headers with the original epoch nonce and header-protection mask.
-    const secret = [_]u8{0x31} ** 32;
-    const hp = [_]u8{0x42} ** crypto.max_key_len;
+    const secret = @as([32]u8, @splat(0x31));
+    const hp = @as([crypto.max_key_len]u8, @splat(0x42));
     var ku = crypto.KeyUpdateManager.init(secret, secret, hp, hp);
     var space = PacketNumSpace{ .crypto_open = ku.current_open };
     for ([_]PacketType{ .initial, .handshake }) |packet_type| {

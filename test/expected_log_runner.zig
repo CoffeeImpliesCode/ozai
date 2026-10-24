@@ -155,11 +155,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
 fn mainServer(init: std.process.Init.Minimal) !void {
     stdin_reader = .initStreaming(.stdin(), runner_io, &stdin_buffer);
     stdout_writer = .initStreaming(.stdout(), runner_io, &stdout_buffer);
-    var server = try std.zig.Server.init(.{
+    var server: std.zig.Server = .{
         .in = &stdin_reader.interface,
         .out = &stdout_writer.interface,
-        .zig_version = builtin.zig_version_string,
-    });
+    };
+    try server.serveStringMessage(.zig_version, builtin.zig_version_string);
 
     while (true) {
         const header = try server.receiveMessage();
@@ -173,7 +173,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 .{},
             ),
             else => {
-                std.debug.print("unsupported message: {x}\n", .{@intFromEnum(header.tag)});
+                std.debug.print("unsupported message: {x}\n", .{@backingInt(header.tag)});
                 std.process.exit(1);
             },
         }
@@ -185,8 +185,8 @@ fn mainServer(init: std.process.Init.Minimal) !void {
 /// compilation that reaches no test block answers it with an empty list and
 /// still exits 0.
 fn queryMetadata(server: *std.zig.Server) !void {
-    testing.allocator_instance = .{};
-    defer if (testing.allocator_instance.deinit() == .leak) {
+    testing.allocator_instance = .init(std.heap.page_allocator, .{});
+    defer if (testing.allocator_instance.deinit() != 0) {
         @panic("internal test runner memory leak");
     };
 
@@ -229,7 +229,10 @@ fn queryMetadata(server: *std.zig.Server) !void {
 /// what keeps the rest of the suite able to notice a real one.
 fn runTest(server: *std.zig.Server, init: std.process.Init.Minimal) !void {
     testing.environ = init.environ;
-    testing.allocator_instance = .{};
+    testing.allocator_instance = .init(std.heap.page_allocator, .{
+        .canary = 0xc3a701ba,
+        .check_write_after_free = true,
+    });
     testing.io_instance = .init(testing.allocator, .{
         .argv0 = .init(init.args),
         .environ = init.environ,
@@ -253,8 +256,7 @@ fn runTest(server: *std.zig.Server, init: std.process.Init.Minimal) !void {
         },
     };
     testing.io_instance.deinit();
-    const leak_count = testing.allocator_instance.detectLeaks();
-    testing.allocator_instance.deinitWithoutLeakChecks();
+    const leak_count = testing.allocator_instance.deinit();
 
     try server.serveTestResults(.{
         .index = index,
@@ -306,7 +308,7 @@ fn finish() noreturn {
 /// `std.testing.log_level`, and it cannot hide anything that counts: `err` is
 /// the lowest of the four, so no threshold could drop one.
 fn wanted(comptime level: std.log.Level) bool {
-    return @intFromEnum(level) <= @intFromEnum(std.log.Level.warn);
+    return @backingInt(level) <= @backingInt(std.log.Level.warn);
 }
 
 /// What a message too long for the render buffer is printed as. It is a thing

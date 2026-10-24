@@ -96,7 +96,7 @@ test "pending gossip copies borrowed payload and refuses bounded overflow" {
     const queue = try t.allocator.create(Queue);
     defer t.allocator.destroy(queue);
     queue.* = .{};
-    var secret = try SecretKey.fromSeed([_]u8{5} ** 32);
+    var secret = try SecretKey.fromSeed(@as([32]u8, @splat(5)));
     defer secret.deinit();
     var payload = [_]u8{ 1, 2, 3 };
     const plumtree = @import("../gossip/plumtree.zig");
@@ -122,9 +122,9 @@ test "pending gossip keeps FIFO order per peer and topic" {
     const queue = try t.allocator.create(Queue);
     defer t.allocator.destroy(queue);
     queue.* = .{};
-    var a = try SecretKey.fromSeed([_]u8{6} ** 32);
+    var a = try SecretKey.fromSeed(@as([32]u8, @splat(6)));
     defer a.deinit();
-    var b = try SecretKey.fromSeed([_]u8{7} ** 32);
+    var b = try SecretKey.fromSeed(@as([32]u8, @splat(7)));
     defer b.deinit();
     const message: codec.Message = .{ .gossip = .{ .prune = {} } };
     try queue.push(a.nodeId(), 0, message);

@@ -39,11 +39,6 @@ pub const SocketError = error{
 
 /// The socket a lookup goes out on: two calls and a stop, as a vtable.
 ///
-/// Injected, and the reason is layering as much as testability:
-/// `docs/ARCHITECTURE.md` puts `ozai.transport` above `ozai.discovery`, and a
-/// lookup's socket is the one thing above it that a lookup needs. `io: std.Io`
-/// is a parameter of both calls and is stored nowhere, for the reason
-/// `docs/DECISIONS/0002-async-substrate.md` gives.
 ///
 /// Nothing here is owned: `ctx` is the socket's own value and the three
 /// functions are the caller's, so all of it has to outlive every `Retrieval`

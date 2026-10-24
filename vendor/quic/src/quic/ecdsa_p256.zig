@@ -15,7 +15,7 @@
 //! Everything else follows std's `Signer.finalizePrehashed` (Zig 0.16.0) step
 //! for step, including its hedged deterministic nonce, so for the same key,
 //! message and noise the signature is byte-identical to std's; the tests hold
-//! it to that. See DECISIONS/zig_std_divergences.md.
+//! it to that.
 
 const std = @import("std");
 const crypto = std.crypto;
@@ -145,7 +145,7 @@ pub fn sign(secret_key: [32]u8, msg: []const u8, noise: ?[noise_length]u8) (cryp
 }
 
 fn reduceToScalar(s: [32]u8) Scalar {
-    var xs = [_]u8{0} ** 48;
+    var xs = @as([48]u8, @splat(0));
     @memcpy(xs[xs.len - s.len ..], s[0..]);
     return Scalar.fromBytes48(xs, .big);
 }
@@ -153,9 +153,9 @@ fn reduceToScalar(s: [32]u8) Scalar {
 /// std's, verbatim but for the types: the "Deterministic ECDSA and EdDSA
 /// Signatures with Additional Randomness" construction.
 fn deterministicScalar(h: [Sha256.digest_length]u8, secret_key: [32]u8, noise: ?[noise_length]u8) Scalar {
-    var k = [_]u8{0x00} ** h.len;
-    var m = [_]u8{0x00} ** (h.len + 1 + noise_length + secret_key.len + h.len);
-    var t = [_]u8{0x00} ** P256.scalar.encoded_length;
+    var k = @as([h.len]u8, @splat(0x00));
+    var m = @as([(h.len + 1 + noise_length + secret_key.len + h.len)]u8, @splat(0x00));
+    var t = @as([P256.scalar.encoded_length]u8, @splat(0x00));
     const m_v = m[0..h.len];
     const m_i = &m[m_v.len];
     const m_z = m[m_v.len + 1 ..][0..noise_length];

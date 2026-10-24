@@ -202,7 +202,7 @@ pub const Role = enum(u64) {
 /// role — which is what makes the parameter's declared length 1 for all
 /// three, and the test below is what holds that.
 pub fn encodeRole(role: Role, out: []u8) Error!usize {
-    return quic_varint.put(out, @intFromEnum(role));
+    return quic_varint.put(out, @backingInt(role));
 }
 
 /// The role a parameter's value spells, and how many bytes it occupied.
@@ -544,7 +544,7 @@ test "every prefix that ends inside the frame is Truncated" {
             .sequence = max_sequence,
             .addr = switch (family) {
                 .v4 => .{ .ip = .{ .v4 = .{ 198, 51, 100, 7 } }, .port = 1 },
-                .v6 => .{ .ip = .{ .v6 = [_]u8{0} ** 16 }, .port = 1 },
+                .v6 => .{ .ip = .{ .v6 = @as([16]u8, @splat(0)) }, .port = 1 },
             },
         }, &full);
         var cut: usize = 0;
@@ -576,7 +576,7 @@ test "a frame type this build does not carry is refused by name" {
 test "a buffer one byte short is NoRoom, and the widest frame fits" {
     const widest: ObservedAddress = .{
         .sequence = max_sequence,
-        .addr = .{ .ip = .{ .v6 = [_]u8{0xff} ** 16 }, .port = 65_535 },
+        .addr = .{ .ip = .{ .v6 = @as([16]u8, @splat(0xff)) }, .port = 65_535 },
     };
     var out: [max_frame_length]u8 = undefined;
     const length = try encode(widest, &out);

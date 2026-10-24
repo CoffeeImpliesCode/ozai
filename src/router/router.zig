@@ -182,11 +182,11 @@ test "the handler vtable is four fields and no more" {
     // The plan names the four. A fifth would be a trait method wearing a
     // vtable's name, which is what `AddressLookup` refuses in
     // `discovery/resolve.zig`.
-    const fields = @typeInfo(ProtocolHandler).@"struct".fields;
+    const fields = @typeInfo(ProtocolHandler).@"struct".field_names;
     try t.expectEqual(@as(usize, 4), fields.len);
     const names = [_][]const u8{ "ptr", "on_accepting", "accept", "shutdown" };
     inline for (fields, names) |field, name| {
-        try t.expectEqualStrings(name, field.name);
+        try t.expectEqualStrings(name, field);
     }
 }
 

@@ -77,7 +77,7 @@ pub fn encodeAddr(
     return switch (value) {
         .relay => |url| record: {
             out[0] = tag_relay;
-            out[1] = @intFromEnum(url.scheme);
+            out[1] = @backingInt(url.scheme);
             std.mem.writeInt(u16, out[2..4], url.port, .big);
             const host = url.hostSlice();
             // `hostSlice` is `host[0..host_length]`, so the slice is that `u8`

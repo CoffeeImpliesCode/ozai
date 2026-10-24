@@ -273,7 +273,7 @@ const node_test_ids = @import("node_test_ids.zig");
 /// and every one of them is as good as any other, so the bytes only have to
 /// differ.
 fn testTopic(tag: u8) TopicId {
-    var bytes = [_]u8{0} ** topic_id_length;
+    var bytes = @as([topic_id_length]u8, @splat(0));
     bytes[0] = tag;
     return TopicId.fromBytes(bytes);
 }

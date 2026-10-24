@@ -397,10 +397,10 @@ test "removal cancels probes and server sequences are never reused" {
     try std.testing.expectEqual(@as(?u64, null), try sequenceResult(&client, .{ .add = first }));
     try voidResult(&client, .{ .receiveAdd = .{ .sequence = 1, .address = second } });
     try voidResult(&client, .{ .initiate = 0 });
-    try voidResult(&client, .{ .recordProbe = .{ .address = second, .token = [_]u8{1} ** 8 } });
+    try voidResult(&client, .{ .recordProbe = .{ .address = second, .token = @as([8]u8, @splat(1)) } });
     try voidResult(&client, .{ .receiveRemove = 1 });
     try voidResult(&client, .{ .receiveRemove = 1 });
-    try std.testing.expect(!matchedResult(&client, second, [_]u8{1} ** 8));
+    try std.testing.expect(!matchedResult(&client, second, @as([8]u8, @splat(1))));
     try std.testing.expectEqual(@as(?Address, null), probeResult(&client, 0));
     try std.testing.expectEqual(@as(usize, 0), client.remoteCandidates().len);
     try voidResult(&client, .{ .initiate = 1 });
@@ -413,10 +413,10 @@ test "server ignores stale rounds and duplicates and replaces old round candidat
     try voidResult(&server, .{ .receiveReach = .{ .round = 1, .address = first, .now = 10 } });
     try std.testing.expectError(error.TooManyAddresses, voidResult(&server, .{ .receiveReach = .{ .round = 1, .address = second, .now = 10 } }));
     try std.testing.expect(Address.eql(first, probeResult(&server, 0).?));
-    try voidResult(&server, .{ .recordProbe = .{ .address = first, .token = [_]u8{1} ** 8 } });
+    try voidResult(&server, .{ .recordProbe = .{ .address = first, .token = @as([8]u8, @splat(1)) } });
     try std.testing.expectEqual(@as(?Address, null), probeResult(&server, 1));
     try voidResult(&server, .{ .receiveReach = .{ .round = 2, .address = second, .now = 20 } });
-    try std.testing.expect(!matchedResult(&server, first, [_]u8{1} ** 8));
+    try std.testing.expect(!matchedResult(&server, first, @as([8]u8, @splat(1))));
     try voidResult(&server, .{ .receiveReach = .{ .round = 1, .address = first, .now = 20 } });
     try std.testing.expect(Address.eql(second, probeResult(&server, 20).?));
     try std.testing.expectEqual(@as(u64, 2), server.currentRound());
@@ -437,7 +437,7 @@ test "nine Noq default probe attempts expire and a new round resets the schedule
     for (times, 0..) |now, index| {
         if (index != 0) try std.testing.expectEqual(@as(?Address, null), probeResult(&client, now - 1));
         try std.testing.expect(Address.eql(second, probeResult(&client, now).?));
-        try voidResult(&client, .{ .recordProbe = .{ .address = second, .token = [_]u8{@intCast(index)} ** 8 } });
+        try voidResult(&client, .{ .recordProbe = .{ .address = second, .token = @as([8]u8, @splat(@intCast(index))) } });
         try std.testing.expectEqual(@as(?Address, null), probeResult(&client, now));
     }
     try std.testing.expectEqual(@as(?Address, null), probeResult(&client, 20_000_000_000));
@@ -455,14 +455,14 @@ test "offers survive failed sends and responses bind source token and current ro
     try std.testing.expectEqual(@as(?u64, null), try sequenceResult(&client, .{ .add = first }));
     try voidResult(&client, .{ .receiveAdd = .{ .sequence = 0, .address = second } });
     try voidResult(&client, .{ .initiate = 0 });
-    const token = [_]u8{7} ** 8;
+    const token = @as([8]u8, @splat(7));
     try std.testing.expectEqual(RoundState.probing, client.roundState());
     try std.testing.expect(Address.eql(second, probeResult(&client, 0).?));
     try std.testing.expect(Address.eql(second, probeResult(&client, 10).?));
     try std.testing.expect(!matchedResult(&client, second, token));
     try voidResult(&client, .{ .recordProbe = .{ .address = second, .token = token } });
     try std.testing.expect(!matchedResult(&client, first, token));
-    try std.testing.expect(!matchedResult(&client, second, [_]u8{8} ** 8));
+    try std.testing.expect(!matchedResult(&client, second, @as([8]u8, @splat(8))));
     try std.testing.expect(matchedResult(&client, second, token));
     try std.testing.expect(!matchedResult(&client, second, token));
     try std.testing.expectEqual(RoundState.probing, client.roundState());
@@ -488,15 +488,15 @@ test "mapped addresses canonicalize and bounded challenge storage rejects a tent
     var empty: [0]Address = .{};
     try std.testing.expectEqual(@as(usize, 0), state.snapshotLocal(&empty).len);
     for (0..9) |index| {
-        try voidResult(&state, .{ .recordChallenge = .{ .address = first, .token = [_]u8{@intCast(index)} ** 8 } });
+        try voidResult(&state, .{ .recordChallenge = .{ .address = first, .token = @as([8]u8, @splat(@intCast(index))) } });
     }
-    try voidResult(&state, .{ .recordChallenge = .{ .address = mapped, .token = [_]u8{0} ** 8 } });
+    try voidResult(&state, .{ .recordChallenge = .{ .address = mapped, .token = @as([8]u8, @splat(0)) } });
     try std.testing.expectError(
         error.TooManyChallenges,
-        voidResult(&state, .{ .recordChallenge = .{ .address = first, .token = [_]u8{9} ** 8 } }),
+        voidResult(&state, .{ .recordChallenge = .{ .address = first, .token = @as([8]u8, @splat(9)) } }),
     );
-    try std.testing.expect(matchedResult(&state, mapped, [_]u8{0} ** 8));
-    try std.testing.expect(!matchedResult(&state, first, [_]u8{1} ** 8));
+    try std.testing.expect(matchedResult(&state, mapped, @as([8]u8, @splat(0))));
+    try std.testing.expect(!matchedResult(&state, first, @as([8]u8, @splat(1))));
 }
 
 test "server fails exhausted sequence space instead of reusing its final sequence" {
@@ -526,7 +526,7 @@ test "pure transition output aliases or preserves input and clamps peer address 
     for (0..9) |index| {
         const result = try process(&output, .{ .recordChallenge = .{
             .address = first,
-            .token = [_]u8{@intCast(index)} ** 8,
+            .token = @as([8]u8, @splat(@intCast(index))),
         } }, &output);
         try std.testing.expectEqual(@as(Result, .none), result);
     }
@@ -579,16 +579,16 @@ test "duplicate sequence destinations commit once even with first pending cleare
     state.probes[0].pending = false;
     try std.testing.expect(Address.eql(second, probeResult(&state, 0).?));
     try std.testing.expect((try process(&state, .{ .preflightProbe = second }, &state)).ready);
-    try voidResult(&state, .{ .recordProbe = .{ .address = second, .token = [_]u8{4} ** 8 } });
+    try voidResult(&state, .{ .recordProbe = .{ .address = second, .token = @as([8]u8, @splat(4)) } });
     try std.testing.expectEqual(@as(u16, 1), state.challenge_count);
     try std.testing.expectEqual(@as(?Address, null), probeResult(&state, 0));
     try std.testing.expectEqual(@as(usize, 2), state.remoteCandidates().len);
     try voidResult(&state, .{ .receiveRemove = 1 });
-    try std.testing.expect(matchedResult(&state, second, [_]u8{4} ** 8));
+    try std.testing.expect(matchedResult(&state, second, @as([8]u8, @splat(4))));
     try std.testing.expect(state.probes[0].succeeded);
     try voidResult(&state, .{ .receiveAdd = .{ .sequence = 3, .address = second } });
     try voidResult(&state, .{ .initiate = 1 });
-    try voidResult(&state, .{ .recordProbe = .{ .address = second, .token = [_]u8{5} ** 8 } });
+    try voidResult(&state, .{ .recordProbe = .{ .address = second, .token = @as([8]u8, @splat(5)) } });
     try std.testing.expectEqual(@as(?Address, null), probeResult(&state, 1));
 }
 
@@ -606,14 +606,14 @@ test "IPv4 sending family excludes IPv6 pending retries and tokens" {
     try std.testing.expect(!(try process(&state, .{ .preflightProbe = six }, &state)).ready);
     try std.testing.expect(!state.canRecordChallenge(six));
     try std.testing.expectError(error.InvalidAddress, voidResult(&state, .{
-        .recordChallenge = .{ .address = six, .token = [_]u8{1} ** 8 },
+        .recordChallenge = .{ .address = six, .token = @as([8]u8, @splat(1)) },
     }));
-    try voidResult(&state, .{ .recordProbe = .{ .address = second, .token = [_]u8{1} ** 8 } });
+    try voidResult(&state, .{ .recordProbe = .{ .address = second, .token = @as([8]u8, @splat(1)) } });
     try std.testing.expect(Address.eql(second, probeResult(&state, 33_300_000).?));
     try voidResult(&state, .cancel);
     try std.testing.expectEqual(@as(?i64, null), state.deadline());
     try std.testing.expectEqual(@as(?Address, null), probeResult(&state, 100_000_000));
-    try std.testing.expect(!matchedResult(&state, second, [_]u8{1} ** 8));
+    try std.testing.expect(!matchedResult(&state, second, @as([8]u8, @splat(1))));
     try voidResult(&state, .{ .configure = .{ .supported_ipv6 = true } });
     try voidResult(&state, .{ .initiate = 0 });
     try std.testing.expect(Address.eql(six, probeResult(&state, 0).?));
@@ -625,12 +625,12 @@ test "probe preflight capacity prevents send and full path validation alone comp
     try voidResult(&state, .{ .receiveAdd = .{ .sequence = 1, .address = second } });
     try voidResult(&state, .{ .initiate = 0 });
     for (0..9) |index| {
-        try voidResult(&state, .{ .recordChallenge = .{ .address = second, .token = [_]u8{@intCast(index)} ** 8 } });
+        try voidResult(&state, .{ .recordChallenge = .{ .address = second, .token = @as([8]u8, @splat(@intCast(index))) } });
     }
     try std.testing.expect(!(try process(&state, .{ .preflightProbe = second }, &state)).ready);
-    try std.testing.expectError(error.TooManyChallenges, voidResult(&state, .{ .recordProbe = .{ .address = second, .token = [_]u8{10} ** 8 } }));
+    try std.testing.expectError(error.TooManyChallenges, voidResult(&state, .{ .recordProbe = .{ .address = second, .token = @as([8]u8, @splat(10)) } }));
     try std.testing.expect(state.probes[0].pending);
-    try std.testing.expect(matchedResult(&state, second, [_]u8{0} ** 8));
+    try std.testing.expect(matchedResult(&state, second, @as([8]u8, @splat(0))));
     try std.testing.expectEqual(RoundState.probing, state.roundState());
     try voidResult(&state, .directValidated);
     try std.testing.expectEqual(RoundState.completed, state.roundState());
@@ -648,14 +648,14 @@ test "exhausted attempts expire all tokens after final response grace" {
         try std.testing.expect(Address.eql(second, probeResult(&state, now).?));
         try voidResult(&state, .{ .recordProbe = .{
             .address = second,
-            .token = [_]u8{@intCast(index)} ** 8,
+            .token = @as([8]u8, @splat(@intCast(index))),
         } });
         now = state.deadline().?;
     }
     try std.testing.expectEqual(@as(u16, 9), state.challenge_count);
     try std.testing.expectEqual(@as(?Address, null), probeResult(&state, now));
     try std.testing.expectEqual(@as(u16, 0), state.challenge_count);
-    try std.testing.expect(!matchedResult(&state, second, [_]u8{8} ** 8));
+    try std.testing.expect(!matchedResult(&state, second, @as([8]u8, @splat(8))));
     try std.testing.expectEqual(@as(?i64, null), state.deadline());
     try std.testing.expectEqual(RoundState.failed, state.roundState());
 }
@@ -665,8 +665,8 @@ test "last local candidate removal cancels outstanding client probes" {
     try std.testing.expectEqual(@as(?u64, null), try sequenceResult(&state, .{ .add = first }));
     try voidResult(&state, .{ .receiveAdd = .{ .sequence = 1, .address = second } });
     try voidResult(&state, .{ .initiate = 0 });
-    try voidResult(&state, .{ .recordProbe = .{ .address = second, .token = [_]u8{3} ** 8 } });
+    try voidResult(&state, .{ .recordProbe = .{ .address = second, .token = @as([8]u8, @splat(3)) } });
     try std.testing.expectEqual(@as(?u64, null), try sequenceResult(&state, .{ .remove = first }));
     try std.testing.expectEqual(@as(?i64, null), state.deadline());
-    try std.testing.expect(!matchedResult(&state, second, [_]u8{3} ** 8));
+    try std.testing.expect(!matchedResult(&state, second, @as([8]u8, @splat(3))));
 }

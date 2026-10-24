@@ -130,12 +130,6 @@
 //!
 //! # Purity
 //!
-//! No clock, no global, no thread, no environment. `io: std.Io` is a parameter
-//! of `Datagram`'s two calls and of `Retrieval.ask`, and is stored nowhere, for
-//! the reason `docs/DECISIONS/0002-async-substrate.md` gives: a struct holding
-//! an `Io` cannot be driven twice with different runtimes. The allocator is the
-//! caller's. `Retrieval` holds a descriptor it was handed and a vtable, which
-//! is a borrowed view and not ownership.
 //!
 //! # The modules behind this one
 //!

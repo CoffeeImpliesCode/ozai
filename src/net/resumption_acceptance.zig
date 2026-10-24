@@ -359,7 +359,7 @@ const alpn_other = "/iroh-qad/0";
 /// A real ed25519 node id, for the reason the resumption policy's own helper
 /// gives: `NodeId`'s key field is a precondition rather than an invariant.
 fn testNodeId(seed: u8) !NodeId {
-    var secret = try base_key.SecretKey.fromSeed([_]u8{seed} ** base_key.SecretKey.seed_length);
+    var secret = try base_key.SecretKey.fromSeed(@as([base_key.SecretKey.seed_length]u8, @splat(seed)));
     defer secret.deinit();
     return secret.nodeId();
 }
@@ -374,7 +374,7 @@ fn ticketFor(
     early_data_max: u32,
 ) SessionTicket {
     var built: SessionTicket = .{
-        .psk = [_]u8{0xa5} ** 32,
+        .psk = @as([32]u8, @splat(0xa5)),
         .lifetime = lifetime_s,
         .creation_time = created_s,
         .quic_version = version,
@@ -587,8 +587,8 @@ test "an expired resumption is refused, dropped and reported as this tree's own"
 test "every refusal names its layer, and the mapping is total" {
     // The comptime sweep is the coverage: `Refusal` gains an arm and this stops
     // compiling rather than leaving the new one unclassified.
-    inline for (@typeInfo(Refusal).error_set.?) |member| {
-        const refusal: Refusal = @field(Refusal, member.name);
+    inline for (@typeInfo(Refusal).error_set.error_names.?) |member| {
+        const refusal: Refusal = @field(Refusal, member);
         const layer = layerOf(refusal);
         try t.expect(layer == .tls_core or layer == .application);
     }

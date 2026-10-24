@@ -16,7 +16,8 @@ fn receivedRoundGrowth(length: usize, round: u16) !void {
     try state.handle(.{ .recv_message = .{
         .from = try testNodeId(4),
         .message = .{ .i_have = try tree.IHaves.init(&.{.{
-            .id = id, .round = .zero,
+            .id = id,
+            .round = .zero,
         }}) },
     } }, 0, &out);
     try t.expectEqual(@as(usize, 1), state.missing_messages_len);
@@ -31,7 +32,8 @@ fn receivedRoundGrowth(length: usize, round: u16) !void {
     const encoded = try codec.encode(incoming, &input);
     const decoded = try codec.decode(encoded);
     try state.handle(.{ .recv_message = .{
-        .from = try testNodeId(2), .message = decoded.gossip,
+        .from = try testNodeId(2),
+        .message = decoded.gossip,
     } }, 0, &out);
     var output: [4100]u8 = undefined;
     var delivered = false;

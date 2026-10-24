@@ -30,7 +30,7 @@ const frame_mod = @import("frame.zig");
 /// Fixed-size CID key for use in HashMap lookups.
 pub const CidKey = struct {
     /// Inline CID bytes; only the prefix selected by `len` participates in routing.
-    buf: [20]u8 = .{0} ** 20,
+    buf: [20]u8 = @splat(0),
     /// Initialized prefix length in bytes, in 0..20.
     len: u8 = 0,
 
@@ -97,7 +97,7 @@ pub const ConnEntry = struct {
     finished_streams: std.AutoArrayHashMapUnmanaged(u64, void) = .empty,
 
     /// Routing keys registered for this entry; only the counted prefix is valid.
-    registered_cids: [9]CidKey = .{CidKey{}} ** 9,
+    registered_cids: [9]CidKey = @splat(CidKey{}),
     /// Initialized routing keys, at most the nine inline slots.
     registered_cid_count: u8 = 0,
     /// Client's current Initial DCID, retained for retransmission routing.
@@ -360,7 +360,7 @@ pub const ConnectionManager = struct {
         return .{
             .allocator = allocator,
             .cid_map = std.HashMap(CidKey, *ConnEntry, CidKeyContext, 80).init(allocator),
-            .entries = .{ .items = &.{}, .capacity = 0 },
+            .entries = .empty,
             .reset_lookup_key = lookup_key,
             .tls_config = tls_config,
             .conn_config = cc,
@@ -931,7 +931,7 @@ pub fn writeRefusal(header: packet.Header, out: []u8) !usize {
     try w.writeByte(0); // token length
 
     // CONNECTION_CLOSE (0x1c), CONNECTION_REFUSED, frame type 0, no reason.
-    const payload = [_]u8{ 0x1c, @intFromEnum(frame_mod.TransportError.connection_refused), 0x00, 0x00 };
+    const payload = [_]u8{ 0x1c, @backingInt(frame_mod.TransportError.connection_refused), 0x00, 0x00 };
     const tag_len = 16;
     const length = pn_len + payload.len + tag_len;
     try packet.writeVarInt(w, length);
@@ -990,13 +990,13 @@ test "max_connections is configurable past 256, and every removed entry is freed
     const now = test_now;
     var entropy = TestRandom.init(0);
     const random = entropy.random();
-    var mgr = ConnectionManager.init(alloc, tls_config, .{}, .{0} ** 16, .{0} ** 16, random);
+    var mgr = ConnectionManager.init(alloc, tls_config, .{}, @splat(0), @splat(0), random);
     defer mgr.deinit();
     mgr.max_connections = 300;
 
     const local: address.Address = .unset;
     var dcids: [301][8]u8 = undefined;
-    const scid = [_]u8{0xaa} ** 8;
+    const scid = @as([8]u8, @splat(0xaa));
     for (&dcids, 0..) |*d, i| {
         std.mem.writeInt(u64, d, i + 1, .big);
         const header: packet.Header = .{
@@ -1030,7 +1030,7 @@ test "connections coming and going leave the CID map free slots to stop a lookup
     defer mgr.deinit();
 
     const local: address.Address = .unset;
-    const scid = [_]u8{0xaa} ** 8;
+    const scid = @as([8]u8, @splat(0xaa));
     var dcid: [8]u8 = undefined;
     for (0..3000) |i| {
         std.mem.writeInt(u64, &dcid, i + 1, .big);
@@ -1058,15 +1058,15 @@ fn testManager(alloc: Allocator, random: std.Random) ConnectionManager {
         .private_key_bytes = &.{},
         .alpn = &.{},
     };
-    return ConnectionManager.init(alloc, tls_config, .{}, .{0} ** 16, .{0} ** 16, random);
+    return ConnectionManager.init(alloc, tls_config, .{}, @splat(0), @splat(0), random);
 }
 
 fn testAcceptedEntry(manager: *ConnectionManager, random: std.Random) !*ConnEntry {
     return manager.acceptConnection(.{
         .version = protocol.SUPPORTED_VERSIONS[0],
         .packet_type = .initial,
-        .dcid = &([_]u8{0xbb} ** 8),
-        .scid = &([_]u8{0xaa} ** 8),
+        .dcid = &(@as([8]u8, @splat(0xbb))),
+        .scid = &(@as([8]u8, @splat(0xaa))),
     }, .unset, .unset, null, null, test_now, random);
 }
 
@@ -1107,9 +1107,9 @@ test "an Initial in a datagram under 1200 bytes opens no connection" {
     defer mgr.deinit();
     const addr: address.Address = .unset;
 
-    var buf = [_]u8{0} ** 1500;
+    var buf = @as([1500]u8, @splat(0));
     var out: [1500]u8 = undefined;
-    const n = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &([_]u8{0x11} ** 8));
+    const n = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &(@as([8]u8, @splat(0x11))));
     const action = try mgr.recvDatagram(buf[0..n], addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .dropped);
     try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
@@ -1124,9 +1124,9 @@ test "an Initial with a DCID under 8 bytes opens no connection" {
     defer mgr.deinit();
     const addr: address.Address = .unset;
 
-    var buf = [_]u8{0} ** 1200;
+    var buf = @as([1200]u8, @splat(0));
     var out: [1500]u8 = undefined;
-    _ = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &([_]u8{0x11} ** 7));
+    _ = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &(@as([7]u8, @splat(0x11))));
     const action = try mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .dropped);
     try std.testing.expectEqual(@as(usize, 0), mgr.connectionCount());
@@ -1143,9 +1143,9 @@ test "Version Negotiation only answers full-size datagrams, and is rate limited"
     const addr: address.Address = .unset;
     const unknown: u32 = 0x1a2a3a4a;
 
-    var buf = [_]u8{0} ** 1200;
+    var buf = @as([1200]u8, @splat(0));
     var out: [1500]u8 = undefined;
-    const n = fakeLongHeader(&buf, unknown, &([_]u8{0x11} ** 8));
+    const n = fakeLongHeader(&buf, unknown, &(@as([8]u8, @splat(0x11))));
     var action = try mgr.recvDatagram(buf[0..n], addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .dropped);
     action = try mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random);
@@ -1164,7 +1164,7 @@ test "stateless reset answers only packets long enough not to be one" {
     defer mgr.deinit();
     const addr: address.Address = .unset;
 
-    var buf = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
+    var buf = [_]u8{0x41} ++ @as([99]u8, @splat(0x22));
     var out: [1500]u8 = undefined;
     const short = buf[0 .. MIN_RESET_TRIGGER - 1];
     var action = try mgr.recvDatagram(short, addr, addr, 0, &out, now, random);
@@ -1205,7 +1205,7 @@ test "spoofed reset triggers do not spend the CONNECTION_REFUSED budget" {
     const addr: address.Address = .unset;
     var out: [1500]u8 = undefined;
 
-    var junk = [_]u8{0x41} ++ [_]u8{0x22} ** 99;
+    var junk = [_]u8{0x41} ++ @as([99]u8, @splat(0x22));
     var action = try mgr.recvDatagram(&junk, addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .send_response);
     action = try mgr.recvDatagram(&junk, addr, addr, 0, &out, now, random);
@@ -1257,7 +1257,7 @@ test "a server at capacity refuses a new client with CONNECTION_REFUSED" {
     client.conn.handleDatagram(@constCast(reply), reply_info, now, random);
     try std.testing.expect(client.conn.isDraining());
     try std.testing.expectEqual(
-        @as(u64, @intFromEnum(frame_mod.TransportError.connection_refused)),
+        @as(u64, @backingInt(frame_mod.TransportError.connection_refused)),
         client.conn.local_err.?.code,
     );
 }
@@ -1297,7 +1297,7 @@ fn steeringManager(alloc: Allocator, server_id: u8, random: std.Random) Connecti
         .alpn = &.{},
     };
     const config: connection.ConnectionConfig = .{ .quic_lb = lbConfig(server_id) };
-    var mgr = ConnectionManager.init(alloc, tls_config, config, .{0} ** 16, .{0} ** 16, random);
+    var mgr = ConnectionManager.init(alloc, tls_config, config, @splat(0), @splat(0), random);
     mgr.steer_foreign = true;
     return mgr;
 }
@@ -1355,7 +1355,7 @@ test "an Initial is accepted locally even when its DCID decodes to another serve
 
     var cid: [8]u8 = undefined;
     quic_lb.generateCid(&lbConfig(2), &cid, random);
-    var buf = [_]u8{0} ** 1200;
+    var buf = @as([1200]u8, @splat(0));
     _ = fakeLongHeader(&buf, protocol.SUPPORTED_VERSIONS[0], &cid);
     const action = try mgr.recvDatagram(&buf, addr, addr, 0, &out, now, random);
     try std.testing.expect(action == .processed);
@@ -1419,8 +1419,8 @@ test "past retry_threshold a new client gets Retry, and is served once it echoes
 
 test "an accept that runs out of memory leaves no connection and no entry behind" {
     const local: address.Address = .unset;
-    const scid = [_]u8{0xaa} ** 8;
-    const dcid = [_]u8{0xbb} ** 8;
+    const scid = @as([8]u8, @splat(0xaa));
+    const dcid = @as([8]u8, @splat(0xbb));
     const header: packet.Header = .{
         .version = protocol.SUPPORTED_VERSIONS[0],
         .packet_type = .initial,
@@ -1491,8 +1491,8 @@ test "CID slot reuse removes retired routes and preserves Initial routing" {
     const random = entropy.random();
     var mgr = testManager(alloc, random);
     defer mgr.deinit();
-    const initial_dcid = [_]u8{0xbb} ** 8;
-    const client_scid = [_]u8{0xaa} ** 8;
+    const initial_dcid = @as([8]u8, @splat(0xbb));
+    const client_scid = @as([8]u8, @splat(0xaa));
     const header: packet.Header = .{
         .version = protocol.SUPPORTED_VERSIONS[0],
         .packet_type = .initial,
@@ -1796,10 +1796,10 @@ test "Initial policy sees NEW_TOKEN provenance and cannot retry it" {
         test_now,
         random,
     );
-    var buf: [1500]u8 = .{0} ** 1500;
+    var buf: [1500]u8 = @splat(0);
     var writer = io.fixedBufferStream(&buf);
-    const dcid = [_]u8{0x11} ** 8;
-    const scid = [_]u8{0x22} ** 8;
+    const dcid = @as([8]u8, @splat(0x11));
+    const scid = @as([8]u8, @splat(0x22));
     var initial: packet.Header = .{
         .packet_type = .initial,
         .version = protocol.SUPPORTED_VERSIONS[0],

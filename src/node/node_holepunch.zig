@@ -209,7 +209,7 @@ test "accepted traffic opens only the source path of the same authenticated conn
     const t = std.testing;
     var state = try State.init(t.allocator, 2);
     defer state.deinit(t.allocator);
-    const peer = try addr.NodeId.fromBytes([_]u8{7} ** 32);
+    const peer = try addr.NodeId.fromBytes(@as([32]u8, @splat(7)));
     const source: addr.SocketAddr = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = 9000 };
     state.begin();
     state.connection(.{ .id = 41, .peer = peer, .side = .client, .packets = 9 });
@@ -219,7 +219,7 @@ test "accepted traffic opens only the source path of the same authenticated conn
     try t.expectEqual(@as(usize, 0), join.path_count);
     state.accepted(.{ .id = 42, .peer = peer, .side = .client, .packets = 10 }, source);
     try t.expectEqual(@as(usize, 0), join.path_count);
-    const other = try addr.NodeId.fromBytes([_]u8{9} ** 32);
+    const other = try addr.NodeId.fromBytes(@as([32]u8, @splat(9)));
     state.accepted(.{ .id = 41, .peer = other, .side = .client, .packets = 10 }, source);
     try t.expectEqual(@as(usize, 0), join.path_count);
     state.accepted(.{ .id = 41, .peer = peer, .side = .client, .packets = 10 }, source);
@@ -235,7 +235,7 @@ test "live client identity selection excludes servers and forgets reaped connect
     const t = std.testing;
     var state = try State.init(t.allocator, 3);
     defer state.deinit(t.allocator);
-    const peer = try addr.NodeId.fromBytes([_]u8{7} ** 32);
+    const peer = try addr.NodeId.fromBytes(@as([32]u8, @splat(7)));
     state.begin();
     state.connection(.{ .id = 3, .peer = peer, .side = .server, .packets = 1 });
     state.connection(.{ .id = 50, .peer = peer, .side = .client, .packets = 1 });
@@ -265,7 +265,7 @@ test "native connection latches do not move fact or peer prefixes" {
     const t = std.testing;
     var state = try State.init(t.allocator, 2);
     defer state.deinit(t.allocator);
-    const peer = try addr.NodeId.fromBytes([_]u8{7} ** 32);
+    const peer = try addr.NodeId.fromBytes(@as([32]u8, @splat(7)));
     state.begin();
     state.connection(.{ .id = 41, .peer = peer, .side = .client, .packets = 9 });
     state.end();
@@ -284,7 +284,7 @@ test "synthetic relay receipt is never direct path proof" {
     const t = std.testing;
     var state = try State.init(t.allocator, 1);
     defer state.deinit(t.allocator);
-    const peer = try addr.NodeId.fromBytes([_]u8{7} ** 32);
+    const peer = try addr.NodeId.fromBytes(@as([32]u8, @splat(7)));
     state.begin();
     state.connection(.{ .id = 41, .peer = peer, .side = .client, .packets = 9 });
     state.end();

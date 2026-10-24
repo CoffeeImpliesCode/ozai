@@ -193,7 +193,7 @@ test "an unsettled connection refuses rather than defaulting to a version" {
     try std_testing.expectError(error.NotBound, pending.encode(.server_confirms_auth, &out));
     try std_testing.expectError(
         error.NotBound,
-        pending.decode(&[_]u8{@intFromEnum(frame.FrameType.server_confirms_auth)}),
+        pending.decode(&[_]u8{@backingInt(frame.FrameType.server_confirms_auth)}),
     );
     try std_testing.expectError(error.NotBound, pending.allows(.ping));
 }

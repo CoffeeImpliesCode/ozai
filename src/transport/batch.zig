@@ -18,11 +18,6 @@
 //!
 // The UDP batch seam: a list of datagrams in, socket writes out.
 //
-// `docs/DECISIONS/0002-async-substrate.md` records the decision this module
-// implements: zio's `std.Io` bridge sends one datagram per `sendmsg`, and a
-// batch of datagrams wants `UDP_SEGMENT`, so the batcher lives here at the
-// transport seam and degrades to one-datagram sends where the platform
-// cannot segment.
 //
 // Captured from n0-computer/noq, commit
 // 89ed00c31297c2127d1697a7b63983d60fd02ecb, fetched 2026-09-30:
@@ -139,7 +134,7 @@ test "the option numbers are the ones the 0.16 std tree carries" {
 }
 
 test "one datagram is one run that carries no segment size" {
-    const datagram = [_]u8{0xaa} ** 100;
+    const datagram = @as([100]u8, @splat(0xaa));
     const send = Send.single(&datagram, null);
     try std_testing.expectEqual(@as(usize, 1), send.datagramCount());
     try std_testing.expect(!send.isSegmented());
@@ -177,7 +172,7 @@ test "N same-size datagrams are one segmented run" {
 test "a batch whose last datagram is short keeps it short" {
     // Four whole datagrams and seven bytes: the size a QUIC burst's last
     // packet has, and the last datagram of a GSO batch is allowed to be.
-    const bytes = [_]u8{0} ** 407;
+    const bytes = @as([407]u8, @splat(0));
     const send = try Send.batch(&bytes, 100, null);
     try std_testing.expectEqual(@as(usize, 5), send.datagramCount());
     try std_testing.expectEqual(@as(usize, 7), send.lastDatagramLen());
@@ -373,7 +368,7 @@ test "a segment size no datagram may carry is refused, not divided by" {
     // And the refusals reach the walk, which is where a caller meets them. A
     // size the `UDP_SEGMENT` control message carries is still a size no run
     // can be built from.
-    const bytes = [_]u8{0} ** 200;
+    const bytes = @as([200]u8, @splat(0));
     try std_testing.expectError(
         error.SegmentSizeTooLarge,
         Runs.init(try Send.batch(&bytes, max_send_payload + 1, null), full),
@@ -454,7 +449,7 @@ test "capability reports unsupported, one side at a time" {
 }
 
 test "a coalesced read of one datagram is the uncoalesced read" {
-    const datagram = [_]u8{0x5a} ** 64;
+    const datagram = @as([64]u8, @splat(0x5a));
     const plain = try Recv.init(&datagram, null, .ect1);
     const coalesced = try Recv.init(&datagram, datagram.len, .ect1);
     try std_testing.expectEqual(plain.stride, coalesced.stride);
@@ -496,7 +491,7 @@ test "a datagram index that overflows the byte offset returns null" {
 }
 
 test "a stride that names no datagram, or one past the buffer, is refused" {
-    const bytes = [_]u8{0} ** 8;
+    const bytes = @as([8]u8, @splat(0));
     try std_testing.expectError(error.ZeroSegmentSize, Recv.init(&bytes, 0, null));
     try std_testing.expectError(error.ZeroSegmentSize, Recv.init(&.{}, null, null));
     try std_testing.expectError(error.StrideExceedsBuffer, Recv.init(&bytes, 9, null));
@@ -521,7 +516,7 @@ test "a codepoint survives from the value to what the seam is handed" {
         .{ .ecn = .ce, .bits = 0b11 },
     };
     for (table) |row| {
-        const payload = [_]u8{0} ** 8;
+        const payload = @as([8]u8, @splat(0));
         const send = Send.single(&payload, row.ecn);
         // The wire carries two bits, and reading them back is the same
         // codepoint: noq's `from_bits` over the low two bits.
@@ -544,7 +539,7 @@ test "a codepoint survives from the value to what the seam is handed" {
 }
 
 test "a segmented run writes the segment size as a short" {
-    const bytes = [_]u8{0} ** 200;
+    const bytes = @as([200]u8, @splat(0));
     const send = try Send.batch(&bytes, 100, .ce);
     var out: [max_cmsg]Cmsg = undefined;
     const cmsgs = cmsg(send, .v6, &out);
@@ -558,7 +553,7 @@ test "a segmented run writes the segment size as a short" {
 }
 
 test "a send with no codepoint writes not-ECT rather than nothing" {
-    const payload = [_]u8{0} ** 8;
+    const payload = @as([8]u8, @splat(0));
     const send = Send.single(&payload, null);
     try std_testing.expectEqual(@as(u8, 0b00), tosBits(send));
     try std_testing.expectEqual(@as(?Ecn, null), Recv.ecnFromBits(tosBits(send)));
@@ -569,7 +564,7 @@ test "a send with no codepoint writes not-ECT rather than nothing" {
 }
 
 test "a send that loses its codepoint says so" {
-    const payload = [_]u8{0} ** 8;
+    const payload = @as([8]u8, @splat(0));
     const send = Send.single(&payload, .ce);
 
     // Nothing refused: the codepoint is carried.
@@ -600,7 +595,7 @@ test "a send that loses its codepoint says so" {
 }
 
 test "a refused segmentation degrades a batch and says so" {
-    const bytes = [_]u8{0} ** 30;
+    const bytes = @as([30]u8, @splat(0));
     const batch = try Send.batch(&bytes, 10, .ect0);
     const degraded = report(batch, .v4, .segmentation);
     try std_testing.expect(degraded.degraded);
@@ -617,7 +612,7 @@ test "noq's own effective_segment_size vectors, captured at 89ed00c" {
     // `noq-udp/src/lib.rs:278-300`, the crate's test for the rule, values
     // copied: ten bytes of payload against a segment size that is larger
     // than, equal to, absent from, and half of the payload.
-    const payload = [_]u8{0} ** 10;
+    const payload = @as([10]u8, @splat(0));
     const cases = [_]struct { segment: ?u16, segmented: bool }{
         .{ .segment = 15, .segmented = false },
         .{ .segment = 10, .segmented = false },
@@ -636,7 +631,7 @@ test "noq's own effective_segment_size vectors, captured at 89ed00c" {
 
 test "a socket has to be asked for the codepoint on both families" {
     try std_testing.expectEqual(Family.v4, Family.of(.{ .v4 = .{ 127, 0, 0, 1 } }));
-    try std_testing.expectEqual(Family.v6, Family.of(.{ .v6 = [_]u8{0} ** 16 }));
+    try std_testing.expectEqual(Family.v6, Family.of(.{ .v6 = @as([16]u8, @splat(0)) }));
     const v4 = socketOptions(.v4, true);
     try std_testing.expectEqual(linux.ip_level, v4[0].level);
     try std_testing.expectEqual(linux.ipv4_recvtos, v4[0].name);

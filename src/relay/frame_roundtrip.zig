@@ -322,7 +322,7 @@ test "golden: a captured ping and pong are the same eight bytes" {
         const bytes = try vectors.parseHex(&scratch, pair.hex);
         const message = try decode(bytes, .v2);
         try std_testing.expectEqual(pair.tag, std.meta.activeTag(message));
-        try std_testing.expectEqual(@as([8]u8, [_]u8{42} ** 8), try payloadOf8(message));
+        try std_testing.expectEqual(@as([8]u8, @as([8]u8, @splat(42))), try payloadOf8(message));
         try vectors.expectHex(bytes, try encode(message, .v2, &out));
     }
 }
@@ -382,7 +382,7 @@ test "version: Health is v1 only, Status is v2 only, both are emittable" {
     // as well-formed ones, so the version rule is not the length rule.
     var header: [1]u8 = undefined;
     var header_writer = Writer.init(&header);
-    try header_writer.writeVarInt(@intFromEnum(FrameType.health));
+    try header_writer.writeVarInt(@backingInt(FrameType.health));
     try std_testing.expectError(error.FrameNotAllowedInVersion, decode(&header, .v2));
     try std_testing.expectError(
         error.FrameNotAllowedInVersion,
@@ -431,7 +431,7 @@ test "codec: frames 0 through 3, derived from the handshake structs" {
     // `ServerChallenge` (`handshake.rs:77`) is a `[u8; 16]`, and postcard writes a
     // fixed array inline with no length prefix, so a challenge is its header and
     // sixteen bytes.
-    const challenge: ServerChallenge = .{ .challenge = [_]u8{0x01} ** 16 };
+    const challenge: ServerChallenge = .{ .challenge = @as([16]u8, @splat(0x01)) };
     const challenge_bytes = try encode(.{ .server_challenge = challenge }, .v2, &out);
     try std_testing.expectEqual(@as(usize, 17), challenge_bytes.len);
     try std_testing.expectEqual(@as(u8, 0), challenge_bytes[0]);
@@ -458,7 +458,7 @@ test "codec: frames 0 through 3, derived from the handshake structs" {
     // `ServerDeniesAuth` (`handshake.rs:105`) is a `String`, so a varint length
     // and then UTF-8. Two bytes of reason is one length byte; two hundred is two,
     // which is the one case where a reader and a writer disagree about width.
-    for ([_][]const u8{ "no", "x" ** 200 }) |reason| {
+    for ([_][]const u8{ "no", &@as([200:0]u8, @splat('x')) }) |reason| {
         const message: Message = .{ .server_denies_auth = .{ .reason = reason } };
         const denial = try encode(message, .v2, &out);
         try std_testing.expectEqual(@as(u8, 0x03), denial[0]);
@@ -593,7 +593,7 @@ test "codec: malformed frames are named errors" {
     for ([_]FrameType{ .client_to_relay_datagram, .client_to_relay_datagram_batch }) |frame_type| {
         var header: [1]u8 = undefined;
         var header_writer = Writer.init(&header);
-        try header_writer.writeVarInt(@intFromEnum(frame_type));
+        try header_writer.writeVarInt(@backingInt(frame_type));
         try std_testing.expectError(error.InvalidFrame, decode(&header, .v2));
         var short: [DatagramFrame.header_length]u8 = undefined;
         @memset(&short, 0);
@@ -687,7 +687,7 @@ test "codec: encodedLen is the length, for every variant" {
     var secret = try vectors.captureKey();
     defer secret.deinit();
     const node_id = secret.nodeId();
-    var other = try key.SecretKey.fromSeed([_]u8{7} ** key.SecretKey.seed_length);
+    var other = try key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(7)));
     defer other.deinit();
     const batched: DatagramFrame = .{
         .node_id = node_id,
@@ -699,7 +699,7 @@ test "codec: encodedLen is the length, for every variant" {
     };
 
     const messages = [_]Message{
-        .{ .server_challenge = .{ .challenge = [_]u8{7} ** 16 } },
+        .{ .server_challenge = .{ .challenge = @as([16]u8, @splat(7)) } },
         .{ .client_auth = .{ .node_id = node_id, .signature = secret.sign("m") } },
         .{ .server_confirms_auth = {} },
         .{ .server_denies_auth = .{ .reason = "no" } },
@@ -708,15 +708,15 @@ test "codec: encodedLen is the length, for every variant" {
         // prefix, which is the one width where a reader and a writer disagree.
         // `encode` refuses a longer one, so 300 is no longer a value this codec
         // can write — see `max_text_length`.
-        .{ .server_denies_auth = .{ .reason = "x" ** ServerDeniesAuth.max_reason_length } },
+        .{ .server_denies_auth = .{ .reason = &@as([ServerDeniesAuth.max_reason_length:0]u8, @splat('x')) } },
         .{ .client_to_relay_datagram = single },
         .{ .client_to_relay_datagram_batch = batched },
         .{ .relay_to_client_datagram = single },
         .{ .relay_to_client_datagram_batch = batched },
         .{ .endpoint_gone = node_id },
         .{ .endpoint_gone = other.nodeId() },
-        .{ .ping = [_]u8{42} ** 8 },
-        .{ .pong = [_]u8{0} ** 8 },
+        .{ .ping = @as([8]u8, @splat(42)) },
+        .{ .pong = @as([8]u8, @splat(0)) },
         .{ .health = "" },
         .{ .health = "a problem long enough to be worth a frame of its own" },
         .{ .restarting = .{ .reconnect_in_ms = 0, .try_for_ms = 0 } },
@@ -739,7 +739,7 @@ test "codec: a reason at the bound round-trips, and one byte over is refused" {
     // longest reason the codec will write goes out whole and comes back whole,
     // and the next byte up is a named refusal rather than a shorter sentence.
     const at_bound: Message = .{
-        .server_denies_auth = .{ .reason = "x" ** ServerDeniesAuth.max_reason_length },
+        .server_denies_auth = .{ .reason = &@as([ServerDeniesAuth.max_reason_length:0]u8, @splat('x')) },
     };
     var out: [vectors.scratch_len]u8 = undefined;
     const written = try encode(at_bound, .v2, &out);
@@ -752,7 +752,7 @@ test "codec: a reason at the bound round-trips, and one byte over is refused" {
     // One byte over, and refused rather than cut: the reason that goes on the
     // wire is never a prefix of the reason the caller chose.
     const over: Message = .{
-        .server_denies_auth = .{ .reason = "x" ** (ServerDeniesAuth.max_reason_length + 1) },
+        .server_denies_auth = .{ .reason = &@as([(ServerDeniesAuth.max_reason_length + 1):0]u8, @splat('x')) },
     };
     var refusal: [vectors.scratch_len]u8 = undefined;
     @memset(&refusal, 0xff);
@@ -770,13 +770,13 @@ test "codec: the health problem is bounded by the same number as the reason" {
     // v1's answer to the same question the denial answers, and the same rule:
     // relay-authored text with no field fixing its length. Both are refused
     // past `max_text_length` and neither is shortened.
-    const at_bound: Message = .{ .health = "x" ** max_text_length };
+    const at_bound: Message = .{ .health = &@as([max_text_length:0]u8, @splat('x')) };
     var out: [vectors.scratch_len]u8 = undefined;
     const written = try encode(at_bound, .v1, &out);
     try std_testing.expectEqual(encodedLen(at_bound), written.len);
     try std_testing.expect(eql(at_bound, try decode(written, .v1)));
 
-    const over: Message = .{ .health = "x" ** (max_text_length + 1) };
+    const over: Message = .{ .health = &@as([(max_text_length + 1):0]u8, @splat('x')) };
     var refusal: [vectors.scratch_len]u8 = undefined;
     @memset(&refusal, 0xff);
     try std_testing.expectError(error.TextTooLong, encode(over, .v1, &refusal));

@@ -247,7 +247,7 @@ test "authentication scans current repository source not strings within guard fi
         @as(usize, 0),
         try testAuthenticate(&.{}, &.{"./scripts/gate_zbc_policy.zig"}, test_tool),
     );
-    try std.testing.expectError(error.StaleZbcTool, testAuthenticate(&.{}, &.{}, "a" ** 64));
+    try std.testing.expectError(error.StaleZbcTool, testAuthenticate(&.{}, &.{}, &@as([64:0]u8, @splat('a'))));
     try std.testing.expectError(
         error.InvalidZbcPolicy,
         testAuthenticate(&.{}, &.{"scripts/gate_zbc_policy.zig"}, test_tool),
@@ -262,7 +262,7 @@ test "authentication scans current repository source not strings within guard fi
     );
     const record: schema.SourceFile = .{
         .path = "scripts/gate_zbc_policy.zig",
-        .source_sha256 = "0" ** 64,
+        .source_sha256 = &@as([64:0]u8, @splat('0')),
         .reason = "This unannotated record is forbidden.",
     };
     try std.testing.expectError(
@@ -316,7 +316,7 @@ test "authentication accepts reviewed annotated repository file and rejects new 
         error.MissingZbcSourceException,
         testAuthenticate(&.{}, &.{"./scripts/gate_measure.zig"}, test_tool),
     );
-    record.source_sha256 = "0" ** 64;
+    record.source_sha256 = &@as([64:0]u8, @splat('0'));
     try std.testing.expectError(
         error.StaleZbcSource,
         testAuthenticate(&.{record}, &.{"./scripts/gate_measure.zig"}, test_tool),

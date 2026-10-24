@@ -378,7 +378,7 @@ test "the handler shape is the one the endpoint loop expects" {
 
     // Four fields, one of them mandatory, and two defaults left to the
     // router: a QAD route adds no `on_accepting` and no `shutdown`.
-    try t.expectEqual(@as(usize, 4), @typeInfo(router.ProtocolHandler).@"struct".fields.len);
+    try t.expectEqual(@as(usize, 4), @typeInfo(router.ProtocolHandler).@"struct".field_names.len);
     try t.expect(handler.on_accepting == null);
     try t.expect(handler.shutdown == null);
     // `accept` is not optional in the first place: it is the whole of a

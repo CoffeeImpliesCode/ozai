@@ -31,7 +31,7 @@ const NodeId = key.NodeId;
 /// seed, so this is the same derivation. "golden: the captured node id is seed
 /// [42]" is what holds that claim to the bytes.
 pub fn captureKey() !key.SecretKey {
-    return key.SecretKey.fromSeed([_]u8{42} ** key.SecretKey.seed_length);
+    return key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(42)));
 }
 
 pub fn captureId() !NodeId {
@@ -50,7 +50,7 @@ pub const id_hex = "197f6b23e16c8532c6abc838" ++ "facd5ea789be0c76b2920334039bfa
 
 /// 32 bytes of `ff`: a compressed ed25519 point whose `y` is `2^255 - 1`, past
 /// the field modulus, so `NodeId.fromBytes` rejects it.
-pub const non_canonical_id_hex = "ff" ** 32;
+pub const non_canonical_id_hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
 /// Source-derived native authentication bytes, independent of the relay encoder.
 /// iroh-base 1.3.0 `key.rs:78-87` serializes the public key as a raw array;

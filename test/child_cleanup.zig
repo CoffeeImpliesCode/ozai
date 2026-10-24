@@ -25,10 +25,10 @@ pub fn CleanupError(comptime Process: type) type {
     const Consumer = @typeInfo(Process).pointer.child;
     return Consumer.PumpError || Consumer.WaitError || SignalError || child_exit.Error ||
         std.Io.Cancelable || error{
-            IncompleteTermination,
-            ChildCleanupDeadlineExceeded,
-            ChildDrainDeadlineExceeded,
-        };
+        IncompleteTermination,
+        ChildCleanupDeadlineExceeded,
+        ChildDrainDeadlineExceeded,
+    };
 }
 
 /// Drain throughout the bounded grace period; only wait once proc confirms exit.

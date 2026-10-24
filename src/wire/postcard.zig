@@ -231,7 +231,7 @@ pub const Writer = struct {
         if (@typeInfo(@TypeOf(tag)) != .@"enum") {
             @compileError("writeVariant takes an enum value, not " ++ @typeName(@TypeOf(tag)));
         }
-        const discriminant = std.math.cast(u32, @intFromEnum(tag)) orelse
+        const discriminant = std.math.cast(u32, @backingInt(tag)) orelse
             return error.ValueOutOfRange;
         try self.writeVarint(u32, discriminant);
     }
@@ -1003,9 +1003,9 @@ test "an over-long varint is rejected, not truncated" {
     const u64_too_large = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02 };
     try testing.expectError(error.ValueOutOfRange, expectU64(&u64_too_large));
     // Every continuation bit set, with nothing to terminate them.
-    try testing.expectError(error.BadVarint, expectU64(&[_]u8{0x80} ** varintMax(u64)));
+    try testing.expectError(error.BadVarint, expectU64(&@as([varintMax(u64)]u8, @splat(0x80))));
     // And one byte short of that, which runs out before it can be judged.
-    try testing.expectError(error.UnexpectedEnd, expectU64(&[_]u8{0x80} ** (varintMax(u64) - 1)));
+    try testing.expectError(error.UnexpectedEnd, expectU64(&@as([(varintMax(u64) - 1)]u8, @splat(0x80))));
 }
 
 test "a bool byte other than 0 or 1 is rejected" {
@@ -1056,7 +1056,7 @@ test "a non-exhaustive enum accepts a tag it has no named arm for" {
     for (cases) |case| {
         var reader = Reader.init(case.bytes);
         const tag = try reader.readVariant(Open);
-        try testing.expectEqual(case.value, @intFromEnum(tag));
+        try testing.expectEqual(case.value, @backingInt(tag));
         try testing.expectEqual(case.named, std.enums.tagName(Open, tag) != null);
         try reader.finish();
     }
@@ -1072,11 +1072,11 @@ test "an open enum's unknown tag survives a write and a read" {
     const Open = enum(u32) { known, _ };
     var buffer: [16]u8 = undefined;
     var writer = Writer.init(&buffer);
-    try writer.writeVariant(@as(Open, @enumFromInt(7)));
+    try writer.writeVariant(@as(Open, @fromBackingInt(@intCast(7))));
     try testing.expectEqualSlices(u8, &.{0x07}, writer.finish());
 
     var reader = Reader.init(writer.finish());
-    try testing.expectEqual(@as(u32, 7), @intFromEnum(try reader.readVariant(Open)));
+    try testing.expectEqual(@as(u32, 7), @backingInt(try reader.readVariant(Open)));
     try reader.finish();
 }
 
@@ -1244,9 +1244,9 @@ test "every field type round trips" {
     }
     {
         var writer = Writer.init(&buffer);
-        try writer.writeArray(32, &[_]u8{0xab} ** 32);
+        try writer.writeArray(32, &@as([32]u8, @splat(0xab)));
         var reader = Reader.init(writer.finish());
-        try testing.expectEqual([_]u8{0xab} ** 32, try reader.readArray(32));
+        try testing.expectEqual(@as([32]u8, @splat(0xab)), try reader.readArray(32));
         try reader.finish();
     }
 }
@@ -1346,9 +1346,9 @@ test "arbitrary bytes never panic and never leave the error set" {
         &.{ 0x80, 0x00 },
         &.{ 0x01, 0xff },
         &.{ 0x05, 0x01 },
-        &[_]u8{0x80} ** varintMax(u64),
-        &[_]u8{0xff} ** varintMax(u64),
-        &[_]u8{0xff} ** (varintMax(u64) + 1),
+        &@as([varintMax(u64)]u8, @splat(0x80)),
+        &@as([varintMax(u64)]u8, @splat(0xff)),
+        &@as([(varintMax(u64) + 1)]u8, @splat(0xff)),
         &.{ 0xff, 0xff, 0xff, 0xff, 0x0f, 0xff, 0xff, 0xff, 0xff, 0x0f },
         &.{ 0x04, 0x01, 0x02, 0x03 },
         &.{ 0x01, 0xc2, 0xa2 },

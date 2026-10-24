@@ -10,7 +10,7 @@ const ozai = @import("ozai");
 const t = std.testing;
 
 test "a node id is the same identity in hex, z32 and local tls name" {
-    var secret = try ozai.SecretKey.fromSeed([_]u8{0} ** ozai.SecretKey.seed_length);
+    var secret = try ozai.SecretKey.fromSeed(@as([ozai.SecretKey.seed_length]u8, @splat(0)));
     defer secret.deinit();
     const node_id = secret.nodeId();
 
@@ -22,7 +22,7 @@ test "a node id is the same identity in hex, z32 and local tls name" {
 test "a signed address verifies at the far end and nothing else does" {
     // The shape of a ticket before tickets exist: an address, signed by the node
     // that owns it. Both halves are what a relay or a peer will check.
-    var secret = try ozai.SecretKey.fromSeed([_]u8{42} ** ozai.SecretKey.seed_length);
+    var secret = try ozai.SecretKey.fromSeed(@as([ozai.SecretKey.seed_length]u8, @splat(42)));
     defer secret.deinit();
 
     const alloc = t.allocator;
@@ -48,14 +48,14 @@ test "a signed address verifies at the far end and nothing else does" {
     // The right address, under the wrong key, must not verify either.
     try t.expectError(
         error.BadSignature,
-        signature.verify(payload, (try ozai.NodeId.fromBytes([_]u8{1} ** 32))),
+        signature.verify(payload, (try ozai.NodeId.fromBytes(@as([32]u8, @splat(1))))),
     );
 }
 
 test "an address renders to the same text every time" {
     // The property that makes a ticket a stable identifier: the same address
     // must always print the same bytes, whatever order it was built in.
-    var secret = try ozai.SecretKey.fromSeed([_]u8{7} ** ozai.SecretKey.seed_length);
+    var secret = try ozai.SecretKey.fromSeed(@as([ozai.SecretKey.seed_length]u8, @splat(7)));
     defer secret.deinit();
     const node_id = secret.nodeId();
 

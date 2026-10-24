@@ -42,14 +42,6 @@
 //!
 //! # The body is opaque here
 //!
-//! The body is a DNS packet, but this milestone does not parse DNS.
-//! `Packet` carries the bytes, checks their length against the cap, and
-//! signs and verifies over them exactly as it found them. Parsing the
-//! records out is the resolver slice's job (`docs/PLAN.md` M5); a
-//! half-implemented parser here would be a second, disagreeing
-//! implementation of a grammar ozai does not yet own. The consequence is
-//! recorded in the divergence list: ozai accepts a correctly signed packet
-//! whose body is not a DNS packet, and upstream rejects it.
 //!
 //! # Purity
 //!
@@ -410,7 +402,7 @@ const t = std.testing;
 // origin, compressed. Every byte below is the reference implementation's.
 
 /// The 32-byte seed the vectors were signed with, and the node id it derives.
-const vector_seed = [_]u8{7} ** key.SecretKey.seed_length;
+const vector_seed = @as([key.SecretKey.seed_length]u8, @splat(7));
 const vector_timestamp = 1_700_000_000_000_000;
 const vector_node_id_hex = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
 
@@ -792,7 +784,7 @@ test "the body is opaque, so an empty one is a packet and a nonsense one too" {
 
 /// The seed the "a different node" cases use. Distinct from `vector_seed`, so
 /// the node it derives is not the node the captured packets are about.
-const other_seed = [_]u8{8} ** key.SecretKey.seed_length;
+const other_seed = @as([key.SecretKey.seed_length]u8, @splat(8));
 
 fn hexBytes(out: []u8, hex: []const u8) ![]const u8 {
     if (hex.len % 2 != 0) return error.OddHexLength;

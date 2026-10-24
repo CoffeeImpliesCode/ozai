@@ -46,8 +46,6 @@ const t = std.testing;
 /// A client's own synthetic address, in the subnet a node is reached on
 /// before a path is chosen.
 pub const client_host: base_ula.HostBits = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
-/// The server's, in the relay subnet — a relay path is the case
-/// `docs/PLAN.md`'s mapping exists for, so it is the one these tests drive.
 pub const server_host: base_ula.HostBits = .{ 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10 };
 
 /// How the client and the server each see the other, as this project
@@ -99,7 +97,7 @@ pub const max_rounds = 8;
 /// Version Negotiation reply limiter and nothing else, and no connection is
 /// created, so a test can drive `recv` without a handshake.
 pub fn unsupportedVersionProbe() [min_initial]u8 {
-    var bytes = [_]u8{0} ** min_initial;
+    var bytes = @as([min_initial]u8, @splat(0));
     // Long header (0x80), fixed bit (0x40), packet type 0b00.
     bytes[0] = 0xc0;
     std.mem.writeInt(u32, bytes[1..5], 0x0a0a0a0a, .big);

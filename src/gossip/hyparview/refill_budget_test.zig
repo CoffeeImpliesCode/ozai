@@ -22,7 +22,8 @@ fn acceptContacts(
         .nodes = try refillContacts(),
     } } }, &input);
     try state.handle(.{ .recv_message = .{
-        .from = try testNodeId(6), .message = decoded.swarm,
+        .from = try testNodeId(6),
+        .message = decoded.swarm,
     } }, out);
 }
 
@@ -31,11 +32,12 @@ fn expectContacts(state: *const swarm.State, excluded: ?NodeId) !void {
     var retained: usize = 0;
     for (contacts.slice()) |contact| {
         const removed = if (excluded) |id|
-            std.mem.eql(u8, &contact.id.toBytes(), &id.toBytes()) else false;
+            std.mem.eql(u8, &contact.id.toBytes(), &id.toBytes())
+        else
+            false;
         try t.expectEqual(!removed, state.passive_view.contains(contact.id));
         // Timeout removes eligibility, not the contact record.
-        try t.expectEqualSlices(u8, contact.data.?,
-            state.peer_data.get(contact.id).?.slice());
+        try t.expectEqualSlices(u8, contact.data.?, state.peer_data.get(contact.id).?.slice());
         if (!removed) retained += 1;
     }
     try t.expectEqual(retained, state.passiveView().len);
@@ -80,8 +82,7 @@ fn pendingTimer(
 
 test "ShuffleReply retains three contacts when own Neighbor4096 cannot fit" {
     const own: [4090]u8 = @splat(0x92);
-    var state = try swarm.State.init(try testNodeId(1), try swarm.PeerData.fromBytes(&own),
-        .{}, .init(42));
+    var state = try swarm.State.init(try testNodeId(1), try swarm.PeerData.fromBytes(&own), .{}, .init(42));
     var out: swarm.Actions(swarm.SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
     var rng_before = state.rng;

@@ -280,7 +280,7 @@ test "a custom address too long for a key is refused, not truncated" {
     try pair.init(client_seed, server_seed, null, 7, true);
     defer pair.deinit();
 
-    const oversize = [_]u8{0x01} ** (base_addr.max_inline_length + 1);
+    const oversize = @as([(base_addr.max_inline_length + 1)]u8, @splat(0x01));
     var route_engine = Prng.init(8);
     try t.expectError(
         error.DataTooLong,

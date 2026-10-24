@@ -236,12 +236,12 @@ test "user data holds 245 bytes and not one more" {
     const empty = try UserData.init("");
     try t.expectEqualStrings("", empty.slice());
 
-    const full = try UserData.init("x" ** max_user_data_length);
-    try t.expectEqualStrings("x" ** max_user_data_length, full.slice());
+    const full = try UserData.init(&@as([max_user_data_length:0]u8, @splat('x')));
+    try t.expectEqualStrings(&@as([max_user_data_length:0]u8, @splat('x')), full.slice());
 
     try t.expectError(
         error.MaxLengthExceeded,
-        UserData.init("x" ** (max_user_data_length + 1)),
+        UserData.init(&@as([(max_user_data_length + 1):0]u8, @splat('x'))),
     );
 }
 

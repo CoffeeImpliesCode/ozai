@@ -113,9 +113,9 @@ pub const Node = struct {
             .wire = undefined,
             .topic = undefined,
             .advert = undefined,
-            .dialled = [_]?Conn{null} ** max_nodes,
-            .outbound = [_]std.ArrayList(u8){.empty} ** max_nodes,
-            .inbound = [_]std.ArrayList(u8){.empty} ** max_nodes,
+            .dialled = @as([max_nodes]?Conn, @splat(null)),
+            .outbound = @as([max_nodes]std.ArrayList(u8), @splat(.empty)),
+            .inbound = @as([max_nodes]std.ArrayList(u8), @splat(.empty)),
             .timers = .empty,
         };
         errdefer self.deinitBuffers();

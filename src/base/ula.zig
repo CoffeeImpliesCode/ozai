@@ -70,7 +70,7 @@ pub const Ula = [16]u8;
 pub const HostBits = [8]u8;
 
 /// The largest host value in a subnet, so the top address of `Path.any_path`.
-const max_host: HostBits = .{0xff} ** 8;
+const max_host: HostBits = @splat(0xff);
 
 /// Upstream's `DEFAULT_FAKE_ADDR`.
 ///
@@ -206,7 +206,7 @@ const captured_prefixes = [_]struct { path: Path, octets: [8]u8 }{
 
 comptime {
     // A new path arm has to arrive with a captured prefix, not without one.
-    if (captured_prefixes.len != @typeInfo(Path).@"enum".fields.len) {
+    if (captured_prefixes.len != @typeInfo(Path).@"enum".field_names.len) {
         @compileError("a Path variant has no captured prefix");
     }
 }
@@ -283,7 +283,7 @@ test "anything outside the map is a direct path" {
     // Neither does IPv6 with the wrong /l or global id, nor IPv6 in the right
     // range on a subnet upstream never allocates: 0, 1 and 3 are taken, 2 is
     // not, and mistaking 2 for a live one is the failure this pins.
-    const zeros: [8]u8 = .{0x00} ** 8;
+    const zeros: [8]u8 = @splat(0x00);
     const unclaimed = [_]Ula{
         zeros ++ zeros,
         .{ 0xfd, 0x16, 0x07, 0x0a, 0x51, 0x0b, 0x00, 0x00 } ++ zeros,
@@ -319,12 +319,12 @@ test "every transport variant maps to a socket address" {
         .{ .custom = .{ .id = 0x2a, .data = &.{} } },
     };
     comptime {
-        if (transports.len != @typeInfo(TransportAddr).@"union".fields.len) {
+        if (transports.len != @typeInfo(TransportAddr).@"union".field_names.len) {
             @compileError("a TransportAddr variant has no captured address");
         }
     }
     inline for (transports, 0..) |transport, index| {
-        try t.expectEqual(index, @intFromEnum(std.meta.activeTag(transport)));
+        try t.expectEqual(index, @backingInt(std.meta.activeTag(transport)));
         try t.expectEqual(per_variant[index], syntheticSocketAddr(transport, test_host));
     }
 }
@@ -337,7 +337,7 @@ test "two paths to one peer never alias" {
     // left that could separate them, and it has to.
     var peer = try addr.NodeAddr.withRelay(
         t.allocator,
-        try addr.NodeId.fromBytes([_]u8{1} ** 32),
+        try addr.NodeId.fromBytes(@as([32]u8, @splat(1))),
         try addr.RelayUrl.parse("https://use1-1.relay.iroh.network./"),
     );
     defer peer.deinit(t.allocator);

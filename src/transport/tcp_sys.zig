@@ -130,7 +130,7 @@ pub fn connectResult(handle: c.fd_t) ConnectError!void {
     }
     if (length != @sizeOf(c_int)) return error.Unexpected;
     if (value == 0) return;
-    return connectFromErrno(@enumFromInt(value));
+    return connectFromErrno(@fromBackingInt(@intCast(value)));
 }
 
 fn connectFromErrno(errno: c.E) ConnectError {

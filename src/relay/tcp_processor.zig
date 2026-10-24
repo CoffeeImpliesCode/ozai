@@ -152,9 +152,9 @@ pub fn server(
 }
 
 test "decoded handshake replay authenticates only after confirmation drains" {
-    var secret = try key.SecretKey.fromSeed(.{19} ** 32);
+    var secret = try key.SecretKey.fromSeed(@splat(19));
     defer secret.deinit();
-    const challenge: frame.ServerChallenge = .{ .challenge = .{23} ** 16 };
+    const challenge: frame.ServerChallenge = .{ .challenge = @splat(23) };
     const connected = try client(.connecting, .connected, &secret);
     const requested = try client(connected.state, .request, &secret);
     try std.testing.expectEqual(ClientState.upgrade, requested.state);
@@ -180,9 +180,9 @@ test "decoded handshake replay authenticates only after confirmation drains" {
 }
 
 test "decoded refusal and out of order authentication cannot reach ready" {
-    var secret = try key.SecretKey.fromSeed(.{29} ** 32);
+    var secret = try key.SecretKey.fromSeed(@splat(29));
     defer secret.deinit();
-    const challenge: frame.ServerChallenge = .{ .challenge = .{31} ** 16 };
+    const challenge: frame.ServerChallenge = .{ .challenge = @splat(31) };
     try std.testing.expectError(
         error.InvalidUpgrade,
         client(.upgrade, .{ .upgrade = false }, &secret),
@@ -195,16 +195,16 @@ test "decoded refusal and out of order authentication cannot reach ready" {
         .message = .{ .server_confirms_auth = {} },
     }, &secret));
     try std.testing.expectError(error.UnexpectedMessage, server(.confirming, .{
-        .message = .{ .ping = .{0} ** 8 },
+        .message = .{ .ping = @splat(0) },
     }, challenge));
     const auth = authentication.signChallenge(&secret, challenge);
     try std.testing.expectError(error.SignatureInvalid, server(.auth, .{
         .message = .{ .client_auth = auth },
-    }, .{ .challenge = .{32} ** 16 }));
+    }, .{ .challenge = @splat(32) }));
 }
 
 test "ready processors return borrowed datagrams and ordered pong actions" {
-    var secret = try key.SecretKey.fromSeed(.{59} ** 32);
+    var secret = try key.SecretKey.fromSeed(@splat(59));
     defer secret.deinit();
     const datagram: frame.DatagramFrame = .{
         .node_id = secret.nodeId(),
@@ -220,7 +220,7 @@ test "ready processors return borrowed datagrams and ordered pong actions" {
     );
     const forwarded = try server(.ready, .{
         .message = .{ .client_to_relay_datagram = datagram },
-    }, .{ .challenge = .{0} ** 16 });
+    }, .{ .challenge = @splat(0) });
     try std.testing.expectEqual(@as(u8, 1), forwarded.count);
     try std.testing.expectEqual(
         datagram.datagrams.contents.ptr,

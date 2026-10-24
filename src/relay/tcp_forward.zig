@@ -7,7 +7,7 @@ const processor = @import("tcp_processor.zig");
 pub const Peer = struct {
     connection: session.Session,
     state: processor.ServerState = .upgrade,
-    challenge: frame.ServerChallenge = .{ .challenge = .{0} ** 16 },
+    challenge: frame.ServerChallenge = .{ .challenge = @splat(0) },
     identity: ?NodeId = null,
     pending: ?frame.DatagramFrame = null,
 };

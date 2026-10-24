@@ -149,7 +149,8 @@ fn runBuildStage(
     stage: []const []const u8,
     index: usize,
 ) SafetyError!void {
-    const optimize = try std.fmt.allocPrint(runner.gpa, "-Doptimize={s}", .{name});
+    const optimize_mode = if (std.mem.eql(u8, name, "Debug")) "debug" else "safe";
+    const optimize = try std.fmt.allocPrint(runner.gpa, "-Doptimize={s}", .{optimize_mode});
     defer runner.gpa.free(optimize);
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(runner.gpa);

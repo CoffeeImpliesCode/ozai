@@ -637,7 +637,7 @@ test "egress is the batcher's value, and a burst of one size is one send" {
 
     // Enough payload for several datagrams, which is what makes the batching
     // observable at all: one datagram is one send whatever the code does.
-    const payload = "ozai" ** 4096;
+    const payload = &@as([4096 * 4]u8, @bitCast(@as([4096][4]u8, @splat("ozai".*))));
     const stream = try conn.entry.conn.openStream();
     try stream.send.writeData(payload);
     stream.send.close();

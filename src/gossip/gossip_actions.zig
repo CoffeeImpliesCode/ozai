@@ -1,7 +1,3 @@
-//! A decoded message and the state this node is in, answered with an action
-//! list. This is `AGENTS.md` §2's rule in one file: a state machine takes a
-//! decoded message and a state value and returns a new state plus an action
-//! list, and nothing in the decision touches the network.
 //!
 //! **It is not a second membership machine.** `hyparview/state_arms.zig` owns
 //! every protocol decision — the views, the walk, the `Neighbor` deviation —
@@ -257,7 +253,7 @@ const SwarmMessage = gossip.SwarmMessage;
 /// A topic named by one byte. A `TopicId` is 32 bytes an application chose and
 /// every one of them is as good as any other, so the bytes only have to differ.
 fn testTopic(tag: u8) TopicId {
-    var bytes = [_]u8{0} ** gossip.topic_id_length;
+    var bytes = @as([gossip.topic_id_length]u8, @splat(0));
     bytes[0] = tag;
     return TopicId.fromBytes(bytes);
 }
@@ -511,7 +507,7 @@ test "deciding twice leaves the policy exactly as it was" {
 // error here rather than a frame that reaches a decision function that never
 // looked at it.
 comptime {
-    const arms = @typeInfo(SwarmMessage).@"union".fields;
+    const arms = @typeInfo(SwarmMessage).@"union".field_names;
     const named = [_][]const u8{
         "join",
         "forward_join",
@@ -524,7 +520,7 @@ comptime {
         @compileError("a membership arm was added or removed; this module decides on it");
     }
     for (named, 0..) |name, index| {
-        if (!std.mem.eql(u8, arms[index].name, name)) {
+        if (!std.mem.eql(u8, arms[index], name)) {
             @compileError("a membership arm was reordered; this module decides on it");
         }
     }

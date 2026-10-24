@@ -1,42 +1,27 @@
 const std = @import("std");
 const Dir = std.Io.Dir;
 pub const ValidateError = std.mem.Allocator.Error || std.process.RunError ||
-    error{ MissingScratch, UnapprovedScratch, MissingHome };
+    error{ MissingScratch, UnapprovedScratch };
 pub const CreateError = ValidateError || std.Io.RandomSecureError || Dir.CreateDirError;
 
-// Re-source the host policy, then prove ownership and the selected physical mount.
+// Validate an explicitly selected private scratch directory and its descendants.
 // Positional arguments prevent shell interpretation of environment paths.
 const validate_script =
     \\set -eu
     \\expected=$1
-    \\helper=$2
-    \\[ -f "$helper" ] && [ -r "$helper" ]
-    \\. "$helper"
-    \\[ "${HOST_SCRATCH_ROOT:-}" = "$expected" ]
     \\[ -d "$expected" ] && [ -O "$expected" ] && [ -w "$expected" ]
     \\[ ! -L "$expected" ]
-    \\base=$(dirname -- "$expected")
-    \\case "$base" in /home/tmp2|/home/tmp|/vol/tmp2|/vol/tmp) ;; *) exit 1;; esac
-    \\[ -d "$base" ] && [ -w "$base" ] && mountpoint -q -- "$base"
-    \\physical_base=$(realpath -e -- "$base")
-    \\physical_root=$(realpath -e -- "$expected")
-    \\[ "$(dirname -- "$physical_root")" = "$physical_base" ]
-    \\mount=$(findmnt -n -o TARGET --target "$physical_root")
-    \\[ "$(realpath -e -- "$mount")" = "$physical_base" ]
-    \\filesystem=$(findmnt -n -o FSTYPE --target "$physical_root")
+    \\[ "$(stat -c '%a' -- "$expected")" = 700 ]
+    \\physical_scratch=$(realpath -e -- "$expected")
+    \\filesystem=$(findmnt -n -o FSTYPE --target "$physical_scratch")
     \\case "$filesystem" in ''|nfs|nfs4) exit 1;; esac
-    \\scratch="$expected/scratch"
-    \\[ -d "$scratch" ] && [ -O "$scratch" ] && [ -w "$scratch" ]
-    \\[ ! -L "$scratch" ]
-    \\physical_scratch=$(realpath -e -- "$scratch")
-    \\[ "$(dirname -- "$physical_scratch")" = "$physical_root" ]
-    \\target=$3
+    \\device=$(stat -c '%d' -- "$physical_scratch")
+    \\target=$2
     \\if [ -n "$target" ]; then
     \\    [ -d "$target" ] && [ ! -L "$target" ]
     \\    physical_target=$(realpath -e -- "$target")
     \\    case "$physical_target" in "$physical_scratch"/*) ;; *) exit 1;; esac
-    \\    target_mount=$(findmnt -n -o TARGET --target "$physical_target")
-    \\    [ "$(realpath -e -- "$target_mount")" = "$physical_base" ]
+    \\    [ "$(stat -c '%d' -- "$physical_target")" = "$device" ]
     \\    current=$physical_target
     \\    remaining=256
     \\    while [ "$current" != "$physical_scratch" ]; do
@@ -55,14 +40,10 @@ pub fn validatedScratch(
     environment: *const std.process.Environ.Map,
     target: []const u8,
 ) ValidateError![]const u8 {
-    const selected = environment.get("HOST_SCRATCH_ROOT") orelse return error.MissingScratch;
+    const selected = environment.get("GATE_SCRATCH") orelse return error.MissingScratch;
     if (!std.fs.path.isAbsolute(selected)) return error.UnapprovedScratch;
-    const home = environment.get("HOME") orelse return error.MissingHome;
-    if (!std.fs.path.isAbsolute(home)) return error.MissingHome;
-    const helper = try std.fs.path.join(gpa, &.{ home, ".local", "lib", "host-scratch.sh" });
-    defer gpa.free(helper);
     const checked = try std.process.run(gpa, io, .{
-        .argv = &.{ "bash", "-c", validate_script, "gate-scratch", selected, helper, target },
+        .argv = &.{ "bash", "-c", validate_script, "gate-scratch", selected, target },
         .environ_map = environment,
         .expand_arg0 = .expand,
     });
@@ -70,7 +51,7 @@ pub fn validatedScratch(
     defer gpa.free(checked.stderr);
     switch (checked.term) {
         .exited => |code| if (code != 0) {
-            std.log.err("host scratch validation failed: {s}", .{checked.stderr});
+            std.log.err("scratch validation failed: {s}", .{checked.stderr});
             return error.UnapprovedScratch;
         },
         else => return error.UnapprovedScratch,

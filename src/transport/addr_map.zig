@@ -134,11 +134,11 @@ pub const KeyContext = struct {
         var hasher = std.hash.Wyhash.init(0);
         // The arm, so two keys whose payloads collide do not share a bucket on
         // the strength of the tag alone.
-        hasher.update(&[_]u8{@intFromEnum(std.meta.activeTag(key))});
+        hasher.update(&[_]u8{@backingInt(std.meta.activeTag(key))});
         switch (key) {
             .any_path => |node| hasher.update(&node.toBytes()),
             .relay => |pair| {
-                hasher.update(&[_]u8{@intFromEnum(pair.relay.scheme)});
+                hasher.update(&[_]u8{@backingInt(pair.relay.scheme)});
                 hasher.update(std.mem.asBytes(&pair.relay.port));
                 hasher.update(pair.relay.hostSlice());
                 hasher.update(&pair.node.toBytes());
@@ -219,11 +219,6 @@ pub const MappedAddrs = struct {
     /// candidate the reverse index already holds is drawn again rather than
     /// handed out twice.
     ///
-    /// `random` is where this leaves upstream. `MappedAddr::generate` calls
-    /// `rand::rng()` inside the loop (`mapped_addrs.rs:141`), and a
-    /// process-global RNG is what AGENTS.md §2 forbids, so the host bits come
-    /// from a generator the caller owns. It is read only on a miss: a second
-    /// `get` for a key already in the table draws nothing at all.
     ///
     /// The bits have to be unpredictable in production, which is upstream's
     /// reason for drawing them at all (`mapped_addrs.rs:63`): a peer that can
@@ -641,7 +636,7 @@ test "a custom key owns its bytes rather than borrowing them" {
 }
 
 test "a custom address too large to own is refused, not truncated" {
-    const too_long = [_]u8{0} ** (base_addr.max_inline_length + 1);
+    const too_long = @as([(base_addr.max_inline_length + 1)]u8, @splat(0));
     const overlong: CustomAddr = .{ .id = 1, .data = &too_long };
     try t.expectError(error.DataTooLong, CustomKey.from(overlong));
 }
@@ -650,7 +645,7 @@ test "a custom address too long for the length byte is refused, not a trap" {
     // One past what a `u8` holds, so the refusal comes from the cast rather
     // than from the ceiling. A bare `@intCast` here panics in Debug instead,
     // which is a crash the caller cannot catch and this function can.
-    const far_too_long = [_]u8{0} ** (@as(usize, std.math.maxInt(u8)) + 1);
+    const far_too_long: [@as(usize, std.math.maxInt(u8)) + 1]u8 = @splat(0);
     const overlong: CustomAddr = .{ .id = 1, .data = &far_too_long };
     try t.expectError(error.DataTooLong, CustomKey.from(overlong));
 }

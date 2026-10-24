@@ -5,8 +5,8 @@
 test {
     const root = @import("lib.zig");
     @import("std").testing.refAllDecls(root);
-    inline for (@typeInfo(root).@"struct".decls) |decl| {
-        @import("std").testing.refAllDecls(@field(root, decl.name));
+    inline for (@typeInfo(root).@"struct".decl_names) |name| {
+        @import("std").testing.refAllDecls(@field(root, name));
     }
     _ = @import("address.zig");
     _ = @import("quic/ack_handler.zig");

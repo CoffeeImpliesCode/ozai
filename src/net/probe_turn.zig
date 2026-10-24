@@ -209,7 +209,7 @@ pub const Runner = struct {
 // widened only so the test in `probe.zig` can read the bit a family occupies.
 // ziglint-ignore: Z012
 pub fn bit(proto: Probe) u8 {
-    return @as(u8, 1) << @intFromEnum(proto);
+    return @as(u8, 1) << @backingInt(proto);
 }
 
 /// One turn's instructions.

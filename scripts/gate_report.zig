@@ -629,14 +629,14 @@ fn expectAbsentSourceDisposition(path: []const u8) !void {
     for (policy.modes) |mode| {
         try collectItems(gpa, std.testing.io, report, mode, &.{.{
             .path = path,
-            .sha256 = "a" ** 64,
+            .sha256 = &@as([64:0]u8, @splat('a')),
         }}, &items);
     }
     var ledger: policy.Ledger = .{
         .schema = policy.schema_version,
         .source_digest = "current",
         .compiler = "0.16.0",
-        .measurement = .{ .path = "/retained/measurement.json", .sha256 = "b" ** 64 },
+        .measurement = .{ .path = "/retained/measurement.json", .sha256 = &@as([64:0]u8, @splat('b')) },
         .scope = policy.scope,
         .modes = policy.modes,
         .dispositions = &.{},
@@ -651,14 +651,14 @@ fn expectAbsentSourceDisposition(path: []const u8) !void {
     for (items.items, policy.modes) |item, mode| {
         try std.testing.expectEqualStrings(mode, item.mode);
         try std.testing.expectEqualStrings(path, item.path);
-        try std.testing.expectEqualStrings("a" ** 64, item.source_sha256);
+        try std.testing.expectEqualStrings(&@as([64:0]u8, @splat('a')), item.source_sha256);
         try std.testing.expectEqual(@as(u32, 0), item.line);
         try std.testing.expectEqualStrings("unattributed_file", item.unit);
     }
     var dispositions: [policy.modes.len]policy.Disposition = @splat(.{
         .mode = "",
         .path = path,
-        .source_sha256 = "a" ** 64,
+        .source_sha256 = &@as([64:0]u8, @splat('a')),
         .line = 0,
         .unit = "unattributed_file",
         .action = "accept",

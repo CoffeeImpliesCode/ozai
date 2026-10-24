@@ -78,12 +78,6 @@
 //! handshake would have arrived directly. Dropping costs nothing: the entry is
 //! removed and the slot freed, so the next capture has room.
 //!
-//! Expiry is measured in the same seconds the ticket records, on the caller's
-//! own clock — `Tls13Handshake.step`'s `now_s`, which
-//! `docs/PLAN.md`'s "One divergence to know before touching TLS" section says is
-//! only ever differenced and never compared against an epoch. Every `now_s`
-//! here comes from the same source as the one the core stamped `creation_time`
-//! with, which is what makes the subtraction meaningful.
 //!
 //! # ALPN mismatch: refused by construction, not by a check
 //!
@@ -150,15 +144,6 @@ pub const alpn_len_max: usize = 32;
 
 /// How many tickets one store holds.
 ///
-/// Eight, and the number is not this file's to tune. `docs/DECISIONS/0001`
-/// records that iroh works to "up to 8 concurrent paths per connection" and
-/// that the core holds two `NetworkPath`s behind one `active_path_idx`
-/// (`vendor/quic/src/quic/connection.zig:626`); `path_table.max_paths` and
-/// `holepunch_trigger.max_attempts` both adopt the same eight. A store is
-/// per-identity and a node holds one node id, so eight entries is eight peers'
-/// worth of resumption — which is the number of peers a connection's path table
-/// is sized for anyway. A ninth peer's ticket is refused and that peer still
-/// handshakes in full.
 ///
 /// It is also the memory. `SessionTicket` carries an inline 512-byte `ticket`
 /// array, so an entry is roughly 700 bytes and the table is about 5.6 KB of
@@ -185,7 +170,7 @@ pub const Key = struct {
     /// doc gives under "Why a weaker key is wrong": RFC 8446 §4.2.10's
     /// comparison is equality over names, so a name that does not fit is a
     /// protocol this store will not pretend to know.
-    alpn: [alpn_len_max]u8 = .{0} ** alpn_len_max,
+    alpn: [alpn_len_max]u8 = @splat(0),
     /// Bytes of `alpn` in use, at or below `alpn.len`.
     alpn_len: u8 = 0,
 
@@ -430,7 +415,7 @@ const peers: [peer_count]NodeId = blk: {
     var searched: usize = 0;
     while (index < peer_count and searched < std.math.maxInt(u8) + 1) : (searched += 1) {
         seed +%= 1;
-        const point = NodeId.fromBytes([_]u8{seed} ** 32) catch continue;
+        const point = NodeId.fromBytes(@as([32]u8, @splat(seed))) catch continue;
         found[index] = point;
         index += 1;
     }
@@ -458,7 +443,7 @@ fn ticketFor(
     created_s: i64,
 ) SessionTicket {
     var built: SessionTicket = .{
-        .psk = [_]u8{0xa5} ** 32,
+        .psk = @as([32]u8, @splat(0xa5)),
         .lifetime = lifetime_s,
         .creation_time = created_s,
         .quic_version = version,
@@ -554,7 +539,7 @@ test "a ticket offered for another protocol is never handed back" {
 
     // And a name longer than the core's own selection cannot be held, so there
     // is no key for it: the lookup refuses rather than matching a truncation.
-    const too_long = "z" ** (alpn_len_max + 1);
+    const too_long = &@as([(alpn_len_max + 1):0]u8, @splat('z'));
     try t.expectEqual(@as(usize, alpn_len_max + 1), too_long.len);
     try t.expect(store.take(peer, too_long, quic_v1, 100) == null);
     // The entry is untouched by any of those lookups.
@@ -625,7 +610,7 @@ test "a second capture for the same key replaces the ticket in place" {
     // and the older one would then be the one a lookup found.
     const newer = ticketFor(alpn_main, quic_v1, 3_600, 200);
     var updated = newer;
-    updated.psk = [_]u8{0x5a} ** 32;
+    updated.psk = @as([32]u8, @splat(0x5a));
     try t.expect(store.capture(peer, updated, 200).stored);
     try t.expectEqual(@as(usize, 1), store.slice().len);
     try t.expectEqual(@as(?u8, 0x5a), pskOf(store.take(peer, alpn_main, quic_v1, 200)));

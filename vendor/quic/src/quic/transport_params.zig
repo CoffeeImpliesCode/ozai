@@ -58,20 +58,20 @@ pub const ParamId = enum(u64) {
 /// is a claim a peer made about an address this endpoint has not verified.
 pub const PreferredAddress = struct {
     /// The offered IPv4 address as 4 octets in network order.
-    ipv4_addr: [4]u8 = .{0} ** 4,
+    ipv4_addr: [4]u8 = @splat(0),
     /// Network byte order. 0 is how RFC 9000 §9.6 says the IPv4 half is
     /// absent, so a zero port means `hasIpv4` is false and the address octets
     /// beside it are meaningless.
     ipv4_port: u16 = 0,
     /// The offered IPv6 address as 16 octets in network order.
-    ipv6_addr: [16]u8 = .{0} ** 16,
+    ipv6_addr: [16]u8 = @splat(0),
     /// Network byte order, with the same 0-means-absent rule as `ipv4_port`.
     ipv6_port: u16 = 0,
     /// Inline storage for the connection ID the peer wants this endpoint to
     /// use when migrating. Fixed at 20 bytes because that is the RFC 9000
     /// §17.2 maximum connection ID length; only `cid_buf[0..cid_len]` is the
     /// ID and the rest is zero.
-    cid_buf: [20]u8 = .{0} ** 20,
+    cid_buf: [20]u8 = @splat(0),
     /// Caller-enforced length, 1..20 when offered. The default zero is not an
     /// offered address. `decode` rejects lengths outside 1..20; `encode` trusts
     /// the local value and slices `cid_buf` by this length.
@@ -79,7 +79,7 @@ pub const PreferredAddress = struct {
     /// The reset token to use for the connection ID the peer chose. Peer-
     /// supplied and unverifiable, and it is the only thing that makes a reset
     /// for the migrated connection recognisable.
-    stateless_reset_token: [16]u8 = .{0} ** 16,
+    stateless_reset_token: [16]u8 = @splat(0),
 
     /// Whether the peer offered an IPv4 address, which RFC 9000 §9.6 encodes
     /// as a non-zero port.
@@ -230,7 +230,7 @@ pub const TransportParams = struct {
     /// `decode` keeps the first 8 and drops the rest — but it checks every
     /// entry of a longer list on the way past, so a zero behind the eighth is
     /// refused rather than dropped unread.
-    version_info_available: [8]u32 = .{0} ** 8,
+    version_info_available: [8]u32 = @splat(0),
     /// How many entries of `version_info_available` are set, 0 to 8. It is
     /// the count `encode` writes and the bound `hasAvailableVersion` reads to,
     /// so a value above 8 would read past the array. Zero here means an empty
@@ -314,20 +314,20 @@ pub const TransportParams = struct {
         // Helper to write a single parameter
         const Helper = struct {
             fn writeParam(w: anytype, id: ParamId, value: u64) !void {
-                try packet.writeVarInt(w, @intFromEnum(id));
+                try packet.writeVarInt(w, @backingInt(id));
                 const len = packet.varIntLength(value);
                 try packet.writeVarInt(w, len);
                 try packet.writeVarInt(w, value);
             }
 
             fn writeParamBytes(w: anytype, id: ParamId, data: []const u8) !void {
-                try packet.writeVarInt(w, @intFromEnum(id));
+                try packet.writeVarInt(w, @backingInt(id));
                 try packet.writeVarInt(w, data.len);
                 try w.writeAll(data);
             }
 
             fn writeParamEmpty(w: anytype, id: ParamId) !void {
-                try packet.writeVarInt(w, @intFromEnum(id));
+                try packet.writeVarInt(w, @backingInt(id));
                 try packet.writeVarInt(w, 0);
             }
         };
@@ -341,7 +341,7 @@ pub const TransportParams = struct {
         }
 
         if (self.stateless_reset_token) |token| {
-            try packet.writeVarInt(writer, @intFromEnum(ParamId.stateless_reset_token));
+            try packet.writeVarInt(writer, @backingInt(ParamId.stateless_reset_token));
             try packet.writeVarInt(writer, 16);
             try writer.writeAll(&token);
         }
@@ -387,7 +387,7 @@ pub const TransportParams = struct {
         }
 
         if (self.preferred_address) |pref| {
-            try packet.writeVarInt(writer, @intFromEnum(ParamId.preferred_address));
+            try packet.writeVarInt(writer, @backingInt(ParamId.preferred_address));
             // Length: 4+2 + 16+2 + 1+cid_len + 16 = 41 + cid_len
             const pref_len: u64 = 41 + @as(u64, pref.cid_len);
             try packet.writeVarInt(writer, pref_len);
@@ -460,7 +460,7 @@ pub const TransportParams = struct {
         if (self.version_info_chosen) |chosen| {
             const n = self.version_info_available_count;
             const param_len: u64 = 4 + @as(u64, n) * 4; // chosen(4) + available(n*4)
-            try packet.writeVarInt(writer, @intFromEnum(ParamId.version_information));
+            try packet.writeVarInt(writer, @backingInt(ParamId.version_information));
             try packet.writeVarInt(writer, param_len);
             try writer.writeInt(u32, chosen, .big);
             for (0..n) |i| {
@@ -504,7 +504,7 @@ pub const TransportParams = struct {
             const param_start = fbs.seek;
 
             switch (param_id) {
-                @intFromEnum(ParamId.observed_address) => {
+                @backingInt(ParamId.observed_address) => {
                     if (params.address_discovery_role != .disabled)
                         return error.TransportParameterError;
                     params.address_discovery_role = observed_address.Role.decodeTransportValue(
@@ -512,7 +512,7 @@ pub const TransportParams = struct {
                     ) catch return error.TransportParameterError;
                     fbs.seek += param_len;
                 },
-                @intFromEnum(ParamId.initial_max_path_id) => {
+                @backingInt(ParamId.initial_max_path_id) => {
                     if (params.initial_max_path_id != null) return error.TransportParameterError;
                     const maximum = try readParamVarInt(reader, param_len);
                     if (maximum > std.math.maxInt(u32)) return error.TransportParameterError;
@@ -520,7 +520,7 @@ pub const TransportParams = struct {
                         return error.TransportParameterError;
                     params.initial_max_path_id = @intCast(maximum);
                 },
-                @intFromEnum(ParamId.n0_nat_traversal) => {
+                @backingInt(ParamId.n0_nat_traversal) => {
                     if (params.max_remote_nat_traversal_addresses != null)
                         return error.TransportParameterError;
                     if (param_len != 1) return error.TransportParameterError;
@@ -528,50 +528,50 @@ pub const TransportParams = struct {
                     if (capacity == 0) return error.TransportParameterError;
                     params.max_remote_nat_traversal_addresses = capacity;
                 },
-                @intFromEnum(ParamId.original_destination_connection_id) => {
+                @backingInt(ParamId.original_destination_connection_id) => {
                     params.original_destination_connection_id = data[fbs.seek..][0..param_len];
                     fbs.seek += param_len;
                 },
-                @intFromEnum(ParamId.max_idle_timeout) => {
+                @backingInt(ParamId.max_idle_timeout) => {
                     params.max_idle_timeout = try readParamVarInt(reader, param_len);
                 },
-                @intFromEnum(ParamId.stateless_reset_token) => {
+                @backingInt(ParamId.stateless_reset_token) => {
                     if (param_len != 16) return error.TransportParameterError;
                     var token: [16]u8 = undefined;
                     try reader.readSliceAll(&token);
                     params.stateless_reset_token = token;
                 },
-                @intFromEnum(ParamId.max_udp_payload_size) => {
+                @backingInt(ParamId.max_udp_payload_size) => {
                     params.max_udp_payload_size = try readParamVarInt(reader, param_len);
                 },
-                @intFromEnum(ParamId.initial_max_data) => {
+                @backingInt(ParamId.initial_max_data) => {
                     params.initial_max_data = try readParamVarInt(reader, param_len);
                 },
-                @intFromEnum(ParamId.initial_max_stream_data_bidi_local) => {
+                @backingInt(ParamId.initial_max_stream_data_bidi_local) => {
                     params.initial_max_stream_data_bidi_local = try readParamVarInt(reader, param_len);
                 },
-                @intFromEnum(ParamId.initial_max_stream_data_bidi_remote) => {
+                @backingInt(ParamId.initial_max_stream_data_bidi_remote) => {
                     params.initial_max_stream_data_bidi_remote = try readParamVarInt(reader, param_len);
                 },
-                @intFromEnum(ParamId.initial_max_stream_data_uni) => {
+                @backingInt(ParamId.initial_max_stream_data_uni) => {
                     params.initial_max_stream_data_uni = try readParamVarInt(reader, param_len);
                 },
-                @intFromEnum(ParamId.initial_max_streams_bidi) => {
+                @backingInt(ParamId.initial_max_streams_bidi) => {
                     params.initial_max_streams_bidi = try readParamVarInt(reader, param_len);
                 },
-                @intFromEnum(ParamId.initial_max_streams_uni) => {
+                @backingInt(ParamId.initial_max_streams_uni) => {
                     params.initial_max_streams_uni = try readParamVarInt(reader, param_len);
                 },
-                @intFromEnum(ParamId.ack_delay_exponent) => {
+                @backingInt(ParamId.ack_delay_exponent) => {
                     params.ack_delay_exponent = try readParamVarInt(reader, param_len);
                 },
-                @intFromEnum(ParamId.max_ack_delay) => {
+                @backingInt(ParamId.max_ack_delay) => {
                     params.max_ack_delay = try readParamVarInt(reader, param_len);
                 },
-                @intFromEnum(ParamId.disable_active_migration) => {
+                @backingInt(ParamId.disable_active_migration) => {
                     params.disable_active_migration = true;
                 },
-                @intFromEnum(ParamId.preferred_address) => {
+                @backingInt(ParamId.preferred_address) => {
                     if (param_len < 42) return error.TransportParameterError;
                     var pref = PreferredAddress{};
                     try reader.readSliceAll(&pref.ipv4_addr);
@@ -593,24 +593,24 @@ pub const TransportParams = struct {
                     try reader.readSliceAll(&pref.stateless_reset_token);
                     params.preferred_address = pref;
                 },
-                @intFromEnum(ParamId.active_connection_id_limit) => {
+                @backingInt(ParamId.active_connection_id_limit) => {
                     params.active_connection_id_limit = try readParamVarInt(reader, param_len);
                 },
-                @intFromEnum(ParamId.initial_source_connection_id) => {
+                @backingInt(ParamId.initial_source_connection_id) => {
                     params.initial_source_connection_id = data[fbs.seek..][0..param_len];
                     fbs.seek += param_len;
                 },
-                @intFromEnum(ParamId.retry_source_connection_id) => {
+                @backingInt(ParamId.retry_source_connection_id) => {
                     params.retry_source_connection_id = data[fbs.seek..][0..param_len];
                     fbs.seek += param_len;
                 },
-                @intFromEnum(ParamId.max_datagram_frame_size) => {
+                @backingInt(ParamId.max_datagram_frame_size) => {
                     params.max_datagram_frame_size = try readParamVarInt(reader, param_len);
                 },
-                @intFromEnum(ParamId.min_ack_delay) => {
+                @backingInt(ParamId.min_ack_delay) => {
                     params.min_ack_delay = try readParamVarInt(reader, param_len);
                 },
-                @intFromEnum(ParamId.version_information) => {
+                @backingInt(ParamId.version_information) => {
                     // RFC 9368 §4: too short, or not divisible by four, is a
                     // parsing failure the endpoint has to act on. Skipping it
                     // left `version_info_chosen` null, which is also what a
@@ -838,9 +838,9 @@ test "TransportParams: a version_information length that is not a multiple of fo
     inline for (.{ 0, 1, 2, 3, 5, 6, 7, 9 }) |value_len| {
         var buffer: [32]u8 = undefined;
         var writer = io.fixedBufferStream(&buffer);
-        try packet.writeVarInt(&writer, @intFromEnum(ParamId.version_information));
+        try packet.writeVarInt(&writer, @backingInt(ParamId.version_information));
         try packet.writeVarInt(&writer, value_len);
-        try writer.writeAll(&([_]u8{0x11} ** value_len));
+        try writer.writeAll(&(@as([value_len]u8, @splat(0x11))));
         try testing.expectError(
             error.TransportParameterError,
             TransportParams.decode(writer.buffered()),
@@ -852,7 +852,7 @@ test "TransportParams: a version_information length that is not a multiple of fo
     // buffer keeps, which holds the first eight rather than being refused.
     var buffer: [64]u8 = undefined;
     var writer = io.fixedBufferStream(&buffer);
-    try packet.writeVarInt(&writer, @intFromEnum(ParamId.version_information));
+    try packet.writeVarInt(&writer, @backingInt(ParamId.version_information));
     try packet.writeVarInt(&writer, 4 + 10 * 4);
     try writer.writeInt(u32, protocol.QUIC_V1, .big);
     for (0..10) |i| {
@@ -889,17 +889,17 @@ fn version_list_entry(index: usize) u32 {
 /// reached — a fixture failure, not the refusal under test.
 fn write_neighboured_version_information(out: []u8, zero_at: ?usize) ![]const u8 {
     var writer = io.fixedBufferStream(out);
-    try packet.writeVarInt(&writer, @intFromEnum(ParamId.max_idle_timeout));
+    try packet.writeVarInt(&writer, @backingInt(ParamId.max_idle_timeout));
     try packet.writeVarInt(&writer, 4);
     try writer.writeInt(u32, 0x8000_7530, .big);
-    try packet.writeVarInt(&writer, @intFromEnum(ParamId.version_information));
+    try packet.writeVarInt(&writer, @backingInt(ParamId.version_information));
     try packet.writeVarInt(&writer, 4 + 10 * 4);
     try writer.writeInt(u32, protocol.QUIC_V1, .big);
     for (0..10) |i| {
         const zero_here = zero_at != null and zero_at.? == i;
         try writer.writeInt(u32, if (zero_here) 0 else version_list_entry(i), .big);
     }
-    try packet.writeVarInt(&writer, @intFromEnum(ParamId.disable_active_migration));
+    try packet.writeVarInt(&writer, @backingInt(ParamId.disable_active_migration));
     try packet.writeVarInt(&writer, 0);
     return writer.buffered();
 }
@@ -943,7 +943,7 @@ test "TransportParams: a zero available version among the eight stored is refuse
     inline for (0..8) |zero_at| {
         var buffer: [38]u8 = undefined;
         var writer = io.fixedBufferStream(&buffer);
-        try packet.writeVarInt(&writer, @intFromEnum(ParamId.version_information));
+        try packet.writeVarInt(&writer, @backingInt(ParamId.version_information));
         try packet.writeVarInt(&writer, 4 + 8 * 4);
         try writer.writeInt(u32, protocol.QUIC_V1, .big);
         for (0..8) |i| {
@@ -967,7 +967,7 @@ test "TransportParams: a zero available version past the eight stored is refused
     inline for (.{ 8, 9 }) |zero_at| {
         var buffer: [46]u8 = undefined;
         var writer = io.fixedBufferStream(&buffer);
-        try packet.writeVarInt(&writer, @intFromEnum(ParamId.version_information));
+        try packet.writeVarInt(&writer, @backingInt(ParamId.version_information));
         try packet.writeVarInt(&writer, 4 + 10 * 4);
         try writer.writeInt(u32, protocol.QUIC_V1, .big);
         for (0..10) |i| {
@@ -1098,17 +1098,17 @@ test "TransportParams: scalar values must fill their declared length" {
     }) |id| {
         var buffer: [16]u8 = undefined;
         var writer = io.fixedBufferStream(&buffer);
-        try packet.writeVarInt(&writer, @intFromEnum(id));
+        try packet.writeVarInt(&writer, @backingInt(id));
         // A zero-length value must not borrow the following parameter's id.
         try packet.writeVarInt(&writer, 0);
-        try packet.writeVarInt(&writer, @intFromEnum(ParamId.disable_active_migration));
+        try packet.writeVarInt(&writer, @backingInt(ParamId.disable_active_migration));
         try packet.writeVarInt(&writer, 0);
         try testing.expectError(error.TransportParameterError, TransportParams.decode(
             writer.buffered(),
         ));
 
         writer.seek = 0;
-        try packet.writeVarInt(&writer, @intFromEnum(id));
+        try packet.writeVarInt(&writer, @backingInt(id));
         try packet.writeVarInt(&writer, 2);
         try writer.writeAll(&.{ 5, 7 });
         try testing.expectError(error.TransportParameterError, TransportParams.decode(
@@ -1118,8 +1118,8 @@ test "TransportParams: scalar values must fill their declared length" {
 }
 
 const preferred_test_parameter =
-    [_]u8{ @intFromEnum(ParamId.preferred_address), 42 } ++
-    ([_]u8{0} ** 24) ++ [_]u8{ 1, 0xaa } ++ ([_]u8{0xcd} ** 16);
+    [_]u8{ @backingInt(ParamId.preferred_address), 42 } ++
+    (@as([24]u8, @splat(0))) ++ [_]u8{ 1, 0xaa } ++ (@as([16]u8, @splat(0xcd)));
 
 test "TransportParams: preferred addresses require a nonempty cid" {
     var buffer = preferred_test_parameter;
@@ -1130,7 +1130,7 @@ test "TransportParams: preferred addresses require a nonempty cid" {
 
     const valid = (try TransportParams.decode(&preferred_test_parameter)).preferred_address.?;
     try testing.expectEqualSlices(u8, &.{0xaa}, valid.getCid());
-    try testing.expectEqualSlices(u8, &([_]u8{0xcd} ** 16), &valid.stateless_reset_token);
+    try testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0xcd))), &valid.stateless_reset_token);
 }
 
 test "TransportParams: preferred addresses require complete fixed fields and reset token" {

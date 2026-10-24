@@ -99,12 +99,6 @@ pub const Nanos = report.Nanos;
 
 /// How many live paths one peer may carry.
 ///
-/// `docs/DECISIONS/0001` records the number upstream works to: "iroh wants up
-/// to 8 concurrent paths per connection", against a core that holds two
-/// `NetworkPath`s behind one `active_path_idx` (`vendor/quic/src/quic/
-/// connection.zig:626`). Eight is therefore the ceiling this tree is aiming at
-/// rather than one picked for this table, and a table that outgrows it is a
-/// substrate that has arrived rather than a bug in the bound.
 ///
 /// It is also the memory: `Entry` is dominated by the 253-byte `RelayUrl` a
 /// `TransportAddr` holds inline, so eight entries are a couple of kilobytes of
@@ -114,23 +108,10 @@ pub const max_paths: usize = 8;
 
 /// How long an open path may move nothing before `mark` calls it inactive.
 ///
-/// It has to clear the longest event this tree has measured, and
-/// `docs/DECISIONS/0001` records that one: a NAT rebinding, port only, on a
-/// saturated link cost 109 RTTs at 20 ms, about 2.2 s. A timeout shorter than
-/// that would mark a path inactive while the network was busy changing its
-/// mapping underneath it. Thirty seconds clears it by more than an order of
-/// magnitude and is short enough that a path that has died stops being the
-/// incumbent before a caller notices the peer has gone quiet.
 pub const idle_timeout: Nanos = 30 * std.time.ns_per_s;
 
 /// How old a latency sample may be and still be believed.
 ///
-/// Younger than the slowest event recorded in `DECISIONS/0001` — a worst-case
-/// rebinding taking eight path challenges at 109 RTTs each — so a sample that
-/// survives this age describes a mapping that has not been disturbed since it
-/// was taken. A sample older than that is treated as no sample at all, which
-/// is what `Entry.latency` does and what stops selection acting on a figure
-/// measured across a network that has since changed shape.
 pub const rtt_max_age: Nanos = 5 * std.time.ns_per_s;
 
 /// One path to a peer, and everything observed on it.

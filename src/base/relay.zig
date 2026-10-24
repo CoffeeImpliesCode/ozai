@@ -210,7 +210,10 @@ pub const RelayUrl = struct {
     /// literal, and the padding past `host_length` is left unspecified; see
     /// the `host` field.
     pub fn parse(text: []const u8) RelayUrlParseError!RelayUrl {
-        const uri = std.Uri.parse(text) catch return error.Malformed;
+        const uri = std.Uri.parse(text) catch |err| switch (err) {
+            error.InvalidHostName => return error.HostTooLong,
+            else => return error.Malformed,
+        };
         if (uri.query != null or uri.fragment != null) return error.UnexpectedComponent;
         // A `Component` is a union: read either arm as-is. Percent-encoding in
         // a relay path is already a malformed relay URL.
@@ -287,7 +290,7 @@ pub const RelayUrl = struct {
     /// with it.
     pub fn order(self: RelayUrl, other: RelayUrl) std.math.Order {
         if (self.scheme != other.scheme) {
-            return std.math.order(@intFromEnum(self.scheme), @intFromEnum(other.scheme));
+            return std.math.order(@backingInt(self.scheme), @backingInt(other.scheme));
         }
         if (self.port != other.port) return std.math.order(self.port, other.port);
         return std.mem.order(u8, self.hostSlice(), other.hostSlice());

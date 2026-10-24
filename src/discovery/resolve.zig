@@ -413,7 +413,7 @@ test "the attribute set is upstream's three, spelled upstream's way" {
     try t.expectEqual(@as(usize, 3), Attribute.all.len);
     // `all` is what `parse` iterates. An arm missing from it would be
     // unreadable and unwritable, so the list is held to the enum here.
-    try t.expectEqual(Attribute.all.len, @typeInfo(Attribute).@"enum".fields.len);
+    try t.expectEqual(Attribute.all.len, @typeInfo(Attribute).@"enum".field_names.len);
     try t.expectEqualStrings("relay", Attribute.relay.text());
     try t.expectEqualStrings("addr", Attribute.addr.text());
     try t.expectEqualStrings("user-data", Attribute.user_data.text());

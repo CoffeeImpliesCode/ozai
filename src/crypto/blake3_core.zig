@@ -15,9 +15,6 @@
 //! this same function, and a tree never asks for more than 32 bytes. Neither
 //! is ported rather than ported and left unused.
 //!
-//! `AGENTS.md` §2 makes interoperability a test, so nothing here is a wire
-//! claim until the published vectors say so. The test block below is where
-//! that happens, against `../gossip/plumtree/blake3_vectors.zig`.
 
 const std = @import("std");
 const mem = std.mem;

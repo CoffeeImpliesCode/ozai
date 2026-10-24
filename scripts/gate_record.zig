@@ -12,7 +12,7 @@ const gate_scratch = @import("gate_scratch.zig");
 pub const ReplayError = Allocator.Error || std.json.ParseError(std.json.Scanner) ||
     files.ReadFileError || files.HashFileError || sources.SourcesError ||
     gate_scratch.ValidateError || raw.AuditError || reports.ParseError || reports.CollectError ||
-    policy.ValidateError || policy.CountsError || policy.ReferenceError || policy.RecordError ||
+    policy.ValidateError || policy.CountsError || policy.ReferenceError ||
     std.Io.Dir.OpenError || std.Io.Dir.Iterator.Error || error{
     UnreferencedMeasurement,
     MeasurementHashMismatch,
@@ -28,6 +28,8 @@ pub const ReplayError = Allocator.Error || std.json.ParseError(std.json.Scanner)
     UnexpectedRawArtifact,
     MissingArtifact,
     StaleLedger,
+    MissingCoveragePolicy,
+    CoveragePolicyMustBeAbsolute,
     IncompleteReport,
     PartialScope,
     PartialMapping,
@@ -55,7 +57,7 @@ pub const Measurement = struct {
     cold_items: []const policy.Item,
     reports: []const reports.ModeEvidence,
 };
-/// Replays the mandatory source-bound snapshot named by the current machine ledger.
+/// Replays the source-bound snapshot named by the external coverage policy.
 /// Temporary parsing and replay storage is released before returning.
 pub fn validateRetained(
     gpa: Allocator,
@@ -65,11 +67,11 @@ pub fn validateRetained(
     var temporary = std.heap.ArenaAllocator.init(gpa);
     defer temporary.deinit();
     const scratch = temporary.allocator();
-    const ledger = try loadLedger(scratch, io);
+    const ledger = try loadLedger(scratch, io, env);
     try validateSnapshot(scratch, io, ledger.measurement.path, env, ledger);
 }
 
-/// Replays only the exact ledger-referenced path and captured SHA, never an arbitrary manifest.
+/// Replays only the policy-referenced path and captured SHA, never an arbitrary manifest.
 pub fn validate(
     gpa: Allocator,
     io: std.Io,
@@ -79,19 +81,27 @@ pub fn validate(
     var temporary = std.heap.ArenaAllocator.init(gpa);
     defer temporary.deinit();
     const scratch = temporary.allocator();
-    try validateSnapshot(scratch, io, path, env, try loadLedger(scratch, io));
+    try validateSnapshot(scratch, io, path, env, try loadLedger(scratch, io, env));
 }
 
-// Both parsers borrow strings from arena-owned bounded reads; the large ledger
-// is loaded once and shared throughout replay rather than reparsed at the end.
-fn loadLedger(arena: Allocator, io: std.Io) (files.ReadFileError ||
-    std.json.ParseError(std.json.Scanner) || policy.RecordError ||
-    policy.ReferenceError || error{StaleLedger})!policy.Ledger {
-    const markdown = try ev.readFile(arena, io, "docs/COVERAGE-LEDGER.md");
+// Parsed strings borrow arena-owned bounded reads throughout replay.
+fn loadLedger(
+    arena: Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+) (files.ReadFileError || std.json.ParseError(std.json.Scanner) ||
+    policy.ReferenceError || error{
+    StaleLedger,
+    MissingCoveragePolicy,
+    CoveragePolicyMustBeAbsolute,
+})!policy.Ledger {
+    const path = env.get("OZAI_COVERAGE_POLICY") orelse return error.MissingCoveragePolicy;
+    if (!std.fs.path.isAbsolute(path)) return error.CoveragePolicyMustBeAbsolute;
+    const bytes = try ev.readFile(arena, io, path);
     const ledger = try std.json.parseFromSliceLeaky(
         policy.Ledger,
         arena,
-        try policy.extractRecord(markdown),
+        bytes,
         .{ .allocate = .alloc_if_needed },
     );
     if (ledger.schema != policy.schema_version) return error.StaleLedger;
@@ -342,7 +352,7 @@ fn validateManifest(measurement: Measurement) ManifestError!void {
     {
         return error.IncompleteReport;
     }
-    if (!std.mem.eql(u8, measurement.compiler, "0.16.0") or measurement.compiler_sha256.len != 64 or
+    if (!std.mem.eql(u8, measurement.compiler, "0.17.0") or measurement.compiler_sha256.len != 64 or
         !exactList(measurement.scope, policy.scope) or !exactList(measurement.modes, policy.modes))
         return error.PartialScope;
     try validateRuntimeIdentity(measurement.runtime);
@@ -418,9 +428,9 @@ test "plausible two mode report with omitted artifact manifest fails" {
         .scope = policy.scope,
         .modes = policy.modes,
         .source_digest = "digest",
-        .compiler = "0.16.0",
+        .compiler = "0.17.0",
         .compiler_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .runtime = .{ .path = "/captured/zig-cov-rt.o", .sha256 = "a" ** 64 },
+        .runtime = .{ .path = "/captured/zig-cov-rt.o", .sha256 = &@as([64:0]u8, @splat('a')) },
         .sources = &.{},
         .artifacts = &.{},
         .cold_items = &.{},
@@ -450,9 +460,9 @@ test "mode manifest rejects impossible unmapped hit counts before artifact looku
         .scope = policy.scope,
         .modes = policy.modes,
         .source_digest = "digest",
-        .compiler = "0.16.0",
+        .compiler = "0.17.0",
         .compiler_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .runtime = .{ .path = "/captured/zig-cov-rt.o", .sha256 = "a" ** 64 },
+        .runtime = .{ .path = "/captured/zig-cov-rt.o", .sha256 = &@as([64:0]u8, @splat('a')) },
         .sources = &.{},
         .artifacts = &.{},
         .cold_items = &.{},
@@ -482,9 +492,9 @@ test "mode manifest rejects impossible and excessive unowned counts before artif
         .scope = policy.scope,
         .modes = policy.modes,
         .source_digest = "digest",
-        .compiler = "0.16.0",
+        .compiler = "0.17.0",
         .compiler_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .runtime = .{ .path = "/captured/zig-cov-rt.o", .sha256 = "a" ** 64 },
+        .runtime = .{ .path = "/captured/zig-cov-rt.o", .sha256 = &@as([64:0]u8, @splat('a')) },
         .sources = &.{},
         .artifacts = &.{},
         .cold_items = &.{},
@@ -510,7 +520,7 @@ test "retained manifest reference rejects changed file bytes before parsing" {
         error.MeasurementHashMismatch,
         readReferencedMeasurement(std.testing.allocator, std.testing.io, .{
             .path = "scripts/gate_record.zig",
-            .sha256 = "0" ** 64,
+            .sha256 = &@as([64:0]u8, @splat('0')),
         }, "scripts/gate_record.zig"),
     );
 }
@@ -536,7 +546,7 @@ test "replayed cold tuple metadata cannot be forged omitted or duplicated" {
     defer actual.deinit(gpa);
     try reports.collectItems(gpa, std.testing.io, report, "Debug", &.{.{
         .path = "src/a.zig",
-        .sha256 = "a" ** 64,
+        .sha256 = &@as([64:0]u8, @splat('a')),
     }}, &actual);
     var stored = actual.items[0];
     const copied_path = try gpa.dupe(u8, stored.path);
@@ -589,12 +599,12 @@ test "serialized measurement cannot omit captured runtime identity" {
 
 test "retained runtime identity requires an absolute object path and SHA256" {
     const identities = [_]ev.Artifact{
-        .{ .path = "", .sha256 = "a" ** 64 },
-        .{ .path = "zig-cov-rt.o", .sha256 = "a" ** 64 },
-        .{ .path = "/", .sha256 = "a" ** 64 },
+        .{ .path = "", .sha256 = &@as([64:0]u8, @splat('a')) },
+        .{ .path = "zig-cov-rt.o", .sha256 = &@as([64:0]u8, @splat('a')) },
+        .{ .path = "/", .sha256 = &@as([64:0]u8, @splat('a')) },
         .{ .path = "/captured/zig-cov-rt.o", .sha256 = "" },
-        .{ .path = "/captured/zig-cov-rt.o", .sha256 = "a" ** 63 },
-        .{ .path = "/captured/zig-cov-rt.o", .sha256 = "g" ** 64 },
+        .{ .path = "/captured/zig-cov-rt.o", .sha256 = &@as([63:0]u8, @splat('a')) },
+        .{ .path = "/captured/zig-cov-rt.o", .sha256 = &@as([64:0]u8, @splat('g')) },
     };
     for (identities) |identity| {
         try std.testing.expectError(error.InvalidRuntimeIdentity, validateRuntimeIdentity(identity));

@@ -17,7 +17,8 @@ test "valid Join cannot commit an unwritable ForwardJoin" {
     var out: swarm.Actions(swarm.SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
     try state.handle(.{ .recv_message = .{
-        .from = try testNodeId(2), .message = .{ .join = null },
+        .from = try testNodeId(2),
+        .message = .{ .join = null },
     } }, &out);
     out.clear();
     const forward: codec.Message = .{ .swarm = .{ .forward_join = .{
@@ -27,7 +28,8 @@ test "valid Join cannot commit an unwritable ForwardJoin" {
     try t.expectEqual(@as(usize, 4128), codec.encodedLen(forward));
     try t.expectError(error.FrameTooLarge, codec.encode(forward, &frame));
     const result = state.handle(.{ .recv_message = .{
-        .from = try testNodeId(3), .message = decoded.swarm,
+        .from = try testNodeId(3),
+        .message = decoded.swarm,
     } }, &out);
     try t.expect(!state.active_view.contains(try testNodeId(3)));
     try t.expect(state.peer_data.get(try testNodeId(3)) == null);
@@ -42,7 +44,8 @@ test "receive capacity still admits Join without a forwarding recipient" {
     var out: swarm.Actions(swarm.SwarmOutEvent) = .init(t.allocator);
     defer out.deinit();
     try state.handle(.{ .recv_message = .{
-        .from = try testNodeId(2), .message = .{ .join = &contact },
+        .from = try testNodeId(2),
+        .message = .{ .join = &contact },
     } }, &out);
     try t.expect(state.active_view.contains(try testNodeId(2)));
     try t.expectEqualSlices(u8, &contact, state.peer_data.get(try testNodeId(2)).?.slice());
@@ -121,7 +124,8 @@ fn joinTtl(ttl: u16, reject: bool) !void {
     try t.expectEqual(@as(usize, if (reject) 4096 else 4095), codec.encodedLen(candidate));
     if (reject) try t.expectError(error.FrameTooLarge, codec.encode(candidate, &output));
     const result = state.handle(.{ .recv_message = .{
-        .from = try testNodeId(3), .message = decoded.swarm,
+        .from = try testNodeId(3),
+        .message = decoded.swarm,
     } }, &out);
     if (reject) {
         try t.expectEqual(@as(usize, 1), state.activeView().len);
@@ -174,7 +178,8 @@ test "inclusive Join4091 remains receivable without forward recipient" {
     try t.expectEqual(@as(usize, 4096), codec.encodedLen(incoming));
     const decoded = try budget_peer.receiveIncoming(incoming, &input);
     try state.handle(.{ .recv_message = .{
-        .from = try testNodeId(2), .message = decoded.swarm,
+        .from = try testNodeId(2),
+        .message = decoded.swarm,
     } }, &out);
     try t.expect(state.active_view.contains(try testNodeId(2)));
     try t.expectEqualSlices(u8, &contact, state.peer_data.get(try testNodeId(2)).?.slice());

@@ -27,23 +27,6 @@
 //! connection is none of those things, so the case is made again from the
 //! connection's own side:
 //!
-//! 1. **The trade is not symmetric.** The peer that would be evicted is one this
-//!    node finished a handshake with, holds streams on, and has already counted
-//!    in its gossip views — `gossip/topic_bounds.zig:41-49` names
-//!    `max_topics * max_active` outbound peers, and every one of them is a
-//!    socket. The peer that would take its place has presented a certificate
-//!    and nothing else. Shedding the first for the second is a downgrade
-//!    dressed as an admission.
-//! 2. **Nothing here could choose honestly.** The only rules available are
-//!    oldest-first and arbitrary, and oldest-first needs a clock. This module
-//!    has none (`AGENTS.md` §2), and `ConnIndex` says outright that its entry
-//!    order is first-bound order and not a property
-//!    (`node/conn_index.zig:108-110`). A policy that reads that order is not a
-//!    policy; it is a preference invented here and never defended.
-//! 3. **Eviction is silent to the peer and counted nowhere.** The far end sees
-//!    a transport close with no cause, and this node drops a per-connection
-//!    state the `Conn` and the session store own. A refusal costs the
-//!    directory nothing and the peer one attempt it is free to make again.
 //!
 //! So `at_bound` is a refusal — and a peer this node **already holds** is not
 //! refused at the bound at all: a rebind needs no slot
@@ -288,8 +271,8 @@ test "every refusal reaches the peer as a rejection and never as a silence" {
     // Swept at comptime over the whole reason set rather than case by case: the
     // two refusals are the two a peer must be able to tell from a lost packet,
     // and a refusal added later without an answer here would ship a silent one.
-    inline for (@typeInfo(Reason).@"enum".fields) |field| {
-        const reason: Reason = @enumFromInt(field.value);
+    inline for (@typeInfo(Reason).@"enum".field_names) |field| {
+        const reason: Reason = @field(Reason, field);
         const admission = decide(attemptFor(reason, peer));
         // `reject`, and neither of the two answers a peer cannot act on:
         // `ignore` sends nothing, and `retry` would spend the flow's one

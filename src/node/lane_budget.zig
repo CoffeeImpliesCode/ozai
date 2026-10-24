@@ -108,14 +108,7 @@ const alpn_table = @import("../router/alpn_table.zig");
 /// The comptime read fails loudly, and not silently at zero, if `Bridge` ever
 /// loses the field or its type: that is a `@compileError` at the point where the
 /// bound would otherwise have become a number nobody checked.
-pub const max_alpns: usize = blk: {
-    for (@typeInfo(bridge.Bridge).@"struct".fields) |field| {
-        if (std.mem.eql(u8, field.name, "alpn_list")) {
-            break :blk @typeInfo(field.type).array.len;
-        }
-    }
-    @compileError("bridge.Bridge has no `alpn_list` field to size a lane budget from");
-};
+pub const max_alpns: usize = @typeInfo(@FieldType(bridge.Bridge, "alpn_list")).array.len;
 
 /// The one ALPN an application registration cannot claim. See
 /// `router/alpn_table.qad_alpn`.
@@ -206,12 +199,6 @@ pub fn LaneBudget(comptime lanes: usize) type {
         /// budget exactly as it was — including the budget that had never been
         /// planned.
         ///
-        /// **An empty list is not refused.** It claims no lane and offers
-        /// nothing, which is a node no peer can reach — but `node_config.zig:160`
-        /// gives `Config.alpn` a default and the node passes the one ALPN it
-        /// holds, so this tree has no path that produces an empty list. Refusing
-        /// a value a caller cannot construct would be a check for a guaranteed
-        /// value, and `AGENTS.md` §9 asks for it to be deleted instead.
         pub fn plan(self: *Self, protocols: []const []const u8) PlanError!void {
             // This budget's own state first: a second plan means the startup
             // path ran twice, and that is the diagnosis worth giving ahead of

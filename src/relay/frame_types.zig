@@ -269,7 +269,7 @@ pub fn negotiate(header_value: []const u8) ?ProtocolVersion {
         const comma = std.mem.findScalar(u8, rest, ',');
         const token = if (comma) |at| rest[0..at] else rest;
         if (ProtocolVersion.parse(std.mem.trim(u8, token, &std.ascii.whitespace))) |version| {
-            if (best == null or @intFromEnum(version) > @intFromEnum(best.?)) best = version;
+            if (best == null or @backingInt(version) > @backingInt(best.?)) best = version;
         }
         const at = comma orelse return best;
         rest = rest[at + 1 ..];
@@ -369,7 +369,7 @@ pub const FrameType = enum(u8) {
     /// `noq_proto::VarInt::size`, and a rule written down twice is a rule one table
     /// extension away from being wrong in two places.
     pub fn encodedLen(frame_type: FrameType) usize {
-        return frame_writer.varIntLen(@intFromEnum(frame_type));
+        return frame_writer.varIntLen(@backingInt(frame_type));
     }
 };
 
@@ -405,7 +405,7 @@ pub const Ecn = enum(u8) {
     /// spelling of what it meant is the second decode's, which is the one a
     /// metamorphic check compares.
     pub fn toBits(self: Ecn) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -796,7 +796,7 @@ test "FrameType: 0 through 13, the numbers and no others" {
         .status,
     };
     for (table, 0..) |frame_type, index| {
-        try std_testing.expectEqual(@as(u8, @intCast(index)), @intFromEnum(frame_type));
+        try std_testing.expectEqual(@as(u8, @intCast(index)), @backingInt(frame_type));
         try std_testing.expectEqual(frame_type, FrameType.fromInt(@intCast(index)).?);
         // Every type in the table is below 64, so every header is one byte and
         // the header byte is the type. `Health` is `0b` in the captured vectors,

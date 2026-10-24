@@ -319,7 +319,7 @@ pub const BlobTicket = struct {
     /// `deinit`.
     pub fn decodeBytes(alloc: Allocator, bytes: []const u8) DecodeError!BlobTicket {
         var reader = postcard.Reader.init(bytes);
-        if (try reader.readU32() != @intFromEnum(WireVariant.variant0)) {
+        if (try reader.readU32() != @backingInt(WireVariant.variant0)) {
             return error.UnknownTicketVariant;
         }
         const id = try readNodeId(&reader);
@@ -497,7 +497,7 @@ test "a ticket with no custom transport round trips through variant 0 unchanged"
         try RelayUrl.parse("https://relay.example/"),
     );
     const v4: SocketAddr = .{ .ip = .{ .v4 = .{ 192, 0, 2, 7 } }, .port = 41641 };
-    const v6: SocketAddr = .{ .ip = .{ .v6 = [_]u8{ 0x20, 0x01 } ** 8 }, .port = 443 };
+    const v6: SocketAddr = .{ .ip = .{ .v6 = .{ 0x20, 0x01, 0x20, 0x01, 0x20, 0x01, 0x20, 0x01, 0x20, 0x01, 0x20, 0x01, 0x20, 0x01, 0x20, 0x01 } }, .port = 443 };
     address = (try address.insert(alloc, .{ .ip = v4 })) orelse
         return error.TestUnexpectedResult;
     address = (try address.insert(alloc, .{ .ip = v6 })) orelse

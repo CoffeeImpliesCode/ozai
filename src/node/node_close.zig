@@ -26,9 +26,6 @@ const Instant = bridge_mod.Instant;
 
 /// The pass bound on a close that does not finish in one pass.
 ///
-/// A close is four phases and `finish` takes one iteration per phase, so this
-/// is the bound on a close that is resumed from somewhere in the middle. It
-/// asserts rather than spinning — `AGENTS.md` §1.
 pub const max_close_steps = 8;
 
 /// Wind the node down, in the order `router.Shutdown` enforces.

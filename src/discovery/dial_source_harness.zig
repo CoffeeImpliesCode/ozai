@@ -31,9 +31,6 @@ const server_seed: [key.SecretKey.seed_length]u8 = @splat(0x53);
 /// The one ALPN both ends speak.
 const alpn = "ozai";
 
-/// Where virtual time starts: a second past zero, so every deadline a core
-/// computes is a plain offset. It is a constant, and a run is driven entirely
-/// at it, which is what `docs/DECISIONS/0002` bought.
 const at_instant: dial.Instant = 1_000 * std.time.ns_per_s;
 
 /// A seeded generator's engine. `std.Random` is an interface over a pointer to

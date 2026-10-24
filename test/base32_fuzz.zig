@@ -130,7 +130,7 @@ const absent: u8 = 0xff;
 /// A 256-entry reverse index of the alphabet, one of which this crate builds
 /// and the other of which the decoder does not get to see.
 fn symbolTable(comptime alphabet: base32.Alphabet) [256]u8 {
-    comptime var table = [_]u8{absent} ** 256;
+    comptime var table = @as([256]u8, @splat(absent));
     inline for (alphabet.symbols.*, 0..) |symbol, i| {
         table[symbol] = @intCast(i);
         if (alphabet.case_insensitive) {

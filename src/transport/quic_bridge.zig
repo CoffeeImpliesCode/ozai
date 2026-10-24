@@ -19,11 +19,6 @@
 //!
 // The seam between the vendored QUIC core and this project's transport.
 //
-// `docs/DECISIONS/0001-transport-substrate.md`, M8 step 5, says the vendored
-// core is "consumed by `ozai.transport`". Until this file existed nothing
-// under `src/` named it: the module was declared in `build.zig`, compiled by
-// `zig build quic-test`, and otherwise unreachable from the project. This is
-// that consumer.
 //
 // What the core is: `vendor/quic/src/`, sans-IO, patched so its clock and
 // its randomness are parameters and its peer certificate is a bare 44-byte
@@ -33,45 +28,12 @@
 //
 // # The three things that reach the core
 //
-// The core takes `now: i64` and `random: std.Random` on every ingress,
-// every egress and every timer pass. This project threads `io: std.Io`
-// (`docs/DECISIONS/0002-async-substrate.md`) and keeps a clock and a
-// generator out of every struct below `ozai.transport`. Reconciling the two
-// is the whole design question of this file, and the answer is:
-////
-// - **The instant is the caller's.** `Instant` is a parameter of `recv`,
-//   `drain` and `tick` — every call that moves the core forward — and
-//   nothing in this file ever reads a clock. `std.Io` can answer
-//   `Io.Clock.now(io, .monotonic)` and no function here asks it: a bridge
-//   that asked would be one refactor away from being undrivable, and
-//   `docs/DECISIONS/0002` names that property as the reason the runtime's
-//   `Io` is threaded rather than stored.
-// - **The generator is the caller's**, by value, on the same lines as
-//   `transport/addr_map.zig`'s `MappedAddrs.get`. `std.Random` is an
-//   interface over a pointer to an engine, so the caller keeps the engine
-//   next to every value it hands out; nothing here draws entropy.
-// - **`std.Io` reaches the core nowhere**, and that is a finding rather than
-//   an omission: the vendored tree's only surviving `std.Io` is
-//   `tls13.P256Cert.init` (`vendor/quic/src/quic/tls13.zig:4580`), the X.509
-//   certificate helper, which the ed25519 SPKI path never reaches. So `io`
-//   appears on `create` and nowhere else, and it is used for the one job
-//   left for it — the two transport secrets a caller did not supply.
 //
 // # What the core does not know about addresses
 //
 // Four things, all of them found by reading the vendored tree rather than
 // assumed, and all of them load-bearing for `base/ula.zig`:
 //
-// 1. **Nothing validates a synthetic address.** The core never asks whether
-//    a peer's address is routable, private, or even well formed. The only
-//    address-sensitive policy in the tree is `NetworkPath.canSend`
-//    (`connection.zig:127`), the server-side 3× anti-amplification limit,
-//    and the two comparisons `Address.eql` and `Address.sameIp`
-//    (`vendor/quic/src/address.zig`). An RFC 4193 ULA is therefore
-//    accepted as a peer address without complaint, which is the answer to
-//    the question `docs/PLAN.md`'s mapping raises, and the test
-//    "the core takes a synthetic address for a peer's address" is that
-//    answer demonstrated rather than asserted.
 //
 // 2. **One active path, not N.** `Connection` holds exactly two
 //    `NetworkPath`s and indexes one as active (`connection.zig:626`). A

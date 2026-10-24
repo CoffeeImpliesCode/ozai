@@ -4,7 +4,7 @@ const TopicId = @import("../gossip/hyparview.zig").TopicId;
 const t = std.testing;
 
 // Source-derived transport shapes, not captured upstream schema vectors.
-const header = [_]u8{ 0, 0, 0, 32 } ++ [_]u8{7} ** 32;
+const header = [_]u8{ 0, 0, 0, 32 } ++ @as([32]u8, @splat(7));
 const prune = [_]u8{ 0, 0, 0, 2, 1, 1 };
 
 test "gossip receive assembles fragmented fixed4 header and consecutive frames" {
@@ -14,7 +14,7 @@ test "gossip receive assembles fragmented fixed4 header and consecutive frames" 
         try t.expectEqual(@as(usize, 1), progress.consumed);
     }
     const topic = try parser.takeHeader();
-    try t.expect(topic.eql(TopicId.fromBytes([_]u8{7} ** 32)));
+    try t.expect(topic.eql(TopicId.fromBytes(@as([32]u8, @splat(7)))));
     const pair = prune ++ prune;
     const first = try parser.push(&pair);
     try t.expectEqual(prune.len, first.consumed);
@@ -43,7 +43,7 @@ test "gossip receive topic mismatch and transport echo are not accepted as gossi
     var parser: receive.Assembly = .{};
     _ = try parser.push(&header);
     const topic = try parser.takeHeader();
-    try t.expect(!topic.eql(TopicId.fromBytes([_]u8{8} ** 32)));
+    try t.expect(!topic.eql(TopicId.fromBytes(@as([32]u8, @splat(8)))));
     parser = .{};
     _ = try parser.push(&.{ 0, 0, 0, 17 });
     _ = try parser.push("transport-echo-17!");

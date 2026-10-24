@@ -84,7 +84,7 @@ test "upgrade response validates selected protocol and challenge binding" {
     var response_buffer: [512]u8 = undefined;
     const correct = try upgrade.build(&response_buffer, .v2, "dGhlIHNhbXBsZSBub25jZQ==");
     try verifyResponse(correct, &expected);
-    try std.testing.expectError(error.InvalidUpgrade, verifyResponse(correct, &(.{0} ** 28)));
+    try std.testing.expectError(error.InvalidUpgrade, verifyResponse(correct, &@as([28]u8, @splat(0))));
     const wrong_version = try upgrade.build(&response_buffer, .v1, "dGhlIHNhbXBsZSBub25jZQ==");
     try std.testing.expectError(error.InvalidUpgrade, verifyResponse(wrong_version, &expected));
 }

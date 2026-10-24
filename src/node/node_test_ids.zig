@@ -30,7 +30,7 @@ const NodeId = key.NodeId;
 /// The secret is wiped before the id leaves, so a peer named in a test leaves
 /// no key material on the stack behind it.
 pub fn testNodeId(seed: u8) !NodeId {
-    var secret = try key.SecretKey.fromSeed([_]u8{seed} ** key.SecretKey.seed_length);
+    var secret = try key.SecretKey.fromSeed(@as([key.SecretKey.seed_length]u8, @splat(seed)));
     defer secret.deinit();
     return secret.nodeId();
 }

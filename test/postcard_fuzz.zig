@@ -728,15 +728,15 @@ fn writeRecord(writer: *Writer, decoded: Decoded) Error!void {
     try writer.writeArray(8, &record.tagged);
 }
 
-/// Every field, through `std.meta.fields` so that a field added to `Record` is
+/// Every field, through reflection so that a field added to `Record` is
 /// compared without this having to be edited, and the count and its elements
 /// alongside them because a count that does not match the elements behind it is
 /// a record no encoder could have written.
 fn recordsEql(a: Decoded, b: Decoded) bool {
     if (a.count != b.count) return false;
     if (!std.mem.eql(u8, a.elements[0..a.count], b.elements[0..b.count])) return false;
-    inline for (std.meta.fields(Record)) |field| {
-        if (!valuesEql(@field(a.record, field.name), @field(b.record, field.name))) return false;
+    inline for (@typeInfo(Record).@"struct".field_names) |field| {
+        if (!valuesEql(@field(a.record, field), @field(b.record, field))) return false;
     }
     return true;
 }

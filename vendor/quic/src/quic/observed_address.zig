@@ -265,9 +265,9 @@ test "observed frame roundtrip boundaries truncation and consumed length" {
                 try std.testing.expectError(error.InvalidFrame, decode(bytes[0..cut]));
             }
             try std.testing.expectError(error.NoSpaceLeft, report.encode(bytes[0 .. length - 1]));
-            var short = [_]u8{0xaa} ** max_frame_length;
+            var short = @as([max_frame_length]u8, @splat(0xaa));
             try std.testing.expectError(error.NoSpaceLeft, report.encode(short[0 .. length - 1]));
-            try std.testing.expectEqualSlices(u8, &([_]u8{0xaa} ** max_frame_length), &short);
+            try std.testing.expectEqualSlices(u8, &(@as([max_frame_length]u8, @splat(0xaa))), &short);
         }
     }
     const unset: Report = .{ .sequence = 0, .address = .unset };
@@ -413,7 +413,7 @@ fn fuzzReport(_: void, smith: *std.testing.Smith) !void {
 test "observed IPv6 reports omit interface scope as upstream does" {
     const report: Report = .{
         .sequence = 0,
-        .address = .initIpv6([_]u8{0} ** 16, 80, 9),
+        .address = .initIpv6(@as([16]u8, @splat(0)), 80, 9),
     };
     var bytes: [max_frame_length]u8 = undefined;
     const count = try report.encode(&bytes);

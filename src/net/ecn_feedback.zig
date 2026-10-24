@@ -1,12 +1,6 @@
 //! ECN feedback for one path: what the codepoint on it was, what that means,
 //! and what the path should carry next.
 //!
-//! `docs/DECISIONS/0002-async-substrate.md` records the gap this closes:
-//! "a P2P stack that drops ECN cannot report congestion to the path it actually
-//! used." The plumbing that carries a codepoint is in place — `batch.Send.ecn`
-//! going out and `batch.Recv.ecn` coming back (`transport/batch_run.zig:135`,
-//! `:237`) — and nothing above it asks what a codepoint means. This module is
-//! the part that asks, over one path.
 //!
 //! # What it holds and what it decides
 //!

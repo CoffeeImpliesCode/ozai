@@ -23,7 +23,8 @@ pub fn seedNeighbor(
     out: *swarm.Actions(swarm.SwarmOutEvent),
 ) !void {
     try state.handle(.{ .recv_message = .{
-        .from = id, .message = .{ .neighbor = .{ .priority = .high, .data = data } },
+        .from = id,
+        .message = .{ .neighbor = .{ .priority = .high, .data = data } },
     } }, out);
     try t.expect(state.active_view.contains(id));
     out.clear();

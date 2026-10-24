@@ -448,7 +448,7 @@ pub const Parse = union(enum) {
 test "explicit lookup peers retain static peers and DNS settings" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var secret = try ozai.SecretKey.fromSeed(.{7} ** ozai.SecretKey.seed_length);
+    var secret = try ozai.SecretKey.fromSeed(@splat(7));
     defer secret.deinit();
     var id_buffer: [ozai.NodeId.z32_length + 1]u8 = undefined;
     const id = try std.fmt.bufPrintSentinel(&id_buffer, "{s}", .{secret.nodeId().toZ32()}, 0);
@@ -477,7 +477,7 @@ test "explicit lookup peers retain static peers and DNS settings" {
 test "lookup requires explicit peers and source and bounded positive timing" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var secret = try ozai.SecretKey.fromSeed(.{7} ** ozai.SecretKey.seed_length);
+    var secret = try ozai.SecretKey.fromSeed(@splat(7));
     defer secret.deinit();
     var id_buffer: [ozai.NodeId.z32_length + 1]u8 = undefined;
     const id = try std.fmt.bufPrintSentinel(&id_buffer, "{s}", .{secret.nodeId().toZ32()}, 0);
@@ -521,7 +521,7 @@ test "lookup requires explicit peers and source and bounded positive timing" {
 test "static peer does not enable external DNS" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var secret = try ozai.SecretKey.fromSeed(.{7} ** ozai.SecretKey.seed_length);
+    var secret = try ozai.SecretKey.fromSeed(@splat(7));
     defer secret.deinit();
     const id = secret.nodeId().toZ32();
     var peer_buffer: [100]u8 = undefined;
@@ -537,7 +537,7 @@ test "static peer does not enable external DNS" {
 test "carrier and pinned relay peers leave inner application independent" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var secret = try ozai.SecretKey.fromSeed(.{7} ** ozai.SecretKey.seed_length);
+    var secret = try ozai.SecretKey.fromSeed(@splat(7));
     defer secret.deinit();
     var peer_buffer: [160]u8 = undefined;
     const peer = try std.fmt.bufPrintSentinel(
@@ -580,8 +580,8 @@ test "gossip topics and getter options use protocol values" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const args = [_][*:0]const u8{
-        "ozai-node", "--topic-hex", "ab" ** 32,       "--topic-hex", "cd" ** 32,
-        "--message", "hello",       "--relay-listen", "127.0.0.1:0",
+        "ozai-node", "--topic-hex", "abababababababababababababababababababababababababababababababab", "--topic-hex", "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "--message", "hello",       "--relay-listen",                                                   "127.0.0.1:0",
     };
     var out: std.Io.Writer.Allocating = .init(arena.allocator());
     const gossip = try Options.parse(arena.allocator(), .{ .vector = &args }, &out.writer);
@@ -590,7 +590,7 @@ test "gossip topics and getter options use protocol values" {
     try std.testing.expectEqual(@as(u8, 0xab), gossip.run.gossip_topics.items[0].bytes[0]);
     try std.testing.expectEqualStrings("hello", gossip.run.message.?);
     const blob_args = [_][*:0]const u8{
-        "ozai-node",    "--blob-role", "getter",       "--blob-hash", "ab" ** 32,
+        "ozai-node",    "--blob-role", "getter",       "--blob-hash", "abababababababababababababababababababababababababababababababab",
         "--blob-size",  "40000",       "--blob-range", "15:33",       "--blob-output",
         "verified.bin",
     };
@@ -625,16 +625,16 @@ test "protocol contradictions invalid values and removed flags are rejected" {
         },
         .{
             .args = &.{
-                "node", "--blob-role", "getter", "--blob-hash", "ab" ** 32, "--alpn", "other",
+                "node", "--blob-role", "getter", "--blob-hash", "abababababababababababababababababababababababababababababababab", "--alpn", "other",
             },
             .refusal = error.BlobAlpnMismatch,
         },
         .{
-            .args = &.{ "node", "--blob-role", "provider", "--blob-hash", "ab" ** 32 },
+            .args = &.{ "node", "--blob-role", "provider", "--blob-hash", "abababababababababababababababababababababababababababababababab" },
             .refusal = error.BlobNeedsDirectory,
         },
         .{ .args = &.{ "node", "--blob-role", "getter" }, .refusal = error.BlobNeedsHash },
-        .{ .args = &.{ "node", "--blob-hash", "zz" ** 32 }, .refusal = error.InvalidBlobHash },
+        .{ .args = &.{ "node", "--blob-hash", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" }, .refusal = error.InvalidBlobHash },
         .{ .args = &.{ "node", "--blob-hash", "ab" }, .refusal = error.InvalidBlobHash },
         .{ .args = &.{ "node", "--blob-range", "1:1" }, .refusal = error.InvalidBlobRange },
         .{ .args = &.{ "node", "--blob-range", "2:1" }, .refusal = error.InvalidBlobRange },
@@ -643,9 +643,9 @@ test "protocol contradictions invalid values and removed flags are rejected" {
         .{ .args = &.{ "node", "--topic-hex", "ab" }, .refusal = error.InvalidTopic },
         .{
             .args = &.{
-                "node",        "--topic-hex", "ab" ** 32,    "--topic-hex", "ab" ** 32,
-                "--topic-hex", "ab" ** 32,    "--topic-hex", "ab" ** 32,    "--topic-hex",
-                "ab" ** 32,
+                "node",                                                             "--topic-hex",                                                      "abababababababababababababababababababababababababababababababab", "--topic-hex",                                                      "abababababababababababababababababababababababababababababababab",
+                "--topic-hex",                                                      "abababababababababababababababababababababababababababababababab", "--topic-hex",                                                      "abababababababababababababababababababababababababababababababab", "--topic-hex",
+                "abababababababababababababababababababababababababababababababab",
             },
             .refusal = error.TooManyTopics,
         },
@@ -661,7 +661,7 @@ test "protocol contradictions invalid values and removed flags are rejected" {
 test "expected peer identity is explicit and curve validated" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var secret = try ozai.SecretKey.fromSeed(.{9} ** ozai.SecretKey.seed_length);
+    var secret = try ozai.SecretKey.fromSeed(@splat(9));
     defer secret.deinit();
     var buffer: [ozai.NodeId.z32_length + 1]u8 = undefined;
     const id = try std.fmt.bufPrintSentinel(&buffer, "{s}", .{secret.nodeId().toZ32()}, 0);
@@ -680,8 +680,8 @@ test "provider directory and all chunk getter range are accepted" {
     defer arena.deinit();
     var out: std.Io.Writer.Allocating = .init(arena.allocator());
     const provider_args = [_][*:0]const u8{
-        "node",        "--blob-role", "provider", "--blob-dir",    "store",
-        "--blob-hash", "ab" ** 32,    "--alpn",   "/iroh-bytes/4",
+        "node",        "--blob-role",                                                      "provider", "--blob-dir",    "store",
+        "--blob-hash", "abababababababababababababababababababababababababababababababab", "--alpn",   "/iroh-bytes/4",
     };
     const provider = try Options.parse(
         arena.allocator(),
@@ -692,7 +692,7 @@ test "provider directory and all chunk getter range are accepted" {
     try std.testing.expect(provider.run.blob_role == .provider);
     try std.testing.expectEqualStrings("store", provider.run.blob_dir.?);
     const getter_args = [_][*:0]const u8{
-        "node",         "--blob-role", "getter",      "--blob-hash", "ab" ** 32,
+        "node",         "--blob-role", "getter",      "--blob-hash", "abababababababababababababababababababababababababababababababab",
         "--blob-range", "all",         "--blob-size", "0",
     };
     const getter = try Options.parse(arena.allocator(), .{ .vector = &getter_args }, &out.writer);
@@ -720,14 +720,14 @@ test "role dependent options do not disappear into defaults" {
         },
         .{
             .args = &.{
-                "node",        "--blob-role", "provider",     "--blob-dir", "store",
-                "--blob-hash", "ab" ** 32,    "--blob-range", "all",
+                "node",        "--blob-role",                                                      "provider",     "--blob-dir", "store",
+                "--blob-hash", "abababababababababababababababababababababababababababababababab", "--blob-range", "all",
             },
             .refusal = error.BlobProviderGetterOptions,
         },
         .{
             .args = &.{
-                "node", "--blob-role", "getter", "--blob-hash", "ab" ** 32, "--blob-dir", "store",
+                "node", "--blob-role", "getter", "--blob-hash", "abababababababababababababababababababababababababababababababab", "--blob-dir", "store",
             },
             .refusal = error.BlobGetterDirectory,
         },
@@ -755,20 +755,20 @@ test "explicit gossip topics select gossip and reject competing application prot
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var out: std.Io.Writer.Allocating = .init(arena.allocator());
-    const args = [_][*:0]const u8{ "node", "--topic-hex", "ab" ** 32 };
+    const args = [_][*:0]const u8{ "node", "--topic-hex", "abababababababababababababababababababababababababababababababab" };
     const parsed = try Options.parse(arena.allocator(), .{ .vector = &args }, &out.writer);
     try std.testing.expect(parsed == .run);
     try std.testing.expectEqualStrings(node_mod.gossip_alpn, parsed.run.alpn.?);
     const Case = struct { args: []const [*:0]const u8, refusal: CliError };
     const cases = [_]Case{
         .{
-            .args = &.{ "node", "--topic-hex", "ab" ** 32, "--alpn", "other" },
+            .args = &.{ "node", "--topic-hex", "abababababababababababababababababababababababababababababababab", "--alpn", "other" },
             .refusal = error.TopicAlpnMismatch,
         },
         .{
             .args = &.{
-                "node",     "--topic-hex", "ab" ** 32, "--blob-role", "getter", "--blob-hash",
-                "ab" ** 32,
+                "node",                                                             "--topic-hex", "abababababababababababababababababababababababababababababababab", "--blob-role", "getter", "--blob-hash",
+                "abababababababababababababababababababababababababababababababab",
             },
             .refusal = error.ConflictingProtocols,
         },

@@ -29,10 +29,6 @@
 //!
 //! # Entropy comes from the caller
 //!
-//! The RFC 1035 §4.1.1 transaction id is drawn from the pass's `random`, and
-//! the TLS driver's 240 bytes of key share and randoms are filled from the
-//! same one, into storage this node owns. Nothing here reaches for a global
-//! generator, which is what `AGENTS.md` §2 forbids by name.
 
 const std = @import("std");
 

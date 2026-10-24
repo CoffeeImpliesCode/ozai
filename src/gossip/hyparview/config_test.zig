@@ -21,8 +21,8 @@ const Config = settings.Config;
 // `max_bootstrap`. Either half on its own would let the other one past.
 test "a bootstrap list is refused by its count and by its length" {
     const peer = try sim.nodeIdFor(2);
-    const over = [_]NodeId{peer} ** (max_bootstrap + 1);
-    const unspellable = [_]NodeId{peer} ** (std.math.maxInt(u8) + 1);
+    const over = @as([(max_bootstrap + 1)]NodeId, @splat(peer));
+    const unspellable = @as([(std.math.maxInt(u8) + 1)]NodeId, @splat(peer));
     try t.expectError(error.BootstrapListTooLong, Peers.init(over[0..]));
     try t.expectError(error.BootstrapListTooLong, Peers.init(unspellable[0..]));
     const list = try Peers.init(over[0..max_bootstrap]);

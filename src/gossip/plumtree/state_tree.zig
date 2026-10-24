@@ -399,7 +399,7 @@ pub const State = struct {
         if (content.len > max_content) return error.MessageTooLarge;
         // The codec counts a fixed-width id; sizing must not hash rejected input.
         const candidate: Gossip = .{
-            .id = MessageId.fromBytes([_]u8{0} ** 32),
+            .id = MessageId.fromBytes(@as([32]u8, @splat(0))),
             .content = content,
             .scope = deliveryScope(scope),
         };

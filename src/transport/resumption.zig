@@ -231,7 +231,7 @@ const alpn_other = "/iroh-qad/0";
 /// field is a precondition rather than an invariant and a struct literal
 /// would test the policy against a value the identity type never promised.
 fn testNodeId(seed: u8) !NodeId {
-    var secret = try base_key.SecretKey.fromSeed([_]u8{seed} ** base_key.SecretKey.seed_length);
+    var secret = try base_key.SecretKey.fromSeed(@as([base_key.SecretKey.seed_length]u8, @splat(seed)));
     defer secret.deinit();
     return secret.nodeId();
 }
@@ -246,7 +246,7 @@ fn ticketFor(
     created_s: i64,
 ) SessionTicket {
     var built: SessionTicket = .{
-        .psk = [_]u8{0xa5} ** 32,
+        .psk = @as([32]u8, @splat(0xa5)),
         .lifetime = lifetime_s,
         .creation_time = created_s,
         .quic_version = version,
@@ -401,6 +401,6 @@ test "an empty store and an unholdable protocol are an ordinary full handshake" 
 
     // A protocol longer than the store can key on can never be filed, so it
     // can never match: same cold start, without probing.
-    const too_long = "z" ** (store_mod.alpn_len_max + 1);
+    const too_long = &@as([(store_mod.alpn_len_max + 1):0]u8, @splat('z'));
     try t.expectError(error.NoTicket, offer(&store, intentFor(peer, too_long, quic_v1), 100));
 }

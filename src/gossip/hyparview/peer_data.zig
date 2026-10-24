@@ -30,7 +30,7 @@ const peer_data_max = bounds.peer_data_max;
 /// the next `handle` on the same state.
 pub const PeerData = struct {
     /// Zeroed, and only `len` bytes of it mean anything.
-    bytes: [peer_data_max]u8 = [_]u8{0} ** peer_data_max,
+    bytes: [peer_data_max]u8 = @as([peer_data_max]u8, @splat(0)),
     /// `u16` holds every frame-fitting contact record.
     len: u16 = 0,
 

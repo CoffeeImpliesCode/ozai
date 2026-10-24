@@ -137,7 +137,7 @@ pub const Opcode = enum(u8) {
 
     /// The byte, which is the discriminant itself.
     pub fn toInt(self: Opcode) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Whether this is a control opcode, which RFC 6455 section 5.5 defines as
@@ -147,7 +147,7 @@ pub const Opcode = enum(u8) {
     /// the rule the section states is the range and a new control opcode added
     /// to the enum would then be a control opcode by the section's own words.
     pub fn isControl(self: Opcode) bool {
-        return @intFromEnum(self) >= 0x8;
+        return @backingInt(self) >= 0x8;
     }
 };
 

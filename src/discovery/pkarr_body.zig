@@ -33,14 +33,6 @@
 //! 0010 0001 0000001e 001b 1a ...    TXT, IN, TTL 30, RDLENGTH 27, 26 + bytes
 //! ```
 //!
-//! Every field of that layout is the reference implementation's, not this
-//! project's reading of RFC 1035: it is the body of the packet `discovery/pkarr.zig`
-//! captured from the `pkarr` crate v8.0.2 (`pubky/pkarr`
-//! `pkarr/src/types/signed_packet.rs` at aa4011cabc3676d533dd3c633dc0801c94bfca86),
-//! and the test at the bottom of this file writes the same record and compares
-//! the result against `discovery/lookup_test_support.zig`'s copy of those bytes.
-//! A wire claim that is a test rather than a comment is `AGENTS.md` §2's whole
-//! rule, and this is the one place in the pkarr path where a claim could be made.
 //!
 //! **Records after the first carry a compression pointer, not the name again.**
 //! `discovery/pkarr.zig`'s four-record captured packet writes `c00c` — a
@@ -333,7 +325,7 @@ test "every record after the first is a pointer, and a long record is several st
 
     // Three records, one of them over §3.3.14's 255-octet ceiling.
     const first_record = "relay=https://one.example./";
-    const longest = "addr=" ++ "0123456789abcdef" ** 17;
+    const longest = "addr=" ++ "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const last_record = "relay=https://two.example./";
     var records: [512]u8 = undefined;
     var writer = std.Io.Writer.fixed(&records);
@@ -388,7 +380,9 @@ test "the three refusals are the three ways the arithmetic comes apart" {
     // Nothing to publish is not a body.
     try t.expectError(error.NoRecords, writeBody(&out, asked, .init("")));
     // More records than `ANCOUNT` can carry is a body no reader walks.
-    const overflow = "a\x00" ** (wire.max_section_records + 1);
+    const overflow = &@as([(wire.max_section_records + 1) * 2]u8, @bitCast(
+        @as([wire.max_section_records + 1][2]u8, @splat(.{ 'a', 0 })),
+    ));
     try t.expectError(error.TooManyRecords, writeBody(&out, asked, .init(overflow)));
     // And a short buffer is refused before anything is written.
     try t.expectError(

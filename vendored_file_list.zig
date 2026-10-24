@@ -28,12 +28,14 @@ const vendored_invariants = @import("test/vendored_invariants.zig");
 /// here and nowhere else: the gate runs on every `zig build test` and may not
 /// read the filesystem, because it audits a tree by embedding it.
 fn collectVendoredSources(
+    b: *std.Build,
     gpa: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
     prefix: []const u8,
     out: *std.ArrayList([]const u8),
 ) !void {
+    b.dependOnDirectoryContents(b.path(b.fmt("vendor/quic/src/{s}", .{prefix})));
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind == .directory) {
@@ -48,7 +50,7 @@ fn collectVendoredSources(
             // zwanzig-disable-next-line: store-violations-engine
             defer gpa.free(sub_prefix);
             // Recursion borrows sub; only this scope closes the newly opened handle.
-            try collectVendoredSources(gpa, io, sub, sub_prefix, out);
+            try collectVendoredSources(b, gpa, io, sub, sub_prefix, out);
             continue;
         }
         if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
@@ -74,11 +76,11 @@ pub fn checkVendoredFileList(b: *std.Build) void {
     }
     // The recursive walk borrows this handle; this scope closes it exactly once.
     // zwanzig-disable-next-line: store-violations-engine
-    var dir = b.build_root.handle.openDir(io, root, .{ .iterate = true }) catch |err| {
+    var dir = b.root.openDir(io, root, .{ .iterate = true }) catch |err| {
         std.debug.panic("cannot read {s}: {s}", .{ root, @errorName(err) });
     };
     defer dir.close(io);
-    collectVendoredSources(gpa, io, dir, "", &found) catch |err| {
+    collectVendoredSources(b, gpa, io, dir, "", &found) catch |err| {
         std.debug.panic("cannot walk {s}: {s}", .{ root, @errorName(err) });
     };
 

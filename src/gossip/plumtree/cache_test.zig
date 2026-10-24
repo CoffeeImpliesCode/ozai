@@ -163,7 +163,7 @@ test "a received payload too long to record is refused" {
 
 test "received frame storage may be reused after actions are consumed" {
     const codec = @import("../codec.zig");
-    const original = [_]u8{0x42} ** 2048;
+    const original = @as([2048]u8, @splat(0x42));
     const id = MessageId.fromContent(&original);
     var frame: [codec.max_message_size + codec.max_prefix_size]u8 = undefined;
     const encoded = try codec.encode(.{ .gossip = .{ .gossip = .{

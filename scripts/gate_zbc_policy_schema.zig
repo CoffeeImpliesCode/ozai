@@ -14,7 +14,7 @@ pub const Policy = struct {
 };
 
 test "schema rejects malformed duplicate missing unknown and incorrectly typed fields" {
-    const tool = "0" ** 64;
+    const tool = &@as([64:0]u8, @splat('0'));
     const cases = [_][]const u8{
         "{}",
         "null",
@@ -37,17 +37,17 @@ test "schema rejects malformed duplicate missing unknown and incorrectly typed f
 
 test "record values require canonical Zig paths lower hashes and nonempty reasons" {
     const cases = .{
-        .{ "path", "../scripts/example.zig" }, .{ "path", "./scripts/example.zig" },
-        .{ "path", "/scripts/example.zig" },   .{ "path", "scripts//example.zig" },
-        .{ "path", "scripts/./example.zig" },  .{ "path", "scripts\\example.zig" },
-        .{ "path", "scripts/example.zig/" },   .{ "path", "" },
-        .{ "path", "scripts/example.txt" },    .{ "source_sha256", "A" ** 64 },
-        .{ "source_sha256", "0" ** 63 },       .{ "reason", " \t\r\n" },
+        .{ "path", "../scripts/example.zig" },             .{ "path", "./scripts/example.zig" },
+        .{ "path", "/scripts/example.zig" },               .{ "path", "scripts//example.zig" },
+        .{ "path", "scripts/./example.zig" },              .{ "path", "scripts\\example.zig" },
+        .{ "path", "scripts/example.zig/" },               .{ "path", "" },
+        .{ "path", "scripts/example.txt" },                .{ "source_sha256", &@as([64:0]u8, @splat('A')) },
+        .{ "source_sha256", &@as([63:0]u8, @splat('0')) }, .{ "reason", " \t\r\n" },
     };
     inline for (cases) |case| {
         var record: SourceFile = .{
             .path = "scripts/example.zig",
-            .source_sha256 = "0" ** 64,
+            .source_sha256 = &@as([64:0]u8, @splat('0')),
             .reason = "Reviewed.",
         };
         @field(record, case[0]) = case[1];
@@ -55,7 +55,7 @@ test "record values require canonical Zig paths lower hashes and nonempty reason
         defer arena.deinit();
         const bytes = try std.json.Stringify.valueAlloc(arena.allocator(), Policy{
             .schema = 1,
-            .tool_sha256 = "0" ** 64,
+            .tool_sha256 = &@as([64:0]u8, @splat('0')),
             .files = &.{record},
         }, .{});
         try std.testing.expectError(error.InvalidZbcPolicy, parse(arena.allocator(), bytes));
@@ -66,10 +66,10 @@ test "strict record JSON rejects duplicate extra missing and nonstring fields" {
     const gpa = std.testing.allocator;
     const valid = try std.json.Stringify.valueAlloc(gpa, Policy{
         .schema = 1,
-        .tool_sha256 = "0" ** 64,
+        .tool_sha256 = &@as([64:0]u8, @splat('0')),
         .files = &.{.{
             .path = "scripts/example.zig",
-            .source_sha256 = "0" ** 64,
+            .source_sha256 = &@as([64:0]u8, @splat('0')),
             .reason = "Reviewed.",
         }},
     }, .{});
@@ -104,8 +104,8 @@ test "strict record JSON rejects duplicate extra missing and nonstring fields" {
         try std.testing.expectError(error.InvalidZbcPolicy, parse(temporary, malformed));
     }
     const duplicate =
-        "{\"schema\":1,\"tool_sha256\":\"" ++ "0" ** 64 ++ "\",\"files\":[" ++
-        "{\"path\":\"a.zig\",\"path\":\"a.zig\",\"source_sha256\":\"" ++ "0" ** 64 ++
+        "{\"schema\":1,\"tool_sha256\":\"" ++ &@as([64:0]u8, @splat('0')) ++ "\",\"files\":[" ++
+        "{\"path\":\"a.zig\",\"path\":\"a.zig\",\"source_sha256\":\"" ++ &@as([64:0]u8, @splat('0')) ++
         "\",\"reason\":\"Reviewed.\"}]}";
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -155,10 +155,10 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) ParseError!Policy {
 
 fn exactObject(comptime T: type, value: std.json.Value) error{InvalidZbcPolicy}!void {
     if (value != .object) return error.InvalidZbcPolicy;
-    const fields = std.meta.fields(T);
-    if (value.object.count() != fields.len) return error.InvalidZbcPolicy;
-    inline for (fields) |entry| {
-        if (!value.object.contains(entry.name)) return error.InvalidZbcPolicy;
+    const names = @typeInfo(T).@"struct".field_names;
+    if (value.object.count() != names.len) return error.InvalidZbcPolicy;
+    inline for (names) |name| {
+        if (!value.object.contains(name)) return error.InvalidZbcPolicy;
     }
 }
 

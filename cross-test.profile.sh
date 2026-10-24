@@ -1,11 +1,8 @@
 # Full Linux socket/process suite, including matching foreign node artifacts.
 # The portable ABI survey is separate: cross-test.portable.profile.sh.
-# n32 and x32 are excluded: Zig 0.16's std.os.linux does not compile for those
-# pointer/register-width combinations. The complete survey still records them.
-# Full Hexagon Debug socket/node artifacts crash the pinned compiler. Its pure
-# modules remain executable in the complete survey.
-# LoongArch64 uses canonical musl (lp64d) and soft-float (lp64s). The
-# single-float muslf32 (lp64f) ABI is unstandardized in pinned LLVM.
+# n32, x32, and full Hexagon socket/node artifacts are excluded here.
+# The portable survey keeps these targets visible.
+# LoongArch64 covers canonical musl (lp64d) and soft-float (lp64s).
 CROSS_BUILD_STEP=test
 # Native test rows need the detected host loader on Nix, not a deployment path.
 CROSS_BUILD_ARGS=(-Dnative-test-linker=true)

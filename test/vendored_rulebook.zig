@@ -7,9 +7,6 @@
 
 const std = @import("std");
 
-/// Upstream's syscall seam, deleted by DECISIONS/0001 step 2 once its last
-/// caller went. Named here so the rule that forbids importing it never depends
-/// on remembering the spelling.
 pub const deleted_seam = "sys.zig";
 
 /// Qualifiers that mean "reached through a system namespace". A call is read
@@ -142,7 +139,7 @@ pub const rule_socket: Rule = .{
     .name = "a socket syscall",
     .breaks = "a stack that owns a descriptor cannot be handed a datagram by " ++
         "the transport multiplexer, so the endpoint stops being drivable in " ++
-        "process. DECISIONS/0001 dropped the socket-owning layers for this.",
+        "process. The vendored core excludes socket-owning layers.",
 };
 
 pub const rule_libc_call: Rule = .{
@@ -162,7 +159,7 @@ pub const rule_link_libc: Rule = .{
     .name = "`link_libc`",
     .breaks = "the vendored module deliberately does not link libc; setting " ++
         "it here would make every consumer pay for a dependency that " ++
-        "DECISIONS/0001 removed.",
+        "the sans-IO core does not require.",
 };
 
 pub const rule_cimport: Rule = .{
@@ -175,8 +172,7 @@ pub const rule_clock: Rule = .{
     .name = "a clock read",
     .breaks = "the real clock is hidden input. A test cannot put a " ++
         "connection at a chosen time, so loss recovery and idle timeouts can " ++
-        "only be exercised by waiting. AGENTS.md §2 forbids this below " ++
-        "`ozai.base`, and the vendored core is below it.",
+        "only be exercised by waiting. Pass the clock as an explicit input.",
 };
 
 pub const rule_entropy: Rule = .{
@@ -222,7 +218,7 @@ pub const rule_library_rng: Rule = .{
 pub const rule_seam_import: Rule = .{
     .name = "an import of the deleted seam",
     .breaks = "`sys.zig` held the sockets, the clock and the process CSPRNG " ++
-        "behind one import, and DECISIONS/0001 step 2 deleted it once its last " ++
+        "behind one import, which was removed after its last " ++
         "caller went. Naming it again does not restore it; it fails the build " ++
         "and points at whoever expected it back.",
 };

@@ -145,7 +145,7 @@ pub const Error = error{
 /// The twelve octets RFC 4291 §2.5.5.2 puts in front of an IPv4 address to
 /// spell it in IPv6: ten zeros and two `0xff`. Sixteen minus four, which is
 /// what makes the mapped form's collapse a slice copy rather than a parse.
-const mapped_prefix: [12]u8 = .{0} ** 10 ++ .{ 0xff, 0xff };
+const mapped_prefix: [12]u8 = @as([10]u8, @splat(0)) ++ .{ 0xff, 0xff };
 
 /// What a frame means, once its address is canonical and its latency is known.
 ///
@@ -447,9 +447,9 @@ test "a synthetic address is refused, not canonicalised" {
     // subnets reach it, so a relay reporting any of them back at us cannot put
     // an unroutable dress-up address into a published report.
     const hosts = [_]ula.HostBits{
-        .{0} ** 8,
+        @splat(0),
         .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef },
-        .{0xff} ** 8,
+        @splat(0xff),
     };
     inline for ([_]ula.Path{ .any_path, .relay, .custom }) |path| {
         for (hosts) |host| {

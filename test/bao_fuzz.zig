@@ -76,11 +76,11 @@ const pair_length = bao_plan.pair_length;
 const empty_seed: [0]u8 = .{};
 const one_byte = [_]u8{0x00};
 const one_byte_high = [_]u8{0xff};
-const bare_pair = [_]u8{0x00} ** pair_length;
-const short_pair = [_]u8{0x00} ** (pair_length - 1);
-const data_run = [_]u8{0x5a} ** 32;
-const pair_trailing_byte = [_]u8{0x00} ** (pair_length + 1);
-const data_run_nonzero = [_]u8{0x11} ** 16;
+const bare_pair = @as([pair_length]u8, @splat(0x00));
+const short_pair = @as([(pair_length - 1)]u8, @splat(0x00));
+const data_run = @as([32]u8, @splat(0x5a));
+const pair_trailing_byte = @as([(pair_length + 1)]u8, @splat(0x00));
+const data_run_nonzero = @as([16]u8, @splat(0x11));
 
 const corpus = [_][]const u8{
     &empty_seed, // empty: no response at all
@@ -147,16 +147,13 @@ comptime {
     // refusal added there without a line here is a name a peer can be given that
     // this file has no record of, so it stops the build instead; a rename or a
     // reorder stops it too, which is the point of holding both.
-    // `.error_set` is optional because `Type` is a union; the branch is the one
-    // an error set is in, and a null there means `VerifyError` stopped being an
-    // error set, which is as much of a stop as a rename is.
-    const fields: []const std.builtin.Type.Error =
-        @typeInfo(VerifyError).error_set orelse @compileError("VerifyError must be an error set");
+    const fields = @typeInfo(VerifyError).error_set.error_names orelse
+        @compileError("VerifyError must be a finite error set");
     if (fields.len != refusal_names.len) {
         @compileError("the proof verifier gained or lost a refusal");
     }
     for (fields, 0..) |field, index| {
-        if (!std.mem.eql(u8, field.name, refusal_names[index])) {
+        if (!std.mem.eql(u8, field, refusal_names[index])) {
             @compileError("a proof refusal was renamed, moved, or is not listed");
         }
     }

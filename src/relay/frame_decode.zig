@@ -252,7 +252,7 @@ fn readArray(comptime length: usize, payload: []const u8) Error![length]u8 {
 // --- tests
 
 test "codec: invalid UTF-8 in a peer health frame is refused" {
-    const wire = [_]u8{ @intFromEnum(FrameType.health), 0xff };
+    const wire = [_]u8{ @backingInt(FrameType.health), 0xff };
     try std_testing.expectError(error.InvalidUtf8, decode(&wire, .v1));
     try std_testing.expectError(error.FrameNotAllowedInVersion, decode(&wire, .v2));
 }
@@ -262,7 +262,7 @@ test "codec: a payload over max_packet_size is refused" {
     const bytes = try alloc.alloc(u8, max_packet_size + 2);
     defer alloc.free(bytes);
     @memset(bytes, 0xff);
-    bytes[0] = @intFromEnum(FrameType.ping);
+    bytes[0] = @backingInt(FrameType.ping);
     // The frame type is read, the payload is measured, and only then is it refused:
     // upstream takes the same order at `relay.rs:402`.
     try std_testing.expectError(error.FrameTooLarge, decode(bytes, .v2));
