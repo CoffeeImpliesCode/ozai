@@ -32,9 +32,8 @@ pub fn main(init: std.process.Init) !void {
                 "--evidence-dir ABS " ++
                 "--original-netns 'net:[N]' --original-userns 'user:[N]' " ++
                 "[--endpoint-a-role server|client|both] [--for-ms 45000]\n" ++
-                "Source ~/.local/lib/host-scratch.sh first. Capture your own net/user " ++
-                "namespace identities before unshare. Existing evidence directory must be " ++
-                "caller-owned, canonical, under /tmp/scratch/.\n",
+                "Capture your own net/user namespace identities before unshare. " ++
+                "Existing evidence directory must be caller-owned, canonical, and absolute.\n",
         );
         return err;
     };
