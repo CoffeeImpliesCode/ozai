@@ -392,11 +392,12 @@ pub fn build(b: *std.Build) void {
     node_test_options.addOptionPath("node_executable", node_exe.getEmittedBin());
     // A QEMU-run test must use that executor for its children too: the host
     // kernel need not have binfmt_misc or native 32-bit execution enabled.
-    const cross_executor = if (std.mem.eql(
-        u8,
-        b.graph.environ_map.get("CROSS_TEST_RUNNER_KIND") orelse "",
-        "exec",
-    )) b.graph.environ_map.get("CROSS_TEST_RUNNER") else null;
+    const runner_kind = b.graph.environ_map.get("CROSS_TEST_RUNNER_KIND") orelse "";
+    const cross_executor = if (std.mem.eql(u8, runner_kind, "exec") or
+        std.mem.eql(u8, runner_kind, "qemu_user"))
+        b.graph.environ_map.get("CROSS_TEST_RUNNER")
+    else
+        null;
     const node_executor = b.option(
         []const u8,
         "test-node-executor",

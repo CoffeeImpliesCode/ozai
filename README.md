@@ -37,6 +37,7 @@ zig build quic-test invariants test-gate-policy
 `test-portable` covers socket-free protocol and state-machine code.
 `quic-test` runs the vendored transport tests. `invariants` checks source contracts.
 Repeat the tests with `-Doptimize=safe` to use optimized safety checks.
+Foreign node-test children use cross-test's selected executor, including QEMU user runners.
 
 The optional Linux NAT fixture accepts an absolute, canonical, caller-owned evidence
 directory. `zig build nat-fixture relay-fixture` builds its supervisor and Zig peer.
