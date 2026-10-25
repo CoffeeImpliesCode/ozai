@@ -120,6 +120,4 @@ Line hits do not establish branch coverage, protocol interoperability, or produc
 
 ## License
 
-This repository does not include a root license. Do not assume a license grant
-for first-party code. The vendored QUIC code retains its
-[MIT license](vendor/quic/LICENSE).
+MIT, see [LICENSE](LICENSE). Third-party components keep their own licenses: see THIRD_PARTY_NOTICES.md.

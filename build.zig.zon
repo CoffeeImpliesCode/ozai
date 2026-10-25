@@ -13,6 +13,8 @@
         "examples.zig",
         "vendored_file_list.zig",
         "README.md",
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
         "zlint.json",
         ".zbc-source-exceptions.json",
         "cross-test.profile.sh",
