@@ -4,10 +4,10 @@ const Dir = std.Io.Dir;
 const gate_scratch = @import("gate_scratch.zig");
 pub const CreateError = std.process.Environ.CreateMapError ||
     gate_scratch.ValidateError || std.mem.Allocator.Error || Dir.OpenError ||
-    Dir.CreateDirError || std.Io.File.StatError || std.Io.RandomSecureError ||
+    Dir.CreateDirError || Dir.RealPathError || std.Io.File.StatError || std.Io.RandomSecureError ||
     error{ NoSpaceLeft, SharedScratchParent, UnapprovedScratch };
 const CreateTmpDirError = gate_scratch.ValidateError || Dir.OpenError ||
-    Dir.CreateDirError || std.Io.File.StatError || std.Io.RandomSecureError ||
+    Dir.CreateDirError || Dir.RealPathError || std.Io.File.StatError || std.Io.RandomSecureError ||
     error{ NoSpaceLeft, SharedScratchParent };
 const ParentValidationError = Dir.OpenError || std.Io.File.StatError ||
     error{ SharedScratchParent, UnapprovedScratch };
@@ -64,15 +64,23 @@ const cleanup_script =
 
 pub const TmpDir = struct {
     dir: Dir,
-    parent_dir: Dir,
-    sub_path: [42]u8,
     path: []const u8,
-    inode: std.Io.File.INode,
+    backing: union(enum) {
+        standard: std.testing.TmpDir,
+        external: External,
+    },
     gpa: std.mem.Allocator,
     io: std.Io,
     environment: std.process.Environ.Map,
 
-    /// The exclusively created 0700 child is private to this test. Callers must
+    const External = struct {
+        parent_dir: Dir,
+        sub_path: [42]u8,
+        inode: std.Io.File.INode,
+    };
+
+    /// Default scratch uses std.testing cleanup. For an explicit root, the
+    /// exclusively created 0700 child is private to this test. Callers must
     /// close all child handles and join/stop any child process before cleanup;
     /// they must not publish this path to unrelated processes. Cleanup closes
     /// its own child handle, revalidates the approved mount and inode, and checks
@@ -80,27 +88,32 @@ pub const TmpDir = struct {
     /// If any proof/check fails, retain the tree and print its path and reason.
     /// No global PID scan, signals, CWD changes or unverified deletion occur.
     pub fn cleanup(self: *TmpDir) void {
-        self.dir.close(self.io);
-        defer self.parent_dir.close(self.io);
         defer self.gpa.free(self.path);
         defer self.environment.deinit();
-        self.removeOwnedChild() catch |err| {
-            std.debug.print("retained test scratch {s}: {s}\n", .{ self.path, @errorName(err) });
-        };
+        switch (self.backing) {
+            .standard => |*temporary| temporary.cleanup(),
+            .external => |*external| {
+                self.dir.close(self.io);
+                defer external.parent_dir.close(self.io);
+                self.removeOwnedChild(external) catch |err| {
+                    std.debug.print("retained test scratch {s}: {s}\n", .{ self.path, @errorName(err) });
+                };
+            },
+        }
     }
 
-    fn removeOwnedChild(self: *TmpDir) CleanupError!void {
-        try validatePrivateParent(self.io, self.parent_dir);
+    fn removeOwnedChild(self: *TmpDir, external: *const External) CleanupError!void {
+        try validatePrivateParent(self.io, external.parent_dir);
         try gate_scratch.validateRoot(self.gpa, self.io, &self.environment, self.path);
         var parent_buffer: [Dir.max_path_bytes]u8 = undefined;
-        const parent_path = parent_buffer[0..try self.parent_dir.realPath(self.io, &parent_buffer)];
+        const parent_path = parent_buffer[0..try external.parent_dir.realPath(self.io, &parent_buffer)];
         const expected_parent = std.fs.path.dirname(self.path) orelse
             return error.ScratchIdentityChanged;
         if (!std.mem.eql(u8, expected_parent, parent_path)) return error.ScratchIdentityChanged;
-        const metadata = try self.parent_dir.statFile(self.io, &self.sub_path, .{
+        const metadata = try external.parent_dir.statFile(self.io, &external.sub_path, .{
             .follow_symlinks = false,
         });
-        if (metadata.kind != .directory or metadata.inode != self.inode)
+        if (metadata.kind != .directory or metadata.inode != external.inode)
             return error.ScratchIdentityChanged;
         const process_id = switch (builtin.os.tag) {
             .linux => std.os.linux.getpid(),
@@ -122,16 +135,39 @@ pub const TmpDir = struct {
             },
             else => return error.UnprovenScratchCleanup,
         }
-        try self.parent_dir.deleteTree(self.io, &self.sub_path);
+        try external.parent_dir.deleteTree(self.io, &external.sub_path);
     }
 };
 
-/// A test-only replacement for std.testing.tmpDir; no repository cache fallback.
+/// Use standard test scratch by default; validate an explicit GATE_SCRATCH strictly.
 pub fn tmpDir(opts: Dir.OpenOptions) CreateError!TmpDir {
     const t = std.testing;
     var environment = try t.environ.createMap(t.allocator);
     errdefer environment.deinit();
-    return createTmpDir(t.allocator, t.io, &environment, opts);
+    return tmpDirFromEnvironment(t.allocator, t.io, &environment, opts);
+}
+
+fn tmpDirFromEnvironment(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    opts: Dir.OpenOptions,
+) CreateTmpDirError!TmpDir {
+    if (environment.get("GATE_SCRATCH") == null) {
+        var temporary = std.testing.tmpDir(opts);
+        errdefer temporary.cleanup();
+        var buffer: [Dir.max_path_bytes]u8 = undefined;
+        const path = try gpa.dupe(u8, buffer[0..try temporary.dir.realPath(io, &buffer)]);
+        return .{
+            .dir = temporary.dir,
+            .backing = .{ .standard = temporary },
+            .path = path,
+            .gpa = gpa,
+            .io = io,
+            .environment = environment.*,
+        };
+    }
+    return createTmpDir(gpa, io, environment, opts);
 }
 
 // On success the result takes ownership of the environment; on error the caller keeps it.
@@ -166,10 +202,12 @@ fn createTmpDir(
     const metadata = try dir.stat(io);
     return .{
         .dir = dir,
-        .parent_dir = parent,
-        .sub_path = sub_path,
+        .backing = .{ .external = .{
+            .parent_dir = parent,
+            .sub_path = sub_path,
+            .inode = metadata.inode,
+        } },
         .path = path,
-        .inode = metadata.inode,
         .gpa = gpa,
         .io = io,
         .environment = environment.*,
@@ -204,10 +242,26 @@ test "test scratch rejects missing and relative roots before filesystem writes" 
     defer environment.deinit();
     try t.expectError(error.MissingScratch, createTmpDir(t.allocator, t.io, &environment, .{}));
     try environment.put("GATE_SCRATCH", ".zig-cache/tmp");
-    try t.expectError(error.UnapprovedScratch, createTmpDir(t.allocator, t.io, &environment, .{}));
+    try t.expectError(error.UnapprovedScratch, tmpDirFromEnvironment(t.allocator, t.io, &environment, .{}));
 }
 
-test "test scratch writes externally without changing fixture cwd and removes its own child" {
+test "test scratch uses a standard temporary directory when unset" {
+    const t = std.testing;
+    var environment: std.process.Environ.Map = .init(t.allocator);
+    var temporary = tmpDirFromEnvironment(t.allocator, t.io, &environment, .{}) catch |err| {
+        environment.deinit();
+        return err;
+    };
+    defer temporary.cleanup();
+    const file = try temporary.dir.createFile(t.io, "payload", .{ .exclusive = true });
+    defer file.close(t.io);
+    try file.writeStreamingAll(t.io, "default test scratch");
+    const bytes = try temporary.dir.readFileAlloc(t.io, "payload", t.allocator, .limited(100));
+    defer t.allocator.free(bytes);
+    try t.expectEqualStrings("default test scratch", bytes);
+}
+
+test "test scratch writes without changing fixture cwd and removes its own child" {
     const t = std.testing;
     const cwd_before = try std.process.currentPathAlloc(t.io, t.allocator);
     defer t.allocator.free(cwd_before);
@@ -218,10 +272,12 @@ test "test scratch writes externally without changing fixture cwd and removes it
     defer t.allocator.free(path);
     var environment = try t.environ.createMap(t.allocator);
     defer environment.deinit();
-    const scratch = try gate_scratch.validatedScratch(t.allocator, t.io, &environment, path);
-    defer t.allocator.free(scratch);
-    try t.expect(std.mem.startsWith(u8, path, scratch));
-    try t.expectEqual(@as(u8, '/'), path[scratch.len]);
+    if (environment.get("GATE_SCRATCH") != null) {
+        const scratch = try gate_scratch.validatedScratch(t.allocator, t.io, &environment, path);
+        defer t.allocator.free(scratch);
+        try t.expect(std.mem.startsWith(u8, path, scratch));
+        try t.expectEqual(@as(u8, '/'), path[scratch.len]);
+    }
     {
         const file = try temporary.dir.createFile(t.io, "payload", .{ .exclusive = true });
         defer file.close(t.io);

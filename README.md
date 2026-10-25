@@ -22,11 +22,9 @@ The development shell uses Zig from `PATH` and checks its version.
 
 ## Build and test
 
-Native tests use a private scratch directory. Choose a local filesystem, not NFS.
+Tests use standard temporary directories under `.zig-cache/tmp` by default.
 
 ```sh
-export GATE_SCRATCH="${XDG_CACHE_HOME:-$HOME/.cache}/ozai/scratch"
-mkdir -p -m 700 "$GATE_SCRATCH"
 zig build
 zig build test
 zig build test-portable
@@ -81,8 +79,12 @@ Build that peer with `cargo build --locked --manifest-path interop/iroh-peer/Car
 The strict gate also needs `zig-gate`, ziglint, zlint, Zwanzig, cross-test,
 and the coverage tools through `PATH`. Set `ZBC` to the native analyzer's absolute path.
 Its default is `$HOME/.local/bin/zbc`.
+For the gate or external test scratch, set `GATE_SCRATCH` to a private directory
+on a local filesystem, not NFS. An explicit invalid path is rejected.
 
 ```sh
+export GATE_SCRATCH="${XDG_CACHE_HOME:-$HOME/.cache}/ozai/scratch"
+mkdir -p -m 700 "$GATE_SCRATCH"
 export ZIG="$(command -v zig)"
 export OZAI_COVERAGE_RT=/absolute/path/to/zig-cov-rt.o
 zig run scripts/project_gate.zig -- measure
